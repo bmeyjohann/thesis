@@ -1,0 +1,6 @@
+[submodule "fast_td3"]
+	path = fast_td3
+	url = https://github.com/bmeyjohann/FastTD3-thesis.git
+[submodule "gymnasium-maze"]
+	path = gymnasium-maze
+	url = https://github.com/bmeyjohann/gymnasium-maze-thesis
