@@ -4,6 +4,8 @@ import torch.nn.functional as F
 import numpy as np
 import gymnasium as gym
 import gymnasium_maze
+from PIL import Image
+import matplotlib.pyplot as plt
 
 from fast_td3.fast_td3 import Actor, Critic
 from fast_td3.fast_td3_utils import SimpleReplayBuffer
@@ -29,10 +31,11 @@ def main():
     # Register gymnasium_maze environments
     gym.register_envs(gymnasium_maze)
 
+    # Create environment with rgb_array mode for offscreen rendering
     env = gym.make(
         args.env_name, 
         continuing_task=False,
-        render_mode="human",  # Disable for now - WSL/MuJoCo OpenGL context issue
+        render_mode="rgb_array",  # Offscreen rendering to numpy arrays
         max_episode_steps=500
     )
     torch.manual_seed(args.seed)
@@ -61,6 +64,15 @@ def main():
             torch.tensor(goal, dtype=torch.float32, device=args.device)
         ])  # Remove .unsqueeze(0) for individual transitions
 
+    def save_frame(frame, step, episode, reward):
+        """Save rendered frame as image"""
+        if frame is not None and step % 100 == 0:  # Save every 100 steps
+            os.makedirs("renders", exist_ok=True)
+            img = Image.fromarray(frame)
+            filename = f"renders/step_{step:06d}_ep_{episode:03d}_reward_{reward:.2f}.png"
+            img.save(filename)
+            print(f"Saved frame: {filename}")
+
     actor = Actor(obs_dim, act_dim, num_envs=1, device=args.device, init_scale=1.0, hidden_dim=256).to(args.device)
     actor_target = Actor(obs_dim, act_dim, num_envs=1, device=args.device, init_scale=1.0, hidden_dim=256).to(args.device)
     actor_target.load_state_dict(actor.state_dict())
@@ -86,6 +98,7 @@ def main():
     obs = process_obs(obs_dict)
     episode_reward = 0
     global_step = 0
+    episode_count = 0
 
     while global_step < args.total_timesteps:
         if global_step < args.learning_starts:
@@ -97,6 +110,13 @@ def main():
         next_obs_dict, reward, terminated, truncated, _ = env.step(action)
         done = terminated or truncated
         next_obs = process_obs(next_obs_dict)
+
+        # Render and save frame occasionally
+        try:
+            frame = env.render()
+            save_frame(frame, global_step, episode_count, episode_reward)
+        except Exception as e:
+            print(f"Rendering failed: {e}")
 
         transition = {
             "observations": obs,
@@ -115,10 +135,11 @@ def main():
         episode_reward += reward
 
         if done:
-            print(f"Step: {global_step}, Episode Reward: {episode_reward:.2f}")
+            print(f"Step: {global_step}, Episode: {episode_count}, Reward: {episode_reward:.2f}")
             obs_dict, _ = env.reset()
             obs = process_obs(obs_dict)
             episode_reward = 0
+            episode_count += 1
 
         if global_step >= args.learning_starts:
             for _ in range(1):  # single update per step
@@ -158,5 +179,7 @@ def main():
                     for param, target_param in zip(critic.parameters(), critic_target.parameters()):
                         target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
 
+    print("Training completed! Check the 'renders' folder for saved frames.")
+
 if __name__ == "__main__":
-    main()
+    main() 

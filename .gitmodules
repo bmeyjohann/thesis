@@ -4,3 +4,6 @@
 [submodule "gymnasium-maze"]
 	path = gymnasium-maze
 	url = https://github.com/bmeyjohann/gymnasium-maze-thesis
+[submodule "ogbench"]
+	path = ogbench
+	url = git@github.com:bmeyjohann/ogbench.git
