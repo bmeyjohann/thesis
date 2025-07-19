@@ -3,17 +3,26 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import gymnasium as gym
-import gymnasium_maze
+import pygame
 from PIL import Image
 import matplotlib.pyplot as plt
 
-from fast_td3.fast_td3 import Actor, Critic
-from fast_td3.fast_td3_utils import SimpleReplayBuffer
-from fast_td3.hyperparams import get_args
+# Fix WSL window positioning issues  
+os.environ['SDL_VIDEO_CENTERED'] = '1'  # Center windows
+
+# Import ogbench to register environments
+import ogbench
+
+import sys
+sys.path.append('fasttd3/fast_td3')
+
+from fast_td3_utils import SimpleReplayBuffer
+from hyperparams import get_args
+from fast_td3 import Actor, Critic
 
 def main():
     args = get_args()
-    args.env_name = "PointMaze_Medium_Dangerous-v3"
+    args.env_name = "pointmaze-medium-v0"  # Changed to OGBench environment
     args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     args.total_timesteps = 100_000
     args.learning_starts = 1_000
@@ -28,50 +37,45 @@ def main():
     args.policy_frequency = 2
     args.seed = 0
 
-    # Register gymnasium_maze environments
-    gym.register_envs(gymnasium_maze)
+    print(f"Using device: {args.device}")
 
-    # Create environment with rgb_array mode for offscreen rendering
-    env = gym.make(
-        args.env_name, 
-        continuing_task=False,
-        render_mode="rgb_array",  # Offscreen rendering to numpy arrays
-        max_episode_steps=500
-    )
+    # OGBench environments are automatically registered on import
+    
+    # Create environment with visual rendering like intervention example
+    try:
+        env = gym.make(
+            args.env_name,
+            render_mode="human",
+            max_episode_steps=500,
+            width=800,
+            height=600
+        )
+    except Exception as e:
+        print(f"Failed to create environment: {e}")
+        print("This might be a MuJoCo/OpenGL issue.")
+        return
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
     print(env.observation_space)
     print(env.action_space)
 
-    # For goal-conditioned environments, concatenate observation + desired_goal
-    # Note: actual observation is 2D despite space claiming 6D
-    main_obs_dim = 2  # position coordinates (x, y)
-    goal_dim = env.observation_space['desired_goal'].shape[0]     # 2
-    obs_dim = main_obs_dim + goal_dim  # 4 total (2 + 2)
+    # OGBench PointMaze has simple Box observation space (position only)
+    obs_dim = env.observation_space.shape[0]  # 2D position
     act_dim = env.action_space.shape[0]
     act_limit = env.action_space.high[0]
     
-    print(f"Observation dimensions: {main_obs_dim} + {goal_dim} = {obs_dim}")
+    print(f"Observation dimensions: {obs_dim}")
     print(f"Creating replay buffer with n_obs={obs_dim}")
 
-    def process_obs(obs_dict):
-        """Convert dictionary observation to concatenated tensor"""
-        main_obs = obs_dict['observation']
-        goal = obs_dict['desired_goal']
-        return torch.cat([
-            torch.tensor(main_obs, dtype=torch.float32, device=args.device),
-            torch.tensor(goal, dtype=torch.float32, device=args.device)
-        ])  # Remove .unsqueeze(0) for individual transitions
+    def process_obs(obs):
+        """Convert observation to tensor"""
+        return torch.tensor(obs, dtype=torch.float32, device=args.device)
 
-    def save_frame(frame, step, episode, reward):
-        """Save rendered frame as image"""
-        if frame is not None and step % 100 == 0:  # Save every 100 steps
-            os.makedirs("renders", exist_ok=True)
-            img = Image.fromarray(frame)
-            filename = f"renders/step_{step:06d}_ep_{episode:03d}_reward_{reward:.2f}.png"
-            img.save(filename)
-            print(f"Saved frame: {filename}")
+    def print_progress(step, episode, reward):
+        """Print training progress"""
+        if step % 100 == 0:  # Print every 100 steps
+            print(f"Step {step:06d} | Episode {episode:03d} | Reward: {reward:.2f}")
 
     actor = Actor(obs_dim, act_dim, num_envs=1, device=args.device, init_scale=1.0, hidden_dim=256).to(args.device)
     actor_target = Actor(obs_dim, act_dim, num_envs=1, device=args.device, init_scale=1.0, hidden_dim=256).to(args.device)
@@ -94,38 +98,51 @@ def main():
         device=args.device,
     )
 
-    obs_dict, _ = env.reset(seed=args.seed)
-    obs = process_obs(obs_dict)
+    # Initialize pygame for event handling
+    pygame.init()
+    
+    obs, _ = env.reset(seed=args.seed)
+    obs = process_obs(obs)
     episode_reward = 0
     global_step = 0
     episode_count = 0
+    running = True
 
-    while global_step < args.total_timesteps:
+    print("=== VISUAL TRAINING ===")
+    print("🤖 Training FastTD3 on OGBench PointMaze")
+    print("🎮 Visual rendering enabled - you can watch the agent learn!")
+    print("❌ Press Ctrl+C to exit or close the window.")
+
+    while global_step < args.total_timesteps and running:
         if global_step < args.learning_starts:
             action = env.action_space.sample()
         else:
             with torch.no_grad():
                 action = actor(obs.unsqueeze(0)).cpu().numpy()[0]  # Add batch dim for actor
 
-        next_obs_dict, reward, terminated, truncated, _ = env.step(action)
+        next_obs, reward, terminated, truncated, _ = env.step(action)
         done = terminated or truncated
-        next_obs = process_obs(next_obs_dict)
+        next_obs = process_obs(next_obs)
 
-        # Render and save frame occasionally
-        try:
-            frame = env.render()
-            save_frame(frame, global_step, episode_count, episode_reward)
-        except Exception as e:
-            print(f"Rendering failed: {e}")
+        # Handle pygame events to prevent window freezing
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    running = False
+
+        # Render automatically happens with render_mode="human"
+        print_progress(global_step, episode_count, episode_reward)
 
         transition = {
             "observations": obs,
-            "actions": torch.tensor(action, dtype=torch.float32, device=args.device),  # Remove .unsqueeze(0)
+            "actions": torch.tensor(action, dtype=torch.float32, device=args.device),
             "next": {
                 "observations": next_obs,
-                "rewards": torch.tensor([reward], dtype=torch.float32, device=args.device),  # Single bracket
-                "truncations": torch.tensor([truncated], dtype=torch.int, device=args.device),  # Single bracket
-                "dones": torch.tensor([terminated], dtype=torch.int, device=args.device),  # Single bracket
+                "rewards": torch.tensor([reward], dtype=torch.float32, device=args.device),
+                "truncations": torch.tensor([truncated], dtype=torch.int, device=args.device),
+                "dones": torch.tensor([terminated], dtype=torch.int, device=args.device),
             },
         }
         replay.extend(transition)
@@ -136,8 +153,8 @@ def main():
 
         if done:
             print(f"Step: {global_step}, Episode: {episode_count}, Reward: {episode_reward:.2f}")
-            obs_dict, _ = env.reset()
-            obs = process_obs(obs_dict)
+            obs, _ = env.reset()
+            obs = process_obs(obs)
             episode_reward = 0
             episode_count += 1
 
@@ -179,7 +196,18 @@ def main():
                     for param, target_param in zip(critic.parameters(), critic_target.parameters()):
                         target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
 
-    print("Training completed! Check the 'renders' folder for saved frames.")
+    print("Training completed!")
+    
+    # Clean up
+    try:
+        env.close()
+    except:
+        pass
+    pygame.quit()
 
 if __name__ == "__main__":
-    main() 
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\nExiting...")
+        pygame.quit()

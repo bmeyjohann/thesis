@@ -3,16 +3,20 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import gymnasium as gym
-import gymnasium_maze
+import ogbench
 
-from fast_td3.fast_td3 import Actor, Critic
-from fast_td3.fast_td3_utils import SimpleReplayBuffer
-from fast_td3.hyperparams import get_args
+import sys
+sys.path.append('fasttd3/fast_td3')
+
+from fast_td3_utils import SimpleReplayBuffer
+from hyperparams import get_args
+from fast_td3 import Actor, Critic
 
 def main():
     args = get_args()
-    args.env_name = "PointMaze_Medium_Dangerous-v3"
+    args.env_name = "pointmaze-medium-v0"  # Changed to OGBench environment
     args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    args.num_envs = 16  # More parallel environments for even faster training
     args.total_timesteps = 100_000
     args.learning_starts = 1_000
     args.batch_size = 256
@@ -25,14 +29,15 @@ def main():
     args.noise_clip = 0.5
     args.policy_frequency = 2
     args.seed = 0
+    
+    print(f"Using device: {args.device}")
+    print(f"Training with {args.num_envs} parallel environments")
 
-    # Register gymnasium_maze environments
-    gym.register_envs(gymnasium_maze)
-
+    # OGBench environments are automatically registered on import
+    
     env = gym.make(
         args.env_name, 
-        continuing_task=False,
-        render_mode="human",  # Disable for now - WSL/MuJoCo OpenGL context issue
+        render_mode=None,  # No rendering for training
         max_episode_steps=500
     )
     torch.manual_seed(args.seed)
@@ -41,28 +46,20 @@ def main():
     print(env.observation_space)
     print(env.action_space)
 
-    # For goal-conditioned environments, concatenate observation + desired_goal
-    # Note: actual observation is 2D despite space claiming 6D
-    main_obs_dim = 2  # position coordinates (x, y)
-    goal_dim = env.observation_space['desired_goal'].shape[0]     # 2
-    obs_dim = main_obs_dim + goal_dim  # 4 total (2 + 2)
+    # OGBench PointMaze has simple Box observation space (position only)
+    obs_dim = env.observation_space.shape[0]  # 2D position
     act_dim = env.action_space.shape[0]
     act_limit = env.action_space.high[0]
     
-    print(f"Observation dimensions: {main_obs_dim} + {goal_dim} = {obs_dim}")
+    print(f"Observation dimensions: {obs_dim}")
     print(f"Creating replay buffer with n_obs={obs_dim}")
 
-    def process_obs(obs_dict):
-        """Convert dictionary observation to concatenated tensor"""
-        main_obs = obs_dict['observation']
-        goal = obs_dict['desired_goal']
-        return torch.cat([
-            torch.tensor(main_obs, dtype=torch.float32, device=args.device),
-            torch.tensor(goal, dtype=torch.float32, device=args.device)
-        ])  # Remove .unsqueeze(0) for individual transitions
+    def process_obs(obs):
+        """Convert observation to tensor"""
+        return torch.tensor(obs, dtype=torch.float32, device=args.device)
 
-    actor = Actor(obs_dim, act_dim, num_envs=1, device=args.device, init_scale=1.0, hidden_dim=256).to(args.device)
-    actor_target = Actor(obs_dim, act_dim, num_envs=1, device=args.device, init_scale=1.0, hidden_dim=256).to(args.device)
+    actor = Actor(obs_dim, act_dim, num_envs=args.num_envs, device=args.device, init_scale=1.0, hidden_dim=256).to(args.device)
+    actor_target = Actor(obs_dim, act_dim, num_envs=args.num_envs, device=args.device, init_scale=1.0, hidden_dim=256).to(args.device)
     actor_target.load_state_dict(actor.state_dict())
 
     critic = Critic(obs_dim, act_dim, num_atoms=1, v_min=-100, v_max=100, hidden_dim=256, device=args.device).to(args.device)
@@ -73,7 +70,7 @@ def main():
     critic_opt = torch.optim.Adam(critic.parameters(), lr=args.critic_learning_rate)
 
     replay = SimpleReplayBuffer(
-        n_env=1,
+        n_env=args.num_envs,
         buffer_size=args.buffer_size,
         n_obs=obs_dim,
         n_act=act_dim,
@@ -82,8 +79,8 @@ def main():
         device=args.device,
     )
 
-    obs_dict, _ = env.reset(seed=args.seed)
-    obs = process_obs(obs_dict)
+    obs, _ = env.reset(seed=args.seed)
+    obs = process_obs(obs)
     episode_reward = 0
     global_step = 0
 
@@ -94,9 +91,9 @@ def main():
             with torch.no_grad():
                 action = actor(obs.unsqueeze(0)).cpu().numpy()[0]  # Add batch dim for actor
 
-        next_obs_dict, reward, terminated, truncated, _ = env.step(action)
+        next_obs, reward, terminated, truncated, _ = env.step(action)
         done = terminated or truncated
-        next_obs = process_obs(next_obs_dict)
+        next_obs = process_obs(next_obs)
 
         transition = {
             "observations": obs,
@@ -116,8 +113,8 @@ def main():
 
         if done:
             print(f"Step: {global_step}, Episode Reward: {episode_reward:.2f}")
-            obs_dict, _ = env.reset()
-            obs = process_obs(obs_dict)
+            obs, _ = env.reset()
+            obs = process_obs(obs)
             episode_reward = 0
 
         if global_step >= args.learning_starts:
