@@ -14,11 +14,11 @@ os.environ['SDL_VIDEO_CENTERED'] = '1'  # Center windows
 import ogbench
 
 import sys
-sys.path.append('fasttd3/fast_td3')
+sys.path.append('fasttd3/fast_sac')
 
-from fast_td3_utils import SimpleReplayBuffer
+from fast_sac_utils import SimpleReplayBuffer
 from hyperparams import get_args
-from fast_td3 import Actor, Critic
+from fast_sac import Actor, Critic
 
 def main():
     args = get_args()
@@ -78,12 +78,16 @@ def main():
             print(f"Step {step:06d} | Episode {episode:03d} | Reward: {reward:.2f}")
 
     actor = Actor(obs_dim, act_dim, num_envs=1, device=args.device, init_scale=1.0, hidden_dim=256).to(args.device)
-    actor_target = Actor(obs_dim, act_dim, num_envs=1, device=args.device, init_scale=1.0, hidden_dim=256).to(args.device)
-    actor_target.load_state_dict(actor.state_dict())
 
-    critic = Critic(obs_dim, act_dim, num_atoms=1, v_min=-100, v_max=100, hidden_dim=256, device=args.device).to(args.device)
-    critic_target = Critic(obs_dim, act_dim, num_atoms=1, v_min=-100, v_max=100, hidden_dim=256, device=args.device).to(args.device)
+    critic = Critic(obs_dim, act_dim, hidden_dim=256, device=args.device).to(args.device)
+    critic_target = Critic(obs_dim, act_dim, hidden_dim=256, device=args.device).to(args.device)
     critic_target.load_state_dict(critic.state_dict())
+    
+    # SAC: Alpha parameter for entropy regularization
+    target_entropy = -float(act_dim)
+    log_alpha = torch.ones(1, requires_grad=True, device=args.device)
+    log_alpha.data.copy_(torch.tensor([np.log(0.001)], device=args.device))
+    alpha_opt = torch.optim.Adam([log_alpha], lr=args.critic_learning_rate)
 
     actor_opt = torch.optim.Adam(actor.parameters(), lr=args.actor_learning_rate)
     critic_opt = torch.optim.Adam(critic.parameters(), lr=args.critic_learning_rate)
@@ -109,7 +113,7 @@ def main():
     running = True
 
     print("=== VISUAL TRAINING ===")
-    print("🤖 Training FastTD3 on OGBench PointMaze")
+    print("🤖 Training FastSAC on OGBench PointMaze")
     print("🎮 Visual rendering enabled - you can watch the agent learn!")
     print("❌ Press Ctrl+C to exit or close the window.")
 
@@ -118,7 +122,8 @@ def main():
             action = env.action_space.sample()
         else:
             with torch.no_grad():
-                action = actor(obs.unsqueeze(0)).cpu().numpy()[0]  # Add batch dim for actor
+                action, _, _ = actor(obs.unsqueeze(0))
+                action = action.cpu().numpy()[0]  # Add batch dim for actor
 
         next_obs, reward, terminated, truncated, _ = env.step(action)
         done = terminated or truncated
@@ -168,11 +173,12 @@ def main():
                 done_b = batch["next"]["dones"]
 
                 with torch.no_grad():
-                    noise = (torch.randn_like(act_b) * args.policy_noise).clamp(-args.noise_clip, args.noise_clip)
-                    next_action = (actor_target(next_obs_b) + noise).clamp(-act_limit, act_limit)
+                    # SAC: Get next actions and log probs from actor
+                    next_action, next_log_prob, _ = actor(next_obs_b)
                     target_q1, target_q2 = critic_target(next_obs_b, next_action)
                     target_q = torch.min(target_q1, target_q2)
-                    target = rew_b + args.gamma * (1 - done_b) * target_q
+                    # SAC: Subtract log prob for entropy regularization
+                    target = rew_b + args.gamma * (1 - done_b) * (target_q - log_alpha.exp() * next_log_prob)
 
                 q1, q2 = critic(obs_b, act_b)
                 critic_loss = ((q1 - target).pow(2).mean() + (q2 - target).pow(2).mean())
@@ -182,17 +188,22 @@ def main():
                 critic_opt.step()
 
                 if global_step % args.policy_frequency == 0:
-                    # Get Q-values for actor loss
-                    q1_dist, q2_dist = critic(obs_b, actor(obs_b))
-                    q1_values = critic.get_value(F.softmax(q1_dist, dim=1))
-                    actor_loss = -q1_values.mean()
+                    # SAC: Actor update
+                    action, log_prob, _ = actor(obs_b)
+                    q1, q2 = critic(obs_b, action)
+                    q_value = torch.min(q1, q2)
+                    actor_loss = (log_alpha.exp() * log_prob - q_value).mean()
                     actor_opt.zero_grad()
                     actor_loss.backward()
                     actor_opt.step()
+                    
+                    # SAC: Alpha update
+                    alpha_loss = -log_alpha.exp() * (log_prob + target_entropy).detach().mean()
+                    alpha_opt.zero_grad()
+                    alpha_loss.backward()
+                    alpha_opt.step()
 
-                    for param, target_param in zip(actor.parameters(), actor_target.parameters()):
-                        target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
-
+                    # SAC: Only update critic target (no actor target in SAC)
                     for param, target_param in zip(critic.parameters(), critic_target.parameters()):
                         target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
 

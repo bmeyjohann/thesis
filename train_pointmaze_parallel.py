@@ -29,10 +29,10 @@ import ogbench
 from ogbench.wrappers import RelativeGoalWrapper, SpeedWrapper
 
 import sys
-sys.path.append('fasttd3/fast_td3')
+sys.path.append('fasttd3/fast_sac')
 
-from fast_td3_utils import SimpleReplayBuffer, EmpiricalNormalization
-from fast_td3 import Actor, Critic
+from fast_sac_utils import SimpleReplayBuffer, EmpiricalNormalization
+from fast_sac import Actor, Critic
 from tensordict import TensorDict
 
 @dataclass
@@ -66,7 +66,7 @@ class ParallelTrainingArgs:
     save_interval: int = 100_000
     log_interval: int = 1000
     
-    # Fast TD3 specific
+    # Fast SAC specific
     obs_normalization: bool = True
     num_updates: int = 2
     max_grad_norm: float = 0.0
@@ -167,10 +167,10 @@ class VectorizedPointMazeEnv:
         return next_observations, rewards, dones, infos
 
 
-def create_networks(args: ParallelTrainingArgs, obs_dim: int, act_dim: int) -> Tuple[Actor, Actor, Critic, Critic]:
-    """Create actor and critic networks"""
+def create_networks(args: ParallelTrainingArgs, obs_dim: int, act_dim: int) -> Tuple[Actor, Critic, Critic]:
+    """Create actor and critic networks for SAC"""
     
-    # Actor networks
+    # Actor network (SAC doesn't use actor target)
     actor = Actor(
         obs_dim, act_dim, 
         num_envs=args.num_envs, 
@@ -179,48 +179,37 @@ def create_networks(args: ParallelTrainingArgs, obs_dim: int, act_dim: int) -> T
         hidden_dim=args.actor_hidden_dim
     ).to(args.device)
     
-    actor_target = Actor(
-        obs_dim, act_dim, 
-        num_envs=args.num_envs, 
-        device=args.device, 
-        init_scale=args.init_scale, 
-        hidden_dim=args.actor_hidden_dim
-    ).to(args.device)
-    actor_target.load_state_dict(actor.state_dict())
-    
     # Critic networks
     critic = Critic(
         obs_dim, act_dim, 
-        num_atoms=1, 
-        v_min=-100, v_max=100, 
         hidden_dim=args.critic_hidden_dim, 
         device=args.device
     ).to(args.device)
     
     critic_target = Critic(
         obs_dim, act_dim, 
-        num_atoms=1, 
-        v_min=-100, v_max=100, 
         hidden_dim=args.critic_hidden_dim, 
         device=args.device
     ).to(args.device)
     critic_target.load_state_dict(critic.state_dict())
     
-    return actor, actor_target, critic, critic_target
+    return actor, critic, critic_target
 
 
 def update_networks(
     actor: Actor, 
-    actor_target: Actor,
     critic: Critic, 
     critic_target: Critic,
     actor_optimizer: torch.optim.Optimizer,
     critic_optimizer: torch.optim.Optimizer,
+    alpha_optimizer: torch.optim.Optimizer,
+    log_alpha: torch.Tensor,
+    target_entropy: float,
     batch: Dict[str, torch.Tensor],
     args: ParallelTrainingArgs,
     global_step: int
 ) -> Dict[str, float]:
-    """Update actor and critic networks"""
+    """Update actor and critic networks using SAC"""
     
     obs = batch["observations"]
     next_obs = batch["next"]["observations"]
@@ -230,15 +219,12 @@ def update_networks(
     
     # Update critic
     with torch.no_grad():
-        # Target policy smoothing
-        noise = torch.randn_like(actions) * args.policy_noise
-        noise = noise.clamp(-args.noise_clip, args.noise_clip)
-        next_actions = (actor_target(next_obs) + noise).clamp(-1.0, 1.0)
-        
-        # Compute target Q-values
-        target_q1, target_q2 = critic_target(next_obs, next_actions)
+        # SAC: Get next actions and log probs from actor
+        next_action, next_log_prob, _ = actor(next_obs)
+        target_q1, target_q2 = critic_target(next_obs, next_action)
         target_q = torch.min(target_q1, target_q2)
-        target_q = rewards + args.gamma * (1 - dones.float()) * target_q
+        # SAC: Subtract log prob for entropy regularization
+        target_q = rewards + args.gamma * (1 - dones.float()) * (target_q - log_alpha.exp() * next_log_prob)
     
     # Current Q-values
     current_q1, current_q2 = critic(obs, actions)
@@ -257,7 +243,11 @@ def update_networks(
     
     # Update actor (delayed)
     if global_step % args.policy_frequency == 0:
-        actor_loss = -critic(obs, actor(obs))[0].mean()
+        # SAC: Actor update
+        action, log_prob, _ = actor(obs)
+        q1, q2 = critic(obs, action)
+        q_value = torch.min(q1, q2)
+        actor_loss = (log_alpha.exp() * log_prob - q_value).mean()
         
         actor_optimizer.zero_grad()
         actor_loss.backward()
@@ -265,15 +255,20 @@ def update_networks(
             torch.nn.utils.clip_grad_norm_(actor.parameters(), args.max_grad_norm)
         actor_optimizer.step()
         
-        # Update target networks
+        # SAC: Alpha update
+        alpha_loss = -log_alpha.exp() * (log_prob + target_entropy).detach().mean()
+        alpha_optimizer.zero_grad()
+        alpha_loss.backward()
+        alpha_optimizer.step()
+        
+        # SAC: Only update critic target (no actor target in SAC)
         with torch.no_grad():
-            for param, target_param in zip(actor.parameters(), actor_target.parameters()):
-                target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
-            
             for param, target_param in zip(critic.parameters(), critic_target.parameters()):
                 target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
         
         logs["actor_loss"] = actor_loss.item()
+        logs["alpha_loss"] = alpha_loss.item()
+        logs["alpha"] = log_alpha.exp().item()
     
     return logs
 
@@ -306,7 +301,8 @@ def evaluate_policy(
             
             with torch.no_grad():
                 norm_obs = obs_normalizer(obs_tensor).squeeze(0)
-                action = actor(norm_obs.unsqueeze(0)).cpu().numpy()[0]
+                action, _, _ = actor(norm_obs.unsqueeze(0))
+                action = action.cpu().numpy()[0]
             
             obs, reward, terminated, truncated, _ = env.step(action)
             episode_return += reward
@@ -356,13 +352,19 @@ def main():
     envs = VectorizedPointMazeEnv(args.env_name, args.num_envs, device)
     
     # Create networks
-    actor, actor_target, critic, critic_target = create_networks(
+    actor, critic, critic_target = create_networks(
         args, envs.num_obs, envs.num_actions
     )
     
     # Create optimizers
     actor_optimizer = torch.optim.Adam(actor.parameters(), lr=args.actor_learning_rate)
     critic_optimizer = torch.optim.Adam(critic.parameters(), lr=args.critic_learning_rate)
+    
+    # SAC: Alpha parameter for entropy regularization
+    target_entropy = -float(envs.num_actions)
+    log_alpha = torch.ones(1, requires_grad=True, device=device)
+    log_alpha.data.copy_(torch.tensor([np.log(0.001)], device=device))
+    alpha_optimizer = torch.optim.Adam([log_alpha], lr=args.critic_learning_rate)
     
     # Create observation normalizer
     obs_normalizer = EmpiricalNormalization(shape=envs.num_obs, device=device)
@@ -401,8 +403,8 @@ def main():
                 # Random actions during initial exploration
                 actions = torch.rand(args.num_envs, envs.num_actions, device=device) * 2 - 1
             else:
-                # Policy actions with exploration noise
-                actions = actor.explore(norm_obs, deterministic=False)
+                # Policy actions from SAC actor
+                actions, _, _ = actor(norm_obs)
         
         # Step environment
         next_obs, rewards, dones, infos = envs.step(actions)
@@ -443,8 +445,9 @@ def main():
                 batch["next"]["observations"] = obs_normalizer(batch["next"]["observations"])
                 
                 logs = update_networks(
-                    actor, actor_target, critic, critic_target,
-                    actor_optimizer, critic_optimizer,
+                    actor, critic, critic_target,
+                    actor_optimizer, critic_optimizer, alpha_optimizer,
+                    log_alpha, target_entropy,
                     batch, args, global_step
                 )
         
