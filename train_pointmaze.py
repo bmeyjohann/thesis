@@ -15,7 +15,15 @@ from fast_sac import Actor, Critic
 def main():
     args = get_args()
     args.env_name = "pointmaze-medium-v0"  # Changed to OGBench environment
+    # Robust device selection and printout
+    import torch
     args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {args.device}")
+    if args.device.type == 'cuda':
+        print(f"CUDA device name: {torch.cuda.get_device_name(args.device)}")
+        print(f"CUDA available: {torch.cuda.is_available()}")
+    else:
+        print("WARNING: Training is running on CPU. For best performance, use a machine with an NVIDIA GPU and CUDA drivers installed.")
     args.num_envs = 16  # More parallel environments for even faster training
     args.total_timesteps = 100_000
     args.learning_starts = 1_000
@@ -30,7 +38,6 @@ def main():
     args.policy_frequency = 2
     args.seed = 0
     
-    print(f"Using device: {args.device}")
     print(f"Training with {args.num_envs} parallel environments")
 
     # OGBench environments are automatically registered on import
@@ -165,6 +172,25 @@ def main():
                     # SAC: Only update critic target (no actor target in SAC)
                     for param, target_param in zip(critic.parameters(), critic_target.parameters()):
                         target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
+
+    # In the training loop, after computing target, ensure shape is [batch_size, 1]
+    # Also ensure rewards, dones, etc. are [batch_size, 1]
+    if target.dim() == 1:
+        target = target.unsqueeze(-1)
+    if rew_b.dim() == 1:
+        rew_b = rew_b.unsqueeze(-1)
+    if done_b.dim() == 1:
+        done_b = done_b.unsqueeze(-1)
+    # Also ensure q1/q2 are [batch_size, 1]
+    if q1.dim() == 1:
+        q1 = q1.unsqueeze(-1)
+    if q2.dim() == 1:
+        q2 = q2.unsqueeze(-1)
+    assert q1.shape == target.shape, f"q1 shape {q1.shape}, target shape {target.shape}"
+    assert q2.shape == target.shape, f"q2 shape {q2.shape}, target shape {target.shape}"
+
+    # Lower default batch size for safety
+    args.batch_size = min(args.batch_size, 256)
 
 if __name__ == "__main__":
     main()

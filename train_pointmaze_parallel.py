@@ -70,6 +70,7 @@ class ParallelTrainingArgs:
     obs_normalization: bool = True
     num_updates: int = 2
     max_grad_norm: float = 0.0
+    enable_reward_shaping: bool = False
 
 
 class VectorizedPointMazeEnv:
@@ -224,12 +225,24 @@ def update_networks(
         target_q1, target_q2 = critic_target(next_obs, next_action)
         target_q = torch.min(target_q1, target_q2)
         # SAC: Subtract log prob for entropy regularization
+        if target_q.dim() == 1:
+            target_q = target_q.unsqueeze(-1)
+        if rewards.dim() == 1:
+            rewards = rewards.unsqueeze(-1)
+        if dones.dim() == 1:
+            dones = dones.unsqueeze(-1)
         target_q = rewards + args.gamma * (1 - dones.float()) * (target_q - log_alpha.exp() * next_log_prob)
     
     # Current Q-values
     current_q1, current_q2 = critic(obs, actions)
     
     # Critic loss
+    if current_q1.dim() == 1:
+        current_q1 = current_q1.unsqueeze(-1)
+    if current_q2.dim() == 1:
+        current_q2 = current_q2.unsqueeze(-1)
+    assert current_q1.shape == target_q.shape, f"current_q1 shape {current_q1.shape}, target_q shape {target_q.shape}"
+    assert current_q2.shape == target_q.shape, f"current_q2 shape {current_q2.shape}, target_q shape {target_q.shape}"
     critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
     
     # Update critic
@@ -325,6 +338,7 @@ def main():
     parser.add_argument("--learning-starts", type=int, default=10_000, help="Timesteps before learning starts")
     parser.add_argument("--eval-interval", type=int, default=25_000, help="Evaluation interval")
     parser.add_argument("--save-interval", type=int, default=100_000, help="Model save interval")
+    parser.add_argument("--enable-reward-shaping", action="store_true", help="Enable distance-based reward shaping")
     
     cmd_args = parser.parse_args()
     
@@ -336,6 +350,7 @@ def main():
     args.learning_starts = cmd_args.learning_starts
     args.eval_interval = cmd_args.eval_interval
     args.save_interval = cmd_args.save_interval
+    args.enable_reward_shaping = cmd_args.enable_reward_shaping
     
     print(f"🚀 Starting Parallel PointMaze Training")
     print(f"   Device: {args.device}")
@@ -343,12 +358,22 @@ def main():
     print(f"   Batch Size: {args.batch_size}")
     print(f"   Total Timesteps: {args.total_timesteps:,}")
     
+    # Robust device selection and printout
+    import torch
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    if device.type == 'cuda':
+        print(f"CUDA device name: {torch.cuda.get_device_name(device)}")
+        print(f"CUDA available: {torch.cuda.is_available()}")
+    else:
+        print("WARNING: Training is running on CPU. For best performance, use a machine with an NVIDIA GPU and CUDA drivers installed.")
+    args.device = device
+
     # Set seeds
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     
     # Create vectorized environment
-    device = torch.device(args.device)
     envs = VectorizedPointMazeEnv(args.env_name, args.num_envs, device)
     
     # Create networks
@@ -391,6 +416,38 @@ def main():
     print(f"   GPU Memory allocated: {torch.cuda.memory_allocated(device) / 1024**3:.2f} GB")
     
     start_time = time.time()
+
+    if args.enable_reward_shaping:
+        print("✅ Reward shaping enabled: using Euclidean distance and directional rewards.")
+        prev_distances = None
+
+    def calculate_distance_reward(obs, prev_distance=None):
+        if obs.shape[-1] != 4:
+            return torch.zeros(obs.shape[0], device=obs.device), None
+        relative_goal = obs[..., 2:4]
+        current_distance = torch.norm(relative_goal, dim=-1)
+        improvement_reward = torch.zeros_like(current_distance)
+        if prev_distance is not None:
+            improvement_reward = prev_distance - current_distance
+        bonus = (current_distance < 2.0).float() * 0.5
+        return improvement_reward + bonus, current_distance
+    def calculate_directional_reward(obs, action):
+        if obs.shape[-1] != 4:
+            return torch.zeros(obs.shape[0], device=obs.device)
+        relative_goal = obs[..., 2:4]
+        goal_distance = torch.norm(relative_goal, dim=-1)
+        mask = goal_distance >= 0.01
+        desired_direction = torch.zeros_like(relative_goal)
+        desired_direction[mask] = relative_goal[mask] / goal_distance[mask].unsqueeze(-1)
+        action_magnitude = torch.norm(action, dim=-1)
+        action_direction = torch.zeros_like(action)
+        mask2 = action_magnitude >= 0.01
+        action_direction[mask2] = action[mask2] / action_magnitude[mask2].unsqueeze(-1)
+        alignment = (desired_direction * action_direction).sum(-1)
+        alignment[~mask2] = 0.0
+        alignment[~mask] = 0.0
+        bonus = (goal_distance < 0.01).float() * 0.5
+        return alignment * 2.0 + bonus
     
     while global_step < args.total_timesteps:
         # Collect experience
@@ -408,6 +465,21 @@ def main():
         
         # Step environment
         next_obs, rewards, dones, infos = envs.step(actions)
+        
+        if args.enable_reward_shaping:
+            dist_reward, current_distances = calculate_distance_reward(next_obs, prev_distances)
+            dir_reward = calculate_directional_reward(obs, actions)
+            # Ensure dist_reward and dir_reward are [num_envs]
+            if dist_reward.dim() == 2 and dist_reward.shape[1] == 1:
+                dist_reward = dist_reward.squeeze(-1)
+            if dir_reward.dim() == 2 and dir_reward.shape[1] == 1:
+                dir_reward = dir_reward.squeeze(-1)
+            rewards = rewards + dist_reward + dir_reward
+            prev_distances = current_distances.detach()
+        # Ensure rewards is [num_envs]
+        if rewards.dim() == 2 and rewards.shape[1] == 1:
+            rewards = rewards.squeeze(-1)
+        assert rewards.dim() == 1 and rewards.shape[0] == args.num_envs, f"rewards shape: {rewards.shape}, num_envs: {args.num_envs}"
         
         # Store transitions
         transition = TensorDict(

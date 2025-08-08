@@ -396,7 +396,15 @@ def main():
             # Get FastSAC args and override environment settings
     args = get_args()
     args.env_name = "pointmaze-medium-v0"
+    # Robust device selection and printout
+    import torch
     args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {args.device}")
+    if args.device.type == 'cuda':
+        print(f"CUDA device name: {torch.cuda.get_device_name(args.device)}")
+        print(f"CUDA available: {torch.cuda.is_available()}")
+    else:
+        print("WARNING: Training is running on CPU. For best performance, use a machine with an NVIDIA GPU and CUDA drivers installed.")
     args.total_timesteps = total_timesteps
     args.learning_starts = 1_000
     args.batch_size = 32768  # Fixed: was 256, now matches reference
@@ -410,7 +418,6 @@ def main():
     args.policy_frequency = 2
     args.seed = 0
 
-    print(f"Using device: {args.device}")
     print(f"🔧 Using reference fast_sac hyperparameters:")
     print(f"   Batch size: {args.batch_size}")
     print(f"   Learning rates: {args.actor_learning_rate}")
@@ -602,15 +609,19 @@ def main():
         global_step += 1
         episode_reward += total_reward
 
-        # Update control window
+        # Always calculate intervention_stats
         intervention_stats = {
             'percentage': (episode_intervention_steps / episode_total_steps * 100) if episode_total_steps > 0 else 0
         }
-        control_window.update(current_mode, episode_count, global_step, intervention_stats)
 
-        # Log training data
-        logger.add_step_data(total_reward, distance_reward, directional_reward, action)
-        logger.add_episode_data(episode_reward, episode_total_steps, intervention_stats['percentage'])
+        # Update control window (less frequently for better performance)
+        if global_step % 10 == 0:
+            control_window.update(current_mode, episode_count, global_step, intervention_stats)
+
+        # Log training data (less frequently)
+        if global_step % 5 == 0:
+            logger.add_step_data(total_reward, distance_reward, directional_reward, action)
+            logger.add_episode_data(episode_reward, episode_total_steps, intervention_stats['percentage'])
 
         # Handle episode termination and mode switching
         if done:
@@ -737,8 +748,11 @@ def main():
                 for param, target_param in zip(critic.parameters(), critic_target.parameters()):
                     target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
 
-        # Small delay to prevent overwhelming the system
-        time.sleep(0.01)
+        # Small delay to prevent overwhelming the system (reduced for better performance)
+        if global_step < args.learning_starts:
+            time.sleep(0.01)  # Keep delay during exploration phase
+        else:
+            time.sleep(0.001)  # Reduce delay during learning phase
 
     print("Training completed!")
     

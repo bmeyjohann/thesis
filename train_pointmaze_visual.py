@@ -23,7 +23,15 @@ from fast_sac import Actor, Critic
 def main():
     args = get_args()
     args.env_name = "pointmaze-medium-v0"  # Changed to OGBench environment
+    # Robust device selection and printout
+    import torch
     args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {args.device}")
+    if args.device.type == 'cuda':
+        print(f"CUDA device name: {torch.cuda.get_device_name(args.device)}")
+        print(f"CUDA available: {torch.cuda.is_available()}")
+    else:
+        print("WARNING: Training is running on CPU. For best performance, use a machine with an NVIDIA GPU and CUDA drivers installed.")
     args.total_timesteps = 100_000
     args.learning_starts = 1_000
     args.batch_size = 256
@@ -36,8 +44,6 @@ def main():
     args.noise_clip = 0.5
     args.policy_frequency = 2
     args.seed = 0
-
-    print(f"Using device: {args.device}")
 
     # OGBench environments are automatically registered on import
     
@@ -116,6 +122,9 @@ def main():
     print("🤖 Training FastSAC on OGBench PointMaze")
     print("🎮 Visual rendering enabled - you can watch the agent learn!")
     print("❌ Press Ctrl+C to exit or close the window.")
+
+    # Lower default batch size for safety
+    args.batch_size = min(args.batch_size, 256)
 
     while global_step < args.total_timesteps and running:
         if global_step < args.learning_starts:
