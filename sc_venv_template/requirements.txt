@@ -68,7 +68,7 @@ nvidia-nccl-cu12==2.21.5
 nvidia-nvjitlink-cu12==12.4.127
 nvidia-nvshmem-cu12==3.3.9
 nvidia-nvtx-cu12==12.4.127
--e git+ssh://git@github.com/bmeyjohann/ogbench.git@a41256c9c9eccbf2eccbce4e758820eaadf615ac#egg=ogbench&subdirectory=../../ogbench
+-e ./ogbench
 onnx==1.18.0
 opt_einsum==3.4.0
 optax==0.2.5
