@@ -360,6 +360,7 @@ def main():
     print(f"Total timesteps: {args.total_timesteps}")
     
     # Initialize wandb (with offline mode for clusters without internet)
+    wandb_initialized = False
     if args.use_wandb:
         # Check if we're on a compute node (no internet) vs login node (internet)
         import socket
@@ -374,19 +375,28 @@ def main():
             os.environ["WANDB__SERVICE_WAIT"] = "0"  # Don't wait for wandb service
             print(f"🔄 Detected compute node ({hostname}) - Using WANDB offline mode")
         
-        wandb.init(
-            project=args.wandb_project,
-            name=args.experiment_name,
-            config=vars(args),
-            mode="offline" if is_compute_node else "online"
-        )
+        try:
+            wandb.init(
+                project=args.wandb_project,
+                name=args.experiment_name,
+                config=vars(args),
+                mode="offline" if is_compute_node else "online"
+            )
+            wandb_initialized = True
+        except Exception as e:
+            print(f"❌ Wandb initialization failed: {e}")
+            print("🔄 Continuing training without wandb logging...")
+            wandb_initialized = False
         
-        if is_compute_node:
-            print(f"✓ Wandb initialized in OFFLINE mode: {args.wandb_project}")
-            print(f"  - Logs saved locally to: {wandb.run.dir}")
-            print(f"  - Sync later from login node with: wandb sync {wandb.run.dir}")
+        if wandb_initialized:
+            if is_compute_node:
+                print(f"✓ Wandb initialized in OFFLINE mode: {args.wandb_project}")
+                print(f"  - Logs saved locally to: {wandb.run.dir}")
+                print(f"  - Sync later from login node with: wandb sync {wandb.run.dir}")
+            else:
+                print(f"✓ Wandb initialized in ONLINE mode: {args.wandb_project}")
         else:
-            print(f"✓ Wandb initialized in ONLINE mode: {args.wandb_project}")
+            print(f"⚠️  Training will proceed without wandb logging")
     
     # Create environment
     print(f"\n🏗️  Creating environment...")
@@ -660,7 +670,7 @@ def main():
                       f"Entropy: {loss_dict['entropy']:.4f}"
                       f"{episode_info}")
                 
-                if args.use_wandb:
+                if args.use_wandb and wandb_initialized:
                     wandb.log(log_data)
                 
                 # Backup CSV logging (works even without internet)
@@ -697,7 +707,7 @@ def main():
     print(f"\n🧹 Cleaning up...")
     env.close()
     
-    if args.use_wandb:
+    if args.use_wandb and wandb_initialized:
         wandb.finish()
         print("✓ Wandb session finished")
     

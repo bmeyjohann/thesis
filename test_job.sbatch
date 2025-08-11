@@ -31,10 +31,10 @@ echo "GPU: $(nvidia-smi -L)"
 date
 
 # Quick test run
-echo "🔬 Running minimal test (2 envs, 1 iteration)..."
+echo "🔬 Running minimal test (2 envs, 2 iterations)..."
 python train_rsl_rl_clean.py \
     --num_envs 2 \
-    --max_iterations 1 \
+    --max_iterations 2 \
     --reward_type dense \
     --experiment_name "test_juwels_$(date +%Y%m%d_%H%M)" \
     --use_wandb
