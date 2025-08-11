@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --account=<your_account>  # Replace with your account
+#SBATCH --account=<your_account>  # This will be auto-replaced by submit_job.sh
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=96

@@ -41,6 +41,7 @@ slurm-*.out
 .env
 .envrc
 *.env
+.slurm_account
 
 # IDE files
 .vscode/

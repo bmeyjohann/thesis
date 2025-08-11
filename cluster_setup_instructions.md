@@ -1,65 +1,15 @@
-# JUWELS Cluster Setup Instructions
 
-## 🚀 First-time Setup
-
-### 1. Upload Code to Cluster
-```bash
-# From your local machine
-rsync -avz --exclude=.git --exclude=wandb --exclude=models \
-    /path/to/thesis/ <username>@juwels-booster.fz-juelich.de:~/thesis/
-```
-
-### 2. Create Virtual Environment (One-time setup)
-```bash
-# On JUWELS login node
-cd ~/thesis/sc_venv_template
-bash setup.sh  # Creates venv and installs all packages from requirements.txt
-```
-
-### 3. Test Interactive Session
-```bash
-# Request interactive node
-salloc --account=<your_account> \
-       --nodes=1 \
-       --cpus-per-task=24 \
-       --gres=gpu:1 \
-       --time=01:00:00 \
-       --partition=booster
-
-# SSH to allocated node (e.g. jrc0123)
-ssh jrc0123
-
-# Navigate and activate environment
-cd ~/thesis
-source sc_venv_template/activate.sh
-
-# Test training
-python train_rsl_rl_clean.py --num_envs 2 --max_iterations 1 --reward_type dense
-```
-
-### 4. Setup Wandb (One-time)
-```bash
-# IMPORTANT: Only do this on login node (has internet access)
-cd ~/thesis
-source sc_venv_template/activate.sh
-wandb login  # Follow prompts with your API key
-```
-
-**Note**: Compute nodes have **no internet access**, so wandb will run in offline mode during training and sync automatically after jobs complete.
-
-## 🎯 Production Training
-
-### Submit Pilot Experiments
-```bash
-# Update account in script first
+# Or edit script manually
 vim juwels_reward_comparison.sbatch
 # Change: #SBATCH --account=<your_account>
-
-# Submit job
 sbatch juwels_reward_comparison.sbatch
+```
 
-# Monitor
-squeue -u $USER
+**Option C: Config File Method**
+```bash
+# Save account permanently
+echo 'export SLURM_ACCOUNT="your_actual_account"' > .slurm_account
+./submit_job.sh  # Will use saved account automatically
 ```
 
 ### Monitor Progress
