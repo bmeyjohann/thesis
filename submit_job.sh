@@ -90,13 +90,31 @@ echo "👤 Using account: $USER_ACCOUNT"
 
 # Create temporary script with account replaced
 TEMP_SCRIPT="$(mktemp --suffix=.sbatch)"
-sed "s/<your_account>/$USER_ACCOUNT/g" "$SCRIPT_NAME" > "$TEMP_SCRIPT"
+echo "🔧 Replacing <your_account> with: $USER_ACCOUNT"
+
+# Simple replacement using awk (most reliable)
+awk -v account="$USER_ACCOUNT" '{gsub(/<your_account>/, account); print}' "$SCRIPT_NAME" > "$TEMP_SCRIPT"
 
 echo "📝 Generated temporary script: $TEMP_SCRIPT"
 
+# Verify the script is not empty and replacement worked
+if [[ ! -s "$TEMP_SCRIPT" ]]; then
+    echo "❌ Generated script is empty!"
+    echo "Original script exists: $(ls -la "$SCRIPT_NAME")"
+    exit 1
+fi
+
 # Show the account line to confirm
 echo "📋 Account configuration:"
-grep "^#SBATCH --account=" "$TEMP_SCRIPT"
+ACCOUNT_LINE=$(grep "^#SBATCH --account=" "$TEMP_SCRIPT")
+if [[ -n "$ACCOUNT_LINE" ]]; then
+    echo "   $ACCOUNT_LINE"
+else
+    echo "❌ No account line found in generated script!"
+    echo "Script contents:"
+    head -10 "$TEMP_SCRIPT"
+    exit 1
+fi
 
 # Ask for confirmation
 echo ""
