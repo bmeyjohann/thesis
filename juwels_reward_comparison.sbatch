@@ -13,14 +13,10 @@
 # Create logs directory if it doesn't exist
 mkdir -p logs
 
-# Load required modules (adjust for JUWELS)
-module load Stages/2024
-module load GCC/11.3.0
-module load CUDA/11.7
-module load Python/3.10.4
-
-# Activate your conda environment
-source activate fasttd3
+# Activate the cluster virtual environment  
+cd sc_venv_template
+source activate.sh
+cd ..
 
 echo "🚀 Starting OGBench Reward Comparison Study on JUWELS"
 echo "Node: $SLURMD_NODENAME"
