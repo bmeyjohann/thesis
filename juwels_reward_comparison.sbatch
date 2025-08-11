@@ -2,7 +2,7 @@
 #SBATCH --account=<your_account>  # This will be auto-replaced by submit_job.sh
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=96
+#SBATCH --cpus-per-task=32
 #SBATCH --gres=gpu:4
 #SBATCH --time=02:00:00
 #SBATCH --partition=booster
