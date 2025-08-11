@@ -9,13 +9,13 @@ echo "Script: $SCRIPT_NAME"
 
 # Function to detect user's SLURM account
 detect_account() {
-    echo "🔍 Auto-detecting SLURM account..."
+    echo "🔍 Auto-detecting SLURM account..." >&2
     
     # Method 1: Check saved config file
     if [[ -f ".slurm_account" ]]; then
         source .slurm_account
         if [[ -n "$SLURM_ACCOUNT" ]]; then
-            echo "✓ Found account in .slurm_account: $SLURM_ACCOUNT"
+            echo "✓ Found account in .slurm_account: $SLURM_ACCOUNT" >&2
             echo "$SLURM_ACCOUNT"
             return 0
         fi
@@ -23,7 +23,7 @@ detect_account() {
     
     # Method 2: Check environment variable
     if [[ -n "$SLURM_ACCOUNT" ]]; then
-        echo "✓ Found account in SLURM_ACCOUNT: $SLURM_ACCOUNT"
+        echo "✓ Found account in SLURM_ACCOUNT: $SLURM_ACCOUNT" >&2
         echo "$SLURM_ACCOUNT"
         return 0
     fi
@@ -37,16 +37,16 @@ detect_account() {
             ACCOUNT_COUNT=$(echo "$ACCOUNTS" | wc -l)
             
             if [[ $ACCOUNT_COUNT -eq 1 ]]; then
-                echo "✓ Found single account: $ACCOUNTS"
+                echo "✓ Found single account: $ACCOUNTS" >&2
                 echo "$ACCOUNTS"
                 return 0
             else
-                echo "⚠️  Multiple accounts found:"
-                echo "$ACCOUNTS" | nl
-                echo ""
-                echo "Please set SLURM_ACCOUNT environment variable:"
-                echo "  export SLURM_ACCOUNT=your_account_name"
-                echo "  bash submit_job.sh"
+                echo "⚠️  Multiple accounts found:" >&2
+                echo "$ACCOUNTS" | nl >&2
+                echo "" >&2
+                echo "Please set SLURM_ACCOUNT environment variable:" >&2
+                echo "  export SLURM_ACCOUNT=your_account_name" >&2
+                echo "  bash submit_job.sh" >&2
                 exit 1
             fi
         fi
@@ -56,22 +56,22 @@ detect_account() {
     if command -v sshare >/dev/null 2>&1; then
         ACCOUNT=$(sshare -U | grep "^$USER" | awk '{print $2}' | head -1)
         if [[ -n "$ACCOUNT" && "$ACCOUNT" != "Account" ]]; then
-            echo "✓ Found account via sshare: $ACCOUNT"
+            echo "✓ Found account via sshare: $ACCOUNT" >&2
             echo "$ACCOUNT"
             return 0
         fi
     fi
     
     # Method 5: Interactive prompt
-    echo "❌ Could not auto-detect account."
-    echo -n "Please enter your SLURM account name: "
+    echo "❌ Could not auto-detect account." >&2
+    echo -n "Please enter your SLURM account name: " >&2
     read -r ACCOUNT
     if [[ -n "$ACCOUNT" ]]; then
         echo "$ACCOUNT"
         return 0
     fi
     
-    echo "❌ No account provided. Exiting."
+    echo "❌ No account provided. Exiting." >&2
     exit 1
 }
 
