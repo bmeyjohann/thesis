@@ -241,6 +241,28 @@ class OGBenchRSLRLVecEnv(VecEnv):
             self.env.close()
 
 
+def _log_to_csv(log_data, experiment_name):
+    """Backup CSV logging for when wandb is offline."""
+    import csv
+    
+    # Create logs directory if it doesn't exist
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+    
+    csv_file = log_dir / f"{experiment_name}_metrics.csv"
+    
+    # Check if file exists to write headers
+    write_header = not csv_file.exists()
+    
+    with open(csv_file, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=log_data.keys())
+        
+        if write_header:
+            writer.writeheader()
+        
+        writer.writerow(log_data)
+
+
 def get_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description='Clean RSL-RL PPO Training for OGBench')
@@ -337,14 +359,31 @@ def main():
     print(f"Environment: {args.env_name}")
     print(f"Total timesteps: {args.total_timesteps}")
     
-    # Initialize wandb
+    # Initialize wandb (with offline mode for clusters without internet)
     if args.use_wandb:
+        # Check if we're on a compute node (no internet) vs login node (internet)
+        import socket
+        hostname = socket.gethostname()
+        is_compute_node = 'jrc' in hostname or 'batch' in hostname or 'node' in hostname
+        
+        if is_compute_node:
+            # Offline mode for compute nodes
+            os.environ["WANDB_MODE"] = "offline"
+            print(f"🔄 Detected compute node ({hostname}) - Using WANDB offline mode")
+        
         wandb.init(
             project=args.wandb_project,
             name=args.experiment_name,
-            config=vars(args)
+            config=vars(args),
+            mode="offline" if is_compute_node else "online"
         )
-        print(f"✓ Wandb initialized: {args.wandb_project}")
+        
+        if is_compute_node:
+            print(f"✓ Wandb initialized in OFFLINE mode: {args.wandb_project}")
+            print(f"  - Logs saved locally to: {wandb.run.dir}")
+            print(f"  - Sync later from login node with: wandb sync {wandb.run.dir}")
+        else:
+            print(f"✓ Wandb initialized in ONLINE mode: {args.wandb_project}")
     
     # Create environment
     print(f"\n🏗️  Creating environment...")
@@ -620,6 +659,9 @@ def main():
                 
                 if args.use_wandb:
                     wandb.log(log_data)
+                
+                # Backup CSV logging (works even without internet)
+                _log_to_csv(log_data, args.experiment_name)
             
             # Check stopping condition
             if total_timesteps >= args.total_timesteps:

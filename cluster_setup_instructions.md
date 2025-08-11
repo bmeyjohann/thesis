@@ -39,11 +39,13 @@ python train_rsl_rl_clean.py --num_envs 2 --max_iterations 1 --reward_type dense
 
 ### 4. Setup Wandb (One-time)
 ```bash
-# In interactive session or login node
+# IMPORTANT: Only do this on login node (has internet access)
 cd ~/thesis
 source sc_venv_template/activate.sh
 wandb login  # Follow prompts with your API key
 ```
+
+**Note**: Compute nodes have **no internet access**, so wandb will run in offline mode during training and sync automatically after jobs complete.
 
 ## 🎯 Production Training
 
@@ -62,12 +64,27 @@ squeue -u $USER
 
 ### Monitor Progress
 ```bash
-# Check job output
+# Check job output (live monitoring)
 tail -f logs/reward_comparison_*.out
 
-# Check wandb dashboard
-# URL will be printed in the log output
+# Check CSV logs (backup, always works)
+tail -f logs/*_metrics.csv
+
+# Sync wandb runs (after job completes)
+bash sync_wandb.sh
+
+# Check wandb dashboard (after syncing)
+# URL: https://wandb.ai/<username>/juwels-reward-pilot
 ```
+
+## 📊 **Logging Strategy (No Internet on Compute Nodes)**
+
+| Method | Location | When | Pros | Cons |
+|--------|----------|------|------|------|
+| **Wandb Offline** | Compute node | During training | Full wandb features | Need to sync later |
+| **CSV Backup** | `logs/*.csv` | During training | Always works | Basic metrics only |
+| **Console Output** | `logs/*.out` | During training | Real-time | Text only |
+| **Wandb Online** | Login node | After syncing | Full dashboard | Post-training only |
 
 ## 📦 What's Included in Virtual Environment
 

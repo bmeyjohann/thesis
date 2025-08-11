@@ -80,10 +80,32 @@ echo "✓ Mixed training completed"
 echo "🎉 All reward shaping experiments completed!"
 date
 
+# Sync wandb runs from compute node (if they were run in offline mode)
+echo "📤 Syncing wandb runs to cloud..."
+if [ -d "$HOME/.wandb" ]; then
+    # Find and sync all offline runs
+    find $HOME/.wandb -name "offline-run-*" -type d | while read run_dir; do
+        echo "Syncing: $run_dir"
+        wandb sync "$run_dir" || echo "⚠️  Failed to sync $run_dir"
+    done
+    
+    # Also check for runs in the working directory
+    find wandb -name "offline-run-*" -type d 2>/dev/null | while read run_dir; do
+        echo "Syncing: $run_dir"
+        wandb sync "$run_dir" || echo "⚠️  Failed to sync $run_dir"
+    done
+else
+    echo "No offline wandb runs found to sync"
+fi
+
 # Optional: Generate comparison summary
 echo "📈 Pilot Training Summary:"
 echo "Sparse (5M steps):  Expected ~1 hour"
 echo "Dense (3M steps):   Expected ~40 minutes" 
 echo "Mixed (4M steps):   Expected ~50 minutes"
 echo "Total budget used:  ~50 core-hours (0.08% of total)"
-echo "Check wandb dashboard for detailed results and comparisons"
+echo ""
+echo "📊 Results available in:"
+echo "  - Wandb dashboard: https://wandb.ai/<username>/juwels-reward-pilot"
+echo "  - CSV logs: ./logs/*_metrics.csv"
+echo "  - Model files: ./models/*/"
