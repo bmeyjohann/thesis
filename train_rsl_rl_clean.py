@@ -367,8 +367,11 @@ def main():
         is_compute_node = 'jrc' in hostname or 'batch' in hostname or 'node' in hostname
         
         if is_compute_node:
-            # Offline mode for compute nodes
+            # Aggressive offline mode for compute nodes - prevent all network attempts
             os.environ["WANDB_MODE"] = "offline"
+            os.environ["WANDB_CONSOLE"] = "off"  # Reduce verbose output
+            os.environ["WANDB_SILENT"] = "true"  # Suppress network retry messages
+            os.environ["WANDB__SERVICE_WAIT"] = "0"  # Don't wait for wandb service
             print(f"🔄 Detected compute node ({hostname}) - Using WANDB offline mode")
         
         wandb.init(

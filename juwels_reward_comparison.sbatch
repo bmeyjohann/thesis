@@ -18,6 +18,12 @@ cd sc_venv_template
 source activate.sh
 cd ..
 
+# Force wandb into silent offline mode (prevents retry loops)
+export WANDB_MODE="offline"
+export WANDB_CONSOLE="off" 
+export WANDB_SILENT="true"
+export WANDB__SERVICE_WAIT="0"
+
 echo "🚀 Starting OGBench Reward Comparison Study on JUWELS"
 echo "Node: $SLURMD_NODENAME"
 echo "Job ID: $SLURM_JOB_ID"
