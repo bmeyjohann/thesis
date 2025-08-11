@@ -1,10 +1,98 @@
+# Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-*.pyw
-*.pyz
-*.pywz
-*.pyzw
-*.pyzwz
-*_l.*
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+build/
+dist/
+*.whl
+
+# Training artifacts
+models/
+logs/
+checkpoints/
+saved_models/
+results/
+outputs/
+
+# Wandb artifacts  
+wandb/
+*.wandb
+
+# Log files
+*.log
+*.out
+*.err
+slurm-*.out
+*.txt.log
+
+# Model files
+*.pt
+*.pth
+*.pkl
+*.pickle
+*.h5
+*.hdf5
+*.ckpt
+*.safetensors
+
+# Environment files
+.env
+.envrc
+*.env
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Jupyter notebooks checkpoints
+.ipynb_checkpoints/
+
+# Data files (often large)
+data/
+datasets/
+*.npz
+*.npy
+*.csv
+*.json.gz
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+.cache/
+
+# System files
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Conda/pip
+*.conda
+pip-log.txt
+pip-delete-this-directory.txt
+
+# SLURM job files (keep templates, ignore actual job outputs)
+*.o[0-9]*
+*.e[0-9]*
+core.*
+
+# Keep these files (negate patterns)
+!*.sbatch
+!*.py
+!*.md
+!*.txt
+!*.yml
+!*.yaml
+!*.json
+!requirements.txt
+!pyproject.toml
+!setup.py

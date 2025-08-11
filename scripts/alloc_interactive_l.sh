@@ -1,0 +1,1 @@
+salloc -A hai_1074 -p booster -t 00:30:00 --cpus-per-task=8 --mem=32G --gres=gpu:1

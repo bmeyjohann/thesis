@@ -24,54 +24,97 @@ sys.path.append('fasttd3/fast_sac')
 
 # Import RSL-RL components
 from rsl_rl.algorithms import PPO
-from rsl_rl.modules import ActorCritic, EmpiricalNormalization
+from rsl_rl.modules import ActorCritic
 from rsl_rl.env import VecEnv
-
-# Import our OGBench environment wrapper
-from fasttd3.fast_sac.environments.ogbench_env import OGBenchEnv
+from rsl_rl.storage import RolloutStorage
+from tensordict import TensorDict
 
 # Import ogbench to register environments
 import ogbench
 
+# Import our OGBench environment wrapper
+from fasttd3.fast_sac.environments.ogbench_env import OGBenchEnv
 
-class OGBenchVecEnvWrapper(VecEnv):
-    """Wrapper to make OGBenchEnv compatible with RSL-RL's VecEnv interface."""
+
+class OGBenchRSLRLVecEnv(VecEnv):
+    """Proper RSL-RL VecEnv wrapper for OGBench environments using TensorDict."""
     
-    def __init__(self, env: OGBenchEnv):
+    def __init__(self, env: OGBenchEnv, cfg: dict = None):
         self.env = env
+        self.cfg = cfg or {}
+        
+        # RSL-RL VecEnv required attributes (exactly as per VecEnv abstract class)
         self.num_envs = env.num_envs
-        self.num_obs = env.num_obs
-        self.num_privileged_obs = None  # OGBench environments don't have privileged observations
         self.num_actions = env.num_actions
         self.max_episode_length = env.max_episode_steps
         self.device = env.sim_device
         
-    def get_observations(self):
-        """Return the current observations."""
-        return self._last_obs
-    
-    def reset(self):
-        """Reset the environment."""
-        self._last_obs = self.env.reset()
-        return self._last_obs
-    
-    def step(self, actions):
-        """Step the environment."""
-        obs, rewards, dones, infos = self.env.step(actions)
-        self._last_obs = obs
+        # Episode tracking buffer (required by RSL-RL)
+        self.episode_length_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
         
-        # RSL-RL expects rewards, dones to have proper shapes
+        # Internal state
+        self._last_obs = None
+        
+        # Initialize observations
+        self.reset()
+        
+    def get_observations(self) -> TensorDict:
+        """Return current observations as TensorDict - required by RSL-RL."""
+        if self._last_obs is None:
+            self.reset()
+        return self._last_obs
+    
+    def reset(self) -> TensorDict:
+        """Reset environment and return observations as TensorDict."""
+        # Get raw observations from OGBench environment
+        raw_obs = self.env.reset()  # Shape: [num_envs, obs_dim]
+        
+        # Convert to TensorDict with proper structure for RSL-RL
+        # RSL-RL expects observations grouped by purpose
+        self._last_obs = TensorDict({
+            "policy": raw_obs,  # Observations for policy network
+            # Could add "critic" group if we had privileged observations
+        }, batch_size=[self.num_envs], device=self.device)
+        
+        # Reset episode length buffer
+        self.episode_length_buf.zero_()
+        
+        return self._last_obs
+    
+    def step(self, actions: torch.Tensor) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict]:
+        """Step environment - RSL-RL signature with TensorDict observations."""
+        # Step the underlying environment
+        raw_obs, rewards, dones, infos = self.env.step(actions)
+        
+        # Update episode lengths
+        self.episode_length_buf += 1
+        
+        # Convert observations to TensorDict
+        obs_tensordict = TensorDict({
+            "policy": raw_obs,  # Policy observations
+        }, batch_size=[self.num_envs], device=self.device)
+        
+        # Store for get_observations()
+        self._last_obs = obs_tensordict
+        
+        # Ensure proper tensor shapes for RSL-RL
         if rewards.dim() == 1:
-            rewards = rewards.unsqueeze(1)
+            rewards = rewards  # Keep as [num_envs] - RSL-RL expects this shape
         if dones.dim() == 1:
-            dones = dones.unsqueeze(1)
+            dones = dones  # Keep as [num_envs] - RSL-RL expects this shape
             
-        # Create extras dict for RSL-RL
+        # Create extras dict with required RSL-RL fields
+        time_outs = infos.get("time_outs", torch.zeros_like(dones))
         extras = {
-            "time_outs": infos.get("time_outs", torch.zeros_like(dones)),
+            "time_outs": time_outs,  # Required by RSL-RL for bootstrapping
+            "log": {}  # Additional logging info
         }
         
-        return obs, rewards, dones, extras
+        # Reset episode lengths for done/timeout environments
+        reset_mask = dones.bool() | time_outs.bool()
+        self.episode_length_buf[reset_mask] = 0
+        
+        return obs_tensordict, rewards, dones, extras
     
     def close(self):
         """Close the environment."""
@@ -85,7 +128,7 @@ def get_args():
     # Environment arguments
     parser.add_argument('--env_name', type=str, default='pointmaze-medium-v0',
                         help='OGBench environment name')
-    parser.add_argument('--num_envs', type=int, default=256,
+    parser.add_argument('--num_envs', type=int, default=1,
                         help='Number of parallel environments')
     
     # Training arguments
@@ -141,10 +184,11 @@ def get_args():
     return parser.parse_args()
 
 
-def create_policy_config(args, env):
-    """Create policy configuration for RSL-RL."""
+def create_rsl_rl_configs(args, env):
+    """Create RSL-RL policy and algorithm configurations."""
     hidden_dims = [int(x) for x in args.hidden_dims.split(',')]
     
+    # Policy configuration for ActorCritic
     policy_cfg = {
         'init_noise_std': 1.0,
         'actor_hidden_dims': hidden_dims,
@@ -152,13 +196,8 @@ def create_policy_config(args, env):
         'activation': args.activation,
     }
     
-    return policy_cfg
-
-
-def create_algorithm_config(args):
-    """Create algorithm configuration for RSL-RL PPO."""
+    # Algorithm configuration for PPO
     alg_cfg = {
-        'class_name': 'PPO',
         'value_loss_coef': args.value_loss_coef,
         'use_clipped_value_loss': True,
         'clip_param': args.clip_param,
@@ -173,45 +212,25 @@ def create_algorithm_config(args):
         'max_grad_norm': 1.0,
     }
     
-    return alg_cfg
-
-
-def evaluate_policy(env, policy, num_eval_episodes=10):
-    """Evaluate the policy."""
-    policy.eval()
-    episode_rewards = []
-    episode_lengths = []
-    
-    for _ in range(num_eval_episodes):
-        obs = env.reset()
-        episode_reward = 0
-        episode_length = 0
-        done = False
-        
-        while not done:
-            with torch.no_grad():
-                actions = policy.act_inference(obs)
-            obs, rewards, dones, _ = env.step(actions)
-            
-            episode_reward += rewards.sum().item()
-            episode_length += 1
-            done = dones.any().item()
-        
-        episode_rewards.append(episode_reward / env.num_envs)
-        episode_lengths.append(episode_length)
-    
-    policy.train()
-    
-    return {
-        'mean_reward': np.mean(episode_rewards),
-        'std_reward': np.std(episode_rewards),
-        'mean_length': np.mean(episode_lengths),
-        'std_length': np.std(episode_lengths),
+    # Runner configuration for OnPolicyRunner
+    runner_cfg = {
+        'num_steps_per_env': 1024,  # Number of steps per environment per rollout
+        'max_iterations': args.max_iterations,
+        'save_interval': args.save_interval,
+        'log_interval': args.log_interval,
+        'experiment_name': args.experiment_name,
+        'logger': 'wandb' if args.use_wandb else 'tensorboard',
+        'wandb_project': args.wandb_project if args.use_wandb else None,
     }
+    
+    return policy_cfg, alg_cfg, runner_cfg
+
+
+
 
 
 def main():
-    """Main training function."""
+    """Main training function using RSL-RL's proper pipeline."""
     args = get_args()
     
     # Set random seeds
@@ -225,140 +244,298 @@ def main():
     # Create experiment name
     if args.experiment_name is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        args.experiment_name = f"ogbench_{args.env_name}_ppo_{timestamp}"
+        args.experiment_name = f"ogbench_{args.env_name}_rslrl_ppo_{timestamp}"
     
-    # Initialize wandb
-    if args.use_wandb:
-        wandb.init(
-            project=args.wandb_project,
-            name=args.experiment_name,
-            config=vars(args)
-        )
+    print(f"🚀 Starting RSL-RL PPO training: {args.experiment_name}")
     
     # Create environment
-    print(f"Creating environment: {args.env_name}")
-    base_env = OGBenchEnv(
-        env_name=args.env_name,
-        num_envs=args.num_envs,
-        device=device
-    )
-    env = OGBenchVecEnvWrapper(base_env)
+    print(f"Creating environment: {args.env_name} with {args.num_envs} parallel environments")
+    try:
+        base_env = OGBenchEnv(
+            env_name=args.env_name,
+            num_envs=args.num_envs,
+            device=device
+        )
+        env = OGBenchRSLRLVecEnv(base_env, cfg={})
+        print(f"✓ Environment created successfully")
+        print(f"  - Envs: {env.num_envs}")
+        print(f"  - Observations: {base_env.num_obs}")
+        print(f"  - Actions: {env.num_actions}")
+        print(f"  - Max episode length: {env.max_episode_length}")
+        
+    except Exception as e:
+        print(f"❌ Failed to create environment: {e}")
+        print("Try reducing --num_envs (e.g., --num_envs 1) or check your MuJoCo installation")
+        return
     
-    print(f"Environment created with {env.num_envs} parallel environments")
-    print(f"Observation space: {env.num_obs}")
-    print(f"Action space: {env.num_actions}")
+    # Create RSL-RL configurations
+    policy_cfg, alg_cfg, runner_cfg = create_rsl_rl_configs(args, env)
     
-    # Create policy
-    policy_cfg = create_policy_config(args, env)
-    policy = ActorCritic(
-        num_actor_obs=env.num_obs,
-        num_critic_obs=env.num_obs,
-        num_actions=env.num_actions,
-        **policy_cfg
-    ).to(device)
+    # Create policy (ActorCritic)
+    print("Creating ActorCritic policy...")
+    try:
+        # Get dummy observations for ActorCritic initialization
+        dummy_obs = env.get_observations()
+        
+        print(f"🔍 Debugging RSL-RL observation requirements:")
+        print(f"  - Original obs shape: {dummy_obs.shape}")
+        print(f"  - Original obs: {dummy_obs}")
+        
+        # Let's try MULTIPLE approaches systematically until one works
+        approaches = []
+        
+        # APPROACH 1: Column-wise feature selection (most likely correct)
+        # obs_groups might index columns, not rows: obs[:, [0,1]] instead of obs[[0,1]]
+        approaches.append({
+            "name": "Column indexing",
+            "obs": dummy_obs.cpu(),  # [1, 2] 
+            "obs_groups": {"policy": [0, 1]},  # Select columns 0, 1
+            "expected": "obs[:, [0,1]] -> [1, 2]"
+        })
+        
+        # APPROACH 2: Dictionary structure 
+        # Maybe RSL-RL expects obs as dict, not tensor
+        approaches.append({
+            "name": "Dictionary structure", 
+            "obs": {"policy": dummy_obs.cpu()},  # Dict with policy key
+            "obs_groups": {"policy": [0, 1]},
+            "expected": "obs['policy'][:, [0,1]] -> [1, 2]"
+        })
+        
+        # APPROACH 3: Expanded multi-env structure
+        # Force multiple environments structure
+        dummy_multi = dummy_obs.repeat(max(2, env.num_envs), 1)  # [2, 2] or [num_envs, 2]
+        approaches.append({
+            "name": "Multi-env structure",
+            "obs": dummy_multi.cpu(),
+            "obs_groups": {"policy": [0, 1]}, 
+            "expected": f"obs[:, [0,1]] -> [{dummy_multi.shape[0]}, 2]"
+        })
+        
+        # APPROACH 4: Flattened then grouped
+        # Maybe obs should be [num_envs, all_features] then grouped
+        approaches.append({
+            "name": "Flattened structure",
+            "obs": dummy_obs.cpu().view(1, -1),  # [1, 2] -> [1, 2]
+            "obs_groups": {"policy": list(range(env.num_obs))},
+            "expected": f"obs[:, 0:2] -> [1, {env.num_obs}]"
+        })
+        
+        # Test each approach
+        policy = None
+        for i, approach in enumerate(approaches):
+            print(f"\n📝 APPROACH {i+1}: {approach['name']}")
+            print(f"  - Obs type: {type(approach['obs'])}")
+            if isinstance(approach['obs'], torch.Tensor):
+                print(f"  - Obs shape: {approach['obs'].shape}")
+            print(f"  - Obs groups: {approach['obs_groups']}")
+            print(f"  - Expected result: {approach['expected']}")
+            
+            # Test indexing behavior
+            try:
+                test_obs = approach['obs']
+                test_groups = approach['obs_groups']['policy']
+                
+                if isinstance(test_obs, dict):
+                    test_result = test_obs['policy'][:, test_groups] if len(test_groups) > 1 else test_obs['policy']
+                else:
+                    # Try column indexing first
+                    test_result = test_obs[:, test_groups]
+                    
+                print(f"  - Test result shape: {test_result.shape}")
+                print(f"  - Test result dims: {len(test_result.shape)}")
+                
+                if len(test_result.shape) == 2:
+                    print(f"  ✓ Correct 2D shape - trying ActorCritic...")
+                    
+                    policy = ActorCritic(
+                        obs=approach['obs'],
+                        obs_groups=approach['obs_groups'],
+                        num_actions=env.num_actions,
+                        **policy_cfg
+                    ).to(device)
+                    
+                    print(f"  🎉 SUCCESS with approach: {approach['name']}")
+                    break
+                else:
+                    print(f"  ❌ Wrong dimensions: {len(test_result.shape)}")
+                    
+            except Exception as e:
+                print(f"  ❌ Failed: {e}")
+                continue
+        
+        if policy is None:
+            print(f"\n💡 All approaches failed. Let me try one more systematic approach...")
+            print(f"Let me examine what RSL-RL actually expects by looking at the source...")
+            
+            # Last resort: try to understand the exact structure RSL-RL wants
+            print("📚 Based on assertion 'len(obs[obs_group].shape) == 2':")
+            print("   This means obs[obs_group] must return a 2D tensor")
+            print("   Let me try obs_groups as feature indices for column selection:")
+            
+            final_obs = dummy_obs.cpu()  # [1, 2]
+            final_groups = {"policy": slice(0, env.num_obs)}  # Use slice instead of list
+            
+            print(f"  - Final attempt with slice: obs[:, {final_groups['policy']}]")
+            test_slice = final_obs[:, final_groups['policy']]
+            print(f"  - Slice result: {test_slice.shape}")
+            
+            policy = ActorCritic(
+                obs=final_obs,
+                obs_groups=final_groups,
+                num_actions=env.num_actions,
+                **policy_cfg
+            ).to(device)
+        
+        print(f"✓ ActorCritic created successfully")
+        print(f"  - Actor obs: {env.num_obs}")
+        print(f"  - Critic obs: {env.num_obs}")
+        print(f"  - Actions: {env.num_actions}")
+        print(f"  - Policy device: {next(policy.parameters()).device}")
+        
+    except Exception as e:
+        print(f"❌ ActorCritic creation failed: {e}")
+        print("This suggests RSL-RL has specific requirements not met by our setup.")
+        print("Debug info:")
+        print(f"  - Target device: {device}")
+        print(f"  - Obs shape: {dummy_obs.shape if 'dummy_obs' in locals() else 'N/A'}")
+        print(f"  - Obs device: {dummy_obs.device if 'dummy_obs' in locals() else 'N/A'}")
+        print(f"  - CPU obs shape: {dummy_obs_cpu.shape if 'dummy_obs_cpu' in locals() else 'N/A'}")
+        print(f"  - Environment info: {env.num_envs} envs, {env.num_obs} obs, {env.num_actions} actions")
+        import traceback
+        traceback.print_exc()
+        return
     
-    # Create algorithm
-    alg_cfg = create_algorithm_config(args)
-    ppo = PPO(policy, device=device, **alg_cfg)
+    # Create PPO algorithm
+    print("Creating PPO algorithm...")
+    try:
+        ppo = PPO(policy, device=device, **alg_cfg)
+        print("✓ PPO algorithm created successfully")
+        
+    except Exception as e:
+        print(f"❌ PPO creation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return
     
-    # Initialize policy
-    obs = env.reset()
+    # Create OnPolicyRunner
+    print("Creating OnPolicyRunner...")
+    try:
+        runner = OnPolicyRunner(env, ppo, **runner_cfg)
+        print("✓ OnPolicyRunner created successfully")
+        
+    except Exception as e:
+        print(f"❌ OnPolicyRunner creation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return
     
-    # Training loop
-    print("Starting training...")
+    # Initialize wandb logging through RSL-RL's system
+    if args.use_wandb:
+        print(f"🔗 Initializing wandb logging: {args.wandb_project}")
+        try:
+            import wandb
+            wandb.init(
+                project=args.wandb_project,
+                name=args.experiment_name,
+                config={
+                    **vars(args),
+                    'policy_cfg': policy_cfg,
+                    'alg_cfg': alg_cfg,
+                    'runner_cfg': runner_cfg,
+                    'env_info': {
+                        'num_envs': env.num_envs,
+                        'num_obs': env.num_obs,
+                        'num_actions': env.num_actions,
+                        'max_episode_length': env.max_episode_length,
+                    }
+                }
+            )
+            # Set wandb logger in runner if available
+            if hasattr(runner, 'logger') and hasattr(runner.logger, 'wandb'):
+                runner.logger.wandb = wandb
+            print("✓ Wandb logging initialized")
+            
+        except Exception as e:
+            print(f"⚠️  Wandb initialization failed: {e}")
+            print("Continuing without wandb logging...")
+    
+    # Training loop using RSL-RL's OnPolicyRunner
+    print("\n🎯 Starting training with RSL-RL OnPolicyRunner...")
+    print(f"Max iterations: {args.max_iterations}")
+    print(f"Steps per rollout: {runner_cfg['num_steps_per_env']}")
+    print(f"Total timesteps target: {args.total_timesteps}")
+    print("-" * 80)
+    
     start_time = datetime.now()
     
-    for iteration in range(args.max_iterations):
-        # Collect rollouts
-        obs = env.get_observations()
-        
-        # Step the environment for one rollout
-        for step in range(ppo.data_loader.batch_size):
-            actions = policy.act(obs)
-            obs, rewards, dones, extras = env.step(actions)
-            ppo.data_loader.add_transitions(obs, actions, rewards, dones, extras)
-        
-        # Compute returns and advantages
-        last_values = policy.evaluate(obs)
-        ppo.data_loader.compute_returns(last_values, gamma=args.gamma, lam=args.lam)
-        
-        # Update policy
-        mean_value_loss, mean_surrogate_loss, mean_entropy_loss = ppo.update()
-        
-        # Logging
-        if iteration % args.log_interval == 0:
+    try:
+        for iteration in range(args.max_iterations):
+            # Run one iteration of PPO training
+            runner.run()
+            
+            # Calculate metrics
             elapsed_time = (datetime.now() - start_time).total_seconds()
-            timesteps = iteration * args.num_envs * ppo.data_loader.batch_size
+            total_timesteps = iteration * env.num_envs * runner_cfg['num_steps_per_env']
+            fps = total_timesteps / elapsed_time if elapsed_time > 0 else 0
             
-            log_data = {
-                'iteration': iteration,
-                'timesteps': timesteps,
-                'value_loss': mean_value_loss,
-                'surrogate_loss': mean_surrogate_loss,
-                'entropy_loss': mean_entropy_loss,
-                'elapsed_time': elapsed_time,
-                'fps': timesteps / elapsed_time if elapsed_time > 0 else 0,
-            }
+            # Logging
+            if iteration % args.log_interval == 0:
+                print(f"Iteration {iteration:6d} | "
+                      f"Timesteps: {total_timesteps:8d} | "
+                      f"FPS: {fps:6.0f} | "
+                      f"Time: {elapsed_time:.1f}s")
+                
+                if args.use_wandb and 'wandb' in locals():
+                    wandb.log({
+                        'iteration': iteration,
+                        'total_timesteps': total_timesteps,
+                        'fps': fps,
+                        'elapsed_time': elapsed_time,
+                    })
             
-            print(f"Iteration {iteration:6d} | "
-                  f"Timesteps: {timesteps:8d} | "
-                  f"Value Loss: {mean_value_loss:.4f} | "
-                  f"Policy Loss: {mean_surrogate_loss:.4f} | "
-                  f"Entropy: {mean_entropy_loss:.4f} | "
-                  f"FPS: {log_data['fps']:.0f}")
-            
-            if args.use_wandb:
-                wandb.log(log_data)
-        
-        # Evaluation
-        if iteration % args.eval_interval == 0 and iteration > 0:
-            eval_results = evaluate_policy(env, policy, num_eval_episodes=5)
-            print(f"Evaluation | Mean Reward: {eval_results['mean_reward']:.2f} ± {eval_results['std_reward']:.2f} | "
-                  f"Mean Length: {eval_results['mean_length']:.1f} ± {eval_results['std_length']:.1f}")
-            
-            if args.use_wandb:
-                wandb.log({
-                    'eval/mean_reward': eval_results['mean_reward'],
-                    'eval/std_reward': eval_results['std_reward'],
-                    'eval/mean_length': eval_results['mean_length'],
-                    'eval/std_length': eval_results['std_length'],
-                })
-        
-        # Save model
-        if iteration % args.save_interval == 0 and iteration > 0:
-            save_path = Path(f"models/{args.experiment_name}")
-            save_path.mkdir(parents=True, exist_ok=True)
-            torch.save({
-                'policy_state_dict': policy.state_dict(),
-                'iteration': iteration,
-                'args': vars(args),
-            }, save_path / f"model_{iteration}.pt")
-            print(f"Model saved to {save_path / f'model_{iteration}.pt'}")
-        
-        # Check if we've reached the target timesteps
-        if iteration * args.num_envs * ppo.data_loader.batch_size >= args.total_timesteps:
-            print(f"Reached target timesteps: {args.total_timesteps}")
-            break
+            # Check if we've reached target timesteps
+            if total_timesteps >= args.total_timesteps:
+                print(f"🎯 Reached target timesteps: {args.total_timesteps}")
+                break
+                
+    except KeyboardInterrupt:
+        print("\n⚠️  Training interrupted by user")
+    except Exception as e:
+        print(f"\n❌ Training error: {e}")
+        import traceback
+        traceback.print_exc()
     
-    # Final save
-    save_path = Path(f"models/{args.experiment_name}")
+    # Save final model
+    print("\n💾 Saving final model...")
+    save_path = Path("models") / args.experiment_name
     save_path.mkdir(parents=True, exist_ok=True)
+    
+    model_path = save_path / "final_model.pt"
     torch.save({
         'policy_state_dict': policy.state_dict(),
-        'iteration': iteration,
+        'iteration': iteration if 'iteration' in locals() else 0,
         'args': vars(args),
-    }, save_path / "final_model.pt")
-    print(f"Final model saved to {save_path / 'final_model.pt'}")
+        'policy_cfg': policy_cfg,
+        'alg_cfg': alg_cfg,
+    }, model_path)
+    print(f"✓ Model saved to {model_path}")
     
-    # Close environment
+    # Cleanup
+    print("\n🧹 Cleaning up...")
     env.close()
     
-    # Finish wandb run
-    if args.use_wandb:
+    if args.use_wandb and 'wandb' in locals():
         wandb.finish()
+        print("✓ Wandb session finished")
     
-    print("Training completed!")
+    elapsed = (datetime.now() - start_time).total_seconds()
+    print(f"\n🎉 Training completed in {elapsed:.1f}s!")
+    print(f"Experiment: {args.experiment_name}")
+    print(f"Model saved: {model_path}")
 
 
 if __name__ == "__main__":
     main()
+
+
