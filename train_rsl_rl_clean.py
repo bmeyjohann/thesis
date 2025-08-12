@@ -110,6 +110,9 @@ class OGBenchRSLRLVecEnv(VecEnv):
         # Step the underlying environment
         raw_obs, rewards, dones, infos = self.env.step(processed_actions)
         
+        # Always keep track of sparse rewards for logging
+        sparse_rewards = rewards.clone()
+        
         # Apply reward shaping if not sparse
         if self.reward_type != 'sparse':
             rewards = self._apply_reward_shaping(raw_obs, rewards, infos)
@@ -131,6 +134,11 @@ class OGBenchRSLRLVecEnv(VecEnv):
         # Track episode statistics for logging
         log_info = {}
         
+        # Track cumulative sparse rewards for episode completion tracking
+        if not hasattr(self, '_episode_sparse_rewards'):
+            self._episode_sparse_rewards = torch.zeros(self.num_envs, device=self.device)
+        self._episode_sparse_rewards += sparse_rewards
+        
         # Check for completed episodes
         reset_mask = dones.bool() | time_outs.bool()
         if reset_mask.any():
@@ -138,6 +146,7 @@ class OGBenchRSLRLVecEnv(VecEnv):
             completed_episodes = reset_mask.sum().item()
             completed_lengths = self.episode_length_buf[reset_mask]
             completed_rewards = infos.get('episode_rewards', torch.zeros_like(rewards))[reset_mask]
+            completed_sparse_rewards = self._episode_sparse_rewards[reset_mask]
             
             if completed_episodes > 0:
                 log_info.update({
@@ -146,6 +155,9 @@ class OGBenchRSLRLVecEnv(VecEnv):
                     '/episode/mean_return': completed_rewards.float().mean().item() if completed_rewards.numel() > 0 else 0.0,
                     '/episode/max_return': completed_rewards.float().max().item() if completed_rewards.numel() > 0 else 0.0,
                     '/episode/min_return': completed_rewards.float().min().item() if completed_rewards.numel() > 0 else 0.0,
+                    '/episode/mean_sparse_return': completed_sparse_rewards.float().mean().item() if completed_sparse_rewards.numel() > 0 else 0.0,
+                    '/episode/goals_reached': (completed_sparse_rewards > 0).sum().item(),  # Count how many episodes reached the goal
+                    '/episode/success_rate': (completed_sparse_rewards > 0).float().mean().item() if completed_sparse_rewards.numel() > 0 else 0.0,
                 })
         
         extras = {
@@ -155,6 +167,8 @@ class OGBenchRSLRLVecEnv(VecEnv):
         
         # Reset episode lengths for done/timeout environments
         self.episode_length_buf[reset_mask] = 0
+        if hasattr(self, '_episode_sparse_rewards'):
+            self._episode_sparse_rewards[reset_mask] = 0
         
         return obs_tensordict, rewards, dones, extras
     
@@ -671,7 +685,12 @@ def main():
                       f"{episode_info}")
                 
                 if args.use_wandb and wandb_initialized:
-                    wandb.log(log_data)
+                    try:
+                        wandb.log(log_data)
+                    except Exception as e:
+                        print(f"⚠️  Wandb logging failed: {e}")
+                        wandb_initialized = False  # Disable wandb for subsequent iterations
+                        print(f"🔄 Disabling wandb logging for remaining iterations...")
                 
                 # Backup CSV logging (works even without internet)
                 _log_to_csv(log_data, args.experiment_name)
@@ -708,8 +727,11 @@ def main():
     env.close()
     
     if args.use_wandb and wandb_initialized:
-        wandb.finish()
-        print("✓ Wandb session finished")
+        try:
+            wandb.finish()
+            print("✓ Wandb session finished")
+        except Exception as e:
+            print(f"⚠️  Wandb finish failed: {e}")
     
     elapsed = (datetime.now() - start_time).total_seconds()
     print(f"\n🎉 Training completed successfully!")

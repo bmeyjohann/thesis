@@ -36,8 +36,7 @@ python train_rsl_rl_clean.py \
     --num_envs 2 \
     --max_iterations 2 \
     --reward_type dense \
-    --experiment_name "test_juwels_$(date +%Y%m%d_%H%M)" \
-    --use_wandb
+    --experiment_name "test_juwels_$(date +%Y%m%d_%H%M)"
 
 echo "✅ Test completed successfully!"
 echo "Check the output above for any errors."

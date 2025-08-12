@@ -94,3 +94,4 @@ echo "🔄 Monitor commands:"
 echo "  watch -n 5 'squeue -u $USER'"
 echo "  tail -f logs/reward_comparison_*.out"
 echo "  bash monitor_job.sh"
+

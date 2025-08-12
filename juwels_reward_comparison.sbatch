@@ -2,11 +2,12 @@
 #SBATCH --account=<your_account>  # This will be auto-replaced by submit_job.sh
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=32
-#SBATCH --gres=gpu:3
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=64GB
+#SBATCH --gres=gpu:1
 #SBATCH --time=02:00:00
 #SBATCH --partition=booster
-#SBATCH --job-name=ogbench_reward_comparison
+#SBATCH --job-name=ogbench_mixed_rewards
 #SBATCH --output=logs/reward_comparison_%j.out
 #SBATCH --error=logs/reward_comparison_%j.err
 
@@ -31,59 +32,75 @@ echo "GPUs: $CUDA_VISIBLE_DEVICES"
 date
 
 # Define shared training parameters (LIGHTER CONFIGURATION)
-SHARED_ARGS="--num_envs 16 --log_interval 25 --use_wandb --wandb_project juwels-reward-pilot"
+SHARED_ARGS="--num_envs 16 --log_interval 25 --wandb_project juwels-mixed-rewards --use_wandb"
 
-# Run 3 parallel training jobs on 3 GPUs (BUDGET-CONSCIOUS)
-echo "📊 Launching 3 lightweight reward shaping pilot experiments..."
+# Run 3 parallel training jobs on 1 A100 GPU (plenty of memory for small RL models)
+echo "📊 Launching 3 parallel mixed reward comparison experiments..."
 
-# GPU 0: Sparse Rewards (Baseline) - Reduced to 5M steps
-echo "GPU 0: Starting SPARSE reward training (5M steps)..."
-CUDA_VISIBLE_DEVICES=0 python train_rsl_rl_clean.py \
-    --reward_type sparse \
-    --total_timesteps 5000000 \
-    --max_iterations 312 \
-    --experiment_name "juwels_sparse_5M_pilot_$(date +%Y%m%d_%H%M)" \
+# Job 1: Dense Rewards (Baseline comparison) 
+echo "🎯 Starting DENSE reward training (baseline)..."
+python train_rsl_rl_clean.py \
+    --reward_type dense \
+    --dense_reward_scale 0.1 \
+    --total_timesteps 15000000 \
+    --max_iterations 750 \
+    --experiment_name "juwels_dense_baseline_$(date +%Y%m%d_%H%M)" \
     $SHARED_ARGS &
 PID1=$!
 
-# GPU 1: Dense Rewards - Higher scaling + 3M steps  
-echo "GPU 1: Starting DENSE reward training (3M steps, higher scaling)..."
-CUDA_VISIBLE_DEVICES=1 python train_rsl_rl_clean.py \
-    --reward_type dense \
-    --dense_reward_scale 0.1 \
-    --total_timesteps 3000000 \
-    --max_iterations 187 \
-    --experiment_name "juwels_dense_3M_pilot_$(date +%Y%m%d_%H%M)" \
-    $SHARED_ARGS &
-PID2=$!
-
-# GPU 2: Mixed Rewards - 4M steps
-echo "GPU 2: Starting MIXED reward training (4M steps)..."  
-CUDA_VISIBLE_DEVICES=2 python train_rsl_rl_clean.py \
+# Job 2: Mixed Rewards - Original weighting (higher dense influence)
+echo "⚖️  Starting MIXED reward training (original weighting)..."  
+python train_rsl_rl_clean.py \
     --reward_type mixed \
     --dense_reward_scale 0.05 \
     --mixed_dense_weight 0.2 \
-    --total_timesteps 4000000 \
-    --max_iterations 250 \
-    --experiment_name "juwels_mixed_4M_pilot_$(date +%Y%m%d_%H%M)" \
+    --total_timesteps 15000000 \
+    --max_iterations 750 \
+    --experiment_name "juwels_mixed_high_$(date +%Y%m%d_%H%M)" \
+    $SHARED_ARGS &
+PID2=$!
+
+# Job 3: Mixed Rewards - Lower dense influence
+echo "🔽 Starting MIXED reward training (lower dense weight)..."  
+python train_rsl_rl_clean.py \
+    --reward_type mixed \
+    --dense_reward_scale 0.05 \
+    --mixed_dense_weight 0.05 \
+    --total_timesteps 15000000 \
+    --max_iterations 750 \
+    --experiment_name "juwels_mixed_low_$(date +%Y%m%d_%H%M)" \
     $SHARED_ARGS &
 PID3=$!
 
-echo "✓ All training jobs launched"
-echo "Process IDs: Sparse=$PID1, Dense=$PID2, Mixed=$PID3"
-echo "Monitor progress at: https://wandb.ai/<your_username>/juwels-reward-study"
+echo "✓ All training jobs launched in parallel"
+echo "Process IDs: Dense=$PID1, Mixed_High=$PID2, Mixed_Low=$PID3"
+echo "Monitor progress at: https://wandb.ai/<your_username>/juwels-mixed-rewards"
 
-# Wait for all jobs to complete
+# Wait for all jobs to complete with error checking
+echo "⏳ Waiting for parallel training jobs to complete..."
+
 wait $PID1
-echo "✓ Sparse training completed"
+if [ $? -eq 0 ]; then
+    echo "✅ Dense baseline training completed successfully"
+else
+    echo "❌ Dense baseline training failed (exit code: $?)"
+fi
 
 wait $PID2  
-echo "✓ Dense training completed"
+if [ $? -eq 0 ]; then
+    echo "✅ Mixed high weight training completed successfully"
+else
+    echo "❌ Mixed high weight training failed (exit code: $?)"
+fi
 
 wait $PID3
-echo "✓ Mixed training completed"
+if [ $? -eq 0 ]; then
+    echo "✅ Mixed low weight training completed successfully"
+else
+    echo "❌ Mixed low weight training failed (exit code: $?)"
+fi
 
-echo "🎉 All reward shaping experiments completed!"
+echo "🎉 All mixed reward comparison experiments completed!"
 date
 
 # Sync wandb runs from compute node (if they were run in offline mode)
@@ -104,14 +121,20 @@ else
     echo "No offline wandb runs found to sync"
 fi
 
-# Optional: Generate comparison summary
-echo "📈 Pilot Training Summary:"
-echo "Sparse (5M steps):  Expected ~1 hour"
-echo "Dense (3M steps):   Expected ~40 minutes" 
-echo "Mixed (4M steps):   Expected ~50 minutes"
-echo "Total budget used:  ~50 core-hours (0.08% of total)"
+# Generate comparison summary
+echo "📈 Mixed Reward Comparison Summary:"
+echo "Dense baseline (15M steps):     Expected ~1.2 hours"
+echo "Mixed high weight (15M steps):  Expected ~1.2 hours" 
+echo "Mixed low weight (15M steps):   Expected ~1.2 hours"
+echo "Total runtime: ~1.2 hours (parallel on 1 A100 GPU)"
+echo "Total budget used: ~19 core-hours (0.03% of total)"
+echo ""
+echo "🔬 Experiment Design:"
+echo "  Dense baseline:    dense_reward_scale=0.1"
+echo "  Mixed high:        dense_scale=0.05, weight=0.2 (20% dense influence)"  
+echo "  Mixed low:         dense_scale=0.05, weight=0.05 (5% dense influence)"
 echo ""
 echo "📊 Results available in:"
-echo "  - Wandb dashboard: https://wandb.ai/<username>/juwels-reward-pilot"
+echo "  - Wandb dashboard: https://wandb.ai/<username>/juwels-mixed-rewards"
 echo "  - CSV logs: ./logs/*_metrics.csv"
 echo "  - Model files: ./models/*/"
