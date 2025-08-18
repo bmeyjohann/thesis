@@ -58,6 +58,9 @@ bash sync_wandb.sh
 # Activate HPC environment
 cd sc_venv_template && source activate.sh
 
+# Activate FastTD3 environment (local development)
+conda activate fasttd3
+
 # Install OGBench in development mode
 pip install -e ogbench/
 
@@ -110,3 +113,22 @@ The `submit_job.sh` script automatically detects SLURM accounts using multiple m
 - For cluster jobs, replace `<your_account>` placeholders or use `submit_job.sh`
 - FastTD3 requires specific PyTorch/CUDA versions (see requirements)
 - The repository includes both individual OGBench and FastTD3 implementations as submodules
+
+## Goal Navigation Experiments
+
+### Quick Cluster Training
+```bash
+# Submit the four-experiment comparison
+./submit_job.sh goal_navigation_experiments.sbatch
+
+# Monitor progress
+tail -f logs/goal_nav_experiments_*.out
+```
+
+### Experiment Configurations
+1. **Simple + Sparse**: SimpleDynamicPointMaze-v0 with goal-only rewards
+2. **Simple + Dense**: SimpleDynamicPointMaze-v0 with distance-based rewards  
+3. **OGBench + Sparse**: pointmaze-medium-v0 with goal-only rewards
+4. **OGBench + Dense**: pointmaze-medium-v0 with distance-based rewards
+
+All experiments use enhanced observations with goal position, distance, and direction information.
