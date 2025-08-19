@@ -5,7 +5,7 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64GB
 #SBATCH --gres=gpu:1
-#SBATCH --time=04:00:00
+#SBATCH --time=02:00:00
 #SBATCH --partition=booster
 #SBATCH --job-name=goal_navigation_experiments
 #SBATCH --output=logs/goal_nav_experiments_%j.out
@@ -33,7 +33,7 @@ date
 
 # Define shared training parameters
 # Adjusted for longer training to see clear learning differences
-SHARED_ARGS="--num_envs 32 --total_timesteps 2000000 --steps_per_update 512 --log_interval 20"
+SHARED_ARGS="--num_envs 64 --total_timesteps 20000000 --num_steps_per_env 512 --log_interval 20"
 WANDB_ARGS="--wandb_project goal-navigation-juwels --use_wandb"
 
 # Generate timestamp for experiment naming
@@ -151,8 +151,8 @@ echo "  OGBench + Sparse:   pointmaze-medium-v0 with goal-only rewards"
 echo "  OGBench + Dense:    pointmaze-medium-v0 with distance-based rewards"
 echo ""
 echo "⚙️  Training Configuration:"
-echo "  - Environments: 32 parallel per experiment"
-echo "  - Timesteps: 2M per experiment (8M total)"
+echo "  - Environments: 64 parallel per experiment"
+echo "  - Timesteps: 20M per experiment (80M total)"
 echo "  - Steps per update: 512"
 echo "  - Algorithm: PPO with RSL-RL"
 echo "  - Observations: Enhanced with goal position, distance, and direction"
