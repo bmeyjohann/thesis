@@ -33,7 +33,7 @@ date
 
 # Define shared training parameters
 # Adjusted for longer training to see clear learning differences
-SHARED_ARGS="--num_envs 64 --total_timesteps 20000000 --num_steps_per_env 512 --log_interval 20"
+SHARED_ARGS="--num_envs 32 --total_timesteps 20000000 --num_steps_per_env 512 --log_interval 20"
 WANDB_ARGS="--wandb_project goal-navigation-juwels --use_wandb"
 
 # Generate timestamp for experiment naming
@@ -52,7 +52,7 @@ echo "🔵 Starting Experiment 1: Simple + Sparse..."
 python train_goal_navigation_experiments.py \
     --env_type simple \
     --reward_type sparse \
-    --experiment_name "simple_sparse_${TIMESTAMP}" \
+    --experiment_name "GoalNav-Simple-Sparse-${TIMESTAMP}" \
     $SHARED_ARGS $WANDB_ARGS &
 PID1=$!
 
@@ -61,7 +61,7 @@ echo "🟢 Starting Experiment 2: Simple + Dense..."
 python train_goal_navigation_experiments.py \
     --env_type simple \
     --reward_type dense \
-    --experiment_name "simple_dense_${TIMESTAMP}" \
+    --experiment_name "GoalNav-Simple-Dense-${TIMESTAMP}" \
     $SHARED_ARGS $WANDB_ARGS &
 PID2=$!
 
@@ -70,7 +70,7 @@ echo "🔴 Starting Experiment 3: OGBench + Sparse..."
 python train_goal_navigation_experiments.py \
     --env_type ogbench \
     --reward_type sparse \
-    --experiment_name "ogbench_sparse_${TIMESTAMP}" \
+    --experiment_name "GoalNav-OGBench-Sparse-${TIMESTAMP}" \
     $SHARED_ARGS $WANDB_ARGS &
 PID3=$!
 
@@ -79,7 +79,7 @@ echo "🟡 Starting Experiment 4: OGBench + Dense..."
 python train_goal_navigation_experiments.py \
     --env_type ogbench \
     --reward_type dense \
-    --experiment_name "ogbench_dense_${TIMESTAMP}" \
+    --experiment_name "GoalNav-OGBench-Dense-${TIMESTAMP}" \
     $SHARED_ARGS $WANDB_ARGS &
 PID4=$!
 
@@ -151,7 +151,7 @@ echo "  OGBench + Sparse:   pointmaze-medium-v0 with goal-only rewards"
 echo "  OGBench + Dense:    pointmaze-medium-v0 with distance-based rewards"
 echo ""
 echo "⚙️  Training Configuration:"
-echo "  - Environments: 64 parallel per experiment"
+echo "  - Environments: 32 parallel per experiment"
 echo "  - Timesteps: 20M per experiment (80M total)"
 echo "  - Steps per update: 512"
 echo "  - Algorithm: PPO with RSL-RL"
