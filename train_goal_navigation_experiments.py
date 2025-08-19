@@ -331,28 +331,40 @@ def main():
                 mean_surrogate_loss = loss_dict.get('surrogate_loss', 0.0)
                 mean_entropy_loss = loss_dict.get('entropy_loss', 0.0)
                 
-                # Calculate episode statistics
-                mean_episode_length = torch.mean(env.episode_length_buf.float()).item()
-                
                 # Get reward statistics from storage if available
                 if hasattr(ppo.storage, 'rewards'):
                     mean_reward = torch.mean(ppo.storage.rewards).item()
                 else:
                     mean_reward = 0.0
                 
+                # Extract episode statistics from last extras
+                goals_achieved = extras.get('goal_achieved', 0.0)
+                episode_length = extras.get('episode_length', 0)
+                distance_to_goal = extras.get('distance_to_goal', 0.0)
+                
+                # Calculate success rate and other metrics
+                success_rate = float(goals_achieved) if episode_length > 0 else 0.0
+                actual_episode_length = episode_length if episode_length > 0 else env.episode_length_buf[0].item()
+                
                 print(f"Iter {iteration:4d} | Steps {total_steps:8d} | "
-                      f"Reward {mean_reward:6.3f} | Ep Len {mean_episode_length:6.1f} | "
-                      f"Value Loss {mean_value_loss:6.4f}")
+                      f"Reward {mean_reward:6.3f} | Ep Len {actual_episode_length:6.1f} | "
+                      f"Success {success_rate:.3f} | Value Loss {mean_value_loss:6.4f}")
                 
                 # Create log data for both wandb and CSV
                 log_data = {
                     'iteration': iteration,
                     'total_steps': total_steps,
                     'rewards/mean': mean_reward,
-                    'episode_length/mean': mean_episode_length,
+                    'episode_length/actual': actual_episode_length,
+                    'episode_length/buffer': env.episode_length_buf[0].item(),
+                    'success_rate': success_rate,
+                    'goals_achieved': goals_achieved,
+                    'distance_to_goal': distance_to_goal,
                     'losses/value_loss': mean_value_loss,
                     'losses/surrogate_loss': mean_surrogate_loss,
                     'losses/entropy_loss': mean_entropy_loss,
+                    'config/reward_type': args.reward_type,
+                    'config/env_type': args.env_type,
                 }
                 
                 if wandb_initialized:
