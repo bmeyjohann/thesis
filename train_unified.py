@@ -25,142 +25,13 @@ sys.path.append('fasttd3/fast_sac')
 # Import gymnasium and ogbench
 import gymnasium as gym
 import ogbench
-from ogbench.wrappers import FlexibleObsWrapper, DetailedRewardWrapper
+from ogbench.wrappers import FlexibleObsWrapper, DetailedRewardWrapper, VectorizedOGBenchEnv
 
 # Import RSL-RL components
 from rsl_rl.algorithms import PPO
 from rsl_rl.modules import ActorCritic
-from rsl_rl.env import VecEnv
 from tensordict import TensorDict
 
-
-class UnifiedOGBenchEnv(VecEnv):
-    """Unified RSL-RL VecEnv wrapper for all OGBench environments."""
-    
-    def __init__(self, cfg: dict = None):
-        self.cfg = cfg or {}
-        
-        # Environment configuration
-        self.env_name = self.cfg.get('env_name', 'pointmaze-arena-v0')
-        self.render_mode = self.cfg.get('render_mode', None)
-        self.max_episode_steps = self.cfg.get('max_episode_steps', 500)
-        
-        # Observation configuration
-        self.obs_config = {
-            'include_goal': self.cfg.get('include_goal', True),
-            'include_distance': self.cfg.get('include_distance', False),
-            'include_direction': self.cfg.get('include_direction', False),
-            'include_velocity': self.cfg.get('include_velocity', False),
-        }
-        
-        # Reward configuration
-        self.reward_config = {
-            'reward_type': self.cfg.get('reward_type', 'sparse'),
-            'dense_reward_scale': self.cfg.get('dense_reward_scale', 0.01),
-            'step_penalty': self.cfg.get('step_penalty', 0.0),
-        }
-        
-        # Create base environment
-        env_kwargs = {'render_mode': self.render_mode}
-        
-        # Add width/height for OGBench environments that support them
-        if self.env_name.startswith(('pointmaze-', 'antmaze-', 'humanoidmaze-')):
-            env_kwargs.update({
-                'width': self.cfg.get('render_width', 800),
-                'height': self.cfg.get('render_height', 600),
-            })
-        
-        self.base_env = gym.make(self.env_name, **env_kwargs)
-        
-        # Apply flexible observation wrapper
-        self.base_env = FlexibleObsWrapper(self.base_env, **self.obs_config)
-        
-        # Apply reward wrapper
-        self.base_env = DetailedRewardWrapper(self.base_env, **self.reward_config)
-        
-        # RSL-RL VecEnv required attributes
-        self.num_envs = 1  # Single environment for now
-        self.num_actions = self.base_env.action_space.shape[0]
-        self.max_episode_length = self.max_episode_steps
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        # Episode tracking buffer (required by RSL-RL)
-        self.episode_length_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
-        
-        # Internal state
-        self._last_obs = None
-        
-        # Initialize observations
-        self.reset()
-        
-    def get_observations(self) -> TensorDict:
-        """Return current observations as TensorDict."""
-        if self._last_obs is None:
-            self.reset()
-        return self._last_obs
-    
-    def reset(self) -> TensorDict:
-        """Reset environment and return TensorDict observations."""
-        # Reset the environment
-        raw_obs, info = self.base_env.reset()
-        
-        # Convert to tensor and add batch dimension
-        obs_tensor = torch.from_numpy(raw_obs).unsqueeze(0).to(device=self.device, dtype=torch.float)
-        
-        # Convert to TensorDict with proper structure for RSL-RL
-        self._last_obs = TensorDict({
-            "policy": obs_tensor,  # Observations for policy network
-        }, batch_size=[self.num_envs], device=self.device)
-        
-        # Reset episode length buffer
-        self.episode_length_buf.zero_()
-        
-        return self._last_obs
-    
-    def step(self, actions: torch.Tensor) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict]:
-        """Step environment with RSL-RL interface."""
-        # Apply action clipping for stability
-        processed_actions = torch.clamp(actions, -1.0, 1.0)
-        
-        # Step the environment
-        raw_obs, reward, terminated, truncated, info = self.base_env.step(processed_actions[0].cpu().numpy())
-        
-        # Convert observations to tensor
-        obs_tensor = torch.from_numpy(raw_obs).unsqueeze(0).to(device=self.device, dtype=torch.float)
-        
-        # Convert to tensors
-        rewards = torch.tensor([reward], device=self.device, dtype=torch.float)
-        dones = torch.tensor([terminated], device=self.device, dtype=torch.bool)
-        
-        # Update episode tracking
-        self.episode_length_buf += 1
-        
-        # Track episode statistics and reset on episode end
-        reset_mask = terminated or truncated
-        episode_length = self.episode_length_buf[0].item() if reset_mask else 0
-        
-        # Reset episode tracking for terminated episodes
-        if reset_mask:
-            self.episode_length_buf.zero_()
-        
-        # Create infos dict with episode statistics
-        time_outs = torch.tensor([truncated], device=self.device, dtype=torch.bool)
-        extras = {
-            'time_outs': time_outs,
-            'episode_rewards': rewards.clone(),  # For logging
-            'goal_achieved': info.get('success', 0.0),
-            'episode_length': episode_length,
-            'raw_infos': [info],  # Include raw info for detailed metrics
-        }
-        
-        # Convert observations to TensorDict
-        obs_tensordict = TensorDict({
-            "policy": obs_tensor,
-        }, batch_size=[self.num_envs], device=self.device)
-        
-        self._last_obs = obs_tensordict
-        
-        return obs_tensordict, rewards, dones, extras
 
 
 def get_available_environments():
@@ -279,6 +150,8 @@ def get_args():
                         help='Small penalty per step')
     
     # Training
+    parser.add_argument('--num_envs', type=int, default=1,
+                        help='Number of parallel environments')
     parser.add_argument('--total_timesteps', type=int, default=None,
                         help='Total training timesteps')
     parser.add_argument('--num_steps_per_env', type=int, default=1024,
@@ -402,33 +275,51 @@ def main():
             config=vars(args)
         )
     
-    # Create environment
-    env_cfg = {
-        'env_name': args.env_name,
-        'max_episode_steps': args.max_episode_steps,
-        'render_mode': args.render_mode,
-        'render_width': args.render_width,
-        'render_height': args.render_height,
-        'include_goal': args.include_goal,
-        'include_distance': args.include_distance,
-        'include_direction': args.include_direction,
-        'include_velocity': args.include_velocity,
-        'reward_type': args.reward_type,
-        'dense_reward_scale': args.dense_reward_scale,
-        'step_penalty': args.step_penalty,
-    }
-    env = UnifiedOGBenchEnv(env_cfg)
+    # Create wrapper functions for environment pipeline
+    def apply_wrappers(env):
+        # Apply flexible observation wrapper
+        env = FlexibleObsWrapper(
+            env,
+            include_goal=args.include_goal,
+            include_distance=args.include_distance,
+            include_direction=args.include_direction,
+            include_velocity=args.include_velocity,
+        )
+        
+        # Apply detailed reward wrapper
+        env = DetailedRewardWrapper(
+            env,
+            reward_type=args.reward_type,
+            dense_reward_scale=args.dense_reward_scale,
+            step_penalty=args.step_penalty,
+        )
+        
+        return env
+    
+    # Create vectorized environment
+    env = VectorizedOGBenchEnv(
+        env_name=args.env_name,
+        num_envs=args.num_envs,
+        wrappers=[apply_wrappers],
+        render_mode=args.render_mode,
+        max_episode_steps=args.max_episode_steps,
+    )
     
     print(f"✅ Environment created successfully")
-    print(f"   Observation space: {env.base_env.observation_space}")
-    print(f"   Action space: {env.base_env.action_space}")
+    print(f"   Number of environments: {env.num_envs}")
+    print(f"   Observation space: {env.observation_space}")
+    print(f"   Action space: {env.action_space}")
     print(f"   Max episode steps: {env.max_episode_length}")
     
     # Create dummy observation to initialize policy
-    dummy_obs = torch.zeros(1, env.get_observations()["policy"].shape[1], device=device)
+    # Reset environment to get observation shape
+    initial_obs = env.reset()
+    obs_shape = initial_obs["policy"].shape[1]  # Get feature dimension
+    
+    dummy_obs = torch.zeros(env.num_envs, obs_shape, device=device)
     dummy_obs_dict = TensorDict({
         "policy": dummy_obs,
-    }, batch_size=[1], device=device)
+    }, batch_size=[env.num_envs], device=device)
     
     # Create ActorCritic policy
     obs_groups = {
