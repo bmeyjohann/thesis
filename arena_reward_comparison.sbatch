@@ -4,7 +4,7 @@
 #SBATCH --partition=dc-gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=32
 #SBATCH --gres=gpu:1
 #SBATCH --time=00:55:00
 #SBATCH --output=logs/arena_rewards_%j.out
@@ -40,15 +40,16 @@ mkdir -p models
 export WANDB_MODE=offline
 export WANDB_DIR=$PWD/wandb
 
-# Common training parameters (tuned for <1 hour completion)
+# Common training parameters (optimized for A100 + 96 cores)
 COMMON_ARGS="--env_name pointmaze-arena-v0 \
 --include_goal \
---total_timesteps 200000 \
---num_steps_per_env 512 \
---learning_rate 5e-4 \
---num_learning_epochs 5 \
---num_mini_batches 4 \
---save_interval 10 \
+--num_envs 32 \
+--total_timesteps 1000000 \
+--num_steps_per_env 1024 \
+--learning_rate 3e-4 \
+--num_learning_epochs 8 \
+--num_mini_batches 16 \
+--save_interval 25 \
 --use_wandb \
 --wandb_project arena-reward-comparison"
 
