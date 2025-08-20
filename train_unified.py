@@ -359,13 +359,13 @@ def main():
     ppo = PPO(policy, device=device, **alg_cfg)
     
     # Initialize PPO storage
-    dummy_actions = torch.zeros(env.num_envs, env.num_actions, device=device)
+    action_shape = (env.num_actions,)  # Shape tuple for actions
     ppo.init_storage(
         "rl",  # training_type for reinforcement learning
         env.num_envs,
         args.num_steps_per_env,
         dummy_obs_dict,  # Use the TensorDict, not the tensor
-        dummy_actions.shape
+        action_shape
     )
     
     print(f"✅ PPO algorithm initialized")
@@ -402,24 +402,35 @@ def main():
             ppo.process_env_step(obs, rewards, dones, extras)
             total_steps += env.num_envs
             
-            # Track detailed episode statistics
+            # Track detailed episode statistics (handle multiple environments)
             if 'episode_rewards' in extras:
-                episode_rewards.append(extras['episode_rewards'].item())
-            if 'episode_length' in extras and extras['episode_length'] > 0:
-                episode_lengths.append(extras['episode_length'])
-                
-                # Collect detailed metrics from the raw_infos if available
-                raw_infos = extras.get('raw_infos', [{}])
-                if raw_infos and len(raw_infos) > 0:
-                    info = raw_infos[0] if isinstance(raw_infos, list) else raw_infos
-                    sparse_rewards.append(info.get('episode_sparse_reward', 0))
-                    dense_rewards.append(info.get('episode_dense_reward', 0))
-                    goals_reached.append(info.get('goal_reached', False))
-                    distances.append(info.get('distance_to_goal', 0))
+                # episode_rewards is now a list (one per completed episode)
+                if isinstance(extras['episode_rewards'], list):
+                    episode_rewards.extend(extras['episode_rewards'])
+                else:
+                    episode_rewards.append(extras['episode_rewards'])
+                    
+            if 'episode_lengths' in extras:
+                # episode_lengths is now a list (one per completed episode)
+                if isinstance(extras['episode_lengths'], list):
+                    episode_lengths.extend(extras['episode_lengths'])
+                else:
+                    episode_lengths.append(extras['episode_lengths'])
             
-            # Render if requested
+            # Collect detailed metrics from completed episodes
+            if 'episode_sparse_rewards' in extras:
+                sparse_rewards.extend(extras['episode_sparse_rewards'])
+            if 'episode_dense_rewards' in extras:
+                dense_rewards.extend(extras['episode_dense_rewards'])
+            if 'goals_reached' in extras:
+                goals_reached.extend(extras['goals_reached'])
+            if 'distances_to_goal' in extras:
+                distances.extend(extras['distances_to_goal'])
+            
+            # Render if requested (only works with single environment)
             if args.render_during_training and total_steps % args.render_interval == 0:
-                env.base_env.render()
+                if env.num_envs == 1 and hasattr(env, 'envs') and len(env.envs) > 0:
+                    env.envs[0].render()
             
             if total_steps >= args.total_timesteps:
                 break
@@ -439,7 +450,7 @@ def main():
             mean_reward = np.mean(episode_rewards)
             mean_length = np.mean(episode_lengths) if episode_lengths else 0
             
-            # Calculate detailed metrics
+            # Calculate detailed metrics (works for any number of environments)
             mean_sparse_reward = np.mean(sparse_rewards) if sparse_rewards else 0
             mean_dense_reward = np.mean(dense_rewards) if dense_rewards else 0
             goal_success_rate = np.mean(goals_reached) if goals_reached else 0
@@ -473,17 +484,24 @@ def main():
             if mean_reward >= best_reward:
                 torch.save(checkpoint, output_dir / 'best_model.pt')
             
-            print(f"Iter {iteration:4d} | Steps: {total_steps:7,} | "
-                  f"Reward: {mean_reward:7.3f} | Sparse: {mean_sparse_reward:6.3f} | Dense: {mean_dense_reward:7.4f} | "
+            # Show number of completed episodes for monitoring parallel training
+            num_episodes = len(episode_rewards)
+            # Calculate mean reward per step for additional context
+            mean_reward_per_step = mean_reward / mean_length if mean_length > 0 else 0
+            
+            print(f"Iter {iteration:4d} | Steps: {total_steps:7,} | Episodes: {num_episodes:3d} | "
+                  f"Reward: {mean_reward:7.3f} | MeanPerStep: {mean_reward_per_step:7.4f}")
+            print(f"           | Sparse: {mean_sparse_reward:6.3f} | Dense: {mean_dense_reward:7.4f} | "
                   f"Success: {goal_success_rate:5.1%} | Length: {mean_length:5.1f}")
-            print(f"           | VLoss: {mean_value_loss:.4f} | PLoss: {mean_surrogate_loss:.4f} | "
-                  f"Distance: {mean_distance:6.2f}")
+            print(f"           | VLoss: {mean_value_loss:.4f} | PLoss: {mean_surrogate_loss:.4f} | Distance: {mean_distance:6.2f}")
             
             # Create log data for both wandb and CSV
             log_data = {
                 'iteration': iteration,
                 'total_timesteps': total_steps,
+                'episodes_completed': num_episodes,
                 'episode_reward_total': mean_reward,
+                'episode_reward_per_step': mean_reward_per_step,
                 'episode_reward_sparse': mean_sparse_reward,
                 'episode_reward_dense': mean_dense_reward,
                 'episode_length_mean': mean_length,
@@ -527,7 +545,7 @@ def main():
     print(f"   Best reward: {best_reward:.3f}")
     print(f"   Models saved to: {output_dir}")
     
-    env.base_env.close()
+    env.close()
     if args.use_wandb:
         wandb.finish()
 
