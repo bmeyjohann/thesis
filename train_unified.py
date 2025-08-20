@@ -270,11 +270,17 @@ def main():
     # Initialize wandb if requested (with error handling for cluster environments)
     wandb_active = False
     if args.use_wandb:
+        # Aggressive offline mode for compute nodes - prevent all network attempts
+        os.environ["WANDB_MODE"] = "offline"
+        os.environ["WANDB_CONSOLE"] = "off"  # Reduce verbose output
+        os.environ["WANDB_SILENT"] = "true"  # Suppress network retry messages
+        
         try:
             wandb.init(
                 project=args.wandb_project,
                 name=args.experiment_name,
-                config=vars(args)
+                config=vars(args),
+                mode="offline"
             )
             wandb_active = True
             print("✅ Wandb initialized successfully")
