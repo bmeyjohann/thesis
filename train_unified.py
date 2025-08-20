@@ -267,13 +267,21 @@ def main():
         env_short = args.env_name.replace('-v0', '').replace('maze', '')
         args.experiment_name = f"{env_short}_{timestamp}"
     
-    # Initialize wandb if requested
+    # Initialize wandb if requested (with error handling for cluster environments)
+    wandb_active = False
     if args.use_wandb:
-        wandb.init(
-            project=args.wandb_project,
-            name=args.experiment_name,
-            config=vars(args)
-        )
+        try:
+            wandb.init(
+                project=args.wandb_project,
+                name=args.experiment_name,
+                config=vars(args)
+            )
+            wandb_active = True
+            print("✅ Wandb initialized successfully")
+        except Exception as e:
+            print(f"⚠️  Wandb initialization failed: {e}")
+            print("📄 Continuing with CSV logging only...")
+            wandb_active = False
     
     # Create wrapper functions for environment pipeline
     def apply_wrappers(env):
@@ -514,9 +522,13 @@ def main():
                 'reward_type': args.reward_type,
             }
             
-            # Wandb logging (if enabled)
-            if args.use_wandb:
-                wandb.log(log_data)
+            # Wandb logging (if enabled and working)
+            if args.use_wandb and wandb_active:
+                try:
+                    wandb.log(log_data)
+                except Exception as e:
+                    print(f"⚠️  Wandb logging failed: {e}")
+                    wandb_active = False
                 
             # Always log to CSV (offline-friendly)
             import csv
@@ -548,8 +560,11 @@ def main():
     print(f"   Models saved to: {output_dir}")
     
     env.close()
-    if args.use_wandb:
-        wandb.finish()
+    if args.use_wandb and wandb_active:
+        try:
+            wandb.finish()
+        except Exception as e:
+            print(f"⚠️  Wandb finish failed: {e}")
 
 
 if __name__ == "__main__":

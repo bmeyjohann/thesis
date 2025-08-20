@@ -35,10 +35,11 @@ mkdir -p logs
 mkdir -p models
 
 # Force wandb into silent offline mode (prevents retry loops)
-export WANDB_MODE="offline"
-export WANDB_CONSOLE="off" 
-export WANDB_SILENT="true"
-export WANDB__SERVICE_WAIT="0"
+export WANDB_MODE=offline
+export WANDB_CONSOLE=off
+export WANDB_SILENT=true
+export WANDB__SERVICE_WAIT=0
+export WANDB_START_METHOD=thread
 
 # Common training parameters (optimized for parallel execution on A100 + 96 cores)
 # Each experiment gets 16 envs (32 total across both experiments)
