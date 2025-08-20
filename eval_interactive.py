@@ -31,6 +31,8 @@ os.environ['SDL_VIDEO_CENTERED'] = '1'
 # Import ogbench to register environments
 import ogbench
 
+# Custom environments will be registered through OGBench
+
 # Add RSL-RL to path
 sys.path.append('fasttd3/fast_sac')
 
@@ -90,8 +92,8 @@ def load_trained_policy(model_path: str, env, device: torch.device):
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model file not found: {model_path}")
     
-    # Load checkpoint
-    checkpoint = torch.load(model_path, map_location=device)
+    # Load checkpoint (trust local files)
+    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
     print(f"✓ Checkpoint loaded")
     
     # Create dummy observation to match model architecture
@@ -190,17 +192,31 @@ def load_trained_policy(model_path: str, env, device: torch.device):
     return policy
 
 def create_env(env_name: str, args):
-    """Create the evaluation environment."""
+    """Create the evaluation environment with appropriate wrappers."""
     print(f"🏗️  Creating environment: {env_name}")
     
+    # Base environment creation parameters
+    env_kwargs = {
+        'render_mode': args.render_mode,
+        'max_episode_steps': args.max_episode_steps,
+    }
+    
+    # Add width/height parameters for OGBench environments that support them
+    if env_name.startswith(('pointmaze-', 'antmaze-', 'humanoidmaze-')):
+        env_kwargs.update({
+            'width': args.width,
+            'height': args.height
+        })
+    
     try:
-        env = gym.make(
-            env_name,
-            render_mode=args.render_mode,
-            max_episode_steps=args.max_episode_steps,
-            width=args.width,
-            height=args.height
-        )
+        env = gym.make(env_name, **env_kwargs)
+        
+        # Apply flexible observation wrapper for arena environments
+        if env_name == 'pointmaze-arena-v0':
+            from ogbench.wrappers import FlexibleObsWrapper
+            env = FlexibleObsWrapper(env, include_goal=True)  # Match training config
+            print(f"✓ Applied FlexibleObsWrapper")
+        
         print(f"✓ Environment created successfully")
         print(f"   Observation space: {env.observation_space}")
         print(f"   Action space: {env.action_space}")

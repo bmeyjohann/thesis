@@ -71,9 +71,9 @@ pip install -e fasttd3/
 ## Architecture
 
 ### Environment Wrappers
-- `fasttd3/fast_sac/environments/ogbench_env.py` - Primary OGBench wrapper supporting both single and parallel environments
-- Compatible with RSL-RL, FastTD3, and other algorithms
-- Automatic tensor conversion and device management
+- `ogbench/ogbench/wrappers/enhanced_obs_wrapper.py` - Enhanced observation wrappers for goal-conditioned navigation
+- `ogbench/ogbench/wrappers/goal_conditioned_wrapper.py` - Goal-conditioned observation wrapper
+- Compatible with RSL-RL, FastTD3, and other algorithms through standard gym interfaces
 
 ### Key Components
 - **OGBench Integration**: Point maze, ant maze, and humanoid maze environments
@@ -108,8 +108,9 @@ The `submit_job.sh` script automatically detects SLURM accounts using multiple m
 
 ## Important Notes
 
-- Always use `fasttd3/fast_sac/environments/ogbench_env.py` for OGBench environments (not direct gym.make)
-- RSL-RL requires TensorDict observations - use `OGBenchRSLRLVecEnv` wrapper
+- Use standard `gym.make()` with OGBench environment IDs (e.g. 'pointmaze-arena-v0')
+- Apply OGBench wrappers as needed for enhanced observations
+- RSL-RL requires TensorDict observations - use custom VecEnv wrapper
 - For cluster jobs, replace `<your_account>` placeholders or use `submit_job.sh`
 - FastTD3 requires specific PyTorch/CUDA versions (see requirements)
 - The repository includes both individual OGBench and FastTD3 implementations as submodules
