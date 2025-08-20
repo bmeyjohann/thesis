@@ -520,7 +520,9 @@ def main():
                 
             # Always log to CSV (offline-friendly)
             import csv
-            csv_file = output_dir / 'training_log.csv'
+            logs_dir = Path('logs')
+            logs_dir.mkdir(exist_ok=True)
+            csv_file = logs_dir / f'{args.experiment_name}_training.csv'
             file_exists = csv_file.exists()
             with open(csv_file, 'a', newline='') as f:
                 writer = csv.DictWriter(f, fieldnames=log_data.keys())

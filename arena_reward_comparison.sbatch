@@ -40,45 +40,68 @@ export WANDB_CONSOLE="off"
 export WANDB_SILENT="true"
 export WANDB__SERVICE_WAIT="0"
 
-# Common training parameters (optimized for A100 + 96 cores)
+# Common training parameters (optimized for parallel execution on A100 + 96 cores)
+# Each experiment gets 16 envs (32 total across both experiments)
 COMMON_ARGS="--env_name pointmaze-arena-v0 \
 --include_goal \
---num_envs 32 \
---total_timesteps 200000 \
---num_steps_per_env 1024 \
+--num_envs 16 \
+--total_timesteps 1000000 \
+--num_steps_per_env 2048 \
 --learning_rate 3e-4 \
---num_learning_epochs 8 \
+--num_learning_epochs 10 \
 --num_mini_batches 16 \
 --save_interval 25 \
 --use_wandb \
 --wandb_project arena-reward-comparison"
 
+# Launch both experiments in parallel
 echo ""
-echo "📊 Experiment 1: SPARSE Rewards (Goal-only)"
+echo "🚀 Launching SPARSE and DENSE reward experiments in parallel..."
 echo "========================================================"
+
+# Experiment 1: SPARSE Rewards (Goal-only) - Background execution
+echo "📊 Starting SPARSE reward training..."
 python train_unified.py $COMMON_ARGS \
     --reward_type sparse \
     --experiment_name "arena_sparse_$(date +%Y%m%d_%H%M%S)" \
-    2>&1 | tee logs/arena_sparse_$SLURM_JOB_ID.log
+    2>&1 | tee logs/arena_sparse_$SLURM_JOB_ID.log &
+PID_SPARSE=$!
 
-# Check if first experiment succeeded
-if [ $? -ne 0 ]; then
-    echo "❌ Sparse reward experiment failed!"
-    exit 1
-fi
-
-echo ""
-echo "📊 Experiment 2: DENSE Rewards (Distance-based)"
-echo "========================================================"
+# Experiment 2: DENSE Rewards (Distance-based) - Background execution  
+echo "📊 Starting DENSE reward training..."
 python train_unified.py $COMMON_ARGS \
     --reward_type dense \
     --dense_reward_scale 0.01 \
     --experiment_name "arena_dense_$(date +%Y%m%d_%H%M%S)" \
-    2>&1 | tee logs/arena_dense_$SLURM_JOB_ID.log
+    2>&1 | tee logs/arena_dense_$SLURM_JOB_ID.log &
+PID_DENSE=$!
 
-# Check if second experiment succeeded
-if [ $? -ne 0 ]; then
-    echo "❌ Dense reward experiment failed!"
+echo "✓ Both training jobs launched in parallel"
+echo "Process IDs: Sparse=$PID_SPARSE, Dense=$PID_DENSE"
+echo ""
+
+# Wait for all jobs to complete with error checking
+echo "⏳ Waiting for parallel training jobs to complete..."
+
+wait $PID_SPARSE
+SPARSE_EXIT_CODE=$?
+if [ $SPARSE_EXIT_CODE -eq 0 ]; then
+    echo "✅ Sparse reward training completed successfully"
+else
+    echo "❌ Sparse reward training failed (exit code: $SPARSE_EXIT_CODE)"
+fi
+
+wait $PID_DENSE
+DENSE_EXIT_CODE=$?
+if [ $DENSE_EXIT_CODE -eq 0 ]; then
+    echo "✅ Dense reward training completed successfully"
+else
+    echo "❌ Dense reward training failed (exit code: $DENSE_EXIT_CODE)"
+fi
+
+# Overall success check
+if [ $SPARSE_EXIT_CODE -ne 0 ] || [ $DENSE_EXIT_CODE -ne 0 ]; then
+    echo "❌ One or more experiments failed!"
     exit 1
 fi
 
