@@ -1,12 +1,13 @@
 #!/bin/bash
 #SBATCH --job-name=arena_rewards
 #SBATCH --account=<your_account>
-#SBATCH --partition=dc-gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
+#SBATCH --mem=128GB
 #SBATCH --gres=gpu:1
-#SBATCH --time=00:55:00
+#SBATCH --time=01:30:00
+#SBATCH --partition=booster
 #SBATCH --output=logs/arena_rewards_%j.out
 #SBATCH --error=logs/arena_rewards_%j.err
 
@@ -14,37 +15,36 @@
 # This script runs two training jobs comparing sparse vs dense rewards
 # Designed to finish in under 1 hour with comprehensive logging
 
-# Load modules
-module purge
-module load Stages/2024
-module load GCC/13.2.0
-module load Python/3.11.5
-module load CUDA/12
+# Create logs directory if it doesn't exist
+mkdir -p logs
+
+# Activate the cluster virtual environment  
+cd sc_venv_template
+source activate.sh
+cd ..
 
 echo "🚀 Starting Arena Reward Comparison Experiment"
+echo "Node: $SLURMD_NODENAME"
 echo "Job ID: $SLURM_JOB_ID"
-echo "Node: $SLURM_NODELIST"
-echo "GPU: $CUDA_VISIBLE_DEVICES"
+echo "GPUs: $CUDA_VISIBLE_DEVICES"
 echo "Time: $(date)"
-echo "========================================================"
-
-# Environment setup
-cd $SLURM_SUBMIT_DIR
-source sc_venv_template/venv/bin/activate
+echo "======================================================="
 
 # Ensure output directories exist
 mkdir -p logs
 mkdir -p models
 
-# Set environment variables for offline wandb
-export WANDB_MODE=offline
-export WANDB_DIR=$PWD/wandb
+# Force wandb into silent offline mode (prevents retry loops)
+export WANDB_MODE="offline"
+export WANDB_CONSOLE="off" 
+export WANDB_SILENT="true"
+export WANDB__SERVICE_WAIT="0"
 
 # Common training parameters (optimized for A100 + 96 cores)
 COMMON_ARGS="--env_name pointmaze-arena-v0 \
 --include_goal \
 --num_envs 32 \
---total_timesteps 1000000 \
+--total_timesteps 200000 \
 --num_steps_per_env 1024 \
 --learning_rate 3e-4 \
 --num_learning_epochs 8 \
