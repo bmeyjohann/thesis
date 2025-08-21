@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=256GB
 #SBATCH --gres=gpu:1
-#SBATCH --time=00:30:00
+#SBATCH --time=01:15:00
 #SBATCH --partition=booster
 #SBATCH --output=logs/arena_rewards_%j.out
 #SBATCH --error=logs/arena_rewards_%j.err
@@ -39,12 +39,15 @@ export WANDB_MODE="offline"
 export WANDB_CONSOLE="off"
 export WANDB_SILENT="true"
 
-# Common training parameters (optimized for 10-minute run on A100 + 96 cores)
-# Each experiment gets 32 envs, ~10 minutes runtime with RSL-RL integration
+# Common training parameters (optimized for 30-minute run on A100 + 96 cores)  
+# Each experiment gets 32 envs, ~30 minutes runtime with RSL-RL integration
+# Calculation: 47 iterations × 32 envs × 1024 steps = 1,540,096 timesteps ≈ 30 min
 COMMON_ARGS="--env_name pointmaze-arena-v0 \
 --num_envs 32 \
---total_timesteps 200000 \
+--total_timesteps 1600000 \
 --include_goal \
+--include_distance \
+--include_direction \
 --config config/ogbench_config.yaml"
 
 # Launch both experiments in parallel
