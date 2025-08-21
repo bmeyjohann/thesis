@@ -11,7 +11,7 @@ Features:
 - Comprehensive metrics logging
 """
 
-import oswh
+import os
 import sys
 import argparse
 import yaml
@@ -209,19 +209,6 @@ def main():
     print(f"   Reward type: {args.reward_type}")
     print(f"   Learning rate: {train_cfg['algorithm']['learning_rate']}")
     
-    # Use max_episode_length from config if specified, otherwise use args
-    max_episode_steps = train_cfg.get('max_episode_length', args.max_episode_steps)
-    if max_episode_steps is None:
-        # Default based on environment type (like train_unified.py)
-        if 'arena' in args.env_name:
-            max_episode_steps = 1000  # Increased from 500 for better exploration
-        elif 'medium' in args.env_name:
-            max_episode_steps = 2000
-        else:
-            max_episode_steps = 1500
-    
-    print(f"📏 Episode length limit: {max_episode_steps}")
-    
     # Create environment
     print(f"🌍 Creating environment...")
     env = create_env(
@@ -236,7 +223,7 @@ def main():
         step_penalty=args.step_penalty,
         clip_actions=args.clip_actions,
         render_mode='human' if args.render_during_training else None,
-        max_episode_steps=max_episode_steps,
+        max_episode_steps=args.max_episode_steps,
     )
     
     print(f"✅ Environment created successfully")
