@@ -107,3 +107,6 @@ core.*
 !requirements.txt
 !pyproject.toml
 !setup.py
+
+rsl_rl/
+IsaacLab/

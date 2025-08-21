@@ -101,6 +101,7 @@ six==1.17.0
 smmap==5.0.2
 stable_baselines3==2.6.0
 sympy==1.13.1
+tensorboard==2.20.0
 tensordict==0.7.2
 tensorflow-probability==0.25.0
 tensorstore==0.1.76
