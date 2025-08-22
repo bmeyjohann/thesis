@@ -1,19 +1,20 @@
 #!/bin/bash
-#SBATCH --job-name=arena_rewards
+#SBATCH --job-name=maze_env_reward_comp
 #SBATCH --account=<your_account>
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=32
-#SBATCH --mem=256GB
-#SBATCH --gres=gpu:1
-#SBATCH --time=01:15:00
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=512GB
+#SBATCH --gres=gpu:4
+#SBATCH --time=04:00:00
 #SBATCH --partition=booster
-#SBATCH --output=logs/arena_rewards_%j.out
-#SBATCH --error=logs/arena_rewards_%j.err
+#SBATCH --output=logs/maze_env_reward_comp_%j.out
+#SBATCH --error=logs/maze_env_reward_comp_%j.err
 
-# Arena Reward Comparison Experiment - RSL-RL Integrated
-# This script runs two training jobs comparing sparse vs dense rewards
-# Designed to finish in ~10 minutes on 96-core A100 node with comprehensive logging
+# Maze Environment & Reward Comparison Experiment - RSL-RL Integrated
+# This script runs four training jobs comparing environments and reward types:
+# 1. Arena + Sparse, 2. Arena + Dense, 3. Medium + Sparse, 4. Medium + Dense
+# Designed to finish in ~2 hours on high-performance node with comprehensive logging
 
 # Create logs directory if it doesn't exist
 mkdir -p logs
@@ -23,7 +24,8 @@ cd sc_venv_template
 source activate.sh
 cd ..
 
-echo "🚀 Starting Arena Reward Comparison Experiment"
+echo "🚀 Starting Maze Environment & Reward Comparison Experiment"
+echo "Experiments: Arena+Sparse, Arena+Dense, Medium+Sparse, Medium+Dense"
 echo "Node: $SLURMD_NODENAME"
 echo "Job ID: $SLURM_JOB_ID"
 echo "GPUs: $CUDA_VISIBLE_DEVICES"
@@ -35,74 +37,113 @@ mkdir -p logs
 mkdir -p models
 
 # Force wandb into silent offline mode (prevents retry loops)
-export WANDB_MODE="offline"
-export WANDB_CONSOLE="off"
-export WANDB_SILENT="true"
+# Useless as this code runs on the login node
+# export WANDB_MODE="offline"
+# export WANDB_CONSOLE="off"
+# export WANDB_SILENT="true"
 
-# Common training parameters (optimized for 30-minute run on A100 + 96 cores)  
-# Each experiment gets 32 envs, ~30 minutes runtime with RSL-RL integration
-# Calculation: 47 iterations × 32 envs × 1024 steps = 1,540,096 timesteps ≈ 30 min
-COMMON_ARGS="--env_name pointmaze-arena-v0 \
---num_envs 32 \
---total_timesteps 1600000 \
+# Common training parameters (optimized for 4-experiment parallel run)
+# Each experiment gets 32 envs to balance resource usage across 4 jobs
+# Total: 4 experiments × 32 envs = 128 parallel environments
+BASE_ARGS="--num_envs 64 \
+--total_timesteps 5000000 \
 --include_goal \
---include_distance \
---include_direction \
 --config config/ogbench_config.yaml"
 
-# Launch both experiments in parallel
+# Launch all four experiments in parallel
 echo ""
-echo "🚀 Launching SPARSE and DENSE reward experiments in parallel..."
+echo "🚀 Launching all 4 experiments in parallel..."
 echo "========================================================"
 
-# Experiment 1: SPARSE Rewards (Goal-only) - Background execution
-echo "📊 Starting SPARSE reward training..."
-python train_rsl_rl_integrated.py $COMMON_ARGS \
+# Experiment 1: Arena + Sparse Rewards
+echo "📊 Starting ARENA + SPARSE reward training..."
+python train_rsl_rl_integrated.py $BASE_ARGS \
+    --env_name pointmaze-arena-v0 \
     --reward_type sparse \
     --experiment_name "arena_sparse_$(date +%Y%m%d_%H%M%S)" \
     2>&1 | tee logs/arena_sparse_$SLURM_JOB_ID.log &
-PID_SPARSE=$!
+PID_ARENA_SPARSE=$!
 
-# Experiment 2: DENSE Rewards (Distance-based) - Background execution  
-echo "📊 Starting DENSE reward training..."
-python train_rsl_rl_integrated.py $COMMON_ARGS \
+# Experiment 2: Arena + Dense Rewards
+echo "📊 Starting ARENA + DENSE reward training..."
+python train_rsl_rl_integrated.py $BASE_ARGS \
+    --env_name pointmaze-arena-v0 \
     --reward_type dense \
     --dense_reward_scale 0.01 \
     --experiment_name "arena_dense_$(date +%Y%m%d_%H%M%S)" \
     2>&1 | tee logs/arena_dense_$SLURM_JOB_ID.log &
-PID_DENSE=$!
+PID_ARENA_DENSE=$!
 
-echo "✓ Both training jobs launched in parallel"
-echo "Process IDs: Sparse=$PID_SPARSE, Dense=$PID_DENSE"
+# Experiment 3: Medium + Sparse Rewards
+echo "📊 Starting MEDIUM + SPARSE reward training..."
+python train_rsl_rl_integrated.py $BASE_ARGS \
+    --env_name pointmaze-medium-v0 \
+    --reward_type sparse \
+    --experiment_name "medium_sparse_$(date +%Y%m%d_%H%M%S)" \
+    2>&1 | tee logs/medium_sparse_$SLURM_JOB_ID.log &
+PID_MEDIUM_SPARSE=$!
+
+# Experiment 4: Medium + Dense Rewards  
+echo "📊 Starting MEDIUM + DENSE reward training..."
+python train_rsl_rl_integrated.py $BASE_ARGS \
+    --env_name pointmaze-medium-v0 \
+    --reward_type dense \
+    --dense_reward_scale 0.01 \
+    --experiment_name "medium_dense_$(date +%Y%m%d_%H%M%S)" \
+    2>&1 | tee logs/medium_dense_$SLURM_JOB_ID.log &
+PID_MEDIUM_DENSE=$!
+
+echo "✓ All 4 training jobs launched in parallel"
+echo "Process IDs:"
+echo "  Arena+Sparse: $PID_ARENA_SPARSE"
+echo "  Arena+Dense:  $PID_ARENA_DENSE" 
+echo "  Medium+Sparse: $PID_MEDIUM_SPARSE"
+echo "  Medium+Dense:  $PID_MEDIUM_DENSE"
 echo ""
 
 # Wait for all jobs to complete with error checking
-echo "⏳ Waiting for parallel training jobs to complete..."
+echo "⏳ Waiting for all 4 parallel training jobs to complete..."
 
-wait $PID_SPARSE
-SPARSE_EXIT_CODE=$?
-if [ $SPARSE_EXIT_CODE -eq 0 ]; then
-    echo "✅ Sparse reward training completed successfully"
+wait $PID_ARENA_SPARSE
+ARENA_SPARSE_EXIT_CODE=$?
+if [ $ARENA_SPARSE_EXIT_CODE -eq 0 ]; then
+    echo "✅ Arena + Sparse reward training completed successfully"
 else
-    echo "❌ Sparse reward training failed (exit code: $SPARSE_EXIT_CODE)"
+    echo "❌ Arena + Sparse reward training failed (exit code: $ARENA_SPARSE_EXIT_CODE)"
 fi
 
-wait $PID_DENSE
-DENSE_EXIT_CODE=$?
-if [ $DENSE_EXIT_CODE -eq 0 ]; then
-    echo "✅ Dense reward training completed successfully"
+wait $PID_ARENA_DENSE
+ARENA_DENSE_EXIT_CODE=$?
+if [ $ARENA_DENSE_EXIT_CODE -eq 0 ]; then
+    echo "✅ Arena + Dense reward training completed successfully"
 else
-    echo "❌ Dense reward training failed (exit code: $DENSE_EXIT_CODE)"
+    echo "❌ Arena + Dense reward training failed (exit code: $ARENA_DENSE_EXIT_CODE)"
+fi
+
+wait $PID_MEDIUM_SPARSE
+MEDIUM_SPARSE_EXIT_CODE=$?
+if [ $MEDIUM_SPARSE_EXIT_CODE -eq 0 ]; then
+    echo "✅ Medium + Sparse reward training completed successfully"
+else
+    echo "❌ Medium + Sparse reward training failed (exit code: $MEDIUM_SPARSE_EXIT_CODE)"
+fi
+
+wait $PID_MEDIUM_DENSE
+MEDIUM_DENSE_EXIT_CODE=$?
+if [ $MEDIUM_DENSE_EXIT_CODE -eq 0 ]; then
+    echo "✅ Medium + Dense reward training completed successfully"
+else
+    echo "❌ Medium + Dense reward training failed (exit code: $MEDIUM_DENSE_EXIT_CODE)"
 fi
 
 # Overall success check
-if [ $SPARSE_EXIT_CODE -ne 0 ] || [ $DENSE_EXIT_CODE -ne 0 ]; then
+if [ $ARENA_SPARSE_EXIT_CODE -ne 0 ] || [ $ARENA_DENSE_EXIT_CODE -ne 0 ] || [ $MEDIUM_SPARSE_EXIT_CODE -ne 0 ] || [ $MEDIUM_DENSE_EXIT_CODE -ne 0 ]; then
     echo "❌ One or more experiments failed!"
     exit 1
 fi
 
 echo ""
-echo "✅ Both experiments completed successfully!"
+echo "✅ All 4 experiments completed successfully!"
 echo "Time: $(date)"
 
 # Summary of results
@@ -110,31 +151,57 @@ echo ""
 echo "📈 Experiment Summary"
 echo "========================================================"
 
-# Find the latest RSL-RL model directories
-SPARSE_DIR=$(find logs/rsl_rl -name "*arena_sparse*" -type d | sort | tail -1)
-DENSE_DIR=$(find logs/rsl_rl -name "*arena_dense*" -type d | sort | tail -1)
+# Find the latest RSL-RL model directories for all experiments
+ARENA_SPARSE_DIR=$(find logs/rsl_rl -name "*arena_sparse*" -type d | sort | tail -1)
+ARENA_DENSE_DIR=$(find logs/rsl_rl -name "*arena_dense*" -type d | sort | tail -1)
+MEDIUM_SPARSE_DIR=$(find logs/rsl_rl -name "*medium_sparse*" -type d | sort | tail -1)
+MEDIUM_DENSE_DIR=$(find logs/rsl_rl -name "*medium_dense*" -type d | sort | tail -1)
 
-echo "Sparse reward results:"
-if [ -d "$SPARSE_DIR" ]; then
-    echo "  RSL-RL log directory: $SPARSE_DIR"
+echo "1. Arena + Sparse reward results:"
+if [ -d "$ARENA_SPARSE_DIR" ]; then
+    echo "  RSL-RL log directory: $ARENA_SPARSE_DIR"
     echo "  Models saved:"
-    ls -la "$SPARSE_DIR"/*.pt 2>/dev/null || echo "    No model files found"
+    ls -la "$ARENA_SPARSE_DIR"/*.pt 2>/dev/null || echo "    No model files found"
     echo "  Recent training output:"
     tail -5 "logs/arena_sparse_$SLURM_JOB_ID.log" 2>/dev/null || echo "    No training log found"
 else
-    echo "  ❌ No sparse model directory found"
+    echo "  ❌ No arena sparse model directory found"
 fi
 
 echo ""
-echo "Dense reward results:"
-if [ -d "$DENSE_DIR" ]; then
-    echo "  RSL-RL log directory: $DENSE_DIR"
+echo "2. Arena + Dense reward results:"
+if [ -d "$ARENA_DENSE_DIR" ]; then
+    echo "  RSL-RL log directory: $ARENA_DENSE_DIR"
     echo "  Models saved:"
-    ls -la "$DENSE_DIR"/*.pt 2>/dev/null || echo "    No model files found"
+    ls -la "$ARENA_DENSE_DIR"/*.pt 2>/dev/null || echo "    No model files found"
     echo "  Recent training output:"
     tail -5 "logs/arena_dense_$SLURM_JOB_ID.log" 2>/dev/null || echo "    No training log found"
 else
-    echo "  ❌ No dense model directory found"
+    echo "  ❌ No arena dense model directory found"
+fi
+
+echo ""
+echo "3. Medium + Sparse reward results:"
+if [ -d "$MEDIUM_SPARSE_DIR" ]; then
+    echo "  RSL-RL log directory: $MEDIUM_SPARSE_DIR"
+    echo "  Models saved:"
+    ls -la "$MEDIUM_SPARSE_DIR"/*.pt 2>/dev/null || echo "    No model files found"
+    echo "  Recent training output:"
+    tail -5 "logs/medium_sparse_$SLURM_JOB_ID.log" 2>/dev/null || echo "    No training log found"
+else
+    echo "  ❌ No medium sparse model directory found"
+fi
+
+echo ""
+echo "4. Medium + Dense reward results:"
+if [ -d "$MEDIUM_DENSE_DIR" ]; then
+    echo "  RSL-RL log directory: $MEDIUM_DENSE_DIR"
+    echo "  Models saved:"
+    ls -la "$MEDIUM_DENSE_DIR"/*.pt 2>/dev/null || echo "    No model files found"
+    echo "  Recent training output:"
+    tail -5 "logs/medium_dense_$SLURM_JOB_ID.log" 2>/dev/null || echo "    No training log found"
+else
+    echo "  ❌ No medium dense model directory found"
 fi
 
 echo ""
@@ -147,8 +214,11 @@ echo ""
 echo "🎯 Next steps:"
 echo "  1. Check goal success rates in the training logs above"
 echo "  2. Sync wandb logs: wandb sync wandb/"
-echo "  3. Compare /Episode/goal_success_rate metrics between sparse vs dense"
-echo "  4. Test model: python eval_interactive.py (if evaluation script exists)"
+echo "  3. Compare metrics across all 4 experiments:"
+echo "     - Arena vs Medium maze complexity"
+echo "     - Sparse vs Dense reward effectiveness"
+echo "     - Environment-reward combination performance"
+echo "  4. Test models: python eval_interactive.py (if evaluation script exists)"
 
 echo "========================================================"
-echo "🏁 Arena Reward Comparison Complete - $(date)"
+echo "🏁 Maze Environment & Reward Comparison Complete - $(date)"

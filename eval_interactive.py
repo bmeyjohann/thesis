@@ -211,11 +211,9 @@ def create_env(env_name: str, args):
     try:
         env = gym.make(env_name, **env_kwargs)
         
-        # Apply flexible observation wrapper for arena environments
-        if env_name == 'pointmaze-arena-v0':
-            from ogbench.wrappers import FlexibleObsWrapper
-            env = FlexibleObsWrapper(env, include_goal=True)  # Match training config
-            print(f"✓ Applied FlexibleObsWrapper")
+        from ogbench.wrappers import FlexibleObsWrapper
+        env = FlexibleObsWrapper(env, include_goal=True)  # Match training config
+        print(f"✓ Applied FlexibleObsWrapper")
         
         print(f"✓ Environment created successfully")
         print(f"   Observation space: {env.observation_space}")
