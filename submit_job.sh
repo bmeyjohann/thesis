@@ -2,7 +2,7 @@
 # Smart SLURM job submission with automatic account detection
 # Usage: bash submit_job.sh [script.sbatch]
 
-SCRIPT_NAME="${1:-juwels_reward_comparison.sbatch}"
+SCRIPT_NAME="${1:-run_experiment.sbatch}"
 
 echo "🚀 Smart SLURM Job Submission"
 echo "Script: $SCRIPT_NAME"

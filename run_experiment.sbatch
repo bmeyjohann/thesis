@@ -3,8 +3,8 @@
 #SBATCH --account=<your_account>
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=64
-#SBATCH --mem=512GB
+#SBATCH --cpus-per-task=96
+#SBATCH --mem=480GB
 #SBATCH --gres=gpu:4
 #SBATCH --time=04:00:00
 #SBATCH --partition=booster
