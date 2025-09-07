@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Contributor Guide
+
+For coding standards, project layout, and workflow, see `AGENTS.md` (Repository Guidelines).
+
 ## Project Overview
 
 This is a reinforcement learning research repository focused on training agents on OGBench environments using various algorithms including RSL-RL PPO and FastTD3. The project includes implementations for both local development and HPC cluster deployment (JUWELS supercomputer).
