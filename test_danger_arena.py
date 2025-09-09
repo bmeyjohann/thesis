@@ -15,8 +15,9 @@ keyboard control window to verify the dangerous tile marker and behavior.
 import argparse
 import time
 import gymnasium as gym
+import numpy as np
 import ogbench  # ensure envs are registered
-from ogbench.wrappers import DirectTeleopWrapper
+from ogbench.wrappers import DirectTeleopWrapper, HumanInterventionWrapper, FlexibleObsWrapper
 from ogbench.teleop import ControlWindowTeleop
 
 
@@ -34,6 +35,7 @@ def main():
     parser.add_argument('--episodes', type=int, default=2)
     parser.add_argument('--max_steps', type=int, default=300)
     parser.add_argument('--fps', type=int, default=30)
+    parser.add_argument('--agent', type=str, default='none', choices=('none', 'bfs'))
     args = parser.parse_args()
 
     env_id = ENV_BY_MODE[args.mode]
@@ -42,7 +44,12 @@ def main():
 
     # Create a dedicated control window for reliable keyboard focus
     teleop = ControlWindowTeleop(width=520, height=420, show_debug_info=True)
-    env = DirectTeleopWrapper(env, teleop)
+    if args.agent == 'none':
+        env = DirectTeleopWrapper(env, teleop)
+    elif args.agent == 'bfs':
+        env = HumanInterventionWrapper(env, teleop)
+        
+    env = FlexibleObsWrapper(env)
 
     print("Controls: Focus the 'Teleoperation Control Panel' window.")
     print("Arrow keys to move; ESC or closing the control window exits.")
@@ -53,8 +60,21 @@ def main():
             teleop.update_state(obs, info, step_count=0)
 
             for t in range(args.max_steps):
-                # DirectTeleopWrapper ignores the action argument and uses human input
-                obs, rew, term, trunc, info = env.step(None)
+                if args.agent == 'none':
+                    # DirectTeleopWrapper ignores the action argument and uses human input
+                    obs, rew, term, trunc, info = env.step(None)
+                    
+                elif args.agent == 'bfs':
+                    print('obs', obs)
+                    print('agent and goal pos', obs[0:2], obs[2:4])
+                    subgoal = env.env.env.env.env.env.get_oracle_subgoal(obs[0:2], obs[2:4])[0]
+                    print('Subgoal: ', subgoal)
+                    rel_dist_to_subgoal = subgoal - obs[0:2]
+                    print('Rel Dist to Subgoal: ', rel_dist_to_subgoal)
+                    action = rel_dist_to_subgoal / np.linalg.norm(rel_dist_to_subgoal)
+                    print('Action: ', action)
+                    obs, rew, term, trunc, info = env.step(action)
+                    
                 ep_rew += float(rew)
                 teleop.update_state(obs, info, step_count=t + 1)
                 # Simple frame pacing
