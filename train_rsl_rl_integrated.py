@@ -42,6 +42,10 @@ def get_available_environments():
     """Get list of available OGBench environments."""
     return [
         'pointmaze-arena-v0',
+        'pointmaze-arena-danger-floor-v0',
+        'pointmaze-arena-danger-sticky-v0',
+        'pointmaze-arena-danger-wall-v0',
+        'pointmaze-arena-danger-lethal-v0',
         'pointmaze-medium-v0', 
         'pointmaze-large-v0',
         'pointmaze-giant-v0',
@@ -53,8 +57,14 @@ def get_available_environments():
 
 
 def create_env(env_name: str, num_envs: int, include_goal: bool, include_distance: bool,
-               include_direction: bool, include_velocity: bool, reward_type: str, 
-               dense_reward_scale: float, step_penalty: float, clip_actions: float = None,
+               include_direction: bool, include_velocity: bool, reward_type: str,
+               dense_reward_scale: float, step_penalty: float,
+               # subgoal shaping + curriculum
+               use_subgoal_shaping: bool = False,
+               subgoal_shaping_coef: float = 1.0,
+               subgoal_shaping_gamma: float = 0.99,
+               curriculum_stage1_steps: int = 0,
+               clip_actions: float = None,
                render_mode: str = None, max_episode_steps: int = None):
     """Create a vectorized OGBench environment with proper wrappers."""
     
@@ -75,6 +85,11 @@ def create_env(env_name: str, num_envs: int, include_goal: bool, include_distanc
             reward_type=reward_type,
             dense_reward_scale=dense_reward_scale,
             step_penalty=step_penalty,
+            use_subgoal_shaping=use_subgoal_shaping,
+            subgoal_shaping_coef=subgoal_shaping_coef,
+            subgoal_shaping_gamma=subgoal_shaping_gamma,
+            curriculum_stage1_steps_per_env=(curriculum_stage1_steps // max(1, num_envs)),
+            log_subgoal_metrics=True,
         )
         
         return env
@@ -141,6 +156,15 @@ def parse_args():
                         help='Scale factor for dense rewards')
     parser.add_argument('--step_penalty', type=float, default=0.0,
                         help='Small penalty per step')
+    # Subgoal shaping + curriculum (reward-only)
+    parser.add_argument('--use_subgoal_shaping', action='store_true', default=False,
+                        help='Enable potential-based shaping towards oracle subgoals (reward-only)')
+    parser.add_argument('--subgoal_shaping_coef', type=float, default=1.0,
+                        help='Coefficient for subgoal shaping term')
+    parser.add_argument('--subgoal_shaping_gamma', type=float, default=0.99,
+                        help='Gamma used in potential-based shaping term')
+    parser.add_argument('--curriculum_stage1_steps', type=int, default=0,
+                        help='Hard cutoff steps for Stage 1 (per global envs); 0 disables curriculum')
     
     # Training
     parser.add_argument('--config', type=str, default='config/ogbench_config.yaml',
@@ -221,6 +245,10 @@ def main():
         reward_type=args.reward_type,
         dense_reward_scale=args.dense_reward_scale,
         step_penalty=args.step_penalty,
+        use_subgoal_shaping=args.use_subgoal_shaping,
+        subgoal_shaping_coef=args.subgoal_shaping_coef,
+        subgoal_shaping_gamma=args.subgoal_shaping_gamma,
+        curriculum_stage1_steps=args.curriculum_stage1_steps,
         clip_actions=args.clip_actions,
         render_mode='human' if args.render_during_training else None,
         max_episode_steps=args.max_episode_steps,
