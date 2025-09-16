@@ -9,6 +9,10 @@ import os
 import sys
 import argparse
 import time
+import json
+from datetime import datetime
+from pathlib import Path
+
 import numpy as np
 
 os.environ.setdefault("WANDB_MODE", "offline")
@@ -85,8 +89,9 @@ def parse_args():
     # Logging
     p.add_argument('--use_wandb', action='store_true', default=False)
     p.add_argument('--project', type=str, default='ogbench-rsl-rl')
-    p.add_argument('--exp_name', type=str, default='fastsac')
-    p.add_argument('--save_interval', type=int, default=0)
+    p.add_argument('--exp_name', type=str, default=None)
+    p.add_argument('--save_interval', type=int, default=200000,
+                   help='Env-step interval for checkpoint saves (0 disables)')
     p.add_argument('--log_interval', type=int, default=200)
     # Misc
     p.add_argument('--compile', action='store_true', default=False)
@@ -128,7 +133,44 @@ def make_wrappers(args):
 def main():
     args = parse_args()
     device = torch.device('cuda' if (args.device=='auto' and torch.cuda.is_available()) or args.device=='cuda' else 'cpu')
+
+    default_buffer_size = 1024 * 50
+    if not args.exp_name:
+        env_tag = args.env_name.replace('-v0', '').replace('-', '_')
+        components = [env_tag]
+        components.append(args.reward_type)
+        if args.use_intervention:
+            components.append(f"teacher_tol{int(args.tolerance_value)}")
+            if args.intervention_enable_after_steps > 0:
+                components.append(f"warmup{args.intervention_enable_after_steps}")
+        else:
+            components.append('student')
+        if args.buffer_size != default_buffer_size:
+            components.append(f"buf{args.buffer_size}")
+        if args.store_denied_actions:
+            components.append('denied')
+        components.append(f"nenv{args.num_envs}")
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        components.append(timestamp)
+        args.exp_name = '_'.join(components)
+
+    logs_root = Path('logs') / 'fast_sac'
+    models_root = Path('models') / 'fast_sac'
+    logs_root.mkdir(parents=True, exist_ok=True)
+    models_root.mkdir(parents=True, exist_ok=True)
+    run_log_dir = logs_root / args.exp_name
+    run_model_dir = models_root / args.exp_name
+    run_log_dir.mkdir(parents=True, exist_ok=True)
+    run_model_dir.mkdir(parents=True, exist_ok=True)
+
     print(f"FastSAC OGBench on {args.env_name} device={device}")
+    print(f"Log directory: {run_log_dir}")
+    print(f"Model directory: {run_model_dir}")
+
+    config_path = run_log_dir / 'args.json'
+    with open(config_path, 'w', encoding='utf-8') as cfg_file:
+        json.dump(vars(args), cfg_file, indent=2)
+    print(f"Saved run config: {config_path}")
 
     wrappers = make_wrappers(args)
     envs = OGBenchVecEnvAdapter(
@@ -190,7 +232,8 @@ def main():
 
     # Rollout & logging setup
     obs = envs.reset()
-    global_step = 0
+    total_env_steps = 0
+    iteration_idx = 0
     start_time = time.time()
     wandb_run = None
     # Episode buffers similar to RSL-RL
@@ -199,8 +242,25 @@ def main():
     rewbuffer = []
     lenbuffer = []
     last_denied_samples = 0
+    next_log_step = args.log_interval if args.log_interval > 0 else None
+    next_save_step = args.save_interval if args.save_interval > 0 else None
 
-    while global_step < args.total_timesteps:
+    run_prefix = args.env_name.replace('-', '_')
+
+    def save_checkpoint(tag: str, step_value: int):
+        save_path = run_model_dir / f"{run_prefix}_{tag}.pt"
+        save_params(
+            step_value,
+            actor,
+            qnet,
+            qnet_target,
+            obs_normalizer,
+            critic_obs_normalizer,
+            args,
+            str(save_path),
+        )
+
+    while total_env_steps < args.total_timesteps:
         with torch.no_grad(), autocast(device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled):
             norm_obs = _normalize_obs(obs)
             actions, _, _ = policy_fn(norm_obs)
@@ -269,7 +329,14 @@ def main():
             cur_episode_length[done_ids] = 0
 
         # Learn
-        if global_step > args.learning_starts:
+        iteration_idx += 1
+        total_env_steps += envs.num_envs
+
+        if next_save_step is not None and total_env_steps >= next_save_step:
+            save_checkpoint(f"step{total_env_steps}", total_env_steps)
+            next_save_step += args.save_interval
+
+        if total_env_steps > args.learning_starts:
             batch_size = args.batch_size // max(1, args.num_envs)
             for i in range(args.num_updates):
                 data = rb.sample(batch_size)
@@ -321,15 +388,21 @@ def main():
                     tp.data.copy_(args.tau * p.data + (1 - args.tau) * tp.data)
 
         # Logging (RSL-RL style)
-        should_log = (global_step % args.log_interval == 0) or (global_step == args.total_timesteps)
-        if should_log and global_step > 0:
+        should_log = False
+        if next_log_step is not None and total_env_steps >= next_log_step:
+            should_log = True
+            next_log_step += args.log_interval
+        if total_env_steps >= args.total_timesteps:
+            should_log = True
+
+        if should_log:
             collection_time = time.time() - start_time
-            total_env_steps = global_step * envs.num_envs
             fps = int(total_env_steps / max(1e-6, collection_time))
             logs = {
                 'Perf/total_fps': fps,
                 'Perf/collection_time_sec': collection_time,
                 'Perf/env_steps': total_env_steps,
+                'Perf/iterations': iteration_idx,
             }
             if len(rewbuffer) > 0:
                 logs['Train/mean_reward'] = float(np.mean(rewbuffer[-100:]))
@@ -344,8 +417,8 @@ def main():
                 logs['/Teacher/denied_transition_samples'] = float(last_denied_samples)
 
             log_line_parts = [
-                f"step {global_step}/{args.total_timesteps}",
-                f"env_steps {total_env_steps}",
+                f"env_steps {total_env_steps}/{args.total_timesteps}",
+                f"iter {iteration_idx}",
                 f"fps {fps}",
             ]
             if 'Train/mean_reward' in logs:
@@ -361,15 +434,21 @@ def main():
             if args.use_wandb:
                 import wandb
                 if wandb_run is None:
-                    wandb_run = wandb.init(project=args.project, name=args.exp_name, config=vars(args), reinit=True)
-                wandb_run.log(logs, step=global_step)
+                    wandb_run = wandb.init(
+                        project=args.project,
+                        name=args.exp_name,
+                        id=args.exp_name,
+                        config=vars(args),
+                        dir=str(run_log_dir),
+                        reinit=True,
+                        resume="allow",
+                    )
+                wandb_run.log(logs, step=total_env_steps)
 
         obs = next_obs
-        global_step += 1
 
     # Save final
-    save_path = f"models/{args.env_name.replace('-','_')}_{args.exp_name}_final.pt"
-    save_params(global_step, actor, qnet, qnet_target, obs_normalizer, critic_obs_normalizer, args, save_path)
+    save_checkpoint('final', total_env_steps)
     if wandb_run is not None:
         try:
             wandb_run.finish()
@@ -379,10 +458,10 @@ def main():
     print("=" * 80)
     print(
         "✅ FastSAC training complete",
-        f"steps={global_step}",
-        f"env_steps={global_step * envs.num_envs}",
+        f"env_steps={total_env_steps}",
+        f"iterations={iteration_idx}",
         f"duration_sec={total_time:.1f}",
-        f"model={save_path}",
+        f"models_dir={run_model_dir}",
     )
 
 

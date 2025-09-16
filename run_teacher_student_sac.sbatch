@@ -25,9 +25,11 @@ HALF_STEPS_GLOBAL=$((TOTAL_STEPS/2))
 ENABLE_AFTER_STEPS_PER_ENV=$((HALF_STEPS_GLOBAL/NUM_ENVS))
 BUFFER_SIZE_DEFAULT=${BUFFER_SIZE:-51200}
 BUFFER_SIZE_HALF=$((BUFFER_SIZE_DEFAULT/2))
-DENIED_PENALTY=${DENIED_PENALTY:--0.1}
+DENIED_PENALTY=${DENIED_PENALTY:--1}
+SAVE_INTERVAL=${SAVE_INTERVAL:-200000}
+LOG_INTERVAL=${LOG_INTERVAL:-20000}
 
-BASE_ARGS="--env_name ${ENV_ID} --num_envs ${NUM_ENVS} --total_timesteps ${TOTAL_STEPS} --include_goal"
+BASE_ARGS="--env_name ${ENV_ID} --num_envs ${NUM_ENVS} --total_timesteps ${TOTAL_STEPS} --include_goal --save_interval ${SAVE_INTERVAL} --log_interval ${LOG_INTERVAL}"
 
 echo "Launching 4 FastSAC teacher-student experiments on ${ENV_ID} with ${NUM_ENVS} envs each"
 
