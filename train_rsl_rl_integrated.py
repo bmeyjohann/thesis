@@ -35,7 +35,7 @@ from rsl_rl.runners import OnPolicyRunner
 
 # Import our OGBench components
 import ogbench
-from ogbench.wrappers import FlexibleObsWrapper, DetailedRewardWrapper, VectorizedOGBenchEnv
+from ogbench.wrappers import FlexibleObsWrapper, DetailedRewardWrapper, VectorizedOGBenchEnv, InterventionWrapper
 
 
 def get_available_environments():
@@ -64,8 +64,18 @@ def create_env(env_name: str, num_envs: int, include_goal: bool, include_distanc
                subgoal_shaping_coef: float = 1.0,
                subgoal_shaping_gamma: float = 0.99,
                curriculum_stage1_steps: int = 0,
+               reward_switch_after_steps: int = 0,
                clip_actions: float = None,
-               render_mode: str = None, max_episode_steps: int = None):
+               render_mode: str = None, max_episode_steps: int = None,
+               # intervention wrapper
+               use_intervention: bool = False,
+               intervention_mode: str = 'agent',
+               teacher_type: str = 'bfs',
+               tolerance_type: str = 'angle',
+               tolerance_value: float = 30.0,
+               hard_block_lethal: bool = True,
+               intervention_enable_after_steps: int = 0,
+               ):
     """Create a vectorized OGBench environment with proper wrappers."""
     
     def apply_wrappers(env):
@@ -90,7 +100,24 @@ def create_env(env_name: str, num_envs: int, include_goal: bool, include_distanc
             subgoal_shaping_gamma=subgoal_shaping_gamma,
             curriculum_stage1_steps_per_env=(curriculum_stage1_steps // max(1, num_envs)),
             log_subgoal_metrics=True,
+            switch_reward_to_sparse_after_steps_per_env=(reward_switch_after_steps // max(1, num_envs)),
         )
+        
+        # Apply intervention wrapper (teacher-student) if enabled
+        if use_intervention:
+            if intervention_mode == 'human':
+                # Training usually won't use human teleop; skip with a warning
+                print("[create_env] Human intervention requested during training—skipping (no teleop).")
+            else:
+                env = InterventionWrapper(
+                    env,
+                    mode='agent',
+                    teacher_type=teacher_type,
+                    tolerance_type=tolerance_type,
+                    tolerance_value=tolerance_value,
+                    hard_block_lethal=hard_block_lethal,
+                    enable_after_steps=intervention_enable_after_steps,
+                )
         
         return env
     
@@ -165,6 +192,8 @@ def parse_args():
                         help='Gamma used in potential-based shaping term')
     parser.add_argument('--curriculum_stage1_steps', type=int, default=0,
                         help='Hard cutoff steps for Stage 1 (per global envs); 0 disables curriculum')
+    parser.add_argument('--reward_switch_after_steps', type=int, default=0,
+                        help='Global steps after which to switch reward to sparse (0 disables)')
     
     # Training
     parser.add_argument('--config', type=str, default='config/ogbench_config.yaml',
@@ -173,6 +202,23 @@ def parse_args():
                         help='Total training timesteps')
     parser.add_argument('--clip_actions', type=float, default=1.0,
                         help='Action clipping value')
+    
+    # Intervention / Teacher-Student
+    parser.add_argument('--use_intervention', action='store_true', default=False,
+                        help='Enable intervention wrapper (teacher-student)')
+    parser.add_argument('--intervention_mode', type=str, default='agent', choices=['human', 'agent'],
+                        help='Intervention mode: human teleop or agent teacher')
+    parser.add_argument('--teacher_type', type=str, default='bfs', choices=['bfs'],
+                        help='Teacher type when mode=agent')
+    parser.add_argument('--tolerance_type', type=str, default='angle', choices=['angle', 'l2'],
+                        help='Intervention tolerance metric')
+    parser.add_argument('--tolerance_value', type=float, default=30.0,
+                        help='Tolerance threshold (deg for angle; abs for l2)')
+    parser.add_argument('--hard_block_lethal', action='store_true', default=True,
+                        help='Intervene if student would step into lethal cell')
+    parser.add_argument('--no_hard_block_lethal', dest='hard_block_lethal', action='store_false')
+    parser.add_argument('--intervention_enable_after_steps', type=int, default=0,
+                        help='Warmup steps per env before enabling interventions')
     
     # Logging
     parser.add_argument('--experiment_name', type=str, default=None,
@@ -249,9 +295,17 @@ def main():
         subgoal_shaping_coef=args.subgoal_shaping_coef,
         subgoal_shaping_gamma=args.subgoal_shaping_gamma,
         curriculum_stage1_steps=args.curriculum_stage1_steps,
+        reward_switch_after_steps=args.reward_switch_after_steps,
         clip_actions=args.clip_actions,
         render_mode='human' if args.render_during_training else None,
         max_episode_steps=args.max_episode_steps,
+        use_intervention=args.use_intervention,
+        intervention_mode=args.intervention_mode,
+        teacher_type=args.teacher_type,
+        tolerance_type=args.tolerance_type,
+        tolerance_value=args.tolerance_value,
+        hard_block_lethal=args.hard_block_lethal,
+        intervention_enable_after_steps=args.intervention_enable_after_steps,
     )
     
     print(f"✅ Environment created successfully")

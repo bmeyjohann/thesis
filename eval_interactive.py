@@ -6,7 +6,16 @@ Load a trained RSL-RL policy and run it interactively on OGBench environments
 with visual rendering. Perfect for testing trained agents and debugging!
 
 Usage:
+    # Plain policy evaluation
     python eval_interactive.py --model_path models/pointmaze_medium_sparse.pt --env_name pointmaze-medium-v0
+
+    # With human teleop intervention overlay
+    python eval_interactive.py --model_path models/pointmaze_medium_sparse.pt --env_name pointmaze-arena-danger-lethal-v0 \
+        --intervention_mode human
+
+    # With BFS teacher interventions
+    python eval_interactive.py --model_path models/pointmaze_medium_sparse.pt --env_name pointmaze-arena-danger-lethal-v0 \
+        --intervention_mode agent --teacher_type bfs --tolerance_type angle --tolerance_value 30
     
 Controls:
     - ESC: Exit
@@ -76,6 +85,22 @@ def get_args():
                         help='Number of episodes to run (0 = infinite)')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
+    parser.add_argument('--print_interventions', action='store_true', default=True,
+                        help='Print when the teacher intervenes and why')
+
+    # Intervention / Teleop
+    parser.add_argument('--intervention_mode', type=str, default='none',
+                        choices=['none', 'human', 'agent'],
+                        help='Intervention mode: none, human teleop, or agent teacher')
+    parser.add_argument('--teacher_type', type=str, default='bfs', choices=['bfs'],
+                        help='Teacher type when intervention_mode=agent')
+    parser.add_argument('--tolerance_type', type=str, default='angle', choices=['angle', 'l2'],
+                        help='Intervention tolerance metric (agent mode)')
+    parser.add_argument('--tolerance_value', type=float, default=30.0,
+                        help='Tolerance threshold (deg for angle; abs for l2)')
+    parser.add_argument('--hard_block_lethal', action='store_true', default=True,
+                        help='Intervene if student would step into lethal cell')
+    parser.add_argument('--no_hard_block_lethal', dest='hard_block_lethal', action='store_false')
     
     # Action processing (should match training settings)
     parser.add_argument('--action_scale', type=float, default=1.0,
@@ -211,9 +236,34 @@ def create_env(env_name: str, args):
     try:
         env = gym.make(env_name, **env_kwargs)
         
-        from ogbench.wrappers import FlexibleObsWrapper
+        # Base observation wrapper
+        from ogbench.wrappers import FlexibleObsWrapper, InterventionWrapper
         env = FlexibleObsWrapper(env, include_goal=True)  # Match training config
         print(f"✓ Applied FlexibleObsWrapper")
+
+        # Optional intervention wrapper
+        if args.intervention_mode == 'human':
+            # Create control window teleop
+            from ogbench.teleop import ControlWindowTeleop
+            teleop = ControlWindowTeleop(width=520, height=420, show_debug_info=True)
+            env = InterventionWrapper(
+                env,
+                teleop_interface=teleop,
+                mode='human',
+                threshold=0.1,
+                hold_time=0.5,
+            )
+            print(f"✓ Applied InterventionWrapper (human teleop)")
+        elif args.intervention_mode == 'agent':
+            env = InterventionWrapper(
+                env,
+                mode='agent',
+                teacher_type=args.teacher_type,
+                tolerance_type=args.tolerance_type,
+                tolerance_value=args.tolerance_value,
+                hard_block_lethal=args.hard_block_lethal,
+            )
+            print(f"✓ Applied InterventionWrapper (agent teacher: {args.teacher_type})")
         
         print(f"✓ Environment created successfully")
         print(f"   Observation space: {env.observation_space}")
@@ -256,6 +306,7 @@ def run_interactive_evaluation(policy, env, args, device):
     
     episode_rewards = []
     episode_lengths = []
+    step_idx = 0
     
     while running and (args.num_episodes == 0 or episode_count < args.num_episodes):
         # Handle pygame events
@@ -302,6 +353,26 @@ def run_interactive_evaluation(policy, env, args, device):
         episode_reward += reward
         episode_length += 1
         
+        # Print intervention events
+        step_idx += 1
+        if args.print_interventions and isinstance(info, dict) and info.get('teacher_intervened', False):
+            reason = info.get('teacher_reason', 'unknown')
+            # compute angle between actions if available
+            angle_str = ''
+            try:
+                sa = np.array(info.get('student_action'), dtype=np.float32)
+                ta = np.array(info.get('teacher_action'), dtype=np.float32)
+                if sa is not None and ta is not None:
+                    an = np.linalg.norm(sa)
+                    bn = np.linalg.norm(ta)
+                    if an > 1e-8 and bn > 1e-8:
+                        cos = float(np.clip(np.dot(sa, ta) / (an * bn), -1.0, 1.0))
+                        angle = float(np.degrees(np.arccos(cos)))
+                        angle_str = f", angle={angle:.1f} deg"
+            except Exception:
+                pass
+            print(f"🛟 Teacher intervention at step {episode_length}: reason={reason}{angle_str}")
+
         # Print step info (every 50 steps to avoid spam)
         if episode_length % 50 == 0:
             print(f"Step {episode_length:3d}: Reward {reward:6.3f}, Episode Reward: {episode_reward:8.3f}")
@@ -329,6 +400,15 @@ def run_interactive_evaluation(policy, env, args, device):
             if goal_reached:
                 print(f"🎯 GOAL REACHED! 🎉")
             
+            # If teacher metrics available, print summary
+            if isinstance(info, dict) and 'teacher_num_interventions' in info:
+                print("   Teacher summary:")
+                print(f"     interventions: {int(info['teacher_num_interventions'])}")
+                print(f"     steps: {int(info['teacher_intervention_steps'])} / {int(info.get('teacher_episode_steps', episode_length))}")
+                print(f"     fraction: {float(info['teacher_fraction_steps']):.3f}")
+                print(f"     avg_burst_len: {float(info['teacher_avg_burst_len']):.2f}")
+                print(f"     safety: {int(info['teacher_num_safety_interventions'])}, divergence: {int(info['teacher_num_divergence_interventions'])}")
+
             # Reset for next episode
             if auto_reset:
                 obs, info = env.reset()
