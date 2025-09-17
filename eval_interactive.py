@@ -33,6 +33,7 @@ import gymnasium as gym
 import pygame
 from pathlib import Path
 from datetime import datetime
+from typing import Any, Dict
 
 # Fix WSL window positioning issues  
 os.environ['SDL_VIDEO_CENTERED'] = '1'
@@ -66,6 +67,9 @@ def get_args():
                         help='OGBench environment name')
     parser.add_argument('--device', type=str, default='auto',
                         help='Device to run on (auto, cpu, cuda)')
+    parser.add_argument('--policy_type', type=str, default='auto',
+                        choices=['auto', 'rsl-rl', 'fastsac'],
+                        help='Policy checkpoint format to load')
     
     # Visualization
     parser.add_argument('--render_mode', type=str, default='human',
@@ -110,7 +114,36 @@ def get_args():
     
     return parser.parse_args()
 
-def load_trained_policy(model_path: str, env, device: torch.device):
+class FastSACPolicy:
+    """Thin wrapper that mimics ActorCritic.act() using the FastSAC actor."""
+
+    def __init__(self, actor, obs_normalizer):
+        self.actor = actor
+        self.obs_normalizer = obs_normalizer
+        self.device = next(actor.parameters()).device
+
+    def eval(self):
+        self.actor.eval()
+        self.obs_normalizer.eval()
+
+    def act(self, obs_dict, deterministic: bool = True):
+        obs = obs_dict["policy"].to(self.device)
+        with torch.no_grad():
+            norm_obs = self.obs_normalizer(obs, center=True)
+            actions, _, means = self.actor(norm_obs)
+        return means if deterministic else actions
+
+
+def _resolve_policy_type(args_policy_type: str, checkpoint: Dict[str, Any]) -> str:
+    if args_policy_type != 'auto':
+        return args_policy_type
+    keys = set(checkpoint.keys())
+    if {'actor_state_dict', 'qnet_state_dict'} <= keys:
+        return 'fastsac'
+    return 'rsl-rl'
+
+
+def load_trained_policy(model_path: str, env, device: torch.device, args) -> Any:
     """Load a trained RSL-RL policy from checkpoint."""
     print(f"🔄 Loading model from: {model_path}")
     
@@ -121,74 +154,104 @@ def load_trained_policy(model_path: str, env, device: torch.device):
     checkpoint = torch.load(model_path, map_location=device, weights_only=False)
     print(f"✓ Checkpoint loaded")
     
-    # Create dummy observation to match model architecture
-    dummy_obs = torch.zeros(1, env.observation_space.shape[0], device=device)
-    dummy_obs_dict = TensorDict({
-        "policy": dummy_obs,
-    }, batch_size=[1], device=device)
-    
-    # Extract model configuration (if available)
-    if 'policy_cfg' in checkpoint:
-        config = checkpoint['policy_cfg']
-        print(f"📋 Model config found: {config}")
-    elif 'model_config' in checkpoint:
-        config = checkpoint['model_config']
-        print(f"📋 Model config found: {config}")
-    else:
-        # Default configuration (adjust based on your training settings)
-        config = {
-            'hidden_dims': [256, 256, 256],
-            'activation': 'elu',
-        }
-        print(f"⚠️  No model config found, using defaults: {config}")
-        
-    # Clean config - remove keys that ActorCritic doesn't recognize
-    valid_config_keys = {'hidden_dims', 'activation', 'init_noise_std', 'actor_hidden_dims', 'critic_hidden_dims'}
-    config = {k: v for k, v in config.items() if k in valid_config_keys}
-    
-    # Create ActorCritic with proper observation groups
-    obs_groups = {
-        "policy": ["policy"],
-        "critic": ["policy"]
-    }
-    
-    try:
-        policy = ActorCritic(
-            obs=dummy_obs_dict,
-            obs_groups=obs_groups,
-            num_actions=env.action_space.shape[0],
-            **config
-        ).to(device)
-        print(f"✓ ActorCritic created with obs shape: {dummy_obs.shape}, action dim: {env.action_space.shape[0]}")
-    except Exception as e:
-        print(f"❌ ActorCritic creation failed: {e}")
-        raise
-    
-    # Load model weights - handle different checkpoint formats
-    if 'policy_state_dict' in checkpoint:
-        # RSL-RL training checkpoint format (from your training script)
-        policy.load_state_dict(checkpoint['policy_state_dict'])
-        print(f"✓ Model weights loaded (policy_state_dict)")
-    elif 'model_state_dict' in checkpoint:
-        policy.load_state_dict(checkpoint['model_state_dict'])
-        print(f"✓ Model weights loaded (model_state_dict)")
-    elif 'state_dict' in checkpoint:
-        policy.load_state_dict(checkpoint['state_dict'])
-        print(f"✓ Model weights loaded (state_dict)")
-    else:
-        # Assume the checkpoint is the state dict itself
-        try:
-            policy.load_state_dict(checkpoint)
-            print(f"✓ Model weights loaded (direct state dict)")
-        except Exception as e:
-            print(f"❌ Failed to load weights. Checkpoint keys: {list(checkpoint.keys())}")
-            raise e
-    
-    policy.eval()  # Set to evaluation mode
-    print(f"✓ Policy set to evaluation mode")
-    
-    # Print training info if available
+    policy_type = _resolve_policy_type(args.policy_type, checkpoint)
+    print(f"📦 Detected policy format: {policy_type}")
+
     training_info = {}
+
+    if policy_type == 'rsl-rl':
+        dummy_obs = torch.zeros(1, env.observation_space.shape[0], device=device)
+        dummy_obs_dict = TensorDict({
+            "policy": dummy_obs,
+        }, batch_size=[1], device=device)
+
+        if 'policy_cfg' in checkpoint:
+            config = checkpoint['policy_cfg']
+            print(f"📋 Model config found: {config}")
+        elif 'model_config' in checkpoint:
+            config = checkpoint['model_config']
+            print(f"📋 Model config found: {config}")
+        else:
+            config = {
+                'hidden_dims': [256, 256, 256],
+                'activation': 'elu',
+            }
+            print(f"⚠️  No model config found, using defaults: {config}")
+
+        valid_keys = {'hidden_dims', 'activation', 'init_noise_std', 'actor_hidden_dims', 'critic_hidden_dims'}
+        config = {k: v for k, v in config.items() if k in valid_keys}
+
+        try:
+            policy = ActorCritic(
+                obs=dummy_obs_dict,
+                obs_groups={"policy": ["policy"], "critic": ["policy"]},
+                num_actions=env.action_space.shape[0],
+                **config,
+            ).to(device)
+            print(
+                f"✓ ActorCritic created with obs shape: {dummy_obs.shape}, action dim: {env.action_space.shape[0]}"
+            )
+        except Exception as e:
+            print(f"❌ ActorCritic creation failed: {e}")
+            raise
+
+        if 'policy_state_dict' in checkpoint:
+            policy.load_state_dict(checkpoint['policy_state_dict'])
+            print(f"✓ Model weights loaded (policy_state_dict)")
+        elif 'model_state_dict' in checkpoint:
+            policy.load_state_dict(checkpoint['model_state_dict'])
+            print(f"✓ Model weights loaded (model_state_dict)")
+        elif 'state_dict' in checkpoint:
+            policy.load_state_dict(checkpoint['state_dict'])
+            print(f"✓ Model weights loaded (state_dict)")
+        else:
+            try:
+                policy.load_state_dict(checkpoint)
+                print(f"✓ Model weights loaded (direct state dict)")
+            except Exception as e:
+                print(f"❌ Failed to load weights. Checkpoint keys: {list(checkpoint.keys())}")
+                raise e
+
+        policy.eval()
+        print(f"✓ Policy set to evaluation mode")
+
+    else:  # FastSAC checkpoint
+        from fast_sac import Actor
+        from fast_sac_utils import EmpiricalNormalization
+
+        args_dict = checkpoint.get('args', {}) or {}
+        if isinstance(args_dict, dict):
+            actor_hidden = args_dict.get('actor_hidden_dim', 512)
+            init_scale = args_dict.get('init_scale', 0.01)
+        else:
+            actor_hidden = getattr(args_dict, 'actor_hidden_dim', 512)
+            init_scale = getattr(args_dict, 'init_scale', 0.01)
+
+        obs_dim = env.observation_space.shape[0]
+        act_dim = env.action_space.shape[0]
+
+        actor = Actor(
+            n_obs=obs_dim,
+            n_act=act_dim,
+            num_envs=1,
+            init_scale=init_scale,
+            hidden_dim=actor_hidden,
+            device=device,
+        ).to(device)
+        actor.load_state_dict(checkpoint['actor_state_dict'])
+        actor.eval()
+        print(f"✓ FastSAC actor weights loaded")
+
+        obs_normalizer = EmpiricalNormalization(shape=obs_dim, device=device)
+        obs_state = checkpoint.get('obs_normalizer_state')
+        if obs_state:
+            obs_normalizer.load_state_dict(obs_state)
+        obs_normalizer.eval()
+
+        policy = FastSACPolicy(actor, obs_normalizer)
+        policy.eval()
+
+    # Gather training metadata if available
     
     # Extract training info from different possible keys
     if 'training_info' in checkpoint:
@@ -201,11 +264,17 @@ def load_trained_policy(model_path: str, env, device: torch.device):
     
     # Extract args if available
     if 'args' in checkpoint:
-        args = checkpoint['args']
-        if hasattr(args, 'env_name'):
-            training_info['env_name'] = args.env_name
-        if hasattr(args, 'reward_type'):
-            training_info['reward_type'] = args.reward_type
+        args_obj = checkpoint['args']
+        if isinstance(args_obj, dict):
+            if 'env_name' in args_obj:
+                training_info['env_name'] = args_obj['env_name']
+            if 'reward_type' in args_obj:
+                training_info['reward_type'] = args_obj['reward_type']
+        else:
+            if hasattr(args_obj, 'env_name'):
+                training_info['env_name'] = args_obj.env_name
+            if hasattr(args_obj, 'reward_type'):
+                training_info['reward_type'] = args_obj.reward_type
     
     if training_info:
         print(f"📊 Training info:")
@@ -457,7 +526,7 @@ def main():
         env = create_env(args.env_name, args)
         
         # Load trained policy
-        policy = load_trained_policy(args.model_path, env, device)
+        policy = load_trained_policy(args.model_path, env, device, args)
         
         # Run interactive evaluation
         run_interactive_evaluation(policy, env, args, device)
