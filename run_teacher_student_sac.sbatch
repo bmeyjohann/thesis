@@ -29,7 +29,7 @@ DENIED_PENALTY=${DENIED_PENALTY:--1}
 SAVE_INTERVAL=${SAVE_INTERVAL:-200000}
 LOG_INTERVAL=${LOG_INTERVAL:-20000}
 
-BASE_ARGS="--env_name ${ENV_ID} --num_envs ${NUM_ENVS} --total_timesteps ${TOTAL_STEPS} --include_goal --save_interval ${SAVE_INTERVAL} --log_interval ${LOG_INTERVAL}"
+BASE_ARGS="--env_name ${ENV_ID} --num_envs ${NUM_ENVS} --total_timesteps ${TOTAL_STEPS} --include_goal --save_interval ${SAVE_INTERVAL} --log_interval ${LOG_INTERVAL} --use_wandb"
 
 echo "Launching 4 FastSAC teacher-student experiments on ${ENV_ID} with ${NUM_ENVS} envs each"
 
