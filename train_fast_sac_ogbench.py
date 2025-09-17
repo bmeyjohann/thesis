@@ -418,48 +418,48 @@ def main():
                     'Perf/env_steps': total_env_steps,
                     'Perf/iterations': iteration_idx,
                 }
-            if len(rewbuffer) > 0:
-                logs['Train/mean_reward'] = float(np.mean(rewbuffer[-100:]))
-                logs['Train/mean_episode_length'] = float(np.mean(lenbuffer[-100:]))
-            if 'log' in infos and isinstance(infos['log'], dict):
-                for k, v in infos['log'].items():
-                    try:
-                        logs[k] = float(v.float().mean().item())
-                    except Exception:
-                        pass
-            if args.store_denied_actions:
-                logs['/Teacher/denied_transition_samples'] = float(last_denied_samples)
+                if len(rewbuffer) > 0:
+                    logs['Train/mean_reward'] = float(np.mean(rewbuffer[-100:]))
+                    logs['Train/mean_episode_length'] = float(np.mean(lenbuffer[-100:]))
+                if 'log' in infos and isinstance(infos['log'], dict):
+                    for k, v in infos['log'].items():
+                        try:
+                            logs[k] = float(v.float().mean().item())
+                        except Exception:
+                            pass
+                if args.store_denied_actions:
+                    logs['/Teacher/denied_transition_samples'] = float(last_denied_samples)
 
-            log_line_parts = [
-                f"env_steps {total_env_steps}/{args.total_timesteps}",
-                f"iter {iteration_idx}",
-                f"fps {fps}",
-            ]
-            if 'Train/mean_reward' in logs:
-                log_line_parts.append(f"mean_reward {logs['Train/mean_reward']:.2f}")
-            if '/Episode/goal_success_rate' in logs:
-                log_line_parts.append(f"success {logs['/Episode/goal_success_rate']:.2f}")
-            if '/Teacher/teacher_fraction_steps' in logs:
-                log_line_parts.append(f"teacher_frac {logs['/Teacher/teacher_fraction_steps']:.2f}")
-            if args.store_denied_actions and last_denied_samples > 0:
-                log_line_parts.append(f"denied {last_denied_samples}")
-            console_line = "[FastSAC] " + " | ".join(log_line_parts)
-            print(console_line, flush=True)
-            record_progress(console_line)
+                log_line_parts = [
+                    f"env_steps {total_env_steps}/{args.total_timesteps}",
+                    f"iter {iteration_idx}",
+                    f"fps {fps}",
+                ]
+                if 'Train/mean_reward' in logs:
+                    log_line_parts.append(f"mean_reward {logs['Train/mean_reward']:.2f}")
+                if '/Episode/goal_success_rate' in logs:
+                    log_line_parts.append(f"success {logs['/Episode/goal_success_rate']:.2f}")
+                if '/Teacher/teacher_fraction_steps' in logs:
+                    log_line_parts.append(f"teacher_frac {logs['/Teacher/teacher_fraction_steps']:.2f}")
+                if args.store_denied_actions and last_denied_samples > 0:
+                    log_line_parts.append(f"denied {last_denied_samples}")
+                console_line = "[FastSAC] " + " | ".join(log_line_parts)
+                print(console_line, flush=True)
+                record_progress(console_line)
 
-            if args.use_wandb:
-                import wandb
-                if wandb_run is None:
-                    wandb_run = wandb.init(
-                        project=args.project,
-                        name=args.exp_name,
-                        id=args.exp_name,
-                        config=vars(args),
-                        dir=str(run_log_dir),
-                        reinit=True,
-                        resume="allow",
-                    )
-                wandb_run.log(logs, step=total_env_steps)
+                if args.use_wandb:
+                    import wandb
+                    if wandb_run is None:
+                        wandb_run = wandb.init(
+                            project=args.project,
+                            name=args.exp_name,
+                            id=args.exp_name,
+                            config=vars(args),
+                            dir=str(run_log_dir),
+                            reinit=True,
+                            resume="allow",
+                        )
+                    wandb_run.log(logs, step=total_env_steps)
 
         obs = next_obs
         # Save final
