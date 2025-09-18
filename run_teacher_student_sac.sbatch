@@ -33,7 +33,7 @@ STEP_PENALTY=${STEP_PENALTY:--0.001}
 
 BASE_ARGS="--env_name ${ENV_ID} --num_envs ${NUM_ENVS} --total_timesteps ${TOTAL_STEPS} --include_goal --save_interval ${SAVE_INTERVAL} --log_interval ${LOG_INTERVAL} --use_wandb --dense_reward_scale ${DENSE_REWARD_SCALE} --step_penalty ${STEP_PENALTY}"
 
-echo "Launching 4 FastSAC teacher-student experiments on ${ENV_ID} with ${NUM_ENVS} envs each"
+echo "Launching 6 FastSAC experiments on ${ENV_ID} with ${NUM_ENVS} envs each (concurrent)"
 
 # 1) Teacher always on (tol A) with denied-action penalty and no lethal block
 CUDA_VISIBLE_DEVICES=0 python train_fast_sac_ogbench.py ${BASE_ARGS} \
@@ -75,19 +75,7 @@ CUDA_VISIBLE_DEVICES=3 python train_fast_sac_ogbench.py ${BASE_ARGS} \
   2>&1 | tee logs/${ENV_ID}_sac_student_only_dense_${SLURM_JOB_ID}.log &
 PID4=$!
 
-echo "PIDs: $PID1 $PID2 $PID3 $PID4"
-wait $PID1; E1=$?
-wait $PID2; E2=$?
-wait $PID3; E3=$?
-wait $PID4; E4=$?
-
-if [ $E1 -ne 0 ] || [ $E2 -ne 0 ] || [ $E3 -ne 0 ] || [ $E4 -ne 0 ]; then
-  echo "One or more base experiments failed: $E1 $E2 $E3 $E4"; exit 1
-fi
-
-echo "Base FastSAC teacher–student experiments completed."
-
-echo "Launching FastSAC variants (tolerance sweep + curriculum without penalties)"
+echo "Launching additional FastSAC variants (all concurrent)"
 
 # 5) Teacher always on (tol B) with denied-action penalty
 CUDA_VISIBLE_DEVICES=0 python train_fast_sac_ogbench.py ${BASE_ARGS} \
@@ -111,12 +99,16 @@ CUDA_VISIBLE_DEVICES=1 python train_fast_sac_ogbench.py ${BASE_ARGS} \
   2>&1 | tee logs/${ENV_ID}_sac_curriculum_teacher_tol${TOL_A}_nop_${SLURM_JOB_ID}.log &
 PID6=$!
 
-echo "Variant PIDs: $PID5 $PID6"
+echo "All PIDs: $PID1 $PID2 $PID3 $PID4 $PID5 $PID6"
+wait $PID1; E1=$?
+wait $PID2; E2=$?
+wait $PID3; E3=$?
+wait $PID4; E4=$?
 wait $PID5; E5=$?
 wait $PID6; E6=$?
 
-if [ $E5 -ne 0 ] || [ $E6 -ne 0 ]; then
-  echo "One or more variant experiments failed: $E5 $E6"; exit 1
+if [ $E1 -ne 0 ] || [ $E2 -ne 0 ] || [ $E3 -ne 0 ] || [ $E4 -ne 0 ] || [ $E5 -ne 0 ] || [ $E6 -ne 0 ]; then
+  echo "One or more experiments failed: $E1 $E2 $E3 $E4 $E5 $E6"; exit 1
 fi
 
 echo "All FastSAC teacher–student experiments completed."
