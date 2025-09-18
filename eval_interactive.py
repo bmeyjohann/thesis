@@ -82,6 +82,29 @@ def get_args():
     parser.add_argument('--fps', type=int, default=30,
                         help='Target FPS for rendering')
     
+    # Observation configuration (match training)
+    parser.add_argument('--include_goal', dest='include_goal', action='store_true', default=True,
+                        help='Include goal coordinates in observations')
+    parser.add_argument('--no_include_goal', dest='include_goal', action='store_false',
+                        help='Exclude goal coordinates from observations')
+    parser.add_argument('--include_distance', action='store_true', default=False,
+                        help='Include distance to goal in observations')
+    parser.add_argument('--include_direction', action='store_true', default=False,
+                        help='Include direction to goal in observations')
+    parser.add_argument('--include_velocity', action='store_true', default=False,
+                        help='Include velocity features in observations')
+
+    # Reward shaping (should mirror training wrapper settings)
+    parser.add_argument('--reward_type', type=str, default='sparse',
+                        choices=['sparse', 'dense', 'combined'],
+                        help='Reward type for DetailedRewardWrapper')
+    parser.add_argument('--dense_reward_scale', type=float, default=0.01,
+                        help='Scale for dense reward shaping (if applicable)')
+    parser.add_argument('--step_penalty', type=float, default=0.0,
+                        help='Per-step penalty applied by DetailedRewardWrapper')
+    parser.add_argument('--reward_switch_after_steps', type=int, default=0,
+                        help='Switch reward to sparse after this many steps (curriculum)')
+
     # Evaluation
     parser.add_argument('--max_episode_steps', type=int, default=500,
                         help='Maximum steps per episode')
@@ -105,6 +128,8 @@ def get_args():
     parser.add_argument('--hard_block_lethal', action='store_true', default=True,
                         help='Intervene if student would step into lethal cell')
     parser.add_argument('--no_hard_block_lethal', dest='hard_block_lethal', action='store_false')
+    parser.add_argument('--intervention_enable_after_steps', type=int, default=0,
+                        help='Warm-up steps before agent teacher interventions engage')
     
     # Action processing (should match training settings)
     parser.add_argument('--action_scale', type=float, default=1.0,
@@ -306,9 +331,24 @@ def create_env(env_name: str, args):
         env = gym.make(env_name, **env_kwargs)
         
         # Base observation wrapper
-        from ogbench.wrappers import FlexibleObsWrapper, InterventionWrapper
-        env = FlexibleObsWrapper(env, include_goal=True)  # Match training config
+        from ogbench.wrappers import FlexibleObsWrapper, DetailedRewardWrapper, InterventionWrapper
+        env = FlexibleObsWrapper(
+            env,
+            include_goal=args.include_goal,
+            include_distance=args.include_distance,
+            include_direction=args.include_direction,
+            include_velocity=args.include_velocity,
+        )
         print(f"✓ Applied FlexibleObsWrapper")
+
+        env = DetailedRewardWrapper(
+            env,
+            reward_type=args.reward_type,
+            dense_reward_scale=args.dense_reward_scale,
+            step_penalty=args.step_penalty,
+            switch_reward_to_sparse_after_steps_per_env=args.reward_switch_after_steps,
+        )
+        print(f"✓ Applied DetailedRewardWrapper (type={args.reward_type})")
 
         # Optional intervention wrapper
         if args.intervention_mode == 'human':
@@ -331,6 +371,7 @@ def create_env(env_name: str, args):
                 tolerance_type=args.tolerance_type,
                 tolerance_value=args.tolerance_value,
                 hard_block_lethal=args.hard_block_lethal,
+                enable_after_steps=args.intervention_enable_after_steps,
             )
             print(f"✓ Applied InterventionWrapper (agent teacher: {args.teacher_type})")
         

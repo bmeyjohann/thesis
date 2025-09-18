@@ -163,9 +163,6 @@ def main():
     run_log_dir.mkdir(parents=True, exist_ok=True)
     run_model_dir.mkdir(parents=True, exist_ok=True)
 
-    # Keep WANDB artifacts inside the run folder for easier syncing/debugging
-    os.environ.setdefault('WANDB_DIR', str(run_log_dir / 'wandb'))
-
     print(f"FastSAC OGBench on {args.env_name} device={device}")
     print(f"Log directory: {run_log_dir}")
     print(f"Model directory: {run_model_dir}")
@@ -455,7 +452,6 @@ def main():
                             name=args.exp_name,
                             id=args.exp_name,
                             config=vars(args),
-                            dir=str(run_log_dir),
                             reinit=True,
                             resume="allow",
                         )
