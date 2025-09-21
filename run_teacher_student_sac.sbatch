@@ -29,7 +29,7 @@ DENIED_PENALTY=${DENIED_PENALTY:--1}
 SAVE_INTERVAL=${SAVE_INTERVAL:-200000}
 LOG_INTERVAL=${LOG_INTERVAL:-20000}
 DENSE_REWARD_SCALE=${DENSE_REWARD_SCALE:-0.05}
-STEP_PENALTY=${STEP_PENALTY:--0.001}
+STEP_PENALTY=${STEP_PENALTY:-0.001}
 
 BASE_ARGS="--env_name ${ENV_ID} --num_envs ${NUM_ENVS} --total_timesteps ${TOTAL_STEPS} --include_goal --save_interval ${SAVE_INTERVAL} --log_interval ${LOG_INTERVAL} --use_wandb --dense_reward_scale ${DENSE_REWARD_SCALE} --step_penalty ${STEP_PENALTY}"
 
@@ -75,7 +75,17 @@ CUDA_VISIBLE_DEVICES=3 python train_fast_sac_ogbench.py ${BASE_ARGS} \
   2>&1 | tee logs/${ENV_ID}_sac_student_only_dense_${SLURM_JOB_ID}.log &
 PID4=$!
 
-echo "Launching additional FastSAC variants (all concurrent)"
+echo "Waiting for first 4 experiments to finish..."
+wait $PID1; E1=$?
+wait $PID2; E2=$?
+wait $PID3; E3=$?
+wait $PID4; E4=$?
+
+if [ $E1 -ne 0 ] || [ $E2 -ne 0 ] || [ $E3 -ne 0 ] || [ $E4 -ne 0 ]; then
+  echo "One or more base experiments failed: $E1 $E2 $E3 $E4"; exit 1
+fi
+
+echo "Launching remaining 2 FastSAC variants (batch 2)"
 
 # 5) Teacher always on (tol B) with denied-action penalty
 CUDA_VISIBLE_DEVICES=0 python train_fast_sac_ogbench.py ${BASE_ARGS} \
@@ -99,16 +109,12 @@ CUDA_VISIBLE_DEVICES=1 python train_fast_sac_ogbench.py ${BASE_ARGS} \
   2>&1 | tee logs/${ENV_ID}_sac_curriculum_teacher_tol${TOL_A}_nop_${SLURM_JOB_ID}.log &
 PID6=$!
 
-echo "All PIDs: $PID1 $PID2 $PID3 $PID4 $PID5 $PID6"
-wait $PID1; E1=$?
-wait $PID2; E2=$?
-wait $PID3; E3=$?
-wait $PID4; E4=$?
+echo "Batch 2 PIDs: $PID5 $PID6"
 wait $PID5; E5=$?
 wait $PID6; E6=$?
 
-if [ $E1 -ne 0 ] || [ $E2 -ne 0 ] || [ $E3 -ne 0 ] || [ $E4 -ne 0 ] || [ $E5 -ne 0 ] || [ $E6 -ne 0 ]; then
-  echo "One or more experiments failed: $E1 $E2 $E3 $E4 $E5 $E6"; exit 1
+if [ $E5 -ne 0 ] || [ $E6 -ne 0 ]; then
+  echo "One or more batch-2 experiments failed: $E5 $E6"; exit 1
 fi
 
 echo "All FastSAC teacher–student experiments completed."

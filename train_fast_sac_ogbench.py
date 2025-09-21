@@ -188,9 +188,8 @@ def main():
     reward_normalizer = RewardNormalizer(gamma=args.gamma, device=device, g_max=10.0)
 
     actor = Actor(n_obs=n_obs, n_act=n_act, num_envs=args.num_envs, init_scale=args.init_scale, hidden_dim=args.actor_hidden_dim, device=device)
-    actor_detach = Actor(n_obs=n_obs, n_act=n_act, num_envs=args.num_envs, init_scale=args.init_scale, hidden_dim=args.actor_hidden_dim, device=device)
-    from_module(actor).data.to_module(actor_detach)
-    policy_fn = actor_detach.forward
+    # Use the live actor for rollout action selection so behavior improves during training
+    policy_fn = actor.forward
     qnet = Critic(n_obs=n_obs, n_act=n_act, hidden_dim=args.critic_hidden_dim, device=device)
     qnet_target = Critic(n_obs=n_obs, n_act=n_act, hidden_dim=args.critic_hidden_dim, device=device)
     qnet_target.load_state_dict(qnet.state_dict())
@@ -225,7 +224,7 @@ def main():
     def _normalize_obs(x): return obs_normalizer(x)
     if args.compile:
         actor = torch.compile(actor)
-        policy_fn = torch.compile(policy_fn)
+        policy_fn = torch.compile(actor.forward)
         qnet = torch.compile(qnet)
         qnet_target = torch.compile(qnet_target)
         _normalize_obs = torch.compile(_normalize_obs)
