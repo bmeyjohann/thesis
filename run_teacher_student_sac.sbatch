@@ -36,7 +36,7 @@ BASE_ARGS="--env_name ${ENV_ID} --num_envs ${NUM_ENVS} --total_timesteps ${TOTAL
 echo "Launching 6 FastSAC experiments on ${ENV_ID} with ${NUM_ENVS} envs each (concurrent)"
 
 # 1) Teacher always on (tol A) with denied-action penalty and no lethal block
-CUDA_VISIBLE_DEVICES=0 python train_fast_sac_ogbench.py ${BASE_ARGS} \
+CUDA_VISIBLE_DEVICES=0 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
   --reward_type sparse \
   --use_intervention --intervention_mode agent --teacher_type bfs \
   --tolerance_type angle --tolerance_value ${TOL_A} \
@@ -47,7 +47,7 @@ CUDA_VISIBLE_DEVICES=0 python train_fast_sac_ogbench.py ${BASE_ARGS} \
 PID1=$!
 
 # 2) Teacher always on (tol A) without denied-action penalty
-CUDA_VISIBLE_DEVICES=1 python train_fast_sac_ogbench.py ${BASE_ARGS} \
+CUDA_VISIBLE_DEVICES=1 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
   --reward_type sparse \
   --use_intervention --intervention_mode agent --teacher_type bfs \
   --tolerance_type angle --tolerance_value ${TOL_A} \
@@ -57,7 +57,7 @@ CUDA_VISIBLE_DEVICES=1 python train_fast_sac_ogbench.py ${BASE_ARGS} \
 PID2=$!
 
 # 3) Curriculum (tol A) with denied-action penalty
-CUDA_VISIBLE_DEVICES=2 python train_fast_sac_ogbench.py ${BASE_ARGS} \
+CUDA_VISIBLE_DEVICES=2 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
   --reward_type dense --reward_switch_after_steps ${HALF_STEPS_GLOBAL} \
   --use_intervention --intervention_mode agent --teacher_type bfs \
   --tolerance_type angle --tolerance_value ${TOL_A} \
@@ -69,7 +69,7 @@ CUDA_VISIBLE_DEVICES=2 python train_fast_sac_ogbench.py ${BASE_ARGS} \
 PID3=$!
 
 # 4) Student-only dense control
-CUDA_VISIBLE_DEVICES=3 python train_fast_sac_ogbench.py ${BASE_ARGS} \
+CUDA_VISIBLE_DEVICES=3 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
   --reward_type dense \
   --exp_name "student_only_dense_${SLURM_JOB_ID}" \
   2>&1 | tee logs/${ENV_ID}_sac_student_only_dense_${SLURM_JOB_ID}.log &
@@ -88,7 +88,7 @@ fi
 echo "Launching remaining 2 FastSAC variants (batch 2)"
 
 # 5) Teacher always on (tol B) with denied-action penalty
-CUDA_VISIBLE_DEVICES=0 python train_fast_sac_ogbench.py ${BASE_ARGS} \
+CUDA_VISIBLE_DEVICES=0 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
   --reward_type sparse \
   --use_intervention --intervention_mode agent --teacher_type bfs \
   --tolerance_type angle --tolerance_value ${TOL_B} \
@@ -99,7 +99,7 @@ CUDA_VISIBLE_DEVICES=0 python train_fast_sac_ogbench.py ${BASE_ARGS} \
 PID5=$!
 
 # 6) Curriculum tol A without denied-action penalty
-CUDA_VISIBLE_DEVICES=1 python train_fast_sac_ogbench.py ${BASE_ARGS} \
+CUDA_VISIBLE_DEVICES=1 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
   --reward_type dense --reward_switch_after_steps ${HALF_STEPS_GLOBAL} \
   --use_intervention --intervention_mode agent --teacher_type bfs \
   --tolerance_type angle --tolerance_value ${TOL_A} \

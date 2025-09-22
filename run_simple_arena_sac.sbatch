@@ -36,14 +36,14 @@ BASE_ARGS="--env_name ${ENV_ID} --num_envs ${NUM_ENVS} --total_timesteps ${TOTAL
 echo "Launching 4 FastSAC simple-arena experiments (batch 1)"
 
 # 1) Student-only dense (baseline learning sanity)
-CUDA_VISIBLE_DEVICES=0 python train_fast_sac_ogbench.py ${BASE_ARGS} \
+CUDA_VISIBLE_DEVICES=0 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
   --reward_type dense \
   --exp_name "simple_student_dense_${SLURM_JOB_ID}" \
   2>&1 | tee logs/${ENV_ID}_sac_simple_student_dense_${SLURM_JOB_ID}.log &
 PID1=$!
 
 # 2) Teacher tol=45 with denied-action penalty (sparse)
-CUDA_VISIBLE_DEVICES=1 python train_fast_sac_ogbench.py ${BASE_ARGS} \
+CUDA_VISIBLE_DEVICES=1 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
   --reward_type sparse \
   --use_intervention --intervention_mode agent --teacher_type bfs \
   --tolerance_type angle --tolerance_value ${TOL} \
@@ -54,7 +54,7 @@ CUDA_VISIBLE_DEVICES=1 python train_fast_sac_ogbench.py ${BASE_ARGS} \
 PID2=$!
 
 # 3) Teacher tol=45 without penalty (sparse)
-CUDA_VISIBLE_DEVICES=2 python train_fast_sac_ogbench.py ${BASE_ARGS} \
+CUDA_VISIBLE_DEVICES=2 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
   --reward_type sparse \
   --use_intervention --intervention_mode agent --teacher_type bfs \
   --tolerance_type angle --tolerance_value ${TOL} \
@@ -64,7 +64,7 @@ CUDA_VISIBLE_DEVICES=2 python train_fast_sac_ogbench.py ${BASE_ARGS} \
 PID3=$!
 
 # 4) Curriculum: dense first half, then teacher+sparse (penalty on)
-CUDA_VISIBLE_DEVICES=3 python train_fast_sac_ogbench.py ${BASE_ARGS} \
+CUDA_VISIBLE_DEVICES=3 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
   --reward_type dense --reward_switch_after_steps $((TOTAL_STEPS/2)) \
   --use_intervention --intervention_mode agent --teacher_type bfs \
   --tolerance_type angle --tolerance_value ${TOL} \
@@ -88,7 +88,7 @@ fi
 echo "Launching 2 simple-arena variants (batch 2)"
 
 # 5) Teacher tol=90 with penalty (sparse)
-CUDA_VISIBLE_DEVICES=0 python train_fast_sac_ogbench.py ${BASE_ARGS} \
+CUDA_VISIBLE_DEVICES=0 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
   --reward_type sparse \
   --use_intervention --intervention_mode agent --teacher_type bfs \
   --tolerance_type angle --tolerance_value 90 \
@@ -99,7 +99,7 @@ CUDA_VISIBLE_DEVICES=0 python train_fast_sac_ogbench.py ${BASE_ARGS} \
 PID5=$!
 
 # 6) Curriculum tol=45 no penalty (control)
-CUDA_VISIBLE_DEVICES=1 python train_fast_sac_ogbench.py ${BASE_ARGS} \
+CUDA_VISIBLE_DEVICES=1 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
   --reward_type dense --reward_switch_after_steps $((TOTAL_STEPS/2)) \
   --use_intervention --intervention_mode agent --teacher_type bfs \
   --tolerance_type angle --tolerance_value ${TOL} \
@@ -118,4 +118,3 @@ if [ $E5 -ne 0 ] || [ $E6 -ne 0 ]; then
 fi
 
 echo "All simple-arena FastSAC experiments completed."
-

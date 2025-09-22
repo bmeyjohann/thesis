@@ -173,6 +173,7 @@ def main():
     print(f"Saved run config: {config_path}")
 
     wrappers = make_wrappers(args)
+    record_progress("[Init] constructing vector env adapter")
     envs = OGBenchVecEnvAdapter(
         env_name=args.env_name,
         num_envs=args.num_envs,
@@ -180,6 +181,7 @@ def main():
         wrappers=wrappers,
         clip_actions=1.0,
     )
+    record_progress("[Init] env adapter constructed")
 
     n_obs = envs.num_obs
     n_act = envs.num_actions
@@ -240,11 +242,24 @@ def main():
         progress_file.flush()
 
     try:
+        # Initialize wandb early so runs appear even if logging hasn't triggered yet
+        if args.use_wandb:
+            import wandb
+            wandb_run = wandb.init(
+                project=args.project,
+                name=args.exp_name,
+                id=args.exp_name,
+                config=vars(args),
+                reinit=True,
+                resume="allow",
+            )
+        else:
+            wandb_run = None
         obs = envs.reset()
         total_env_steps = 0
         iteration_idx = 0
         start_time = time.time()
-        wandb_run = None
+        # wandb_run may be set above
         # Episode buffers similar to RSL-RL
         cur_reward_sum = torch.zeros(envs.num_envs, dtype=torch.float32, device=device)
         cur_episode_length = torch.zeros(envs.num_envs, dtype=torch.float32, device=device)
