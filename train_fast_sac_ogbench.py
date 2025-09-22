@@ -192,6 +192,7 @@ def main():
         clip_actions=1.0,
     )
     record_progress("[Init] env adapter constructed")
+    print("[Init] Env adapter constructed", flush=True)
 
     n_obs = envs.num_obs
     n_act = envs.num_actions
@@ -256,6 +257,8 @@ def main():
         else:
             wandb_run = None
         obs = envs.reset()
+        record_progress("[Init] envs.reset() returned; entering loop")
+        print("[Init] Env reset complete; starting training loop", flush=True)
         total_env_steps = 0
         iteration_idx = 0
         start_time = time.time()
