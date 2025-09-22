@@ -298,35 +298,41 @@ def main():
             )
             rb.extend(transition)
 
-            # Optionally log denied student actions into replay buffer with penalty reward
-            last_denied_samples = 0
-            if args.store_denied_actions:
-                teacher_mask = infos.get('teacher_intervened_mask')
-                student_actions = infos.get('student_actions')
-                if teacher_mask is not None and student_actions is not None:
-                    denied_ids = torch.nonzero(teacher_mask, as_tuple=False).flatten()
-                    if denied_ids.numel() > 0:
-                        last_denied_samples = int(denied_ids.numel())
-                        penalty_transition = TensorDict(
-                            {
-                                'observations': obs_detached[denied_ids],
-                                'actions': student_actions.detach()[denied_ids],
-                                'next': {
-                                    'observations': next_obs_detached[denied_ids],
-                                    'rewards': torch.full(
-                                        (denied_ids.numel(),),
-                                        float(args.denied_action_penalty),
-                                        device=device,
-                                        dtype=torch.float32,
-                                    ),
-                                    'truncations': truncations.long()[denied_ids],
-                                    'dones': dones.long()[denied_ids],
-                                },
+        # Optionally log denied student actions into replay buffer with penalty reward
+        last_denied_samples = 0
+        if args.store_denied_actions:
+            teacher_mask = infos.get('teacher_intervened_mask')
+            student_actions = infos.get('student_actions')
+            # Fallback: infer interventions by comparing applied vs. student actions
+            if teacher_mask is None and student_actions is not None and applied_actions is not None:
+                try:
+                    teacher_mask = (torch.abs(applied_actions - student_actions).sum(dim=-1) > 1e-6)
+                except Exception:
+                    teacher_mask = None
+            if teacher_mask is not None and student_actions is not None:
+                denied_ids = torch.nonzero(teacher_mask, as_tuple=False).flatten()
+                if denied_ids.numel() > 0:
+                    last_denied_samples = int(denied_ids.numel())
+                    penalty_transition = TensorDict(
+                        {
+                            'observations': obs_detached[denied_ids],
+                            'actions': student_actions.detach()[denied_ids],
+                            'next': {
+                                'observations': next_obs_detached[denied_ids],
+                                'rewards': torch.full(
+                                    (denied_ids.numel(),),
+                                    float(args.denied_action_penalty),
+                                    device=device,
+                                    dtype=torch.float32,
+                                ),
+                                'truncations': truncations.long()[denied_ids],
+                                'dones': dones.long()[denied_ids],
                             },
-                            batch_size=(denied_ids.numel(),),
-                            device=device,
-                        )
-                        rb.extend(penalty_transition)
+                        },
+                        batch_size=(denied_ids.numel(),),
+                        device=device,
+                    )
+                    rb.extend(penalty_transition)
 
             # Book-keeping for episode stats
             cur_reward_sum += rewards
