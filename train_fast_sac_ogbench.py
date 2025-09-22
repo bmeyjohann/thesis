@@ -167,6 +167,16 @@ def main():
     print(f"Log directory: {run_log_dir}")
     print(f"Model directory: {run_model_dir}")
 
+    # Open progress log early so we can write init breadcrumbs
+    log_file_path = run_log_dir / 'training.log'
+    progress_file = open(log_file_path, 'a', encoding='utf-8')
+    progress_file.write(f"# logging started {datetime.now().isoformat()}\n")
+    progress_file.flush()
+
+    def record_progress(message: str):
+        progress_file.write(f"{datetime.now().isoformat()} {message}\n")
+        progress_file.flush()
+
     config_path = run_log_dir / 'args.json'
     with open(config_path, 'w', encoding='utf-8') as cfg_file:
         json.dump(vars(args), cfg_file, indent=2)
@@ -230,16 +240,6 @@ def main():
         qnet = torch.compile(qnet)
         qnet_target = torch.compile(qnet_target)
         _normalize_obs = torch.compile(_normalize_obs)
-
-    # Rollout & logging setup
-    log_file_path = run_log_dir / 'training.log'
-    progress_file = open(log_file_path, 'a', encoding='utf-8')
-    progress_file.write(f"# logging started {datetime.now().isoformat()}\n")
-    progress_file.flush()
-
-    def record_progress(message: str):
-        progress_file.write(f"{datetime.now().isoformat()} {message}\n")
-        progress_file.flush()
 
     try:
         # Initialize wandb early so runs appear even if logging hasn't triggered yet
