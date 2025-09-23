@@ -201,8 +201,12 @@ def main():
     reward_normalizer = RewardNormalizer(gamma=args.gamma, device=device, g_max=10.0)
 
     actor = Actor(n_obs=n_obs, n_act=n_act, num_envs=args.num_envs, init_scale=args.init_scale, hidden_dim=args.actor_hidden_dim, device=device)
-    # Use the live actor for rollout action selection so behavior improves during training
-    policy_fn = actor.forward
+    # Match FastTD3 vendor behavior: use a separate "exploration" actor whose
+    # parameters share storage with the trainable actor. This keeps rollouts
+    # stable while allowing the trainable actor to update.
+    actor_detach = Actor(n_obs=n_obs, n_act=n_act, num_envs=args.num_envs, init_scale=args.init_scale, hidden_dim=args.actor_hidden_dim, device=device)
+    from_module(actor).data.to_module(actor_detach)
+    policy_fn = actor_detach.forward
     qnet = Critic(n_obs=n_obs, n_act=n_act, hidden_dim=args.critic_hidden_dim, device=device)
     qnet_target = Critic(n_obs=n_obs, n_act=n_act, hidden_dim=args.critic_hidden_dim, device=device)
     qnet_target.load_state_dict(qnet.state_dict())
@@ -237,7 +241,8 @@ def main():
     def _normalize_obs(x): return obs_normalizer(x)
     if args.compile:
         actor = torch.compile(actor)
-        policy_fn = torch.compile(actor.forward)
+        # Compile the exploration policy function as well
+        policy_fn = torch.compile(policy_fn)
         qnet = torch.compile(qnet)
         qnet_target = torch.compile(qnet_target)
         _normalize_obs = torch.compile(_normalize_obs)
@@ -287,16 +292,18 @@ def main():
                 str(save_path),
             )
             record_progress(f"[Checkpoint] saved {save_path}")
+            
+        print("[Init] Starting training loop", flush=True)
 
         while total_env_steps < args.total_timesteps:
             with torch.no_grad(), autocast(device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled):
                 norm_obs = _normalize_obs(obs)
                 actions, _, _ = policy_fn(norm_obs)
-
+                
             next_obs, rewards, dones, infos = envs.step(actions.float())
             truncations = infos.get('time_outs', torch.zeros_like(dones, device=device))
             applied_actions = infos.get('applied_actions', actions)
-
+            
             # Build transition
             obs_detached = obs.detach()
             next_obs_detached = next_obs.detach()
@@ -315,42 +322,42 @@ def main():
                 device=device,
             )
             rb.extend(transition)
-
-        # Optionally log denied student actions into replay buffer with penalty reward
-        last_denied_samples = 0
-        if args.store_denied_actions:
-            teacher_mask = infos.get('teacher_intervened_mask')
-            student_actions = infos.get('student_actions')
-            # Fallback: infer interventions by comparing applied vs. student actions
-            if teacher_mask is None and student_actions is not None and applied_actions is not None:
-                try:
-                    teacher_mask = (torch.abs(applied_actions - student_actions).sum(dim=-1) > 1e-6)
-                except Exception:
-                    teacher_mask = None
-            if teacher_mask is not None and student_actions is not None:
-                denied_ids = torch.nonzero(teacher_mask, as_tuple=False).flatten()
-                if denied_ids.numel() > 0:
-                    last_denied_samples = int(denied_ids.numel())
-                    penalty_transition = TensorDict(
-                        {
-                            'observations': obs_detached[denied_ids],
-                            'actions': student_actions.detach()[denied_ids],
-                            'next': {
-                                'observations': next_obs_detached[denied_ids],
-                                'rewards': torch.full(
-                                    (denied_ids.numel(),),
-                                    float(args.denied_action_penalty),
-                                    device=device,
-                                    dtype=torch.float32,
-                                ),
-                                'truncations': truncations.long()[denied_ids],
-                                'dones': dones.long()[denied_ids],
+            
+            # Optionally log denied student actions into replay buffer with penalty reward
+            last_denied_samples = 0
+            if args.store_denied_actions:
+                teacher_mask = infos.get('teacher_intervened_mask')
+                student_actions = infos.get('student_actions')
+                # Fallback: infer interventions by comparing applied vs. student actions
+                if teacher_mask is None and student_actions is not None and applied_actions is not None:
+                    try:
+                        teacher_mask = (torch.abs(applied_actions - student_actions).sum(dim=-1) > 1e-6)
+                    except Exception:
+                        teacher_mask = None
+                if teacher_mask is not None and student_actions is not None:
+                    denied_ids = torch.nonzero(teacher_mask, as_tuple=False).flatten()
+                    if denied_ids.numel() > 0:
+                        last_denied_samples = int(denied_ids.numel())
+                        penalty_transition = TensorDict(
+                            {
+                                'observations': obs_detached[denied_ids],
+                                'actions': student_actions.detach()[denied_ids],
+                                'next': {
+                                    'observations': next_obs_detached[denied_ids],
+                                    'rewards': torch.full(
+                                        (denied_ids.numel(),),
+                                        float(args.denied_action_penalty),
+                                        device=device,
+                                        dtype=torch.float32,
+                                    ),
+                                    'truncations': truncations.long()[denied_ids],
+                                    'dones': dones.long()[denied_ids],
+                                },
                             },
-                        },
-                        batch_size=(denied_ids.numel(),),
-                        device=device,
-                    )
-                    rb.extend(penalty_transition)
+                            batch_size=(denied_ids.numel(),),
+                            device=device,
+                        )
+                        rb.extend(penalty_transition)
 
             # Book-keeping for episode stats
             cur_reward_sum += rewards
@@ -480,7 +487,7 @@ def main():
                         )
                     wandb_run.log(logs, step=total_env_steps)
 
-        obs = next_obs
+            obs = next_obs
         # Save final
         save_checkpoint('final', total_env_steps)
         if wandb_run is not None:
