@@ -86,6 +86,12 @@ def parse_args():
                    help='Add denied student actions to replay buffer with penalty reward')
     p.add_argument('--denied_action_penalty', type=float, default=-1.0,
                    help='Reward assigned to denied student actions when stored')
+    # Intervention reward shaping variants
+    p.add_argument('--intervention_reward_mode', type=str, default='none',
+                   choices=['none', 'penalty_student', 'bonus_teacher'],
+                   help='How to shape reward/actions on intervention')
+    p.add_argument('--intervention_reward_value', type=float, default=0.0,
+                   help='Magnitude for intervention reward shaping (e.g., 0.1)')
     # Logging
     p.add_argument('--use_wandb', action='store_true', default=False)
     p.add_argument('--project', type=str, default='ogbench-rsl-rl')
@@ -303,6 +309,36 @@ def main():
             next_obs, rewards, dones, infos = envs.step(actions.float())
             truncations = infos.get('time_outs', torch.zeros_like(dones, device=device))
             applied_actions = infos.get('applied_actions', actions)
+            student_actions = infos.get('student_actions')
+            teacher_mask = infos.get('teacher_intervened_mask')
+            # Build mask if missing by comparing applied vs student actions
+            if teacher_mask is None and student_actions is not None and applied_actions is not None:
+                try:
+                    teacher_mask = (torch.abs(applied_actions - student_actions).sum(dim=-1) > 1e-6)
+                except Exception:
+                    teacher_mask = None
+
+            # Decide actions to store and reward shaping
+            rewards_eff = rewards
+            used_actions = applied_actions
+            last_denied_samples = 0
+            if teacher_mask is not None:
+                denied_ids = torch.nonzero(teacher_mask, as_tuple=False).flatten()
+                if denied_ids.numel() > 0:
+                    last_denied_samples = int(denied_ids.numel())
+                    mode = args.intervention_reward_mode
+                    val = float(args.intervention_reward_value)
+                    if mode == 'penalty_student':
+                        # Store the STUDENT action for intervened rows and apply a negative adjustment
+                        if student_actions is not None:
+                            used_actions = used_actions.clone()
+                            used_actions[denied_ids] = student_actions[denied_ids]
+                        if val != 0.0:
+                            rewards_eff = rewards_eff.clone()
+                            rewards_eff[denied_ids] = rewards_eff[denied_ids] - abs(val)
+                    elif mode == 'bonus_teacher' and val != 0.0:
+                        rewards_eff = rewards_eff.clone()
+                        rewards_eff[denied_ids] = rewards_eff[denied_ids] + abs(val)
             
             # Build transition
             obs_detached = obs.detach()
@@ -310,10 +346,10 @@ def main():
             transition = TensorDict(
                 {
                     'observations': obs_detached,
-                    'actions': applied_actions.detach(),
+                    'actions': used_actions.detach(),
                     'next': {
                         'observations': next_obs_detached,
-                        'rewards': rewards.detach(),
+                        'rewards': rewards_eff.detach(),
                         'truncations': truncations.long(),
                         'dones': dones.long(),
                     },
@@ -323,41 +359,7 @@ def main():
             )
             rb.extend(transition)
             
-            # Optionally log denied student actions into replay buffer with penalty reward
-            last_denied_samples = 0
-            if args.store_denied_actions:
-                teacher_mask = infos.get('teacher_intervened_mask')
-                student_actions = infos.get('student_actions')
-                # Fallback: infer interventions by comparing applied vs. student actions
-                if teacher_mask is None and student_actions is not None and applied_actions is not None:
-                    try:
-                        teacher_mask = (torch.abs(applied_actions - student_actions).sum(dim=-1) > 1e-6)
-                    except Exception:
-                        teacher_mask = None
-                if teacher_mask is not None and student_actions is not None:
-                    denied_ids = torch.nonzero(teacher_mask, as_tuple=False).flatten()
-                    if denied_ids.numel() > 0:
-                        last_denied_samples = int(denied_ids.numel())
-                        penalty_transition = TensorDict(
-                            {
-                                'observations': obs_detached[denied_ids],
-                                'actions': student_actions.detach()[denied_ids],
-                                'next': {
-                                    'observations': next_obs_detached[denied_ids],
-                                    'rewards': torch.full(
-                                        (denied_ids.numel(),),
-                                        float(args.denied_action_penalty),
-                                        device=device,
-                                        dtype=torch.float32,
-                                    ),
-                                    'truncations': truncations.long()[denied_ids],
-                                    'dones': dones.long()[denied_ids],
-                                },
-                            },
-                            batch_size=(denied_ids.numel(),),
-                            device=device,
-                        )
-                        rb.extend(penalty_transition)
+            # We already folded denied penalties into rewards_eff; just expose count via logging
 
             # Book-keeping for episode stats
             cur_reward_sum += rewards

@@ -35,37 +35,37 @@ BASE_ARGS="--env_name ${ENV_ID} --num_envs ${NUM_ENVS} --total_timesteps ${TOTAL
 
 echo "Launching 6 FastSAC experiments on ${ENV_ID} with ${NUM_ENVS} envs each (concurrent)"
 
-# 1) Teacher always on (tol A) with denied-action penalty and no lethal block
+# 1) Teacher always on (tol A) with student penalty shaping (folded) and no lethal block
 CUDA_VISIBLE_DEVICES=0 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
   --reward_type sparse \
   --use_intervention --intervention_mode agent --teacher_type bfs \
   --tolerance_type angle --tolerance_value ${TOL_A} \
   --no_hard_block_lethal \
-  --store_denied_actions --denied_action_penalty ${DENIED_PENALTY} \
+  --intervention_reward_mode penalty_student --intervention_reward_value 0.1 \
   --exp_name "teacher_always_tol${TOL_A}_${SLURM_JOB_ID}" \
   2>&1 | tee logs/${ENV_ID}_sac_teacher_always_tol${TOL_A}_${SLURM_JOB_ID}.log &
 PID1=$!
 
-# 2) Teacher always on (tol A) without denied-action penalty
+# 2) Teacher always on (tol A) with bonus to teacher on intervention
 CUDA_VISIBLE_DEVICES=1 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
   --reward_type sparse \
   --use_intervention --intervention_mode agent --teacher_type bfs \
   --tolerance_type angle --tolerance_value ${TOL_A} \
   --no_hard_block_lethal \
-  --exp_name "teacher_always_tol${TOL_A}_nop_${SLURM_JOB_ID}" \
-  2>&1 | tee logs/${ENV_ID}_sac_teacher_always_tol${TOL_A}_nop_${SLURM_JOB_ID}.log &
+  --intervention_reward_mode bonus_teacher --intervention_reward_value 0.1 \
+  --exp_name "teacher_always_tol${TOL_A}_bonus_${SLURM_JOB_ID}" \
+  2>&1 | tee logs/${ENV_ID}_sac_teacher_always_tol${TOL_A}_bonus_${SLURM_JOB_ID}.log &
 PID2=$!
 
-# 3) Curriculum (tol A) with denied-action penalty
+# 3) Teacher always on (tol A) but store student action and penalize it
 CUDA_VISIBLE_DEVICES=2 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
-  --reward_type dense --reward_switch_after_steps ${HALF_STEPS_GLOBAL} \
+  --reward_type sparse \
   --use_intervention --intervention_mode agent --teacher_type bfs \
   --tolerance_type angle --tolerance_value ${TOL_A} \
   --no_hard_block_lethal \
-  --store_denied_actions --denied_action_penalty ${DENIED_PENALTY} \
-  --intervention_enable_after_steps ${ENABLE_AFTER_STEPS_PER_ENV} \
-  --exp_name "curriculum_teacher_tol${TOL_A}_${SLURM_JOB_ID}" \
-  2>&1 | tee logs/${ENV_ID}_sac_curriculum_teacher_tol${TOL_A}_${SLURM_JOB_ID}.log &
+  --intervention_reward_mode penalty_student --intervention_reward_value 0.1 \
+  --exp_name "teacher_always_tol${TOL_A}_student_${SLURM_JOB_ID}" \
+  2>&1 | tee logs/${ENV_ID}_sac_teacher_always_tol${TOL_A}_student_${SLURM_JOB_ID}.log &
 PID3=$!
 
 # 4) Student-only dense control
@@ -87,26 +87,28 @@ fi
 
 echo "Launching remaining 2 FastSAC variants (batch 2)"
 
-# 5) Teacher always on (tol B) with denied-action penalty
+# 5) Curriculum (tol A) with student penalty shaping
 CUDA_VISIBLE_DEVICES=0 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
-  --reward_type sparse \
+  --reward_type dense --reward_switch_after_steps ${HALF_STEPS_GLOBAL} \
   --use_intervention --intervention_mode agent --teacher_type bfs \
-  --tolerance_type angle --tolerance_value ${TOL_B} \
+  --tolerance_type angle --tolerance_value ${TOL_A} \
   --no_hard_block_lethal \
-  --store_denied_actions --denied_action_penalty ${DENIED_PENALTY} \
-  --exp_name "teacher_always_tol${TOL_B}_${SLURM_JOB_ID}" \
-  2>&1 | tee logs/${ENV_ID}_sac_teacher_always_tol${TOL_B}_${SLURM_JOB_ID}.log &
+  --intervention_reward_mode penalty_student --intervention_reward_value 0.1 \
+  --intervention_enable_after_steps ${ENABLE_AFTER_STEPS_PER_ENV} \
+  --exp_name "curriculum_teacher_tol${TOL_A}_${SLURM_JOB_ID}" \
+  2>&1 | tee logs/${ENV_ID}_sac_curriculum_teacher_tol${TOL_A}_${SLURM_JOB_ID}.log &
 PID5=$!
 
-# 6) Curriculum tol A without denied-action penalty
+# 6) Curriculum (tol A) with student_override shaping
 CUDA_VISIBLE_DEVICES=1 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
   --reward_type dense --reward_switch_after_steps ${HALF_STEPS_GLOBAL} \
   --use_intervention --intervention_mode agent --teacher_type bfs \
   --tolerance_type angle --tolerance_value ${TOL_A} \
   --no_hard_block_lethal \
+  --intervention_reward_mode penalty_student --intervention_reward_value 0.1 \
   --intervention_enable_after_steps ${ENABLE_AFTER_STEPS_PER_ENV} \
-  --exp_name "curriculum_teacher_tol${TOL_A}_nop_${SLURM_JOB_ID}" \
-  2>&1 | tee logs/${ENV_ID}_sac_curriculum_teacher_tol${TOL_A}_nop_${SLURM_JOB_ID}.log &
+  --exp_name "curriculum_teacher_tol${TOL_A}_student_${SLURM_JOB_ID}" \
+  2>&1 | tee logs/${ENV_ID}_sac_curriculum_teacher_tol${TOL_A}_student_${SLURM_JOB_ID}.log &
 PID6=$!
 
 echo "Batch 2 PIDs: $PID5 $PID6"
