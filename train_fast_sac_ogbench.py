@@ -103,6 +103,20 @@ def parse_args():
     p.add_argument('--compile', action='store_true', default=False)
     p.add_argument('--amp', action='store_true', default=True)
     p.add_argument('--amp_dtype', type=str, default='bf16', choices=['bf16','fp16'])
+    # Counterfactual buffer (student-denied actions) for fast adaptation
+    p.add_argument('--cf_buffer_enable', action='store_true', default=False,
+                   help='Enable counterfactual buffer for denied student actions')
+    p.add_argument('--cf_capacity', type=int, default=100000,
+                   help='Capacity of CF buffer (rows)')
+    p.add_argument('--cf_sample_ratio', type=float, default=0.5,
+                   help='Fraction of batch for CF critic loss (0..1)')
+    p.add_argument('--cf_penalty', type=float, default=-1.0,
+                   help='Target value for Q(s,a_student) on interventions (terminal cost)')
+    p.add_argument('--cf_q_weight', type=float, default=1.0,
+                   help='Weight for CF critic penalty loss')
+    # Replay buffer reset on curriculum switch
+    p.add_argument('--reset_replay_on_switch', action='store_true', default=False,
+                   help='Reset main replay buffer when reward_switch_after_steps is reached')
     return p.parse_args()
 
 
@@ -321,6 +335,7 @@ def main():
             # Decide actions to store and reward shaping
             rewards_eff = rewards
             used_actions = applied_actions
+            dones_eff = dones
             last_denied_samples = 0
             if teacher_mask is not None:
                 denied_ids = torch.nonzero(teacher_mask, as_tuple=False).flatten()
@@ -336,6 +351,9 @@ def main():
                         if val != 0.0:
                             rewards_eff = rewards_eff.clone()
                             rewards_eff[denied_ids] = rewards_eff[denied_ids] - abs(val)
+                        # Mark these rows as terminal so bootstrapping stops
+                        dones_eff = dones_eff.clone()
+                        dones_eff[denied_ids] = 1
                     elif mode == 'bonus_teacher' and val != 0.0:
                         rewards_eff = rewards_eff.clone()
                         rewards_eff[denied_ids] = rewards_eff[denied_ids] + abs(val)
@@ -351,13 +369,24 @@ def main():
                         'observations': next_obs_detached,
                         'rewards': rewards_eff.detach(),
                         'truncations': truncations.long(),
-                        'dones': dones.long(),
+                        'dones': dones_eff.long(),
                     },
                 },
                 batch_size=(envs.num_envs,),
                 device=device,
             )
             rb.extend(transition)
+
+            # Append counterfactual rows to CF buffer (student-denied actions)
+            if args.cf_buffer_enable and teacher_mask is not None and student_actions is not None:
+                denied_ids = torch.nonzero(teacher_mask, as_tuple=False).flatten()
+                if denied_ids.numel() > 0:
+                    # Store (s, a_student)
+                    cf_s = obs_detached[denied_ids]
+                    cf_a = student_actions[denied_ids]
+                    # Initialize CF tensors on first use
+                    if 'cf_obs' in locals() and cf_obs is not None:
+                        cf_append(cf_s, cf_a)
             
             # We already folded denied penalties into rewards_eff; just expose count via logging
 
@@ -395,6 +424,14 @@ def main():
                         next_q = data['next']['rewards'].unsqueeze(-1) + (1.0 - data['next']['dones'].float()).unsqueeze(-1) * (args.gamma * min_q_t)
                         q1, q2 = qnet(data['observations'], data['actions'])
                         qf_loss = F.mse_loss(q1, next_q) + F.mse_loss(q2, next_q)
+                        # Counterfactual critic penalty
+                        if args.cf_buffer_enable and args.cf_q_weight > 0.0 and args.cf_sample_ratio > 0.0 and 'cf_size' in locals() and cf_size > 0:
+                            cf_b = max(1, int((args.batch_size // max(1, args.num_envs)) * args.cf_sample_ratio))
+                            s_cf, a_cf = cf_sample(cf_b)
+                            if s_cf is not None:
+                                q1_cf, q2_cf = qnet(s_cf, a_cf)
+                                y_bad = torch.full_like(q1_cf, float(args.cf_penalty))
+                                qf_loss = qf_loss + args.cf_q_weight * (F.mse_loss(q1_cf, y_bad) + F.mse_loss(q2_cf, y_bad))
 
                     q_optimizer.zero_grad(set_to_none=True)
                     scaler.scale(qf_loss).backward()
