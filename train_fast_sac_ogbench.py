@@ -348,6 +348,9 @@ def main():
 
         run_prefix = args.env_name.replace('-', '_')
 
+        # Learning warm-up threshold (also reused after any replay reset)
+        next_learning_starts_at = int(args.learning_starts)
+
         def save_checkpoint(tag: str, step_value: int):
             save_path = run_model_dir / f"{run_prefix}_{tag}.pt"
             save_params(
@@ -476,12 +479,16 @@ def main():
                     device=device,
                 )
                 did_reset_replay = True
+                # Reapply warm-up: postpone learning by the same number of steps as initially
+                next_learning_starts_at = total_env_steps + int(args.learning_starts)
+                record_progress(f"[Replay] Post-reset warm-up: learning resumes at env_step >= {next_learning_starts_at}")
 
             if next_save_step is not None and total_env_steps >= next_save_step:
                 save_checkpoint(f"step{total_env_steps}", total_env_steps)
                 next_save_step += args.save_interval
 
-            if total_env_steps > args.learning_starts:
+            # Only learn if we have enough data in replay (also after any reset)
+            if total_env_steps >= next_learning_starts_at and getattr(rb, 'ptr', 0) > 0:
                 batch_size = args.batch_size // max(1, args.num_envs)
                 for i in range(args.num_updates):
                     data = rb.sample(batch_size)
