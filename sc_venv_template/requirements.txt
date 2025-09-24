@@ -30,7 +30,7 @@ humanize==4.12.3
 idna==3.10
 imageio==2.37.0
 imageio-ffmpeg==0.6.0
-isaacsim[all,extscache]==5.0.0
+isaacsim[all,extscache]>=5.0.0
 importlib_resources==6.5.2
 jax==0.6.2
 jax-cuda12-pjrt==0.6.2
