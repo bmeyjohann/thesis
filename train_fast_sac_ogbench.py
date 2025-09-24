@@ -252,6 +252,55 @@ def main():
         device=device,
     )
 
+    # Initialize a simple counterfactual buffer (on-device ring buffer) if enabled
+    if args.cf_buffer_enable:
+        cf_capacity = int(max(1, args.cf_capacity))
+        cf_obs = torch.empty((cf_capacity, n_obs), dtype=torch.float32, device=device)
+        cf_act = torch.empty((cf_capacity, n_act), dtype=torch.float32, device=device)
+        cf_ptr = 0
+        cf_size = 0
+
+        def cf_append(s_batch: torch.Tensor, a_batch: torch.Tensor):
+            nonlocal cf_ptr, cf_size
+            if s_batch is None or a_batch is None:
+                return
+            b = int(s_batch.shape[0])
+            if b <= 0:
+                return
+            # If incoming is larger than capacity, keep only the last cf_capacity rows
+            if b > cf_capacity:
+                s_batch = s_batch[-cf_capacity:]
+                a_batch = a_batch[-cf_capacity:]
+                b = cf_capacity
+            end = cf_ptr + b
+            if end <= cf_capacity:
+                cf_obs[cf_ptr:end].copy_(s_batch)
+                cf_act[cf_ptr:end].copy_(a_batch)
+            else:
+                first = cf_capacity - cf_ptr
+                cf_obs[cf_ptr:].copy_(s_batch[:first])
+                cf_act[cf_ptr:].copy_(a_batch[:first])
+                remain = b - first
+                cf_obs[:remain].copy_(s_batch[first:])
+                cf_act[:remain].copy_(a_batch[first:])
+            cf_ptr = (cf_ptr + b) % cf_capacity
+            cf_size = min(cf_size + b, cf_capacity)
+
+        def cf_sample(b: int):
+            if cf_size <= 0:
+                return None, None
+            idx = torch.randint(low=0, high=cf_size, size=(int(b),), device=device)
+            s = cf_obs[idx]
+            a = cf_act[idx]
+            # Normalize states consistently with main replay samples
+            s = _normalize_obs(s)
+            return s, a
+    else:
+        cf_obs = None
+        cf_act = None
+        cf_ptr = 0
+        cf_size = 0
+
     amp_enabled = args.amp and (device.type=='cuda')
     amp_device_type = 'cuda' if device.type=='cuda' else 'cpu'
     amp_dtype = torch.bfloat16 if args.amp_dtype=='bf16' else torch.float16
@@ -314,6 +363,9 @@ def main():
             record_progress(f"[Checkpoint] saved {save_path}")
             
         print("[Init] Starting training loop", flush=True)
+
+        # Track if we have reset the main replay buffer at the curriculum switch
+        did_reset_replay = False
 
         while total_env_steps < args.total_timesteps:
             with torch.no_grad(), autocast(device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled):
@@ -378,15 +430,14 @@ def main():
             rb.extend(transition)
 
             # Append counterfactual rows to CF buffer (student-denied actions)
-            if args.cf_buffer_enable and teacher_mask is not None and student_actions is not None:
+            if args.cf_buffer_enable and teacher_mask is not None and student_actions is not None and cf_obs is not None:
                 denied_ids = torch.nonzero(teacher_mask, as_tuple=False).flatten()
                 if denied_ids.numel() > 0:
                     # Store (s, a_student)
                     cf_s = obs_detached[denied_ids]
                     cf_a = student_actions[denied_ids]
                     # Initialize CF tensors on first use
-                    if 'cf_obs' in locals() and cf_obs is not None:
-                        cf_append(cf_s, cf_a)
+                    cf_append(cf_s, cf_a)
             
             # We already folded denied penalties into rewards_eff; just expose count via logging
 
@@ -403,6 +454,28 @@ def main():
             # Learn
             iteration_idx += 1
             total_env_steps += envs.num_envs
+
+            # Optionally reset main replay buffer once at reward switch (curriculum)
+            if (
+                args.reset_replay_on_switch
+                and not did_reset_replay
+                and args.reward_switch_after_steps > 0
+                and total_env_steps >= args.reward_switch_after_steps
+            ):
+                record_progress(f"[Replay] Resetting main replay buffer at step {total_env_steps}")
+                rb = SimpleReplayBuffer(
+                    n_env=args.num_envs,
+                    buffer_size=args.buffer_size,
+                    n_obs=n_obs,
+                    n_act=n_act,
+                    n_critic_obs=n_obs,
+                    asymmetric_obs=False,
+                    playground_mode=False,
+                    n_steps=1,
+                    gamma=args.gamma,
+                    device=device,
+                )
+                did_reset_replay = True
 
             if next_save_step is not None and total_env_steps >= next_save_step:
                 save_checkpoint(f"step{total_env_steps}", total_env_steps)
