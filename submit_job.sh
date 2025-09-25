@@ -142,6 +142,37 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
         echo "export SLURM_ACCOUNT=\"$USER_ACCOUNT\"" > .slurm_account
         echo "💾 Saved account to .slurm_account for future use"
         
+        # Wait for job to finish, then sync W&B offline runs from this machine (login node)
+        if [[ -n "$JOB_ID" ]]; then
+            echo "⏳ Waiting for job $JOB_ID to finish before syncing W&B..."
+            # Poll until job disappears from the queue
+            while squeue -h -j "$JOB_ID" >/dev/null 2>&1; do
+                sleep 30
+            done
+            echo "✅ Job $JOB_ID finished. Attempting W&B sync of offline runs."
+
+            # Activate environment (only needed if wandb isn't on PATH)
+            if [[ -f sc_venv_template/activate.sh ]]; then
+                (
+                    set +e
+                    source sc_venv_template/activate.sh
+                    # Use python -m to avoid PATH issues with entry points
+                    if python -c 'import wandb; print("wandb-ok")' >/dev/null 2>&1; then
+                        echo "☁️  Syncing wandb offline runs..."
+                        # Mark synced to avoid re-upload loops on repeated calls
+                        WANDB_MODE=run WANDB_CONSOLE=off WANDB_SILENT=true \
+                          python -m wandb sync --mark-synced wandb/offline-run-* 2>/dev/null || true
+                        WANDB_MODE=run WANDB_CONSOLE=off WANDB_SILENT=true \
+                          python -m wandb sync --mark-synced wandb/offline*/* 2>/dev/null || true
+                        echo "☑️  W&B sync attempt complete."
+                    else
+                        echo "⚠️  wandb not available in environment; skipping sync."
+                    fi
+                )
+            else
+                echo "⚠️  sc_venv_template/activate.sh not found; skipping W&B sync."
+            fi
+        fi
     else
         echo "❌ Job submission failed!"
         echo "Error output:"

@@ -40,7 +40,7 @@ CUDA_VISIBLE_DEVICES=0 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
   --use_intervention --intervention_mode agent --teacher_type bfs \
   --tolerance_type angle --tolerance_value ${TOL_A} \
   --no_hard_block_lethal \
-  --intervention_reward_mode none --cf_penalty -1.0 \
+  --intervention_reward_mode none --cf_penalty 1.0 \
   --exp_name "teacher_always_tol${TOL_A}_cfm1_${SLURM_JOB_ID}" \
   2>&1 | tee logs/${ENV_ID}_sac_teacher_always_tol${TOL_A}_cfm1_${SLURM_JOB_ID}.log &
 PID1=$!
@@ -62,7 +62,7 @@ CUDA_VISIBLE_DEVICES=2 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
   --use_intervention --intervention_mode agent --teacher_type bfs \
   --tolerance_type angle --tolerance_value ${TOL_A} \
   --no_hard_block_lethal \
-  --intervention_reward_mode none --cf_penalty -1.0 --reset_replay_on_switch \
+  --intervention_reward_mode none --cf_penalty 1.0 --reset_replay_on_switch \
   --intervention_enable_after_steps ${ENABLE_AFTER_STEPS_PER_ENV} \
   --exp_name "curriculum_teacher_tol${TOL_A}_cfm1_reset_${SLURM_JOB_ID}" \
   2>&1 | tee logs/${ENV_ID}_sac_curriculum_teacher_tol${TOL_A}_cfm1_reset_${SLURM_JOB_ID}.log &
@@ -74,7 +74,7 @@ CUDA_VISIBLE_DEVICES=3 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
   --use_intervention --intervention_mode agent --teacher_type bfs \
   --tolerance_type angle --tolerance_value ${TOL_A} \
   --no_hard_block_lethal \
-  --intervention_reward_mode none --cf_penalty -1.0 \
+  --intervention_reward_mode none --cf_penalty 1.0 \
   --intervention_enable_after_steps ${ENABLE_AFTER_STEPS_PER_ENV} \
   --exp_name "curriculum_teacher_tol${TOL_A}_cfm1_${SLURM_JOB_ID}" \
   2>&1 | tee logs/${ENV_ID}_sac_curriculum_teacher_tol${TOL_A}_cfm1_${SLURM_JOB_ID}.log &
@@ -91,4 +91,3 @@ if [ $E1 -ne 0 ] || [ $E2 -ne 0 ] || [ $E3 -ne 0 ] || [ $E4 -ne 0 ]; then
 fi
 
 echo "Batch B (CF) completed."
-

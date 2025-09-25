@@ -110,8 +110,8 @@ def parse_args():
                    help='Capacity of CF buffer (rows)')
     p.add_argument('--cf_sample_ratio', type=float, default=0.5,
                    help='Fraction of batch for CF critic loss (0..1)')
-    p.add_argument('--cf_penalty', type=float, default=-1.0,
-                   help='Target value for Q(s,a_student) on interventions (terminal cost)')
+    p.add_argument('--cf_penalty', type=float, default=1.0,
+                   help='Positive penalty magnitude; critic target becomes -abs(value) for denied actions')
     p.add_argument('--cf_q_weight', type=float, default=1.0,
                    help='Weight for CF critic penalty loss')
     # Replay buffer reset on curriculum switch
@@ -153,6 +153,9 @@ def make_wrappers(args):
 def main():
     args = parse_args()
     device = torch.device('cuda' if (args.device=='auto' and torch.cuda.is_available()) or args.device=='cuda' else 'cpu')
+
+    cf_penalty_target = -abs(float(args.cf_penalty))
+    setattr(args, 'cf_penalty_target', cf_penalty_target)
 
     default_buffer_size = 1024 * 50
     if not args.exp_name:
@@ -510,7 +513,7 @@ def main():
                             s_cf, a_cf = cf_sample(cf_b)
                             if s_cf is not None:
                                 q1_cf, q2_cf = qnet(s_cf, a_cf)
-                                y_bad = torch.full_like(q1_cf, float(args.cf_penalty))
+                                y_bad = torch.full_like(q1_cf, cf_penalty_target)
                                 qf_loss = qf_loss + args.cf_q_weight * (F.mse_loss(q1_cf, y_bad) + F.mse_loss(q2_cf, y_bad))
 
                     q_optimizer.zero_grad(set_to_none=True)

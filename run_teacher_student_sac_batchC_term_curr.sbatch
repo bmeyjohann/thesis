@@ -20,15 +20,16 @@ source activate.sh
 cd ..
 
 ENV_ID=${ENV_ID:-pointmaze-arena-danger-lethal-v0}
-TOTAL_STEPS=${TOTAL_STEPS:-2000000}
+# Make second stage twice as long as stage 1: total = 3x stage1
+TOTAL_STEPS=${TOTAL_STEPS:-3000000}
 NUM_ENVS=${NUM_ENVS:-64}
 TOL_A=${TOL_A:-30}
-HALF_STEPS_GLOBAL=$((TOTAL_STEPS/2))
-ENABLE_AFTER_STEPS_PER_ENV=$((HALF_STEPS_GLOBAL/NUM_ENVS))
+SWITCH_STEPS_GLOBAL=$((TOTAL_STEPS/3))
+ENABLE_AFTER_STEPS_PER_ENV=$((SWITCH_STEPS_GLOBAL/NUM_ENVS))
 SAVE_INTERVAL=${SAVE_INTERVAL:-200000}
 LOG_INTERVAL=${LOG_INTERVAL:-20000}
 DENSE_REWARD_SCALE=${DENSE_REWARD_SCALE:-0.05}
-STEP_PENALTY=${STEP_PENALTY:-0.001}
+STEP_PENALTY=${STEP_PENALTY:-0.002}
 
 BASE_ARGS="--env_name ${ENV_ID} --num_envs ${NUM_ENVS} --total_timesteps ${TOTAL_STEPS} --include_goal \
 --save_interval ${SAVE_INTERVAL} --log_interval ${LOG_INTERVAL} --use_wandb \
@@ -38,7 +39,7 @@ echo "Launching 4 FastSAC curriculum TERMINAL-STUDENT experiments (Batch C) on $
 
 # 1) Curriculum, terminal-student penalty 1.0, reset replay on switch
 CUDA_VISIBLE_DEVICES=0 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
-  --reward_type dense --reward_switch_after_steps ${HALF_STEPS_GLOBAL} \
+  --reward_type dense --reward_switch_after_steps ${SWITCH_STEPS_GLOBAL} \
   --use_intervention --intervention_mode agent --teacher_type bfs \
   --tolerance_type angle --tolerance_value ${TOL_A} \
   --no_hard_block_lethal \
@@ -50,7 +51,7 @@ PID1=$!
 
 # 2) Curriculum, terminal-student penalty 1.0, no reset
 CUDA_VISIBLE_DEVICES=1 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
-  --reward_type dense --reward_switch_after_steps ${HALF_STEPS_GLOBAL} \
+  --reward_type dense --reward_switch_after_steps ${SWITCH_STEPS_GLOBAL} \
   --use_intervention --intervention_mode agent --teacher_type bfs \
   --tolerance_type angle --tolerance_value ${TOL_A} \
   --no_hard_block_lethal \
@@ -62,7 +63,7 @@ PID2=$!
 
 # 3) Curriculum, terminal-student penalty 0.0, reset replay on switch
 CUDA_VISIBLE_DEVICES=2 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
-  --reward_type dense --reward_switch_after_steps ${HALF_STEPS_GLOBAL} \
+  --reward_type dense --reward_switch_after_steps ${SWITCH_STEPS_GLOBAL} \
   --use_intervention --intervention_mode agent --teacher_type bfs \
   --tolerance_type angle --tolerance_value ${TOL_A} \
   --no_hard_block_lethal \
@@ -74,7 +75,7 @@ PID3=$!
 
 # 4) Curriculum, terminal-student penalty 0.0, no reset
 CUDA_VISIBLE_DEVICES=3 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
-  --reward_type dense --reward_switch_after_steps ${HALF_STEPS_GLOBAL} \
+  --reward_type dense --reward_switch_after_steps ${SWITCH_STEPS_GLOBAL} \
   --use_intervention --intervention_mode agent --teacher_type bfs \
   --tolerance_type angle --tolerance_value ${TOL_A} \
   --no_hard_block_lethal \
@@ -95,4 +96,3 @@ if [ $E1 -ne 0 ] || [ $E2 -ne 0 ] || [ $E3 -ne 0 ] || [ $E4 -ne 0 ]; then
 fi
 
 echo "Batch C (terminal-student curriculum variants) completed."
-
