@@ -43,7 +43,7 @@ CUDA_VISIBLE_DEVICES=0 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
   --use_intervention --intervention_mode agent --teacher_type bfs \
   --tolerance_type angle --tolerance_value ${TOL_A} \
   --no_hard_block_lethal \
-  --intervention_reward_mode penalty_student --intervention_reward_value 1.0 --reset_replay_on_switch \
+  --intervention_reward_mode penalty_student --intervention_reward_value 50.0 --reset_replay_on_switch \
   --intervention_enable_after_steps ${ENABLE_AFTER_STEPS_PER_ENV} \
   --exp_name "D_term1_reset_tol${TOL_A}_${SLURM_JOB_ID}" \
   2>&1 | tee logs/${ENV_ID}_sac_D_term1_reset_tol${TOL_A}_${SLURM_JOB_ID}.log &
@@ -55,7 +55,7 @@ CUDA_VISIBLE_DEVICES=1 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
   --use_intervention --intervention_mode agent --teacher_type bfs \
   --tolerance_type angle --tolerance_value ${TOL_A} \
   --no_hard_block_lethal \
-  --intervention_reward_mode penalty_student --intervention_reward_value 1.0 \
+  --intervention_reward_mode penalty_student --intervention_reward_value 50.0 \
   --intervention_enable_after_steps ${ENABLE_AFTER_STEPS_PER_ENV} \
   --exp_name "D_term1_nrst_tol${TOL_A}_${SLURM_JOB_ID}" \
   2>&1 | tee logs/${ENV_ID}_sac_D_term1_nrst_tol${TOL_A}_${SLURM_JOB_ID}.log &
@@ -67,7 +67,7 @@ CUDA_VISIBLE_DEVICES=2 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
   --use_intervention --intervention_mode agent --teacher_type bfs \
   --tolerance_type angle --tolerance_value ${TOL_A} \
   --no_hard_block_lethal \
-  --cf_buffer_enable --cf_sample_ratio 0.5 --cf_q_weight 1.0 --cf_penalty 1.0 \
+  --cf_buffer_enable --cf_sample_ratio 0.5 --cf_q_weight 1.0 --cf_penalty 50.0 \
   --intervention_reward_mode none --reset_replay_on_switch \
   --intervention_enable_after_steps ${ENABLE_AFTER_STEPS_PER_ENV} \
   --exp_name "D_cf_m1_reset_tol${TOL_A}_${SLURM_JOB_ID}" \
@@ -80,7 +80,7 @@ CUDA_VISIBLE_DEVICES=3 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
   --use_intervention --intervention_mode agent --teacher_type bfs \
   --tolerance_type angle --tolerance_value ${TOL_A} \
   --no_hard_block_lethal \
-  --cf_buffer_enable --cf_sample_ratio 0.5 --cf_q_weight 1.0 --cf_penalty 1.0 \
+  --cf_buffer_enable --cf_sample_ratio 0.5 --cf_q_weight 1.0 --cf_penalty 50.0 \
   --intervention_reward_mode none \
   --intervention_enable_after_steps ${ENABLE_AFTER_STEPS_PER_ENV} \
   --exp_name "D_cf_m1_nrst_tol${TOL_A}_${SLURM_JOB_ID}" \
