@@ -10,6 +10,7 @@ import sys
 import argparse
 import time
 import json
+import copy
 from datetime import datetime
 from pathlib import Path
 
@@ -117,6 +118,8 @@ def parse_args():
     # Replay buffer reset on curriculum switch
     p.add_argument('--reset_replay_on_switch', action='store_true', default=False,
                    help='Reset main replay buffer when reward_switch_after_steps is reached')
+    p.add_argument('--reset_critic_on_switch', action='store_true', default=False,
+                   help='Reload critic weights/optimiser to initial state at curriculum switch')
     return p.parse_args()
 
 
@@ -233,6 +236,9 @@ def main():
     qnet = Critic(n_obs=n_obs, n_act=n_act, hidden_dim=args.critic_hidden_dim, device=device)
     qnet_target = Critic(n_obs=n_obs, n_act=n_act, hidden_dim=args.critic_hidden_dim, device=device)
     qnet_target.load_state_dict(qnet.state_dict())
+
+    initial_qnet_state = copy.deepcopy(qnet.state_dict())
+    initial_qnet_target_state = copy.deepcopy(qnet_target.state_dict())
 
     q_optimizer = optim.AdamW(list(qnet.parameters()), lr=args.critic_learning_rate, weight_decay=0.1)
     actor_optimizer = optim.AdamW(list(actor.parameters()), lr=args.actor_learning_rate, weight_decay=0.1)
@@ -485,6 +491,12 @@ def main():
                 # Reapply warm-up: postpone learning by the same number of steps as initially
                 next_learning_starts_at = total_env_steps + int(args.learning_starts)
                 record_progress(f"[Replay] Post-reset warm-up: learning resumes at env_step >= {next_learning_starts_at}")
+
+                if args.reset_critic_on_switch:
+                    record_progress(f"[Critic] Resetting critic weights/optimizer at step {total_env_steps}")
+                    qnet.load_state_dict(initial_qnet_state)
+                    qnet_target.load_state_dict(initial_qnet_target_state)
+                    q_optimizer = optim.AdamW(list(qnet.parameters()), lr=args.critic_learning_rate, weight_decay=0.1)
 
             if next_save_step is not None and total_env_steps >= next_save_step:
                 save_checkpoint(f"step{total_env_steps}", total_env_steps)
