@@ -42,6 +42,15 @@ import ogbench
 from ogbench.wrappers import FlexibleObsWrapper, DetailedRewardWrapper, InterventionWrapper
 from fasttd3.fast_sac.environments.ogbench_env import OGBenchVecEnvAdapter
 
+TOOLS_PATH = Path(__file__).resolve().parent / "tools"
+if TOOLS_PATH.exists():
+    sys.path.append(str(TOOLS_PATH))
+
+try:
+    from visualize_policy_map import generate_policy_map  # type: ignore
+except Exception:  # pragma: no cover - optional dependency for viz
+    generate_policy_map = None
+
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -120,6 +129,17 @@ def parse_args():
                    help='Reset main replay buffer when reward_switch_after_steps is reached')
     p.add_argument('--reset_critic_on_switch', action='store_true', default=False,
                    help='Reload critic weights/optimiser to initial state at curriculum switch')
+    # Policy visualization
+    p.add_argument('--viz_on_checkpoint', action='store_true', default=False,
+                   help='Render policy/critic maps whenever a checkpoint is saved')
+    p.add_argument('--viz_grid_resolution', type=int, default=64,
+                   help='Grid resolution for policy maps if enabled')
+    p.add_argument('--viz_quiver_stride', type=int, default=1,
+                   help='Stride for quiver arrows in policy maps')
+    p.add_argument('--viz_device', type=str, default='cpu',
+                   help='Device to use when generating policy maps')
+    p.add_argument('--viz_seed', type=int, default=0,
+                   help='Seed used to sample/lock the visualization goal location')
     return p.parse_args()
 
 
@@ -188,6 +208,8 @@ def main():
     run_model_dir = models_root / args.exp_name
     run_log_dir.mkdir(parents=True, exist_ok=True)
     run_model_dir.mkdir(parents=True, exist_ok=True)
+    viz_output_dir = run_log_dir / 'policy_maps'
+    viz_cache_path = run_log_dir / 'policy_map_goal.json'
 
     print(f"FastSAC OGBench on {args.env_name} device={device}")
     print(f"Log directory: {run_log_dir}")
@@ -373,7 +395,32 @@ def main():
                 str(save_path),
             )
             record_progress(f"[Checkpoint] saved {save_path}")
-            
+            return save_path
+
+        def maybe_render_policy_map(tag: str, step_value: int, checkpoint_path: Path):
+            if not args.viz_on_checkpoint or generate_policy_map is None:
+                return
+            try:
+                png_path, meta_path, _ = generate_policy_map(
+                    model_path=checkpoint_path,
+                    output_dir=viz_output_dir,
+                    tag=tag,
+                    env_name=args.env_name,
+                    device=args.viz_device,
+                    grid_resolution=args.viz_grid_resolution,
+                    quiver_stride=args.viz_quiver_stride,
+                    seed=args.viz_seed,
+                    cache_path=viz_cache_path,
+                )
+                record_progress(f"[Viz] generated {png_path}")
+                if args.use_wandb and wandb_run is not None:
+                    import wandb
+                    wandb_run.log({
+                        f"viz/{tag}": wandb.Image(str(png_path)),
+                    }, step=step_value)
+            except Exception as exc:  # pragma: no cover - best effort logging
+                record_progress(f"[Viz] failed for {tag}: {exc}")
+
         print("[Init] Starting training loop", flush=True)
 
         # Track if we have reset the main replay buffer at the curriculum switch
@@ -499,7 +546,9 @@ def main():
                     q_optimizer = optim.AdamW(list(qnet.parameters()), lr=args.critic_learning_rate, weight_decay=0.1)
 
             if next_save_step is not None and total_env_steps >= next_save_step:
-                save_checkpoint(f"step{total_env_steps}", total_env_steps)
+                tag_name = f"step{total_env_steps}"
+                ckpt_path = save_checkpoint(tag_name, total_env_steps)
+                maybe_render_policy_map(tag_name, total_env_steps, ckpt_path)
                 next_save_step += args.save_interval
 
             # Only learn if we have enough data in replay (also after any reset)
@@ -623,7 +672,8 @@ def main():
 
             obs = next_obs
         # Save final
-        save_checkpoint('final', total_env_steps)
+        final_ckpt = save_checkpoint('final', total_env_steps)
+        maybe_render_policy_map('final', total_env_steps, final_ckpt)
         if wandb_run is not None:
             try:
                 wandb_run.finish()

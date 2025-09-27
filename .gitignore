@@ -26,6 +26,7 @@ checkpoints/
 saved_models/
 results/
 outputs/
+visualizations/
 
 # Wandb artifacts  
 wandb/
