@@ -416,7 +416,7 @@ def main():
                 if args.use_wandb and wandb_run is not None:
                     import wandb
                     wandb_run.log({
-                        f"viz/{tag}": wandb.Image(str(png_path)),
+                        "viz/policy_map": wandb.Image(str(png_path), caption=tag),
                     }, step=step_value)
             except Exception as exc:  # pragma: no cover - best effort logging
                 record_progress(f"[Viz] failed for {tag}: {exc}")
