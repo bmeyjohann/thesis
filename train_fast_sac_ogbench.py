@@ -102,6 +102,8 @@ def parse_args():
                    help='How to shape reward/actions on intervention')
     p.add_argument('--intervention_reward_value', type=float, default=0.0,
                    help='Magnitude for intervention reward shaping (e.g., 0.1)')
+    p.add_argument('--bonus_teacher_value', type=float, default=0.0,
+                   help='Additional reward added when teacher action is applied (can combine with penalty modes)')
     # Logging
     p.add_argument('--use_wandb', action='store_true', default=False)
     p.add_argument('--project', type=str, default='ogbench-rsl-rl')
@@ -468,6 +470,11 @@ def main():
                     elif mode == 'bonus_teacher' and val != 0.0:
                         rewards_eff = rewards_eff.clone()
                         rewards_eff[denied_ids] = rewards_eff[denied_ids] + abs(val)
+                    bonus_val = float(args.bonus_teacher_value)
+                    if bonus_val != 0.0:
+                        if rewards_eff is rewards:
+                            rewards_eff = rewards_eff.clone()
+                        rewards_eff[denied_ids] = rewards_eff[denied_ids] + bonus_val
             
             # Build transition
             obs_detached = obs.detach()
