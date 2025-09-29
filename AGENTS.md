@@ -11,6 +11,7 @@
 
 ## Build, Test, and Development Commands
 - Env: `source sc_venv_template/activate.sh` (sets modules, venv, `PYTHONPATH`).
+- Local fallback env: `conda activate fasttd3` (preferred on developer machines).
 - Local run: `python train_rsl_rl_integrated.py --env_name pointmaze-medium-v0`.
 - Evaluate: `python eval_interactive.py --model_path models/<file>.pt --env_name pointmaze-medium-v0`.
 - SLURM: `bash submit_job.sh run_experiment.sbatch` (auto-detects `--account`).
