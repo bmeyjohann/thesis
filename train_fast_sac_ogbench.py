@@ -130,6 +130,30 @@ def parse_args():
                    help='Positive penalty magnitude; critic target becomes -abs(value) for denied actions')
     p.add_argument('--cf_q_weight', type=float, default=1.0,
                    help='Weight for CF critic penalty loss')
+    # Preference buffer (pairwise ranking on intervened rows: teacher vs student)
+    p.add_argument('--pref_buffer_enable', action='store_true', default=False,
+                   help='Enable preference buffer storing pairs (s, a_teacher, a_student) and ranking loss')
+    p.add_argument('--pref_capacity', type=int, default=100000,
+                   help='Capacity of preference buffer (pairs)')
+    p.add_argument('--pref_sample_ratio', type=float, default=0.5,
+                   help='Fraction of update batch for preference pairs (0..1)')
+    p.add_argument('--pref_rank_weight', type=float, default=1.0,
+                   help='Weight for the pairwise ranking loss added to critic loss')
+    p.add_argument('--pref_rank_margin', type=float, default=0.1,
+                   help='Margin for ranking loss: softplus(margin - (Qpos - Qneg))')
+    # Preference-TD buffer (balanced TD samples: teacher real transition; student synthetic terminal negative)
+    p.add_argument('--pref_td_buffer_enable', action='store_true', default=False,
+                   help='Enable preference-TD buffer that keeps balanced teacher/student TD transitions')
+    p.add_argument('--pref_td_capacity', type=int, default=100000,
+                   help='Capacity per-role (teacher/student) for preference-TD buffer')
+    p.add_argument('--pref_td_sample_ratio', type=float, default=0.5,
+                   help='Fraction of update batch to draw from preference-TD buffer (split 50/50 teacher/student)')
+    p.add_argument('--pref_td_q_weight', type=float, default=1.0,
+                   help='Weight for additional critic TD loss from preference-TD samples')
+    p.add_argument('--pref_td_penalty_value', type=float, default=0.1,
+                   help='Negative reward assigned to synthetic student terminal in preference-TD buffer')
+    p.add_argument('--pref_td_teacher_bonus_value', type=float, default=0.0,
+                   help='Optional extra reward added to teacher transitions in preference-TD buffer')
     # Replay buffer reset on curriculum switch
     p.add_argument('--reset_replay_on_switch', action='store_true', default=False,
                    help='Reset main replay buffer when reward_switch_after_steps is reached')
@@ -340,6 +364,165 @@ def main():
         cf_ptr = 0
         cf_size = 0
 
+    # Initialize preference pair buffer if enabled: stores (s, a_teacher, a_student)
+    if args.pref_buffer_enable:
+        pref_capacity = int(max(1, args.pref_capacity))
+        pref_s = torch.empty((pref_capacity, n_obs), dtype=torch.float32, device=device)
+        pref_a_pos = torch.empty((pref_capacity, n_act), dtype=torch.float32, device=device)
+        pref_a_neg = torch.empty((pref_capacity, n_act), dtype=torch.float32, device=device)
+        pref_ptr = 0
+        pref_size = 0
+
+        def pref_append(s_batch: torch.Tensor, a_pos: torch.Tensor, a_neg: torch.Tensor):
+            nonlocal pref_ptr, pref_size
+            if s_batch is None or a_pos is None or a_neg is None:
+                return
+            b = int(s_batch.shape[0])
+            if b <= 0:
+                return
+            if b > pref_capacity:
+                s_batch = s_batch[-pref_capacity:]
+                a_pos = a_pos[-pref_capacity:]
+                a_neg = a_neg[-pref_capacity:]
+                b = pref_capacity
+            end = pref_ptr + b
+            if end <= pref_capacity:
+                pref_s[pref_ptr:end].copy_(s_batch)
+                pref_a_pos[pref_ptr:end].copy_(a_pos)
+                pref_a_neg[pref_ptr:end].copy_(a_neg)
+            else:
+                first = pref_capacity - pref_ptr
+                pref_s[pref_ptr:].copy_(s_batch[:first])
+                pref_a_pos[pref_ptr:].copy_(a_pos[:first])
+                pref_a_neg[pref_ptr:].copy_(a_neg[:first])
+                remain = b - first
+                pref_s[:remain].copy_(s_batch[first:])
+                pref_a_pos[:remain].copy_(a_pos[first:])
+                pref_a_neg[:remain].copy_(a_neg[first:])
+            pref_ptr = (pref_ptr + b) % pref_capacity
+            pref_size = min(pref_size + b, pref_capacity)
+
+        def pref_sample(b: int):
+            if pref_size <= 0:
+                return None, None, None
+            idx = torch.randint(low=0, high=pref_size, size=(int(b),), device=device)
+            s = pref_s[idx]
+            a_pos = pref_a_pos[idx]
+            a_neg = pref_a_neg[idx]
+            s = _normalize_obs(s)
+            return s, a_pos, a_neg
+    else:
+        pref_s = pref_a_pos = pref_a_neg = None
+        pref_ptr = 0
+        pref_size = 0
+
+    # Initialize preference-TD buffer if enabled: balanced teacher/student TD samples
+    if args.pref_td_buffer_enable:
+        td_cap = int(max(1, args.pref_td_capacity))
+        # Teacher ring buffers
+        t_s = torch.empty((td_cap, n_obs), dtype=torch.float32, device=device)
+        t_a = torch.empty((td_cap, n_act), dtype=torch.float32, device=device)
+        t_r = torch.empty((td_cap, 1), dtype=torch.float32, device=device)
+        t_next_s = torch.empty((td_cap, n_obs), dtype=torch.float32, device=device)
+        t_done = torch.empty((td_cap, 1), dtype=torch.float32, device=device)
+        t_ptr = 0
+        t_size = 0
+        # Student ring buffers (terminal negatives)
+        s_s = torch.empty((td_cap, n_obs), dtype=torch.float32, device=device)
+        s_a = torch.empty((td_cap, n_act), dtype=torch.float32, device=device)
+        s_r = torch.empty((td_cap, 1), dtype=torch.float32, device=device)
+        s_ptr = 0
+        s_size = 0
+
+        def pref_td_append_teacher(s_batch, a_batch, r_batch, next_s_batch, done_batch):
+            nonlocal t_ptr, t_size
+            if s_batch is None or a_batch is None:
+                return
+            b = int(s_batch.shape[0])
+            if b <= 0:
+                return
+            if b > td_cap:
+                s_batch = s_batch[-td_cap:]
+                a_batch = a_batch[-td_cap:]
+                r_batch = r_batch[-td_cap:]
+                next_s_batch = next_s_batch[-td_cap:]
+                done_batch = done_batch[-td_cap:]
+                b = td_cap
+            end = t_ptr + b
+            if end <= td_cap:
+                t_s[t_ptr:end].copy_(s_batch)
+                t_a[t_ptr:end].copy_(a_batch)
+                t_r[t_ptr:end].copy_(r_batch.view(-1, 1))
+                t_next_s[t_ptr:end].copy_(next_s_batch)
+                t_done[t_ptr:end].copy_(done_batch.view(-1, 1))
+            else:
+                first = td_cap - t_ptr
+                t_s[t_ptr:].copy_(s_batch[:first])
+                t_a[t_ptr:].copy_(a_batch[:first])
+                t_r[t_ptr:].copy_(r_batch[:first].view(-1, 1))
+                t_next_s[t_ptr:].copy_(next_s_batch[:first])
+                t_done[t_ptr:].copy_(done_batch[:first].view(-1, 1))
+                remain = b - first
+                t_s[:remain].copy_(s_batch[first:])
+                t_a[:remain].copy_(a_batch[first:])
+                t_r[:remain].copy_(r_batch[first:].view(-1, 1))
+                t_next_s[:remain].copy_(next_s_batch[first:])
+                t_done[:remain].copy_(done_batch[first:].view(-1, 1))
+            t_ptr = (t_ptr + b) % td_cap
+            t_size = min(t_size + b, td_cap)
+
+        def pref_td_append_student(s_batch, a_batch, r_batch):
+            nonlocal s_ptr, s_size
+            if s_batch is None or a_batch is None:
+                return
+            b = int(s_batch.shape[0])
+            if b <= 0:
+                return
+            if b > td_cap:
+                s_batch = s_batch[-td_cap:]
+                a_batch = a_batch[-td_cap:]
+                r_batch = r_batch[-td_cap:]
+                b = td_cap
+            end = s_ptr + b
+            if end <= td_cap:
+                s_s[s_ptr:end].copy_(s_batch)
+                s_a[s_ptr:end].copy_(a_batch)
+                s_r[s_ptr:end].copy_(r_batch.view(-1, 1))
+            else:
+                first = td_cap - s_ptr
+                s_s[s_ptr:].copy_(s_batch[:first])
+                s_a[s_ptr:].copy_(a_batch[:first])
+                s_r[s_ptr:].copy_(r_batch[:first].view(-1, 1))
+                remain = b - first
+                s_s[:remain].copy_(s_batch[first:])
+                s_a[:remain].copy_(a_batch[first:])
+                s_r[:remain].copy_(r_batch[first:].view(-1, 1))
+            s_ptr = (s_ptr + b) % td_cap
+            s_size = min(s_size + b, td_cap)
+
+        def pref_td_sample(b: int):
+            b_teacher = max(1, int(b // 2))
+            b_student = max(1, b - b_teacher)
+            if t_size <= 0 or s_size <= 0:
+                return None
+            idx_t = torch.randint(low=0, high=t_size, size=(b_teacher,), device=device)
+            idx_s = torch.randint(low=0, high=s_size, size=(b_student,), device=device)
+            batch = {
+                't_s': _normalize_obs(t_s[idx_t]),
+                't_a': t_a[idx_t],
+                't_r': t_r[idx_t],
+                't_next_s': _normalize_obs(t_next_s[idx_t]),
+                't_done': t_done[idx_t],
+                's_s': _normalize_obs(s_s[idx_s]),
+                's_a': s_a[idx_s],
+                's_r': s_r[idx_s],
+            }
+            return batch
+    else:
+        t_s = t_a = t_r = t_next_s = t_done = None
+        s_s = s_a = s_r = None
+        t_ptr = t_size = s_ptr = s_size = 0
+
     amp_enabled = args.amp and (device.type=='cuda')
     amp_device_type = 'cuda' if device.type=='cuda' else 'cpu'
     amp_dtype = torch.bfloat16 if args.amp_dtype=='bf16' else torch.float16
@@ -442,6 +625,9 @@ def main():
                 actions, _, _ = policy_fn(norm_obs)
                 
             next_obs, rewards, dones, infos = envs.step(actions.float())
+            # Detach copies for any auxiliary buffers before we mutate below
+            obs_detached_now = obs.detach()
+            next_obs_detached_now = next_obs.detach()
             truncations = infos.get('time_outs', torch.zeros_like(dones, device=device))
             applied_actions = infos.get('applied_actions', actions)
             student_actions = infos.get('student_actions')
@@ -483,10 +669,36 @@ def main():
                         if rewards_eff is rewards:
                             rewards_eff = rewards_eff.clone()
                         rewards_eff[denied_ids] = rewards_eff[denied_ids] + bonus_val
+
+                    # Append to preference pair buffer (s, a_teacher, a_student)
+                    if args.pref_buffer_enable and student_actions is not None and 'teacher_actions' in infos:
+                        try:
+                            a_teacher_all = infos['teacher_actions']
+                            s_batch = obs_detached_now[denied_ids]
+                            pref_append(s_batch, a_teacher_all[denied_ids], student_actions[denied_ids])
+                        except Exception:
+                            pass
+
+                    # Append to preference-TD buffer (balanced TD samples)
+                    if args.pref_td_buffer_enable and student_actions is not None and 'teacher_actions' in infos:
+                        try:
+                            a_teacher_all = infos['teacher_actions']
+                            s_now = obs_detached_now[denied_ids]
+                            s_next = next_obs_detached_now[denied_ids]
+                            r_teacher = rewards[denied_ids].clone().view(-1, 1)
+                            if float(args.pref_td_teacher_bonus_value) != 0.0:
+                                r_teacher = r_teacher + float(args.pref_td_teacher_bonus_value)
+                            d_teacher = dones[denied_ids].clone().view(-1, 1).float()
+                            pref_td_append_teacher(s_now, a_teacher_all[denied_ids], r_teacher.squeeze(1), s_next, d_teacher.squeeze(1))
+                            # Student synthetic terminal negatives
+                            r_student = -abs(float(args.pref_td_penalty_value)) * torch.ones((denied_ids.numel(), 1), device=device, dtype=torch.float32)
+                            pref_td_append_student(s_now, student_actions[denied_ids], r_student.squeeze(1))
+                        except Exception:
+                            pass
             
             # Build transition
-            obs_detached = obs.detach()
-            next_obs_detached = next_obs.detach()
+            obs_detached = obs_detached_now
+            next_obs_detached = next_obs_detached_now
             transition = TensorDict(
                 {
                     'observations': obs_detached,
@@ -600,9 +812,14 @@ def main():
 
             # Only learn if we have enough data in replay (also after any reset)
             if total_env_steps >= next_learning_starts_at and getattr(rb, 'ptr', 0) > 0:
-                batch_size = args.batch_size // max(1, args.num_envs)
+                base_batch = args.batch_size // max(1, args.num_envs)
+                # Compute sub-batch allocations for auxiliary buffers
+                b_pref = int(base_batch * args.pref_sample_ratio) if args.pref_buffer_enable else 0
+                b_pref_td = int(base_batch * args.pref_td_sample_ratio) if args.pref_td_buffer_enable else 0
+                main_batch = max(1, base_batch - b_pref - b_pref_td)
+
                 for i in range(args.num_updates):
-                    data = rb.sample(batch_size)
+                    data = rb.sample(main_batch)
                     # Normalize obs
                     data['observations'] = _normalize_obs(data['observations'])
                     data['next']['observations'] = _normalize_obs(data['next']['observations'])
@@ -617,12 +834,39 @@ def main():
                         qf_loss = F.mse_loss(q1, next_q) + F.mse_loss(q2, next_q)
                         # Counterfactual critic penalty
                         if args.cf_buffer_enable and args.cf_q_weight > 0.0 and args.cf_sample_ratio > 0.0 and 'cf_size' in locals() and cf_size > 0:
-                            cf_b = max(1, int((args.batch_size // max(1, args.num_envs)) * args.cf_sample_ratio))
+                            cf_b = max(1, int(base_batch * args.cf_sample_ratio))
                             s_cf, a_cf = cf_sample(cf_b)
                             if s_cf is not None:
                                 q1_cf, q2_cf = qnet(s_cf, a_cf)
                                 y_bad = torch.full_like(q1_cf, cf_penalty_target)
                                 qf_loss = qf_loss + args.cf_q_weight * (F.mse_loss(q1_cf, y_bad) + F.mse_loss(q2_cf, y_bad))
+                        # Preference ranking loss (teacher > student at s)
+                        if args.pref_buffer_enable and args.pref_rank_weight > 0.0 and b_pref > 0 and 'pref_size' in locals() and pref_size > 0:
+                            s_pair, a_pos, a_neg = pref_sample(b_pref)
+                            if s_pair is not None:
+                                q1p, q2p = qnet(s_pair, a_pos)
+                                q1n, q2n = qnet(s_pair, a_neg)
+                                qpos = torch.min(q1p, q2p)
+                                qneg = torch.min(q1n, q2n)
+                                margin = float(args.pref_rank_margin)
+                                rank_loss = torch.nn.functional.softplus(margin - (qpos - qneg)).mean()
+                                qf_loss = qf_loss + float(args.pref_rank_weight) * rank_loss
+                        # Preference-TD balanced critic loss
+                        if args.pref_td_buffer_enable and args.pref_td_q_weight > 0.0 and b_pref_td > 0 and 't_size' in locals() and t_size > 0 and s_size > 0:
+                            batch = pref_td_sample(b_pref_td)
+                            if batch is not None:
+                                # Teacher real TD targets
+                                npi_t, nlogpi_t, _ = actor(batch['t_next_s'])
+                                q1_targ, q2_targ = qnet_target(batch['t_next_s'], npi_t)
+                                min_q_tp = torch.min(q1_targ, q2_targ) - log_alpha.exp() * nlogpi_t
+                                y_teacher = batch['t_r'] + (1.0 - batch['t_done']) * (args.gamma * min_q_tp)
+                                q1_teach, q2_teach = qnet(batch['t_s'], batch['t_a'])
+                                loss_teach = F.mse_loss(q1_teach, y_teacher) + F.mse_loss(q2_teach, y_teacher)
+                                # Student terminal negatives
+                                y_student = batch['s_r']  # terminal
+                                q1_stu, q2_stu = qnet(batch['s_s'], batch['s_a'])
+                                loss_stu = F.mse_loss(q1_stu, y_student) + F.mse_loss(q2_stu, y_student)
+                                qf_loss = qf_loss + float(args.pref_td_q_weight) * (loss_teach + loss_stu)
 
                     q_optimizer.zero_grad(set_to_none=True)
                     scaler.scale(qf_loss).backward()
@@ -686,6 +930,11 @@ def main():
                             pass
                 if args.store_denied_actions:
                     logs['/Teacher/denied_transition_samples'] = float(last_denied_samples)
+                if args.pref_buffer_enable:
+                    logs['/Buffers/pref_pairs'] = float(pref_size)
+                if args.pref_td_buffer_enable:
+                    logs['/Buffers/pref_td_teacher'] = float(t_size)
+                    logs['/Buffers/pref_td_student'] = float(s_size)
 
                 log_line_parts = [
                     f"env_steps {total_env_steps}/{args.total_timesteps}",
