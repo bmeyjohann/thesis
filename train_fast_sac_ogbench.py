@@ -69,6 +69,10 @@ def parse_args():
     p.add_argument('--dense_reward_scale', type=float, default=0.01)
     p.add_argument('--step_penalty', type=float, default=0.0)
     p.add_argument('--reward_switch_after_steps', type=int, default=0)
+    p.add_argument('--switch_env_name', type=str, default=None,
+                   help='Optional OGBench env id to switch to after a curriculum step')
+    p.add_argument('--switch_env_after_steps', type=int, default=0,
+                   help='Global env steps after which to switch to switch_env_name (0 disables)')
     # Intervention / Teacher
     p.add_argument('--use_intervention', action='store_true', default=False)
     p.add_argument('--intervention_mode', type=str, default='agent', choices=['human','agent'])
@@ -233,12 +237,14 @@ def main():
     print(f"Saved run config: {config_path}")
 
     wrappers = make_wrappers(args)
+    current_wrappers = wrappers
+    current_env_name = args.env_name
     record_progress("[Init] constructing vector env adapter")
     envs = OGBenchVecEnvAdapter(
-        env_name=args.env_name,
+        env_name=current_env_name,
         num_envs=args.num_envs,
         device=device,
-        wrappers=wrappers,
+        wrappers=current_wrappers,
         clip_actions=1.0,
     )
     record_progress("[Init] env adapter constructed")
@@ -379,7 +385,7 @@ def main():
         next_log_step = args.log_interval if args.log_interval > 0 else None
         next_save_step = args.save_interval if args.save_interval > 0 else None
 
-        run_prefix = args.env_name.replace('-', '_')
+        run_prefix = current_env_name.replace('-', '_')
 
         # Learning warm-up threshold (also reused after any replay reset)
         next_learning_starts_at = int(args.learning_starts)
@@ -407,7 +413,7 @@ def main():
                     model_path=checkpoint_path,
                     output_dir=viz_output_dir,
                     tag=tag,
-                    env_name=args.env_name,
+                    env_name=current_env_name,
                     device=args.viz_device,
                     grid_resolution=args.viz_grid_resolution,
                     quiver_stride=args.viz_quiver_stride,
@@ -427,6 +433,8 @@ def main():
 
         # Track if we have reset the main replay buffer at the curriculum switch
         did_reset_replay = False
+        did_switch_env = False
+        env_switch_global_step = int(max(0, args.switch_env_after_steps))
 
         while total_env_steps < args.total_timesteps:
             with torch.no_grad(), autocast(device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled):
@@ -520,6 +528,38 @@ def main():
             # Learn
             iteration_idx += 1
             total_env_steps += envs.num_envs
+
+            if (
+                not did_switch_env
+                and args.switch_env_name
+                and args.switch_env_name != current_env_name
+                and env_switch_global_step > 0
+                and total_env_steps >= env_switch_global_step
+            ):
+                per_env_progress = total_env_steps // envs.num_envs
+                record_progress(
+                    f"[Env] Switching from {current_env_name} to {args.switch_env_name} at total_steps={total_env_steps}"
+                )
+                try:
+                    obs = envs.switch_env(
+                        args.switch_env_name,
+                        wrappers=current_wrappers,
+                        curriculum_steps=per_env_progress,
+                    )
+                except Exception as exc:
+                    record_progress(f"[Env] switch failed: {exc}")
+                    raise
+                current_env_name = args.switch_env_name
+                run_prefix = current_env_name.replace('-', '_')
+                cur_reward_sum.zero_()
+                cur_episode_length.zero_()
+                did_switch_env = True
+                if args.use_wandb and wandb_run is not None:
+                    import wandb
+                    wandb_run.log({
+                        "env/switch_event": 1,
+                        "env/current_env": current_env_name,
+                    }, step=total_env_steps)
 
             # Optionally reset main replay buffer once at reward switch (curriculum)
             if (
