@@ -9,6 +9,7 @@ import os
 import sys
 import argparse
 import time
+import math
 import json
 import copy
 from datetime import datetime
@@ -115,6 +116,8 @@ def parse_args():
     p.add_argument('--save_interval', type=int, default=200000,
                    help='Env-step interval for checkpoint saves (0 disables)')
     p.add_argument('--log_interval', type=int, default=200)
+    p.add_argument('--post_switch_viz_multiplier', type=int, default=1,
+                   help='Reduce checkpoint/viz interval by this factor after curriculum/env switch (>=1)')
     # Misc
     p.add_argument('--compile', action='store_true', default=False)
     p.add_argument('--amp', action='store_true', default=True)
@@ -566,7 +569,8 @@ def main():
         lenbuffer = []
         last_denied_samples = 0
         next_log_step = args.log_interval if args.log_interval > 0 else None
-        next_save_step = args.save_interval if args.save_interval > 0 else None
+        save_interval_current = args.save_interval if args.save_interval > 0 else None
+        next_save_step = save_interval_current if save_interval_current else None
 
         run_prefix = current_env_name.replace('-', '_')
 
@@ -618,6 +622,18 @@ def main():
         did_reset_replay = False
         did_switch_env = False
         env_switch_global_step = int(max(0, args.switch_env_after_steps))
+
+        # Disagreement tracking
+        teacher_disagreement_sum = 0.0
+        non_teacher_disagreement_sum = 0.0
+        teacher_disagreement_steps = 0.0
+        non_teacher_disagreement_steps = 0.0
+        corr_total_steps = 0.0
+        corr_sum_mask = 0.0
+        corr_sum_dis = 0.0
+        corr_sum_mask_sq = 0.0
+        corr_sum_dis_sq = 0.0
+        corr_sum_mask_dis = 0.0
 
         while total_env_steps < args.total_timesteps:
             with torch.no_grad(), autocast(device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled):
@@ -715,6 +731,30 @@ def main():
             )
             rb.extend(transition)
 
+            # Critic disagreement logging data (evaluate on executed action)
+            if args.pref_buffer_enable or args.pref_td_buffer_enable or args.cf_buffer_enable or True:
+                with torch.no_grad(), autocast(device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled):
+                    norm_obs_now = _normalize_obs(obs)
+                    q1_step, q2_step = qnet(norm_obs_now, used_actions)
+                disagreement_step = torch.abs(q1_step - q2_step).squeeze(-1)
+                if teacher_mask is not None:
+                    teacher_mask_float = teacher_mask.float()
+                else:
+                    teacher_mask_float = torch.zeros_like(disagreement_step, device=device)
+                non_teacher_mask_float = 1.0 - teacher_mask_float
+
+                teacher_disagreement_sum += float((disagreement_step * teacher_mask_float).sum().item())
+                non_teacher_disagreement_sum += float((disagreement_step * non_teacher_mask_float).sum().item())
+                teacher_disagreement_steps += float(teacher_mask_float.sum().item())
+                non_teacher_disagreement_steps += float(non_teacher_mask_float.sum().item())
+
+                corr_total_steps += float(disagreement_step.numel())
+                corr_sum_mask += float(teacher_mask_float.sum().item())
+                corr_sum_dis += float(disagreement_step.sum().item())
+                corr_sum_mask_sq += float(teacher_mask_float.sum().item())  # since mask^2 = mask
+                corr_sum_dis_sq += float((disagreement_step ** 2).sum().item())
+                corr_sum_mask_dis += float((teacher_mask_float * disagreement_step).sum().item())
+
             # Append counterfactual rows to CF buffer (student-denied actions)
             if args.cf_buffer_enable and teacher_mask is not None and student_actions is not None and cf_obs is not None:
                 denied_ids = torch.nonzero(teacher_mask, as_tuple=False).flatten()
@@ -772,6 +812,10 @@ def main():
                         "env/switch_event": 1,
                         "env/current_env": current_env_name,
                     }, step=total_env_steps)
+                # tighten checkpoint/viz interval after switch
+                if save_interval_current is not None and args.post_switch_viz_multiplier > 1:
+                    save_interval_current = max(1, args.save_interval // args.post_switch_viz_multiplier)
+                    next_save_step = total_env_steps + save_interval_current
 
             # Optionally reset main replay buffer once at reward switch (curriculum)
             if (
@@ -803,12 +847,15 @@ def main():
                     qnet.load_state_dict(initial_qnet_state)
                     qnet_target.load_state_dict(initial_qnet_target_state)
                     q_optimizer = optim.AdamW(list(qnet.parameters()), lr=args.critic_learning_rate, weight_decay=0.1)
+                if save_interval_current is not None and args.post_switch_viz_multiplier > 1:
+                    save_interval_current = max(1, args.save_interval // args.post_switch_viz_multiplier)
+                    next_save_step = total_env_steps + save_interval_current
 
             if next_save_step is not None and total_env_steps >= next_save_step:
                 tag_name = f"step{total_env_steps}"
                 ckpt_path = save_checkpoint(tag_name, total_env_steps)
                 maybe_render_policy_map(tag_name, total_env_steps, ckpt_path)
-                next_save_step += args.save_interval
+                next_save_step += save_interval_current
 
             # Only learn if we have enough data in replay (also after any reset)
             if total_env_steps >= next_learning_starts_at and getattr(rb, 'ptr', 0) > 0:
@@ -930,12 +977,22 @@ def main():
                             pass
                 if args.store_denied_actions:
                     logs['/Teacher/denied_transition_samples'] = float(last_denied_samples)
+                if teacher_disagreement_steps > 0:
+                    logs['/Teacher/avg_disagreement_teacher'] = float(teacher_disagreement_sum / max(1e-8, teacher_disagreement_steps))
+                if non_teacher_disagreement_steps > 0:
+                    logs['/Teacher/avg_disagreement_no_teacher'] = float(non_teacher_disagreement_sum / max(1e-8, non_teacher_disagreement_steps))
                 if args.pref_buffer_enable:
                     logs['/Buffers/pref_pairs'] = float(pref_size)
                 if args.pref_td_buffer_enable:
                     logs['/Buffers/pref_td_teacher'] = float(t_size)
                     logs['/Buffers/pref_td_student'] = float(s_size)
-
+                if corr_total_steps > 0:
+                    numer = corr_total_steps * corr_sum_mask_dis - corr_sum_mask * corr_sum_dis
+                    denom_part_x = corr_total_steps * corr_sum_mask_sq - (corr_sum_mask ** 2)
+                    denom_part_y = corr_total_steps * corr_sum_dis_sq - (corr_sum_dis ** 2)
+                    if denom_part_x > 1e-8 and denom_part_y > 1e-8:
+                        corr_value = numer / math.sqrt(denom_part_x * denom_part_y)
+                        logs['/Teacher/disagreement_corr'] = float(corr_value)
                 log_line_parts = [
                     f"env_steps {total_env_steps}/{args.total_timesteps}",
                     f"iter {iteration_idx}",
