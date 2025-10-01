@@ -118,6 +118,8 @@ def parse_args():
     p.add_argument('--log_interval', type=int, default=200)
     p.add_argument('--post_switch_viz_multiplier', type=int, default=1,
                    help='Reduce checkpoint/viz interval by this factor after curriculum/env switch (>=1)')
+    p.add_argument('--disagreement_hist_edges', type=str, default='0.05,0.1,0.2,0.3,0.5,0.75,1.0,1.5,2.0',
+                   help='Comma-separated positive edges for disagreement hist bins (teacher/non-teacher). Empty to disable histogram logging.')
     # Misc
     p.add_argument('--compile', action='store_true', default=False)
     p.add_argument('--amp', action='store_true', default=True)
@@ -624,6 +626,36 @@ def main():
         env_switch_global_step = int(max(0, args.switch_env_after_steps))
 
         # Disagreement tracking
+        if args.disagreement_hist_edges:
+            try:
+                parsed_edges = [float(edge.strip()) for edge in args.disagreement_hist_edges.split(',') if edge.strip()]
+                parsed_edges = sorted([edge for edge in parsed_edges if edge > 0.0])
+            except Exception:
+                parsed_edges = []
+            if parsed_edges:
+                hist_edges_tensor = torch.tensor(parsed_edges, dtype=torch.float32, device=device)
+                num_hist_bins = hist_edges_tensor.numel() + 1
+                hist_labels = []
+                for idx in range(num_hist_bins):
+                    if idx == 0:
+                        hist_labels.append(f"<= {parsed_edges[0]:.2f}")
+                    elif idx == num_hist_bins - 1:
+                        hist_labels.append(f">= {parsed_edges[-1]:.2f}")
+                    else:
+                        hist_labels.append(f"({parsed_edges[idx-1]:.2f}, {parsed_edges[idx]:.2f}]")
+                teacher_hist_counts = torch.zeros(num_hist_bins, device=device)
+                non_teacher_hist_counts = torch.zeros(num_hist_bins, device=device)
+            else:
+                hist_edges_tensor = None
+                hist_labels = []
+                teacher_hist_counts = None
+                non_teacher_hist_counts = None
+        else:
+            hist_edges_tensor = None
+            hist_labels = []
+            teacher_hist_counts = None
+            non_teacher_hist_counts = None
+
         teacher_disagreement_sum = 0.0
         non_teacher_disagreement_sum = 0.0
         teacher_disagreement_steps = 0.0
@@ -754,6 +786,11 @@ def main():
                 corr_sum_mask_sq += float(teacher_mask_float.sum().item())  # since mask^2 = mask
                 corr_sum_dis_sq += float((disagreement_step ** 2).sum().item())
                 corr_sum_mask_dis += float((teacher_mask_float * disagreement_step).sum().item())
+
+                if hist_edges_tensor is not None:
+                    bin_idx = torch.bucketize(disagreement_step, hist_edges_tensor)
+                    teacher_hist_counts.scatter_add_(0, bin_idx, teacher_mask_float)
+                    non_teacher_hist_counts.scatter_add_(0, bin_idx, non_teacher_mask_float)
 
             # Append counterfactual rows to CF buffer (student-denied actions)
             if args.cf_buffer_enable and teacher_mask is not None and student_actions is not None and cf_obs is not None:
@@ -993,6 +1030,15 @@ def main():
                     if denom_part_x > 1e-8 and denom_part_y > 1e-8:
                         corr_value = numer / math.sqrt(denom_part_x * denom_part_y)
                         logs['/Teacher/disagreement_corr'] = float(corr_value)
+                if hist_edges_tensor is not None:
+                    teacher_hist_cpu = teacher_hist_counts.detach().cpu()
+                    non_teacher_hist_cpu = non_teacher_hist_counts.detach().cpu()
+                    for idx, label in enumerate(hist_labels):
+                        logs[f"/Teacher/disagreement_hist_teacher_{label}"] = float(teacher_hist_cpu[idx].item())
+                        logs[f"/Teacher/disagreement_hist_non_teacher_{label}"] = float(non_teacher_hist_cpu[idx].item())
+                    teacher_hist_counts.zero_()
+                    non_teacher_hist_counts.zero_()
+
                 log_line_parts = [
                     f"env_steps {total_env_steps}/{args.total_timesteps}",
                     f"iter {iteration_idx}",
