@@ -118,8 +118,10 @@ def parse_args():
     p.add_argument('--log_interval', type=int, default=200)
     p.add_argument('--post_switch_viz_multiplier', type=int, default=1,
                    help='Reduce checkpoint/viz interval by this factor after curriculum/env switch (>=1)')
-    p.add_argument('--disagreement_hist_edges', type=str, default='0.05,0.1,0.2,0.3,0.5,0.75,1.0,1.5,2.0',
+    p.add_argument('--disagreement_hist_edges', type=str, default='',
                    help='Comma-separated positive edges for disagreement hist bins (teacher/non-teacher). Empty to disable histogram logging.')
+    p.add_argument('--disagreement_thresholds', type=str, default='0.05,0.1,0.2,0.5,1.0,2.0,5.0',
+                   help='Comma-separated thresholds to log fraction of interventions with disagreement >= threshold')
     # Misc
     p.add_argument('--compile', action='store_true', default=False)
     p.add_argument('--amp', action='store_true', default=True)
@@ -667,6 +669,24 @@ def main():
         corr_sum_dis_sq = 0.0
         corr_sum_mask_dis = 0.0
 
+        # Threshold percentages (fraction of teacher interventions with disagreement >= threshold)
+        if args.disagreement_thresholds:
+            try:
+                thresh_vals = [float(x.strip()) for x in args.disagreement_thresholds.split(',') if x.strip()]
+                thresh_vals = sorted([t for t in thresh_vals if t > 0.0])
+            except Exception:
+                thresh_vals = []
+        else:
+            thresh_vals = []
+        if thresh_vals:
+            thresh_tensor = torch.tensor(thresh_vals, dtype=torch.float32, device=device)
+            teacher_above_counts = torch.zeros(len(thresh_vals), dtype=torch.float32, device=device)
+            teacher_steps_window = 0.0
+        else:
+            thresh_tensor = None
+            teacher_above_counts = None
+            teacher_steps_window = 0.0
+
         while total_env_steps < args.total_timesteps:
             with torch.no_grad(), autocast(device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled):
                 norm_obs = _normalize_obs(obs)
@@ -791,6 +811,15 @@ def main():
                     bin_idx = torch.bucketize(disagreement_step, hist_edges_tensor)
                     teacher_hist_counts.scatter_add_(0, bin_idx, teacher_mask_float)
                     non_teacher_hist_counts.scatter_add_(0, bin_idx, non_teacher_mask_float)
+
+                # Threshold fractions accumulation (per log window)
+                if thresh_tensor is not None:
+                    # Compare disagreement against thresholds: [N] vs [T] -> [N,T]
+                    comp = (disagreement_step.unsqueeze(1) >= thresh_tensor.unsqueeze(0)).float()
+                    # Weight by teacher mask to count only interventions
+                    comp_teacher = comp * teacher_mask_float.unsqueeze(1)
+                    teacher_above_counts += comp_teacher.sum(dim=0)
+                    teacher_steps_window += float(teacher_mask_float.sum().item())
 
             # Append counterfactual rows to CF buffer (student-denied actions)
             if args.cf_buffer_enable and teacher_mask is not None and student_actions is not None and cf_obs is not None:
@@ -1038,6 +1067,13 @@ def main():
                         logs[f"/Teacher/disagreement_hist_non_teacher_{label}"] = float(non_teacher_hist_cpu[idx].item())
                     teacher_hist_counts.zero_()
                     non_teacher_hist_counts.zero_()
+                # Threshold percentages since last log (teacher only)
+                if thresh_tensor is not None and teacher_steps_window > 0:
+                    pct = (teacher_above_counts / max(1.0, teacher_steps_window)).detach().cpu().numpy()
+                    for i, thr in enumerate(thresh_vals):
+                        logs[f"/Teacher/disagreement_pct_ge_{thr}"] = float(pct[i])
+                    teacher_above_counts.zero_()
+                    teacher_steps_window = 0.0
 
                 log_line_parts = [
                     f"env_steps {total_env_steps}/{args.total_timesteps}",
