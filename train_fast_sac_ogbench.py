@@ -120,7 +120,7 @@ def parse_args():
                    help='Reduce checkpoint/viz interval by this factor after curriculum/env switch (>=1)')
     p.add_argument('--disagreement_hist_edges', type=str, default='',
                    help='Comma-separated positive edges for disagreement hist bins (teacher/non-teacher). Empty to disable histogram logging.')
-    p.add_argument('--disagreement_thresholds', type=str, default='0.05,0.1,0.2,0.5,1.0,2.0,5.0',
+    p.add_argument('--disagreement_thresholds', type=str, default='0.02,0.05,0.1,0.2,0.3,0.5,0.75,1.0,2.0,5.0',
                    help='Comma-separated thresholds to log fraction of interventions with disagreement >= threshold')
     # Misc
     p.add_argument('--compile', action='store_true', default=False)
@@ -687,6 +687,14 @@ def main():
             teacher_above_counts = None
             teacher_steps_window = 0.0
 
+        # Q and disagreement running averages for the current log window
+        qmin_sum_all = 0.0
+        qmin_steps_all = 0.0
+        qmin_sum_teacher = 0.0
+        qmin_steps_teacher = 0.0
+        qmin_sum_non = 0.0
+        qmin_steps_non = 0.0
+
         while total_env_steps < args.total_timesteps:
             with torch.no_grad(), autocast(device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled):
                 norm_obs = _normalize_obs(obs)
@@ -789,6 +797,7 @@ def main():
                     norm_obs_now = _normalize_obs(obs)
                     q1_step, q2_step = qnet(norm_obs_now, used_actions)
                 disagreement_step = torch.abs(q1_step - q2_step).squeeze(-1)
+                qmin_step = torch.min(q1_step, q2_step).squeeze(-1)
                 if teacher_mask is not None:
                     teacher_mask_float = teacher_mask.float()
                 else:
@@ -820,6 +829,14 @@ def main():
                     comp_teacher = comp * teacher_mask_float.unsqueeze(1)
                     teacher_above_counts += comp_teacher.sum(dim=0)
                     teacher_steps_window += float(teacher_mask_float.sum().item())
+
+                # Q min running averages per window
+                qmin_sum_all += float(qmin_step.sum().item())
+                qmin_steps_all += float(qmin_step.numel())
+                qmin_sum_teacher += float((qmin_step * teacher_mask_float).sum().item())
+                qmin_steps_teacher += float(teacher_mask_float.sum().item())
+                qmin_sum_non += float((qmin_step * non_teacher_mask_float).sum().item())
+                qmin_steps_non += float(non_teacher_mask_float.sum().item())
 
             # Append counterfactual rows to CF buffer (student-denied actions)
             if args.cf_buffer_enable and teacher_mask is not None and student_actions is not None and cf_obs is not None:
@@ -1044,9 +1061,14 @@ def main():
                 if args.store_denied_actions:
                     logs['/Teacher/denied_transition_samples'] = float(last_denied_samples)
                 if teacher_disagreement_steps > 0:
-                    logs['/Teacher/avg_disagreement_teacher'] = float(teacher_disagreement_sum / max(1e-8, teacher_disagreement_steps))
+                    logs['/Teacher/mean_disagreement_intervened'] = float(teacher_disagreement_sum / max(1e-8, teacher_disagreement_steps))
                 if non_teacher_disagreement_steps > 0:
-                    logs['/Teacher/avg_disagreement_no_teacher'] = float(non_teacher_disagreement_sum / max(1e-8, non_teacher_disagreement_steps))
+                    logs['/Teacher/mean_disagreement_no_intervention'] = float(non_teacher_disagreement_sum / max(1e-8, non_teacher_disagreement_steps))
+                # Global disagreement average across all steps in the window
+                total_dis_sum = teacher_disagreement_sum + non_teacher_disagreement_sum
+                total_dis_steps = teacher_disagreement_steps + non_teacher_disagreement_steps
+                if total_dis_steps > 0:
+                    logs['/Critic/mean_disagreement_all'] = float(total_dis_sum / max(1e-8, total_dis_steps))
                 if args.pref_buffer_enable:
                     logs['/Buffers/pref_pairs'] = float(pref_size)
                 if args.pref_td_buffer_enable:
@@ -1058,7 +1080,7 @@ def main():
                     denom_part_y = corr_total_steps * corr_sum_dis_sq - (corr_sum_dis ** 2)
                     if denom_part_x > 1e-8 and denom_part_y > 1e-8:
                         corr_value = numer / math.sqrt(denom_part_x * denom_part_y)
-                        logs['/Teacher/disagreement_corr'] = float(corr_value)
+                        logs['/Teacher/corr(disagreement, intervention)'] = float(corr_value)
                 if hist_edges_tensor is not None:
                     teacher_hist_cpu = teacher_hist_counts.detach().cpu()
                     non_teacher_hist_cpu = non_teacher_hist_counts.detach().cpu()
@@ -1071,9 +1093,19 @@ def main():
                 if thresh_tensor is not None and teacher_steps_window > 0:
                     pct = (teacher_above_counts / max(1.0, teacher_steps_window)).detach().cpu().numpy()
                     for i, thr in enumerate(thresh_vals):
-                        logs[f"/Teacher/disagreement_pct_ge_{thr}"] = float(pct[i])
+                        logs[f"/Teacher/frac_interventions_dis_ge_{thr}"] = float(pct[i])
                     teacher_above_counts.zero_()
                     teacher_steps_window = 0.0
+
+                # Mean Q(s, a_used) summaries (min over heads)
+                if qmin_steps_all > 0:
+                    logs['/Critic/mean_q_min_all'] = float(qmin_sum_all / max(1e-8, qmin_steps_all))
+                if qmin_steps_teacher > 0:
+                    logs['/Critic/mean_q_min_intervened'] = float(qmin_sum_teacher / max(1e-8, qmin_steps_teacher))
+                if qmin_steps_non > 0:
+                    logs['/Critic/mean_q_min_no_intervention'] = float(qmin_sum_non / max(1e-8, qmin_steps_non))
+                # Reset Q-window accumulators
+                qmin_sum_all = qmin_steps_all = qmin_sum_teacher = qmin_steps_teacher = qmin_sum_non = qmin_steps_non = 0.0
 
                 log_line_parts = [
                     f"env_steps {total_env_steps}/{args.total_timesteps}",
