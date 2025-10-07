@@ -17,11 +17,14 @@ from pathlib import Path
 
 import numpy as np
 
+os.environ.setdefault("MUJOCO_GL", os.environ.get("MUJOCO_GL", "egl"))
+
 os.environ.setdefault("WANDB_MODE", "offline")
 os.environ.setdefault("WANDB_CONSOLE", "off")
 os.environ.setdefault("WANDB_SILENT", "true")
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.amp import autocast, GradScaler
