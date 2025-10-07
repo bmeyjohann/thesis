@@ -18,6 +18,7 @@ from matplotlib.lines import Line2D
 from matplotlib import colors
 import numpy as np
 import torch
+import torch.nn as nn
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 FAST_SAC_PATH = PROJECT_ROOT / "fasttd3" / "fast_sac"
@@ -27,6 +28,112 @@ if str(FAST_SAC_PATH) not in sys.path:
 from fast_sac import Actor, Critic  # type: ignore  # noqa: E402
 from fast_sac_utils import EmpiricalNormalization  # type: ignore  # noqa: E402
 from ogbench.wrappers import FlexibleObsWrapper  # type: ignore  # noqa: E402
+
+
+class IdentityNormalizer(nn.Module):
+    def forward(self, x):
+        return x
+
+
+class MLPBackbone(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+        )
+        self.output_dim = hidden_dim
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class GaussianPolicyHead(nn.Module):
+    LOG_STD_MAX = 2
+    LOG_STD_MIN = -5
+
+    def __init__(self, feature_dim: int, action_dim: int, hidden_dim: int, init_scale: float):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(feature_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+        )
+        self.fc_mu = nn.Linear(hidden_dim // 2, action_dim)
+        self.fc_logstd = nn.Linear(hidden_dim // 2, action_dim)
+        nn.init.normal_(self.fc_mu.weight, 0.0, init_scale)
+        nn.init.constant_(self.fc_mu.bias, 0.0)
+
+    def forward(self, features):
+        x = self.net(features)
+        mean = self.fc_mu(x)
+        log_std = self.fc_logstd(x)
+        log_std = torch.tanh(log_std)
+        log_std = self.LOG_STD_MIN + 0.5 * (self.LOG_STD_MAX - self.LOG_STD_MIN) * (log_std + 1)
+        std = log_std.exp()
+        normal = torch.distributions.Normal(mean, std)
+        z = normal.rsample()
+        action = torch.tanh(z)
+        log_prob = normal.log_prob(z) - torch.log(1 - action.pow(2) + 1e-6)
+        log_prob = log_prob.sum(-1, keepdim=True)
+        return action, log_prob, torch.tanh(mean)
+
+
+class CriticHead(nn.Module):
+    def __init__(self, feature_dim: int, action_dim: int, hidden_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(feature_dim + action_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+
+    def forward(self, features, actions):
+        x = torch.cat([features, actions], dim=-1)
+        return self.net(x)
+
+
+class CriticEnsemble(nn.Module):
+    def __init__(self, feature_dim: int, action_dim: int, hidden_dim: int, num_heads: int):
+        super().__init__()
+        self.heads = nn.ModuleList([
+            CriticHead(feature_dim, action_dim, hidden_dim) for _ in range(num_heads)
+        ])
+
+    def forward(self, features, actions):
+        return [head(features, actions) for head in self.heads]
+
+
+class ActorWrapper:
+    def __init__(self, backbone: nn.Module, head: nn.Module):
+        self.backbone = backbone
+        self.head = head
+
+    def eval(self):
+        self.backbone.eval()
+        self.head.eval()
+
+    def __call__(self, obs):
+        return self.head(self.backbone(obs))
+
+
+class CriticWrapper:
+    def __init__(self, backbone: nn.Module, ensemble: CriticEnsemble):
+        self.backbone = backbone
+        self.ensemble = ensemble
+
+    def eval(self):
+        self.backbone.eval()
+        self.ensemble.eval()
+
+    def __call__(self, obs, actions):
+        features = self.backbone(obs)
+        return self.ensemble(features, actions)
 
 WALL_TILE_IDS = {1}
 DANGEROUS_TILE_ID = 2
@@ -63,42 +170,91 @@ def parse_args() -> argparse.Namespace:
 
 def load_checkpoint(model_path: Path, device: torch.device):
     ckpt = torch.load(model_path, map_location=device)
+    if 'actor_backbone' in ckpt:
+        return ckpt, 'fastsac_v2'
     required = {"actor_state_dict", "qnet_state_dict", "obs_normalizer_state", "args"}
     missing = required - ckpt.keys()
     if missing:
         raise KeyError(f"Checkpoint {model_path} missing keys: {missing}")
-    return ckpt
+    return ckpt, 'fastsac'
 
 
-def build_networks(ckpt: dict, device: torch.device):
-    args = ckpt["args"]
-    obs_dim = ckpt["obs_normalizer_state"]["_mean"].shape[1]
-    act_dim = ckpt["actor_state_dict"]["fc_mu.weight"].shape[0]
+def build_networks(ckpt: dict, device: torch.device, policy_type: str):
+    args = ckpt.get('args', {}) or {}
+    if policy_type == 'fastsac':
+        obs_dim = ckpt['obs_normalizer_state']['_mean'].shape[1]
+        act_dim = ckpt['actor_state_dict']['fc_mu.weight'].shape[0]
 
-    actor = Actor(
-        n_obs=obs_dim,
-        n_act=act_dim,
-        num_envs=args.get("num_envs", 1),
-        init_scale=args.get("init_scale", 0.01),
-        hidden_dim=args.get("actor_hidden_dim", 512),
-        device=device,
-    )
-    actor.load_state_dict(ckpt["actor_state_dict"])
-    actor.eval()
+        actor = Actor(
+            n_obs=obs_dim,
+            n_act=act_dim,
+            num_envs=args.get('num_envs', 1),
+            init_scale=args.get('init_scale', 0.01),
+            hidden_dim=args.get('actor_hidden_dim', 512),
+            device=device,
+        )
+        actor.load_state_dict(ckpt['actor_state_dict'])
+        actor.eval()
 
-    critic = Critic(
-        n_obs=obs_dim,
-        n_act=act_dim,
-        hidden_dim=args.get("critic_hidden_dim", 1024),
-        device=device,
-    )
-    critic.load_state_dict(ckpt["qnet_state_dict"])
-    critic.eval()
+        critic = Critic(
+            n_obs=obs_dim,
+            n_act=act_dim,
+            hidden_dim=args.get('critic_hidden_dim', 1024),
+            device=device,
+        )
+        critic.load_state_dict(ckpt['qnet_state_dict'])
+        critic.eval()
 
-    obs_norm = EmpiricalNormalization(shape=obs_dim, device=device)
-    obs_norm.load_state_dict(ckpt["obs_normalizer_state"])
-    obs_norm.eval()
+        obs_norm = EmpiricalNormalization(shape=obs_dim, device=device)
+        obs_norm.load_state_dict(ckpt['obs_normalizer_state'])
+        obs_norm.eval()
 
+        return actor, critic, obs_norm, args
+
+    obs_mode = args.get('obs_mode', 'state')
+    if obs_mode != 'state':
+        raise NotImplementedError('Policy map supports only state observations for now')
+
+    actor_backbone_state = ckpt['actor_backbone']
+    first_weight = actor_backbone_state['net.0.weight']
+    obs_dim = first_weight.shape[1]
+    backbone_hidden = first_weight.shape[0]
+    actor_backbone = MLPBackbone(obs_dim, backbone_hidden).to(device)
+    actor_backbone.load_state_dict(actor_backbone_state)
+    actor_backbone.eval()
+
+    actor_head_state = ckpt['actor_head']
+    act_dim = actor_head_state['fc_mu.weight'].shape[0]
+    actor_head = GaussianPolicyHead(actor_backbone.output_dim, act_dim, args.get('actor_hidden_dim', backbone_hidden), args.get('init_scale', 0.01)).to(device)
+    actor_head.load_state_dict(actor_head_state)
+    actor_head.eval()
+    actor = ActorWrapper(actor_backbone, actor_head)
+
+    critic_backbone_state = ckpt.get('critic_backbone') or ckpt.get('shared_backbone')
+    if critic_backbone_state is None:
+        critic_backbone = actor_backbone
+    else:
+        first_w = critic_backbone_state['net.0.weight']
+        critic_backbone = MLPBackbone(first_w.shape[1], first_w.shape[0]).to(device)
+        critic_backbone.load_state_dict(critic_backbone_state)
+        critic_backbone.eval()
+
+    critic_heads_state = ckpt['critic_heads']
+    head_keys = [k for k in critic_heads_state.keys() if k.endswith('net.0.weight')]
+    num_heads = len(head_keys)
+    head_hidden = critic_heads_state['heads.0.net.0.weight'].shape[0]
+    critic_heads = CriticEnsemble(critic_backbone.output_dim, act_dim, head_hidden, num_heads).to(device)
+    critic_heads.load_state_dict(critic_heads_state)
+    critic_heads.eval()
+    critic = CriticWrapper(critic_backbone, critic_heads)
+
+    obs_state = ckpt.get('obs_normalizer_state')
+    if obs_state:
+        obs_norm = EmpiricalNormalization(shape=obs_dim, device=device)
+        obs_norm.load_state_dict(obs_state)
+        obs_norm.eval()
+    else:
+        obs_norm = IdentityNormalizer()
     return actor, critic, obs_norm, args
 
 
@@ -238,10 +394,19 @@ def evaluate_grid(actor: Actor, critic: Critic, obs_norm: EmpiricalNormalization
     with torch.no_grad():
         norm_obs = obs_norm(obs_tensor)
         _, _, mean_actions = actor(norm_obs)
-        q1, q2 = critic(norm_obs, mean_actions)
-
-        value = torch.min(q1, q2).cpu().numpy().reshape(mesh_x.shape)
-        disagreement = torch.abs(q1 - q2).cpu().numpy().reshape(mesh_x.shape)
+        q_outputs = critic(norm_obs, mean_actions)
+        if isinstance(q_outputs, tuple):
+            q_list = list(q_outputs)
+        else:
+            q_list = q_outputs
+        q_stack = torch.stack(q_list, dim=0)
+        value = torch.min(q_stack, dim=0).values.cpu().numpy().reshape(mesh_x.shape)
+        if q_stack.shape[0] == 1:
+            disagreement = np.zeros_like(value)
+        else:
+            q_max = torch.max(q_stack, dim=0).values
+            q_min = torch.min(q_stack, dim=0).values
+            disagreement = (q_max - q_min).cpu().numpy().reshape(mesh_x.shape)
         actions = mean_actions.cpu().numpy().reshape(*mesh_x.shape, -1)
 
     traversable_grid = traversable.reshape(mesh_x.shape)
@@ -426,8 +591,8 @@ def generate_policy_map(
     write_meta: bool = True,
 ) -> tuple[Path, Path | None, dict]:
     device_t = torch.device(device)
-    ckpt = load_checkpoint(model_path, device_t)
-    actor, critic, obs_norm, train_args = build_networks(ckpt, device_t)
+    ckpt, policy_type = load_checkpoint(model_path, device_t)
+    actor, critic, obs_norm, train_args = build_networks(ckpt, device_t, policy_type)
 
     if goal_override is not None:
         goal_override = np.asarray(goal_override, dtype=np.float32)

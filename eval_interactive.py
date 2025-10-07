@@ -28,6 +28,7 @@ import os
 import sys
 import argparse
 import torch
+import torch.nn as nn
 import numpy as np
 import gymnasium as gym
 import pygame
@@ -37,6 +38,87 @@ from typing import Any, Dict
 
 # Fix WSL window positioning issues  
 os.environ['SDL_VIDEO_CENTERED'] = '1'
+
+
+class PixelNormalizer(nn.Module):
+    def forward(self, x):
+        return x / 255.0
+
+
+class MLPBackbone(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+        )
+        self.output_dim = hidden_dim
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class PixelBackbone(nn.Module):
+    def __init__(self, input_shape, feature_dim: int):
+        super().__init__()
+        c, h, w = input_shape
+        self.conv = nn.Sequential(
+            nn.Conv2d(c, 32, kernel_size=8, stride=4),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.ReLU(),
+        )
+        with torch.no_grad():
+            dummy = torch.zeros(1, c, h, w)
+            flat_dim = self.conv(dummy).view(1, -1).shape[1]
+        self.fc = nn.Sequential(
+            nn.Linear(flat_dim, feature_dim),
+            nn.ReLU(),
+        )
+        self.output_dim = feature_dim
+
+    def forward(self, x):
+        if x.dim() == 4 and x.shape[1] not in (1, 3):
+            x = x.permute(0, 3, 1, 2)
+        x = self.conv(x)
+        x = x.view(x.size(0), -1)
+        return self.fc(x)
+
+
+class GaussianPolicyHead(nn.Module):
+    LOG_STD_MAX = 2
+    LOG_STD_MIN = -5
+
+    def __init__(self, feature_dim: int, action_dim: int, hidden_dim: int, init_scale: float):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(feature_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+        )
+        self.fc_mu = nn.Linear(hidden_dim // 2, action_dim)
+        self.fc_logstd = nn.Linear(hidden_dim // 2, action_dim)
+        nn.init.normal_(self.fc_mu.weight, 0.0, init_scale)
+        nn.init.constant_(self.fc_mu.bias, 0.0)
+
+    def forward(self, features):
+        x = self.net(features)
+        mean = self.fc_mu(x)
+        log_std = self.fc_logstd(x)
+        log_std = torch.tanh(log_std)
+        log_std = self.LOG_STD_MIN + 0.5 * (self.LOG_STD_MAX - self.LOG_STD_MIN) * (log_std + 1)
+        std = log_std.exp()
+        normal = torch.distributions.Normal(mean, std)
+        z = normal.rsample()
+        action = torch.tanh(z)
+        log_prob = normal.log_prob(z) - torch.log(1 - action.pow(2) + 1e-6)
+        log_prob = log_prob.sum(-1, keepdim=True)
+        return action, log_prob, torch.tanh(mean)
 
 # Import ogbench to register environments
 import ogbench
@@ -140,7 +222,57 @@ def get_args():
     return parser.parse_args()
 
 class FastSACPolicy:
-    """Thin wrapper that mimics ActorCritic.act() using the FastSAC actor."""
+    """Unified wrapper for FastSAC policies (legacy and new architectures)."""
+
+    def __init__(self, *,
+                 obs_normalizer: nn.Module,
+                 obs_mode: str,
+                 pixel_shape=None,
+                 actor_backbone: nn.Module | None = None,
+                 actor_head: nn.Module | None = None,
+                 legacy_actor: nn.Module | None = None):
+        self.obs_normalizer = obs_normalizer
+        self.obs_mode = obs_mode
+        self.pixel_shape = pixel_shape
+        self.actor_backbone = actor_backbone
+        self.actor_head = actor_head
+        self.legacy_actor = legacy_actor
+        module = legacy_actor if legacy_actor is not None else actor_head
+        self.device = next(module.parameters()).device
+
+    def eval(self):
+        self.obs_normalizer.eval()
+        if self.legacy_actor is not None:
+            self.legacy_actor.eval()
+        else:
+            self.actor_backbone.eval()
+            self.actor_head.eval()
+
+    def _normalize(self, obs):
+        try:
+            return self.obs_normalizer(obs, center=True)
+        except TypeError:
+            return self.obs_normalizer(obs)
+
+    def act(self, obs_dict, deterministic: bool = True):
+        obs = obs_dict["policy"].to(self.device)
+        if self.legacy_actor is not None:
+            with torch.no_grad():
+                norm_obs = self._normalize(obs)
+                actions, _, means = self.legacy_actor(norm_obs)
+            return means if deterministic else actions
+
+        norm_obs = self._normalize(obs)
+        if self.obs_mode == "pixels":
+            assert self.pixel_shape is not None, "pixel_shape must be provided for pixel observations"
+            obs_input = norm_obs.view(norm_obs.shape[0], *self.pixel_shape)
+        else:
+            obs_input = norm_obs
+        with torch.no_grad():
+            features = self.actor_backbone(obs_input)
+            actions, _, means = self.actor_head(features)
+        return means if deterministic else actions
+
 
     def __init__(self, actor, obs_normalizer):
         self.actor = actor
@@ -163,98 +295,52 @@ def _resolve_policy_type(args_policy_type: str, checkpoint: Dict[str, Any]) -> s
     if args_policy_type != 'auto':
         return args_policy_type
     keys = set(checkpoint.keys())
+    if {'actor_backbone', 'actor_head'} <= keys:
+        return 'fastsac_v2'
     if {'actor_state_dict', 'qnet_state_dict'} <= keys:
         return 'fastsac'
     return 'rsl-rl'
 
 
-def load_trained_policy(model_path: str, env, device: torch.device, args) -> Any:
-    """Load a trained RSL-RL policy from checkpoint."""
-    print(f"🔄 Loading model from: {model_path}")
-    
+def load_trained_policy(model_path: str, env, device: torch.device, args):
+    """Load a trained policy and return (policy, training_metadata)."""
+    print(f"\n🔄 Loading model from: {model_path}")
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model file not found: {model_path}")
-    
-    # Load checkpoint (trust local files)
+
     checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-    print(f"✓ Checkpoint loaded")
-    
+    print("✓ Checkpoint loaded")
+
     policy_type = _resolve_policy_type(args.policy_type, checkpoint)
     print(f"📦 Detected policy format: {policy_type}")
 
-    training_info = {}
+    training_info: Dict[str, Any] = {}
+    obs_space = env.observation_space
+    act_dim = env.action_space.shape[0]
+    obs_dim = int(np.prod(obs_space.shape))
 
     if policy_type == 'rsl-rl':
-        dummy_obs = torch.zeros(1, env.observation_space.shape[0], device=device)
-        dummy_obs_dict = TensorDict({
-            "policy": dummy_obs,
-        }, batch_size=[1], device=device)
-
-        if 'policy_cfg' in checkpoint:
-            config = checkpoint['policy_cfg']
-            print(f"📋 Model config found: {config}")
-        elif 'model_config' in checkpoint:
-            config = checkpoint['model_config']
-            print(f"📋 Model config found: {config}")
-        else:
-            config = {
-                'hidden_dims': [256, 256, 256],
-                'activation': 'elu',
-            }
-            print(f"⚠️  No model config found, using defaults: {config}")
-
+        dummy_obs = torch.zeros(1, obs_dim, device=device)
+        dummy_obs_dict = TensorDict({"policy": dummy_obs}, batch_size=[1], device=device)
+        config = checkpoint.get('policy_cfg') or checkpoint.get('model_config') or {
+            'hidden_dims': [256, 256, 256],
+            'activation': 'elu',
+        }
         valid_keys = {'hidden_dims', 'activation', 'init_noise_std', 'actor_hidden_dims', 'critic_hidden_dims'}
         config = {k: v for k, v in config.items() if k in valid_keys}
-
-        try:
-            policy = ActorCritic(
-                obs=dummy_obs_dict,
-                obs_groups={"policy": ["policy"], "critic": ["policy"]},
-                num_actions=env.action_space.shape[0],
-                **config,
-            ).to(device)
-            print(
-                f"✓ ActorCritic created with obs shape: {dummy_obs.shape}, action dim: {env.action_space.shape[0]}"
-            )
-        except Exception as e:
-            print(f"❌ ActorCritic creation failed: {e}")
-            raise
-
-        if 'policy_state_dict' in checkpoint:
-            policy.load_state_dict(checkpoint['policy_state_dict'])
-            print(f"✓ Model weights loaded (policy_state_dict)")
-        elif 'model_state_dict' in checkpoint:
-            policy.load_state_dict(checkpoint['model_state_dict'])
-            print(f"✓ Model weights loaded (model_state_dict)")
-        elif 'state_dict' in checkpoint:
-            policy.load_state_dict(checkpoint['state_dict'])
-            print(f"✓ Model weights loaded (state_dict)")
-        else:
-            try:
-                policy.load_state_dict(checkpoint)
-                print(f"✓ Model weights loaded (direct state dict)")
-            except Exception as e:
-                print(f"❌ Failed to load weights. Checkpoint keys: {list(checkpoint.keys())}")
-                raise e
-
+        policy = ActorCritic(
+            obs=dummy_obs_dict,
+            obs_groups={"policy": ["policy"], "critic": ["policy"]},
+            num_actions=act_dim,
+            **config,
+        ).to(device)
+        state_dict = checkpoint.get('policy_state_dict') or checkpoint.get('model_state_dict') or checkpoint.get('state_dict') or checkpoint
+        policy.load_state_dict(state_dict)
         policy.eval()
-        print(f"✓ Policy set to evaluation mode")
-
-    else:  # FastSAC checkpoint
-        from fast_sac import Actor
-        from fast_sac_utils import EmpiricalNormalization
-
-        args_dict = checkpoint.get('args', {}) or {}
-        if isinstance(args_dict, dict):
-            actor_hidden = args_dict.get('actor_hidden_dim', 512)
-            init_scale = args_dict.get('init_scale', 0.01)
-        else:
-            actor_hidden = getattr(args_dict, 'actor_hidden_dim', 512)
-            init_scale = getattr(args_dict, 'init_scale', 0.01)
-
-        obs_dim = env.observation_space.shape[0]
-        act_dim = env.action_space.shape[0]
-
+        print("✓ ActorCritic policy loaded")
+    elif policy_type == 'fastsac':
+        actor_hidden = checkpoint.get('args', {}).get('actor_hidden_dim', 512)
+        init_scale = checkpoint.get('args', {}).get('init_scale', 0.01)
         actor = Actor(
             n_obs=obs_dim,
             n_act=act_dim,
@@ -265,50 +351,69 @@ def load_trained_policy(model_path: str, env, device: torch.device, args) -> Any
         ).to(device)
         actor.load_state_dict(checkpoint['actor_state_dict'])
         actor.eval()
-        print(f"✓ FastSAC actor weights loaded")
-
         obs_normalizer = EmpiricalNormalization(shape=obs_dim, device=device)
-        obs_state = checkpoint.get('obs_normalizer_state')
-        if obs_state:
-            obs_normalizer.load_state_dict(obs_state)
+        if checkpoint.get('obs_normalizer_state'):
+            obs_normalizer.load_state_dict(checkpoint['obs_normalizer_state'])
         obs_normalizer.eval()
-
-        policy = FastSACPolicy(actor, obs_normalizer)
+        policy = FastSACPolicy(
+            obs_normalizer=obs_normalizer,
+            obs_mode='state',
+            pixel_shape=None,
+            legacy_actor=actor,
+        )
         policy.eval()
+    else:  # fastsac_v2
+        train_args = checkpoint.get('args', {}) or {}
+        obs_mode = train_args.get('obs_mode', getattr(args, 'obs_mode', 'state'))
+        arch_shared = train_args.get('arch_shared_trunk', False)
+        actor_hidden = train_args.get('actor_hidden_dim', 512)
+        shared_hidden = train_args.get('shared_hidden_dim', actor_hidden)
+        init_scale = train_args.get('init_scale', 0.01)
+        feature_dim = shared_hidden if arch_shared else actor_hidden
+        if obs_mode == 'pixels':
+            pixel_shape = checkpoint.get('pixel_shape') or obs_space.shape
+            backbone = PixelBackbone((pixel_shape[2], pixel_shape[0], pixel_shape[1]), feature_dim).to(device)
+            obs_normalizer = PixelNormalizer().to(device)
+        else:
+            pixel_shape = None
+            backbone = MLPBackbone(obs_dim, feature_dim).to(device)
+            obs_normalizer = EmpiricalNormalization(shape=obs_dim, device=device)
+            if checkpoint.get('obs_normalizer_state'):
+                obs_normalizer.load_state_dict(checkpoint['obs_normalizer_state'])
+        backbone.load_state_dict(checkpoint['actor_backbone'])
+        backbone.eval()
+        actor_head = GaussianPolicyHead(backbone.output_dim, act_dim, actor_hidden, init_scale).to(device)
+        actor_head.load_state_dict(checkpoint['actor_head'])
+        actor_head.eval()
+        policy = FastSACPolicy(
+            obs_normalizer=obs_normalizer,
+            obs_mode=obs_mode,
+            pixel_shape=pixel_shape,
+            actor_backbone=backbone,
+            actor_head=actor_head,
+        )
+        policy.eval()
+        training_info['obs_mode'] = obs_mode
+        training_info['num_critics'] = train_args.get('num_critics', 2)
+        training_info['arch_shared_trunk'] = arch_shared
 
-    # Gather training metadata if available
-    
-    # Extract training info from different possible keys
-    if 'training_info' in checkpoint:
-        training_info.update(checkpoint['training_info'])
-    
-    # Additional info from checkpoint metadata
-    for key in ['iteration', 'total_timesteps']:
+    # Common training metadata
+    args_obj = checkpoint.get('args')
+    if isinstance(args_obj, dict):
+        for key in ['env_name', 'reward_type', 'obs_mode', 'shared_hidden_dim']:
+            if key in args_obj:
+                training_info[key] = args_obj[key]
+    elif args_obj is not None:
+        for key in ['env_name', 'reward_type', 'obs_mode', 'shared_hidden_dim']:
+            if hasattr(args_obj, key):
+                training_info[key] = getattr(args_obj, key)
+    for key in ['training_info', 'iteration', 'total_timesteps']:
         if key in checkpoint:
             training_info[key] = checkpoint[key]
-    
-    # Extract args if available
-    if 'args' in checkpoint:
-        args_obj = checkpoint['args']
-        if isinstance(args_obj, dict):
-            if 'env_name' in args_obj:
-                training_info['env_name'] = args_obj['env_name']
-            if 'reward_type' in args_obj:
-                training_info['reward_type'] = args_obj['reward_type']
-        else:
-            if hasattr(args_obj, 'env_name'):
-                training_info['env_name'] = args_obj.env_name
-            if hasattr(args_obj, 'reward_type'):
-                training_info['reward_type'] = args_obj.reward_type
-    
-    if training_info:
-        print(f"📊 Training info:")
-        for key, value in training_info.items():
-            print(f"   {key}: {value}")
-    else:
-        print(f"ℹ️  No training info available in checkpoint")
-    
-    return policy
+
+    print("✓ Policy set to evaluation mode")
+    return policy, training_info
+
 
 def create_env(env_name: str, args):
     """Create the evaluation environment with appropriate wrappers."""
@@ -332,15 +437,15 @@ def create_env(env_name: str, args):
         
         # Base observation wrapper
         from ogbench.wrappers import FlexibleObsWrapper, DetailedRewardWrapper, InterventionWrapper
-        env = FlexibleObsWrapper(
-            env,
-            include_goal=args.include_goal,
-            include_distance=args.include_distance,
-            include_direction=args.include_direction,
-            include_velocity=args.include_velocity,
-        )
-        print(f"✓ Applied FlexibleObsWrapper")
-
+        if getattr(args, 'obs_mode', 'state') == 'state':
+            env = FlexibleObsWrapper(
+                env,
+                include_goal=args.include_goal,
+                include_distance=args.include_distance,
+                include_direction=args.include_direction,
+                include_velocity=args.include_velocity,
+            )
+            print('Applied FlexibleObsWrapper')
         env = DetailedRewardWrapper(
             env,
             reward_type=args.reward_type,
@@ -348,11 +453,9 @@ def create_env(env_name: str, args):
             step_penalty=args.step_penalty,
             switch_reward_to_sparse_after_steps_per_env=args.reward_switch_after_steps,
         )
-        print(f"✓ Applied DetailedRewardWrapper (type={args.reward_type})")
+        print('Applied DetailedRewardWrapper (type={})'.format(args.reward_type))
 
-        # Optional intervention wrapper
         if args.intervention_mode == 'human':
-            # Create control window teleop
             from ogbench.teleop import ControlWindowTeleop
             teleop = ControlWindowTeleop(width=520, height=420, show_debug_info=True)
             env = InterventionWrapper(
@@ -362,7 +465,7 @@ def create_env(env_name: str, args):
                 threshold=0.1,
                 hold_time=0.5,
             )
-            print(f"✓ Applied InterventionWrapper (human teleop)")
+            print('Applied InterventionWrapper (human teleop)')
         elif args.intervention_mode == 'agent':
             env = InterventionWrapper(
                 env,
@@ -373,9 +476,12 @@ def create_env(env_name: str, args):
                 hard_block_lethal=args.hard_block_lethal,
                 enable_after_steps=args.intervention_enable_after_steps,
             )
-            print(f"✓ Applied InterventionWrapper (agent teacher: {args.teacher_type})")
-        
-        print(f"✓ Environment created successfully")
+            print('Applied InterventionWrapper (agent teacher: {})'.format(args.teacher_type))
+
+        print('Environment created successfully')
+        print('   Observation space:', env.observation_space)
+        print('   Action space:', env.action_space)
+        return env
         print(f"   Observation space: {env.observation_space}")
         print(f"   Action space: {env.action_space}")
         return env
@@ -563,12 +669,21 @@ def main():
         print(f"GPU: {torch.cuda.get_device_name(device)}")
     
     try:
+        # Peek at checkpoint to recover observation mode
+        checkpoint_preview = torch.load(args.model_path, map_location='cpu')
+        args.obs_mode = checkpoint_preview.get('args', {}).get('obs_mode', getattr(args, 'obs_mode', 'state'))
+        del checkpoint_preview
+
         # Create environment
         env = create_env(args.env_name, args)
-        
+
         # Load trained policy
-        policy = load_trained_policy(args.model_path, env, device, args)
-        
+        policy, training_info = load_trained_policy(args.model_path, env, device, args)
+        if training_info:
+            print('Training info:')
+            for key, value in training_info.items():
+                print('   {}: {}'.format(key, value))
+
         # Run interactive evaluation
         run_interactive_evaluation(policy, env, args, device)
         

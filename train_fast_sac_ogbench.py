@@ -47,6 +47,123 @@ TOOLS_PATH = Path(__file__).resolve().parent / "tools"
 if TOOLS_PATH.exists():
     sys.path.append(str(TOOLS_PATH))
 
+
+class PixelNormalizer(nn.Module):
+    def forward(self, x):
+        return x / 255.0
+
+
+class IdentityNormalizer(nn.Module):
+    def forward(self, x):
+        return x
+
+
+class MLPBackbone(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+        )
+        self.output_dim = hidden_dim
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class PixelBackbone(nn.Module):
+    def __init__(self, input_shape, feature_dim: int):
+        super().__init__()
+        c, h, w = input_shape
+        self.conv = nn.Sequential(
+            nn.Conv2d(c, 32, kernel_size=8, stride=4),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.ReLU(),
+        )
+        with torch.no_grad():
+            dummy = torch.zeros(1, c, h, w)
+            flat_dim = self.conv(dummy).view(1, -1).shape[1]
+        self.fc = nn.Sequential(
+            nn.Linear(flat_dim, feature_dim),
+            nn.ReLU(),
+        )
+        self.output_dim = feature_dim
+
+    def forward(self, x):
+        if x.dim() == 4 and x.shape[1] not in (1, 3):
+            x = x.permute(0, 3, 1, 2)
+        x = self.conv(x)
+        x = x.view(x.size(0), -1)
+        return self.fc(x)
+
+
+class GaussianPolicyHead(nn.Module):
+    LOG_STD_MAX = 2
+    LOG_STD_MIN = -5
+
+    def __init__(self, feature_dim: int, action_dim: int, hidden_dim: int, init_scale: float):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(feature_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+        )
+        self.fc_mu = nn.Linear(hidden_dim // 2, action_dim)
+        self.fc_logstd = nn.Linear(hidden_dim // 2, action_dim)
+        nn.init.normal_(self.fc_mu.weight, 0.0, init_scale)
+        nn.init.constant_(self.fc_mu.bias, 0.0)
+
+    def forward(self, features):
+        x = self.net(features)
+        mean = self.fc_mu(x)
+        log_std = self.fc_logstd(x)
+        log_std = torch.tanh(log_std)
+        log_std = self.LOG_STD_MIN + 0.5 * (self.LOG_STD_MAX - self.LOG_STD_MIN) * (log_std + 1)
+        std = log_std.exp()
+        normal = torch.distributions.Normal(mean, std)
+        z = normal.rsample()
+        action = torch.tanh(z)
+        log_prob = normal.log_prob(z) - torch.log(1 - action.pow(2) + 1e-6)
+        log_prob = log_prob.sum(-1, keepdim=True)
+        return action, log_prob, torch.tanh(mean)
+
+
+class CriticHead(nn.Module):
+    def __init__(self, feature_dim: int, action_dim: int, hidden_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(feature_dim + action_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+
+    def forward(self, features, actions):
+        x = torch.cat([features, actions], dim=-1)
+        return self.net(x)
+
+
+class CriticEnsemble(nn.Module):
+    def __init__(self, feature_dim: int, action_dim: int, hidden_dim: int, num_heads: int):
+        super().__init__()
+        self.heads = nn.ModuleList([
+            CriticHead(feature_dim, action_dim, hidden_dim) for _ in range(num_heads)
+        ])
+
+    def forward(self, features, actions):
+        return [head(features, actions) for head in self.heads]
+
+    def min_q(self, features, actions):
+        qs = self.forward(features, actions)
+        stacked = torch.stack(qs, dim=0)
+        return torch.min(stacked, dim=0).values
 try:
     from visualize_policy_map import generate_policy_map  # type: ignore
 except Exception:  # pragma: no cover - optional dependency for viz
@@ -97,6 +214,15 @@ def parse_args():
     p.add_argument('--init_scale', type=float, default=0.01)
     p.add_argument('--actor_hidden_dim', type=int, default=512)
     p.add_argument('--critic_hidden_dim', type=int, default=1024)
+
+    p.add_argument('--arch_shared_trunk', action='store_true', default=False,
+                   help='Share an observation trunk between actor and critic(s)')
+    p.add_argument('--shared_hidden_dim', type=int, default=512,
+                   help='Hidden size for shared trunk when enabled')
+    p.add_argument('--num_critics', type=int, default=2,
+                   help='Number of critic heads (2 or 3 supported)')
+    p.add_argument('--obs_mode', type=str, default='state', choices=['state', 'pixels'],
+                   help='Observation mode: vector state or pixel images')
     p.add_argument('--store_denied_actions', action='store_true', default=False,
                    help='Add denied student actions to replay buffer with penalty reward')
     p.add_argument('--denied_action_penalty', type=float, default=-1.0,
@@ -182,13 +308,14 @@ def parse_args():
 
 def make_wrappers(args):
     def _apply(env):
-        env = FlexibleObsWrapper(
-            env,
-            include_goal=args.include_goal,
-            include_distance=args.include_distance,
-            include_direction=args.include_direction,
-            include_velocity=args.include_velocity,
-        )
+        if args.obs_mode == 'state':
+            env = FlexibleObsWrapper(
+                env,
+                include_goal=args.include_goal,
+                include_distance=args.include_distance,
+                include_direction=args.include_direction,
+                include_velocity=args.include_velocity,
+            )
         env = DetailedRewardWrapper(
             env,
             reward_type=args.reward_type,
@@ -283,26 +410,89 @@ def main():
 
     n_obs = envs.num_obs
     n_act = envs.num_actions
-    obs_normalizer = EmpiricalNormalization(shape=n_obs, device=device)
-    critic_obs_normalizer = EmpiricalNormalization(shape=n_obs, device=device)
+
+    raw_obs_space = envs._env.envs[0].observation_space
+    pixel_shape = None
+    if args.obs_mode == 'pixels':
+        if len(raw_obs_space.shape) != 3:
+            raise RuntimeError('Pixel observation expected to have HxWxC shape')
+        pixel_shape = raw_obs_space.shape
+        obs = obs.view(envs.num_envs, -1)
+        n_obs = obs.shape[1]
+        obs_normalizer = PixelNormalizer().to(device)
+        critic_obs_normalizer = PixelNormalizer().to(device)
+    else:
+        obs_normalizer = EmpiricalNormalization(shape=n_obs, device=device)
+        critic_obs_normalizer = EmpiricalNormalization(shape=n_obs, device=device)
+
     reward_normalizer = RewardNormalizer(gamma=args.gamma, device=device, g_max=10.0)
 
-    actor = Actor(n_obs=n_obs, n_act=n_act, num_envs=args.num_envs, init_scale=args.init_scale, hidden_dim=args.actor_hidden_dim, device=device)
-    # Match FastTD3 vendor behavior: use a separate "exploration" actor whose
-    # parameters share storage with the trainable actor. This keeps rollouts
-    # stable while allowing the trainable actor to update.
-    actor_detach = Actor(n_obs=n_obs, n_act=n_act, num_envs=args.num_envs, init_scale=args.init_scale, hidden_dim=args.actor_hidden_dim, device=device)
-    from_module(actor).data.to_module(actor_detach)
-    policy_fn = actor_detach.forward
-    qnet = Critic(n_obs=n_obs, n_act=n_act, hidden_dim=args.critic_hidden_dim, device=device)
-    qnet_target = Critic(n_obs=n_obs, n_act=n_act, hidden_dim=args.critic_hidden_dim, device=device)
-    qnet_target.load_state_dict(qnet.state_dict())
+    def build_backbone(mode, hidden_dim):
+        if mode == 'pixels':
+            c, h, w = pixel_shape[2], pixel_shape[0], pixel_shape[1]
+            return PixelBackbone((c, h, w), hidden_dim).to(device)
+        return MLPBackbone(n_obs, hidden_dim).to(device)
 
-    initial_qnet_state = copy.deepcopy(qnet.state_dict())
-    initial_qnet_target_state = copy.deepcopy(qnet_target.state_dict())
+    shared_backbone = None
+    initial_shared_backbone_state = None
+    initial_critic_backbone_state = None
+    if args.arch_shared_trunk:
+        shared_backbone = build_backbone(args.obs_mode, args.shared_hidden_dim)
+        actor_backbone = shared_backbone
+        actor_head = GaussianPolicyHead(shared_backbone.output_dim, n_act, args.actor_hidden_dim, args.init_scale).to(device)
+        critic_backbone = shared_backbone
+        critic_heads = CriticEnsemble(shared_backbone.output_dim, n_act, args.critic_hidden_dim, args.num_critics).to(device)
+    else:
+        actor_backbone = build_backbone(args.obs_mode, args.actor_hidden_dim)
+        actor_head = GaussianPolicyHead(actor_backbone.output_dim, n_act, args.actor_hidden_dim, args.init_scale).to(device)
+        critic_backbone = build_backbone(args.obs_mode, args.critic_hidden_dim)
+        critic_heads = CriticEnsemble(critic_backbone.output_dim, n_act, args.critic_hidden_dim, args.num_critics).to(device)
 
-    q_optimizer = optim.AdamW(list(qnet.parameters()), lr=args.critic_learning_rate, weight_decay=0.1)
-    actor_optimizer = optim.AdamW(list(actor.parameters()), lr=args.actor_learning_rate, weight_decay=0.1)
+    critic_feature_backbone = actor_backbone if args.arch_shared_trunk else critic_backbone
+    # Target critic components
+    critic_target_backbone = copy.deepcopy(critic_backbone)
+    critic_target_heads = copy.deepcopy(critic_heads)
+
+    # Optimizers
+    if args.arch_shared_trunk:
+        trunk_params = list(shared_backbone.parameters())
+        actor_params = list(actor_head.parameters())
+        critic_params = list(critic_heads.parameters())
+        trunk_optimizer = optim.Adam(trunk_params, lr=args.critic_learning_rate)
+        q_optimizer = optim.AdamW(critic_params, lr=args.critic_learning_rate, weight_decay=0.1)
+        actor_optimizer = optim.AdamW(actor_params, lr=args.actor_learning_rate, weight_decay=0.1)
+    else:
+        trunk_optimizer = None
+        actor_params = list(actor_backbone.parameters()) + list(actor_head.parameters())
+        critic_params = list(critic_backbone.parameters()) + list(critic_heads.parameters())
+        q_optimizer = optim.AdamW(critic_params, lr=args.critic_learning_rate, weight_decay=0.1)
+        actor_optimizer = optim.AdamW(actor_params, lr=args.actor_learning_rate, weight_decay=0.1)
+
+    if args.arch_shared_trunk:
+        initial_shared_backbone_state = copy.deepcopy(shared_backbone.state_dict())
+    else:
+        initial_critic_backbone_state = copy.deepcopy(critic_backbone.state_dict())
+    initial_critic_heads_state = copy.deepcopy(critic_heads.state_dict())
+    initial_target_backbone_state = copy.deepcopy(critic_target_backbone.state_dict())
+    initial_target_heads_state = copy.deepcopy(critic_target_heads.state_dict())
+
+
+    def reshape_obs(obs_flat: torch.Tensor):
+        if args.obs_mode == 'pixels':
+            return obs_flat.view(obs_flat.shape[0], *pixel_shape)
+        return obs_flat
+
+    def actor_forward(obs_flat: torch.Tensor):
+        obs_in = reshape_obs(obs_flat)
+        features = actor_backbone(obs_in)
+        action, log_pi, mean = actor_head(features)
+        return action, log_pi, mean, features
+
+    def critic_forward(backbone_module, heads_module, obs_flat: torch.Tensor, actions: torch.Tensor):
+        obs_in = reshape_obs(obs_flat)
+        features = backbone_module(obs_in)
+        q_values = heads_module(features, actions)
+        return features, q_values
 
     target_entropy = -float(n_act)
     log_alpha = torch.ones(1, requires_grad=True, device=device)
@@ -538,11 +728,13 @@ def main():
     # Compile optional
     def _normalize_obs(x): return obs_normalizer(x)
     if args.compile:
-        actor = torch.compile(actor)
-        # Compile the exploration policy function as well
-        policy_fn = torch.compile(policy_fn)
-        qnet = torch.compile(qnet)
-        qnet_target = torch.compile(qnet_target)
+        actor_backbone = torch.compile(actor_backbone)
+        actor_head = torch.compile(actor_head)
+        if not args.arch_shared_trunk:
+            critic_backbone = torch.compile(critic_backbone)
+        critic_heads = torch.compile(critic_heads)
+        critic_target_backbone = torch.compile(critic_target_backbone)
+        critic_target_heads = torch.compile(critic_target_heads)
         _normalize_obs = torch.compile(_normalize_obs)
 
     try:
@@ -560,6 +752,8 @@ def main():
         else:
             wandb_run = None
         obs = envs.reset()
+        if args.obs_mode == 'pixels':
+            obs = obs.view(envs.num_envs, -1)
         record_progress("[Init] envs.reset() returned; entering loop")
         print("[Init] Env reset complete; starting training loop", flush=True)
         total_env_steps = 0
@@ -583,16 +777,22 @@ def main():
 
         def save_checkpoint(tag: str, step_value: int):
             save_path = run_model_dir / f"{run_prefix}_{tag}.pt"
-            save_params(
-                step_value,
-                actor,
-                qnet,
-                qnet_target,
-                obs_normalizer,
-                critic_obs_normalizer,
-                args,
-                str(save_path),
-            )
+            checkpoint = {
+                'step': step_value,
+                'actor_backbone': actor_backbone.state_dict(),
+                'actor_head': actor_head.state_dict(),
+                'critic_backbone': (None if args.arch_shared_trunk else critic_backbone.state_dict()),
+                'shared_backbone': actor_backbone.state_dict() if args.arch_shared_trunk else None,
+                'critic_heads': critic_heads.state_dict(),
+                'critic_target_backbone': critic_target_backbone.state_dict(),
+                'critic_target_heads': critic_target_heads.state_dict(),
+                'obs_normalizer_state': (obs_normalizer.state_dict() if hasattr(obs_normalizer, 'state_dict') else None),
+                'critic_obs_normalizer_state': (critic_obs_normalizer.state_dict() if hasattr(critic_obs_normalizer, 'state_dict') else None),
+                'log_alpha': log_alpha.detach().cpu().item(),
+                'pixel_shape': pixel_shape,
+                'args': vars(args),
+            }
+            torch.save(checkpoint, save_path, _use_new_zipfile_serialization=True)
             record_progress(f"[Checkpoint] saved {save_path}")
             return save_path
 
@@ -696,14 +896,19 @@ def main():
         qmin_steps_non = 0.0
 
         while total_env_steps < args.total_timesteps:
+            norm_obs = _normalize_obs(obs)
+            obs_actor_input = reshape_obs(norm_obs)
             with torch.no_grad(), autocast(device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled):
-                norm_obs = _normalize_obs(obs)
-                actions, _, _ = policy_fn(norm_obs)
-                
-            next_obs, rewards, dones, infos = envs.step(actions.float())
+                pi_action, _, _ = actor_head(actor_backbone(obs_actor_input))
+            next_obs_raw, rewards, dones, infos = envs.step(pi_action.float())
+            actions = pi_action
+            if args.obs_mode == 'pixels':
+                next_obs = next_obs_raw.view(envs.num_envs, -1)
+            else:
+                next_obs = next_obs_raw
             # Detach copies for any auxiliary buffers before we mutate below
-            obs_detached_now = obs.detach()
-            next_obs_detached_now = next_obs.detach()
+            obs_detached_flat = obs.detach()
+            next_obs_detached_flat = next_obs.detach()
             truncations = infos.get('time_outs', torch.zeros_like(dones, device=device))
             applied_actions = infos.get('applied_actions', actions)
             student_actions = infos.get('student_actions')
@@ -750,8 +955,8 @@ def main():
                     if args.pref_buffer_enable and student_actions is not None and 'teacher_actions' in infos:
                         try:
                             a_teacher_all = infos['teacher_actions']
-                            s_batch = obs_detached_now[denied_ids]
-                            pref_append(s_batch, a_teacher_all[denied_ids], student_actions[denied_ids])
+                            s_batch = obs_detached_flat[denied_ids]
+                            pref_append(obs_detached_flat[denied_ids], a_teacher_all[denied_ids], student_actions[denied_ids])
                         except Exception:
                             pass
 
@@ -759,8 +964,8 @@ def main():
                     if args.pref_td_buffer_enable and student_actions is not None and 'teacher_actions' in infos:
                         try:
                             a_teacher_all = infos['teacher_actions']
-                            s_now = obs_detached_now[denied_ids]
-                            s_next = next_obs_detached_now[denied_ids]
+                            s_now = obs_detached_flat[denied_ids]
+                            s_next = next_obs_detached_flat[denied_ids]
                             r_teacher = rewards[denied_ids].clone().view(-1, 1)
                             if float(args.pref_td_teacher_bonus_value) != 0.0:
                                 r_teacher = r_teacher + float(args.pref_td_teacher_bonus_value)
@@ -773,8 +978,8 @@ def main():
                             pass
             
             # Build transition
-            obs_detached = obs_detached_now
-            next_obs_detached = next_obs_detached_now
+            obs_detached = obs_detached_flat
+            next_obs_detached = next_obs_detached_flat
             transition = TensorDict(
                 {
                     'observations': obs_detached,
@@ -795,9 +1000,12 @@ def main():
             if args.pref_buffer_enable or args.pref_td_buffer_enable or args.cf_buffer_enable or True:
                 with torch.no_grad(), autocast(device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled):
                     norm_obs_now = _normalize_obs(obs)
-                    q1_step, q2_step = qnet(norm_obs_now, used_actions)
-                disagreement_step = torch.abs(q1_step - q2_step).squeeze(-1)
-                qmin_step = torch.min(q1_step, q2_step).squeeze(-1)
+                    features_now = critic_feature_backbone(reshape_obs(norm_obs_now))
+                    q_stack = torch.stack(critic_heads(features_now, used_actions), dim=0).squeeze(-1)
+                    max_q = torch.max(q_stack, dim=0).values
+                    min_q = torch.min(q_stack, dim=0).values
+                    disagreement_step = max_q - min_q
+                    qmin_step = min_q
                 if teacher_mask is not None:
                     teacher_mask_float = teacher_mask.float()
                 else:
@@ -812,7 +1020,7 @@ def main():
                 corr_total_steps += float(disagreement_step.numel())
                 corr_sum_mask += float(teacher_mask_float.sum().item())
                 corr_sum_dis += float(disagreement_step.sum().item())
-                corr_sum_mask_sq += float(teacher_mask_float.sum().item())  # since mask^2 = mask
+                corr_sum_mask_sq += float(teacher_mask_float.sum().item())
                 corr_sum_dis_sq += float((disagreement_step ** 2).sum().item())
                 corr_sum_mask_dis += float((teacher_mask_float * disagreement_step).sum().item())
 
@@ -821,29 +1029,24 @@ def main():
                     teacher_hist_counts.scatter_add_(0, bin_idx, teacher_mask_float)
                     non_teacher_hist_counts.scatter_add_(0, bin_idx, non_teacher_mask_float)
 
-                # Threshold fractions accumulation (per log window)
                 if thresh_tensor is not None:
-                    # Compare disagreement against thresholds: [N] vs [T] -> [N,T]
                     comp = (disagreement_step.unsqueeze(1) >= thresh_tensor.unsqueeze(0)).float()
-                    # Weight by teacher mask to count only interventions
                     comp_teacher = comp * teacher_mask_float.unsqueeze(1)
                     teacher_above_counts += comp_teacher.sum(dim=0)
                     teacher_steps_window += float(teacher_mask_float.sum().item())
 
-                # Q min running averages per window
                 qmin_sum_all += float(qmin_step.sum().item())
                 qmin_steps_all += float(qmin_step.numel())
                 qmin_sum_teacher += float((qmin_step * teacher_mask_float).sum().item())
                 qmin_steps_teacher += float(teacher_mask_float.sum().item())
                 qmin_sum_non += float((qmin_step * non_teacher_mask_float).sum().item())
                 qmin_steps_non += float(non_teacher_mask_float.sum().item())
-
             # Append counterfactual rows to CF buffer (student-denied actions)
             if args.cf_buffer_enable and teacher_mask is not None and student_actions is not None and cf_obs is not None:
                 denied_ids = torch.nonzero(teacher_mask, as_tuple=False).flatten()
                 if denied_ids.numel() > 0:
                     # Store (s, a_student)
-                    cf_s = obs_detached[denied_ids]
+                    cf_s = obs_detached_flat[denied_ids]
                     cf_a = student_actions[denied_ids]
                     # Initialize CF tensors on first use
                     cf_append(cf_s, cf_a)
@@ -927,9 +1130,20 @@ def main():
 
                 if args.reset_critic_on_switch:
                     record_progress(f"[Critic] Resetting critic weights/optimizer at step {total_env_steps}")
-                    qnet.load_state_dict(initial_qnet_state)
-                    qnet_target.load_state_dict(initial_qnet_target_state)
-                    q_optimizer = optim.AdamW(list(qnet.parameters()), lr=args.critic_learning_rate, weight_decay=0.1)
+                    if args.arch_shared_trunk:
+                        actor_backbone.load_state_dict(initial_shared_backbone_state)
+                        trunk_params = list(actor_backbone.parameters())
+                        trunk_optimizer = optim.Adam(trunk_params, lr=args.critic_learning_rate)
+                        critic_params = list(critic_heads.parameters())
+                        q_optimizer = optim.AdamW(critic_params, lr=args.critic_learning_rate, weight_decay=0.1)
+                    else:
+                        critic_backbone.load_state_dict(initial_critic_backbone_state)
+                        critic_params = list(critic_backbone.parameters()) + list(critic_heads.parameters())
+                        q_optimizer = optim.AdamW(critic_params, lr=args.critic_learning_rate, weight_decay=0.1)
+                    critic_heads.load_state_dict(initial_critic_heads_state)
+                    critic_target_backbone.load_state_dict(initial_target_backbone_state)
+                    critic_target_heads.load_state_dict(initial_target_heads_state)
+                    critic_feature_backbone = actor_backbone if args.arch_shared_trunk else critic_backbone
                 if save_interval_current is not None and args.post_switch_viz_multiplier > 1:
                     save_interval_current = max(1, args.save_interval // args.post_switch_viz_multiplier)
                     next_save_step = total_env_steps + save_interval_current
@@ -949,90 +1163,127 @@ def main():
                 main_batch = max(1, base_batch - b_pref - b_pref_td)
 
                 for i in range(args.num_updates):
-                    data = rb.sample(main_batch)
-                    # Normalize obs
-                    data['observations'] = _normalize_obs(data['observations'])
-                    data['next']['observations'] = _normalize_obs(data['next']['observations'])
+                    batch = rb.sample(main_batch)
+                    obs_batch = batch['observations']
+                    next_obs_batch = batch['next']['observations']
+                    actions_batch = batch['actions']
+                    rewards_batch = batch['next']['rewards'].unsqueeze(-1)
+                    dones_batch = batch['next']['dones'].float().unsqueeze(-1)
 
-                    # Critic update
+                    obs_batch = _normalize_obs(obs_batch)
+                    next_obs_batch = _normalize_obs(next_obs_batch)
+
+                    if args.arch_shared_trunk and trunk_optimizer is not None:
+                        trunk_optimizer.zero_grad(set_to_none=True)
+                    q_optimizer.zero_grad(set_to_none=True)
+
                     with autocast(device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled):
-                        next_pi, next_log_pi, _ = actor(data['next']['observations'])
-                        q1_t, q2_t = qnet_target(data['next']['observations'], next_pi)
-                        min_q_t = torch.min(q1_t, q2_t) - log_alpha.exp() * next_log_pi
-                        next_q = data['next']['rewards'].unsqueeze(-1) + (1.0 - data['next']['dones'].float()).unsqueeze(-1) * (args.gamma * min_q_t)
-                        q1, q2 = qnet(data['observations'], data['actions'])
-                        qf_loss = F.mse_loss(q1, next_q) + F.mse_loss(q2, next_q)
+                        # Target critic evaluation
+                        next_actions, next_log_pi, _, _ = actor_forward(next_obs_batch)
+                        next_features_target = critic_target_backbone(reshape_obs(next_obs_batch))
+                        target_q_list = critic_target_heads(next_features_target, next_actions)
+                        min_next_q = torch.min(torch.stack(target_q_list, dim=0), dim=0).values
+                        min_next_q = min_next_q - log_alpha.exp() * next_log_pi
+                        target_q = rewards_batch + (1.0 - dones_batch) * (args.gamma * min_next_q)
+
+                        current_features = (actor_backbone if args.arch_shared_trunk else critic_backbone)(reshape_obs(obs_batch))
+                        current_q_list = critic_heads(current_features, actions_batch)
+                        qf_loss = torch.tensor(0.0, device=device)
+                        for q_pred in current_q_list:
+                            qf_loss = qf_loss + F.mse_loss(q_pred, target_q)
+
                         # Counterfactual critic penalty
                         if args.cf_buffer_enable and args.cf_q_weight > 0.0 and args.cf_sample_ratio > 0.0 and 'cf_size' in locals() and cf_size > 0:
                             cf_b = max(1, int(base_batch * args.cf_sample_ratio))
                             s_cf, a_cf = cf_sample(cf_b)
                             if s_cf is not None:
-                                q1_cf, q2_cf = qnet(s_cf, a_cf)
-                                y_bad = torch.full_like(q1_cf, cf_penalty_target)
-                                qf_loss = qf_loss + args.cf_q_weight * (F.mse_loss(q1_cf, y_bad) + F.mse_loss(q2_cf, y_bad))
+                                cf_features = (actor_backbone if args.arch_shared_trunk else critic_backbone)(reshape_obs(s_cf))
+                                cf_q_list = critic_heads(cf_features, a_cf)
+                                for q_cf in cf_q_list:
+                                    qf_loss = qf_loss + args.cf_q_weight * F.mse_loss(q_cf, torch.full_like(q_cf, cf_penalty_target))
+
                         # Preference ranking loss (teacher > student at s)
                         if args.pref_buffer_enable and args.pref_rank_weight > 0.0 and b_pref > 0 and 'pref_size' in locals() and pref_size > 0:
                             s_pair, a_pos, a_neg = pref_sample(b_pref)
                             if s_pair is not None:
-                                q1p, q2p = qnet(s_pair, a_pos)
-                                q1n, q2n = qnet(s_pair, a_neg)
-                                qpos = torch.min(q1p, q2p)
-                                qneg = torch.min(q1n, q2n)
+                                pref_features = (actor_backbone if args.arch_shared_trunk else critic_backbone)(reshape_obs(s_pair))
+                                q_pos = critic_heads(pref_features, a_pos)
+                                q_neg = critic_heads(pref_features, a_neg)
+                                qpos_min = torch.min(torch.stack(q_pos, dim=0), dim=0).values
+                                qneg_min = torch.min(torch.stack(q_neg, dim=0), dim=0).values
                                 margin = float(args.pref_rank_margin)
-                                rank_loss = torch.nn.functional.softplus(margin - (qpos - qneg)).mean()
+                                rank_loss = torch.nn.functional.softplus(margin - (qpos_min - qneg_min)).mean()
                                 qf_loss = qf_loss + float(args.pref_rank_weight) * rank_loss
+
                         # Preference-TD balanced critic loss
                         if args.pref_td_buffer_enable and args.pref_td_q_weight > 0.0 and b_pref_td > 0 and 't_size' in locals() and t_size > 0 and s_size > 0:
-                            batch = pref_td_sample(b_pref_td)
-                            if batch is not None:
-                                # Teacher real TD targets
-                                npi_t, nlogpi_t, _ = actor(batch['t_next_s'])
-                                q1_targ, q2_targ = qnet_target(batch['t_next_s'], npi_t)
-                                min_q_tp = torch.min(q1_targ, q2_targ) - log_alpha.exp() * nlogpi_t
-                                y_teacher = batch['t_r'] + (1.0 - batch['t_done']) * (args.gamma * min_q_tp)
-                                q1_teach, q2_teach = qnet(batch['t_s'], batch['t_a'])
-                                loss_teach = F.mse_loss(q1_teach, y_teacher) + F.mse_loss(q2_teach, y_teacher)
-                                # Student terminal negatives
-                                y_student = batch['s_r']  # terminal
-                                q1_stu, q2_stu = qnet(batch['s_s'], batch['s_a'])
-                                loss_stu = F.mse_loss(q1_stu, y_student) + F.mse_loss(q2_stu, y_student)
-                                qf_loss = qf_loss + float(args.pref_td_q_weight) * (loss_teach + loss_stu)
+                            td_batch = pref_td_sample(b_pref_td)
+                            if td_batch is not None:
+                                t_s = td_batch['t_s']
+                                t_next_s = td_batch['t_next_s']
+                                t_a = td_batch['t_a']
+                                t_r = td_batch['t_r'].unsqueeze(-1)
+                                t_done = td_batch['t_done'].unsqueeze(-1)
+                                s_s = td_batch['s_s']
+                                s_a = td_batch['s_a']
+                                s_r = td_batch['s_r'].unsqueeze(-1)
 
-                    q_optimizer.zero_grad(set_to_none=True)
+                                next_actions_td, next_log_pi_td, _, _ = actor_forward(t_next_s)
+                                next_features_td = critic_target_backbone(reshape_obs(t_next_s))
+                                q_td_list = critic_target_heads(next_features_td, next_actions_td)
+                                min_q_td = torch.min(torch.stack(q_td_list, dim=0), dim=0).values
+                                min_q_td = min_q_td - log_alpha.exp() * next_log_pi_td
+                                target_teacher = t_r + (1.0 - t_done) * (args.gamma * min_q_td)
+
+                                teacher_features = (actor_backbone if args.arch_shared_trunk else critic_backbone)(reshape_obs(t_s))
+                                teacher_q_list = critic_heads(teacher_features, t_a)
+                                loss_teacher = sum(F.mse_loss(q_t, target_teacher) for q_t in teacher_q_list)
+
+                                student_features = (actor_backbone if args.arch_shared_trunk else critic_backbone)(reshape_obs(s_s))
+                                student_q_list = critic_heads(student_features, s_a)
+                                loss_student = sum(F.mse_loss(q_s, s_r) for q_s in student_q_list)
+                                qf_loss = qf_loss + float(args.pref_td_q_weight) * (loss_teacher + loss_student)
+
                     scaler.scale(qf_loss).backward()
                     scaler.unscale_(q_optimizer)
-                    torch.nn.utils.clip_grad_norm_(qnet.parameters(), max_norm=args.max_grad_norm if args.max_grad_norm > 0 else float('inf'))
+                    torch.nn.utils.clip_grad_norm_(critic_params, max_norm=args.max_grad_norm if args.max_grad_norm > 0 else float('inf'))
                     scaler.step(q_optimizer)
-                    scaler.update()
 
                     # Actor update
-                    with autocast(device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled):
-                        pi, log_pi, _ = actor(data['observations'])
-                        q1_pi, q2_pi = qnet(data['observations'], pi)
-                        q_pi = torch.min(q1_pi, q2_pi)
-                        actor_loss = (log_alpha.exp().detach() * log_pi - q_pi).mean()
-
                     actor_optimizer.zero_grad(set_to_none=True)
+                    with autocast(device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled):
+                        pi_actions, log_pi, _, _ = actor_forward(obs_batch)
+                        actor_critic_features = (actor_backbone if args.arch_shared_trunk else critic_backbone)(reshape_obs(obs_batch))
+                        q_pi_list = critic_heads(actor_critic_features, pi_actions)
+                        min_q_pi = torch.min(torch.stack(q_pi_list, dim=0), dim=0).values
+                        actor_loss = (log_alpha.exp().detach() * log_pi - min_q_pi).mean()
                     scaler.scale(actor_loss).backward()
                     scaler.unscale_(actor_optimizer)
-                    torch.nn.utils.clip_grad_norm_(actor.parameters(), max_norm=args.max_grad_norm if args.max_grad_norm > 0 else float('inf'))
+                    if args.arch_shared_trunk and trunk_optimizer is not None:
+                        scaler.unscale_(trunk_optimizer)
+                    torch.nn.utils.clip_grad_norm_(actor_params, max_norm=args.max_grad_norm if args.max_grad_norm > 0 else float('inf'))
+                    if args.arch_shared_trunk and trunk_optimizer is not None:
+                        torch.nn.utils.clip_grad_norm_(trunk_params, max_norm=args.max_grad_norm if args.max_grad_norm > 0 else float('inf'))
                     scaler.step(actor_optimizer)
+
+                    if args.arch_shared_trunk and trunk_optimizer is not None:
+                        scaler.step(trunk_optimizer)
                     scaler.update()
 
                     # Alpha update
                     alpha_optimizer.zero_grad(set_to_none=True)
                     with torch.no_grad():
-                        _, log_pi_curr, _ = actor(data['observations'])
-                    alpha_loss = -log_alpha.exp() * (log_pi_curr + (-float(n_act))).detach().mean()
-                    scaler.scale(alpha_loss).backward()
-                    scaler.unscale_(alpha_optimizer)
+                        _, log_pi_curr, _, _ = actor_forward(obs_batch)
+                    alpha_loss = -log_alpha.exp() * (log_pi_curr + target_entropy).detach().mean()
+                    alpha_loss.backward()
                     alpha_optimizer.step()
 
-                    # Soft update target
-                    for p, tp in zip(qnet.parameters(), qnet_target.parameters()):
-                        tp.data.copy_(args.tau * p.data + (1 - args.tau) * tp.data)
-
-            # Logging (RSL-RL style)
+                    # Soft update targets
+                    source_backbone = actor_backbone if args.arch_shared_trunk else critic_backbone
+                    for src_param, tgt_param in zip(source_backbone.parameters(), critic_target_backbone.parameters()):
+                        tgt_param.data.copy_(args.tau * src_param.data + (1 - args.tau) * tgt_param.data)
+                    for src_param, tgt_param in zip(critic_heads.parameters(), critic_target_heads.parameters()):
+                        tgt_param.data.copy_(args.tau * src_param.data + (1 - args.tau) * tgt_param.data)
             should_log = False
             if next_log_step is not None and total_env_steps >= next_log_step:
                 should_log = True

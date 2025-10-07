@@ -10,7 +10,7 @@
 - `logs/`, `models/`, `wandb/`: Outputs, artifacts, offline tracking.
 
 ## Build, Test, and Development Commands
-- Env: `source sc_venv_template/activate.sh` (sets modules, venv, `PYTHONPATH`).
+- Env only on cluster, not for local development and tests: `source sc_venv_template/activate.sh` (sets modules, venv, `PYTHONPATH`).
 - Local fallback env: `conda activate fasttd3` (preferred on developer machines).
 - Local run: `python train_rsl_rl_integrated.py --env_name pointmaze-medium-v0`.
 - Evaluate: `python eval_interactive.py --model_path models/<file>.pt --env_name pointmaze-medium-v0`.
