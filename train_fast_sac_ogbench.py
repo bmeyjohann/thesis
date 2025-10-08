@@ -226,6 +226,12 @@ def parse_args():
                    help='Number of critic heads (2 or 3 supported)')
     p.add_argument('--obs_mode', type=str, default='state', choices=['state', 'pixels'],
                    help='Observation mode: vector state or pixel images')
+    p.add_argument('--pixel_width', type=int, default=64,
+                   help='Pixel observation width when obs_mode=pixels')
+    p.add_argument('--pixel_height', type=int, default=64,
+                   help='Pixel observation height when obs_mode=pixels')
+    p.add_argument('--pixel_camera', type=str, default=None,
+                   help='Optional MuJoCo camera name for pixel observations (defaults to env setting)')
     p.add_argument('--store_denied_actions', action='store_true', default=False,
                    help='Add denied student actions to replay buffer with penalty reward')
     p.add_argument('--denied_action_penalty', type=float, default=-1.0,
@@ -400,6 +406,15 @@ def main():
     wrappers = make_wrappers(args)
     current_wrappers = wrappers
     current_env_name = args.env_name
+    env_make_kwargs = {}
+    if args.obs_mode == 'pixels':
+        env_make_kwargs['render_mode'] = 'rgb_array'
+        if args.pixel_width:
+            env_make_kwargs['width'] = int(args.pixel_width)
+        if args.pixel_height:
+            env_make_kwargs['height'] = int(args.pixel_height)
+        if args.pixel_camera:
+            env_make_kwargs['camera_name'] = args.pixel_camera
     record_progress("[Init] constructing vector env adapter")
     envs = OGBenchVecEnvAdapter(
         env_name=current_env_name,
@@ -407,6 +422,7 @@ def main():
         device=device,
         wrappers=current_wrappers,
         clip_actions=1.0,
+        **env_make_kwargs,
     )
     record_progress("[Init] env adapter constructed")
     print("[Init] Env adapter constructed", flush=True)
@@ -418,12 +434,16 @@ def main():
     pixel_shape = None
     if args.obs_mode == 'pixels':
         if len(raw_obs_space.shape) != 3:
-            raise RuntimeError('Pixel observation expected to have HxWxC shape')
-        pixel_shape = raw_obs_space.shape
-        obs = obs.view(envs.num_envs, -1)
-        n_obs = obs.shape[1]
-        obs_normalizer = PixelNormalizer().to(device)
-        critic_obs_normalizer = PixelNormalizer().to(device)
+            raise RuntimeError('Pixel observation expected to have 3 dims')
+        raw_shape = raw_obs_space.shape
+        if raw_shape[0] in (1, 3, 4):
+            pixel_shape = raw_shape
+        elif raw_shape[-1] in (1, 3, 4):
+            pixel_shape = (raw_shape[-1], raw_shape[0], raw_shape[1])
+        else:
+            raise RuntimeError(f'Unable to determine channel dimension for pixel observations: {raw_shape}')
+        obs_normalizer = IdentityNormalizer().to(device)
+        critic_obs_normalizer = IdentityNormalizer().to(device)
     else:
         obs_normalizer = EmpiricalNormalization(shape=n_obs, device=device)
         critic_obs_normalizer = EmpiricalNormalization(shape=n_obs, device=device)
@@ -432,7 +452,7 @@ def main():
 
     def build_backbone(mode, hidden_dim):
         if mode == 'pixels':
-            c, h, w = pixel_shape[2], pixel_shape[0], pixel_shape[1]
+            c, h, w = pixel_shape
             return PixelBackbone((c, h, w), hidden_dim).to(device)
         return MLPBackbone(n_obs, hidden_dim).to(device)
 
@@ -441,6 +461,8 @@ def main():
     initial_critic_backbone_state = None
     if args.arch_shared_trunk:
         shared_backbone = build_backbone(args.obs_mode, args.shared_hidden_dim)
+        if args.obs_mode == 'pixels' and hasattr(shared_backbone, 'fc'):
+            record_progress(f'[Init] shared trunk fc weight {shared_backbone.fc[0].weight.shape}')
         actor_backbone = shared_backbone
         actor_head = GaussianPolicyHead(shared_backbone.output_dim, n_act, args.actor_hidden_dim, args.init_scale).to(device)
         critic_backbone = shared_backbone
@@ -479,6 +501,54 @@ def main():
     initial_target_backbone_state = copy.deepcopy(critic_target_backbone.state_dict())
     initial_target_heads_state = copy.deepcopy(critic_target_heads.state_dict())
 
+
+    def infer_pixel_shape(obs_input):
+        data = obs_input
+        if isinstance(data, tuple):
+            data = data[0]
+        if isinstance(data, dict):
+            for key in ('policy', 'pixels', 'image', 'observation'):
+                if key in data:
+                    data = data[key]
+                    break
+            else:
+                raise KeyError(f"Unknown observation keys {list(data.keys())}")
+        if isinstance(data, torch.Tensor):
+            sample = data[0]
+        elif isinstance(data, np.ndarray):
+            sample = data[0] if data.ndim == 4 else data
+        else:
+            sample = torch.as_tensor(data)[0]
+        shape = tuple(sample.shape)
+        if len(shape) == 4:
+            shape = shape[1:]
+        if shape[0] in (1, 3, 4):
+            return shape
+        if shape[-1] in (1, 3, 4):
+            return (shape[-1], shape[0], shape[1])
+        raise RuntimeError(f"Unable to determine channel dimension from {shape}")
+
+    def prepare_obs(obs_input):
+        tensor = obs_input
+        if isinstance(tensor, tuple):
+            tensor = tensor[0]
+        if isinstance(tensor, dict):
+            for key in ('policy', 'pixels', 'image', 'observation'):
+                if key in tensor:
+                    tensor = tensor[key]
+                    break
+            else:
+                raise KeyError(f"Unknown observation keys {list(tensor.keys())}")
+        if isinstance(tensor, np.ndarray):
+            tensor = torch.from_numpy(tensor)
+        tensor = tensor.to(device)
+        if args.obs_mode == 'pixels':
+            if tensor.ndim == 4:
+                if tensor.shape[-1] in (1, 3, 4) and tensor.shape[1] not in (1, 3, 4):
+                    tensor = tensor.permute(0, 3, 1, 2).contiguous()
+            if tensor.dtype in (torch.uint8, torch.int8):
+                tensor = tensor.float().div(255.0)
+        return tensor.view(tensor.shape[0], -1)
 
     def reshape_obs(obs_flat: torch.Tensor):
         if args.obs_mode == 'pixels':
@@ -754,9 +824,12 @@ def main():
             )
         else:
             wandb_run = None
-        obs = envs.reset()
+        obs_raw = envs.reset()
         if args.obs_mode == 'pixels':
-            obs = obs.view(envs.num_envs, -1)
+            pixel_shape = infer_pixel_shape(obs_raw)
+            record_progress(f'[Pixels] inferred pixel shape {pixel_shape}')
+        obs = prepare_obs(obs_raw)
+        n_obs = obs.shape[1]
         record_progress("[Init] envs.reset() returned; entering loop")
         print("[Init] Env reset complete; starting training loop", flush=True)
         total_env_steps = 0
@@ -902,13 +975,19 @@ def main():
             norm_obs = _normalize_obs(obs)
             obs_actor_input = reshape_obs(norm_obs)
             with torch.no_grad(), autocast(device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled):
-                pi_action, _, _ = actor_head(actor_backbone(obs_actor_input))
+                if args.obs_mode == 'pixels' and iteration_idx == 0 and total_env_steps == 0:
+                    record_progress(f'[Pixels] actor input shape {obs_actor_input.shape}, pixel_shape {pixel_shape}')
+                try:
+                    features_actor = actor_backbone(obs_actor_input)
+                except RuntimeError as exc:
+                    record_progress(f'[Pixels] backbone failure: input shape {obs_actor_input.shape}, pixel_shape {pixel_shape}')
+                    raise
+                if args.obs_mode == 'pixels' and iteration_idx == 0 and total_env_steps == 0:
+                    record_progress(f'[Pixels] backbone output shape {features_actor.shape}')
+                pi_action, _, _ = actor_head(features_actor)
             next_obs_raw, rewards, dones, infos = envs.step(pi_action.float())
             actions = pi_action
-            if args.obs_mode == 'pixels':
-                next_obs = next_obs_raw.view(envs.num_envs, -1)
-            else:
-                next_obs = next_obs_raw
+            next_obs = prepare_obs(next_obs_raw)
             # Detach copies for any auxiliary buffers before we mutate below
             obs_detached_flat = obs.detach()
             next_obs_detached_flat = next_obs.detach()

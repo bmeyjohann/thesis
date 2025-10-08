@@ -30,11 +30,14 @@ PREF_MARGIN=${PREF_MARGIN:-0.1}
 PREF_WEIGHT=${PREF_WEIGHT:-1.0}
 THRESHOLDS=${THRESHOLDS:-0.02,0.05,0.1,0.2,0.3,0.5,0.75,1.0,2.0,5.0}
 SHARED_DIM=${SHARED_DIM:-512}
+PIXEL_WIDTH=${PIXEL_WIDTH:-64}
+PIXEL_HEIGHT=${PIXEL_HEIGHT:-64}
 
 BASE_ARGS="--env_name ${ENV_ID} --obs_mode pixels --num_envs ${NUM_ENVS} --total_timesteps ${TOTAL_STEPS} --include_goal \
 --save_interval ${SAVE_INTERVAL} --log_interval ${LOG_INTERVAL} --use_wandb \
 --dense_reward_scale ${DENSE_REWARD_SCALE} --step_penalty ${STEP_PENALTY} \
 --reward_type dense --reward_switch_after_steps ${SWITCH_STEPS} \
+--pixel_width ${PIXEL_WIDTH} --pixel_height ${PIXEL_HEIGHT} \
 --post_switch_viz_multiplier 10 --disagreement_thresholds ${THRESHOLDS} \
 --viz_on_checkpoint --viz_grid_resolution 64 --viz_quiver_stride 2 --viz_device cpu --viz_seed 0 \
 --pref_buffer_enable --pref_capacity 100000 --pref_sample_ratio 0.5 \
