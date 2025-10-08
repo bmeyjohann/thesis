@@ -1,4 +1,5 @@
 # Ingore files intended for local use only
+*_l/
 *_l.sh
 *_l.py
 *_l.md
