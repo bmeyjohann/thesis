@@ -32,7 +32,8 @@ THRESHOLDS=${THRESHOLDS:-0.02,0.05,0.1,0.2,0.3,0.5,0.75,1.0,2.0,5.0}
 SHARED_DIM=${SHARED_DIM:-512}
 PIXEL_WIDTH=${PIXEL_WIDTH:-64}
 PIXEL_HEIGHT=${PIXEL_HEIGHT:-64}
-BUFFER_SIZE=${BUFFER_SIZE:-2048}
+BUFFER_SIZE=${BUFFER_SIZE:-1536}
+PREF_CAPACITY=${PREF_CAPACITY:-4096}
 
 BASE_ARGS="--env_name ${ENV_ID} --obs_mode pixels --num_envs ${NUM_ENVS} --total_timesteps ${TOTAL_STEPS} --include_goal \
 --save_interval ${SAVE_INTERVAL} --log_interval ${LOG_INTERVAL} --use_wandb \
@@ -42,7 +43,7 @@ BASE_ARGS="--env_name ${ENV_ID} --obs_mode pixels --num_envs ${NUM_ENVS} --total
 --buffer_size ${BUFFER_SIZE} \
 --post_switch_viz_multiplier 10 --disagreement_thresholds ${THRESHOLDS} \
 --viz_on_checkpoint --viz_grid_resolution 64 --viz_quiver_stride 2 --viz_device cpu --viz_seed 0 \
---pref_buffer_enable --pref_capacity 100000 --pref_sample_ratio 0.5 \
+--pref_buffer_enable --pref_capacity ${PREF_CAPACITY} --pref_sample_ratio 0.5 \
 --pref_rank_margin ${PREF_MARGIN} --pref_rank_weight ${PREF_WEIGHT} \
 --intervention_reward_mode none --bonus_teacher_value 0.0 \
 --use_intervention --intervention_mode agent --teacher_type bfs \
