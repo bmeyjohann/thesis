@@ -27,7 +27,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.amp import autocast, GradScaler
+try:
+    from torch.amp import autocast  # PyTorch 2.0+
+except ImportError:  # pragma: no cover - older torch fallback
+    from torch.cuda.amp import autocast  # type: ignore
+try:
+    from torch.amp import GradScaler  # PyTorch 2.0+
+except ImportError:  # pragma: no cover - older torch fallback
+    from torch.cuda.amp import GradScaler  # type: ignore
 from tensordict import TensorDict, from_module
 
 # Add FastSAC path
