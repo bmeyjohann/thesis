@@ -1,5 +1,4 @@
---extra-index-url https://pypi.nvidia.com
-isaacsim[all,extscache]==5.0.0
+isaacsim[all,extscache]==5.0.0 --extra-index-url https://pypi.nvidia.com
 absl-py==2.3.1
 annotated-types==0.7.0
 attrs==25.3.0
