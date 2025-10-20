@@ -28,6 +28,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.amp import autocast, GradScaler
+from tensordict import TensorDict
 
 # Add FastSAC path
 sys.path.append('fasttd3/fast_sac')

@@ -1,3 +1,6 @@
+-e ./ogbench
+-e ./fasttd3
+
 absl-py==2.3.1
 annotated-types==0.7.0
 attrs==25.3.0
@@ -68,7 +71,6 @@ nvidia-nccl-cu12==2.21.5
 nvidia-nvjitlink-cu12==12.4.127
 nvidia-nvshmem-cu12==3.3.9
 nvidia-nvtx-cu12==12.4.127
--e ./ogbench
 onnx==1.18.0
 opt_einsum==3.4.0
 optax==0.2.5
