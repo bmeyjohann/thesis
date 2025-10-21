@@ -11,6 +11,7 @@
 
 ## Build, Test, and Development Commands
 - See `README.md`
+- Start jobs on cluster with automatic account detection: `bash submit_job.sh [experiment_name].sbatch`
 - Logs: tail `logs/<name>_<JOBID>.log` and `logs/rsl_rl/<experiment>/` for artifacts.
 
 ## Coding Style & Naming Conventions
