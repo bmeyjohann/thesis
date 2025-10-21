@@ -17,3 +17,24 @@ if [[ ! -f "${ENV_DIR}/bin/activate" ]]; then
 fi
 
 source "${ENV_DIR}/bin/activate"
+
+# Discover the venv's site-packages path (python version may vary)
+_PY_DIR="$(find "${ENV_DIR}/lib" -maxdepth 1 -type d -name "python*" | head -n 1)"
+if [[ -z "${_PY_DIR}" ]]; then
+    echo "Unable to locate site-packages under ${ENV_DIR}. Has the venv been created?"
+    return 1
+fi
+_VENV_SITE_PACKAGES="${_PY_DIR}/site-packages"
+
+# Extend PYTHONPATH so IsaacLab sources and venv packages are discoverable.
+_PYTHONPATH_ENTRIES="${_VENV_SITE_PACKAGES}"
+if [[ -d /workspace/IsaacLab/source ]]; then
+    _PYTHONPATH_ENTRIES="/workspace/IsaacLab/source:${_PYTHONPATH_ENTRIES}"
+fi
+if [[ -n "${PYTHONPATH:-}" ]]; then
+    export PYTHONPATH="${_PYTHONPATH_ENTRIES}:${PYTHONPATH}"
+else
+    export PYTHONPATH="${_PYTHONPATH_ENTRIES}"
+fi
+
+unset _PY_DIR _VENV_SITE_PACKAGES _PYTHONPATH_ENTRIES
