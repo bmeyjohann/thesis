@@ -19,7 +19,7 @@ python fasttd3/fast_sac/train.py --env_name Isaac-Lift-Cube-Franka-v0 ...
 
 Environment variables recognised during setup:
 - `PYTHON_BIN` – set to a different interpreter if needed (defaults to `/isaac-sim/python.sh`).
-- `ISAACLAB_PATH` – path to the IsaacLab checkout to install in editable mode (defaults to `../IsaacLab`).
+- `INSTALL_EDITABLE_ISAACLAB` – set to `1` if you want to install a local IsaacLab checkout in editable mode (uses `ISAACLAB_PATH`, default `../IsaacLab`). Leave unset/`0` to keep using the container’s bundled wheel.
 - `FASTTD3_PATH` – path to the fasttd3 sources (defaults to `../fasttd3`).
 
 `requirements.txt` is intentionally minimal; add dependencies here only when they are **not** already supplied by Isaac Sim. If you need to install an extra package with overlapping transitive requirements, prefer `pip install --no-deps` and rely on the container’s versions.
@@ -29,3 +29,6 @@ Helper scripts:
 - `setup.sh` – creates/refreshed the venv and installs extras.
 - `create_python_for_vscode.sh` – writes a small wrapper that launches the venv interpreter; useful for VS Code’s Python path picker.
 - `create_kernel.sh` – optional helper to register a Jupyter kernel that activates the venv before launching `ipykernel`.
+
+Recommended IsaacLab sources (only if you opt into editable installs):
+- For Isaac Sim 5.0.0 use the `release-2025.1` (or newer) tag from https://github.com/isaac-sim/IsaacLab.git and place it at `/workspace/IsaacLab` (or export `ISAACLAB_PATH` to your checkout).

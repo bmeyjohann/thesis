@@ -35,12 +35,17 @@ echo "Installing project Python requirements..."
 
 REPO_ROOT="$(realpath "${ABSOLUTE_PATH}/..")"
 
-ISAACLAB_PATH="${ISAACLAB_PATH:-${REPO_ROOT}/IsaacLab}"
-if [[ -d "${ISAACLAB_PATH}" ]]; then
-    echo "Installing IsaacLab from ${ISAACLAB_PATH} (editable, no dependencies)..."
-    "${VENV_PYTHON}" -m pip install --no-deps -e "${ISAACLAB_PATH}"
+INSTALL_EDITABLE_ISAACLAB="${INSTALL_EDITABLE_ISAACLAB:-0}"
+if [[ "${INSTALL_EDITABLE_ISAACLAB}" == "1" ]]; then
+    ISAACLAB_PATH="${ISAACLAB_PATH:-${REPO_ROOT}/IsaacLab}"
+    if [[ -d "${ISAACLAB_PATH}" ]]; then
+        echo "Installing IsaacLab from ${ISAACLAB_PATH} (editable, no dependencies)..."
+        "${VENV_PYTHON}" -m pip install --no-deps -e "${ISAACLAB_PATH}"
+    else
+        echo "IsaacLab source tree not found at ${ISAACLAB_PATH}; skipping editable install."
+    fi
 else
-    echo "IsaacLab source tree not found at ${ISAACLAB_PATH}; skipping editable install."
+    echo "Skipping editable IsaacLab install (using container-provided package)."
 fi
 
 FASTTD3_PATH="${FASTTD3_PATH:-${REPO_ROOT}/fasttd3}"
