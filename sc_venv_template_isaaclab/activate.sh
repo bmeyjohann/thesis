@@ -1,16 +1,19 @@
 #!/bin/bash
 
-# See https://stackoverflow.com/a/28336473
 SOURCE_PATH="${BASH_SOURCE[0]:-${(%):-%x}}"
-
 RELATIVE_PATH="$(dirname "$SOURCE_PATH")"
 ABSOLUTE_PATH="$(realpath "${RELATIVE_PATH}")"
 
-[[ "$0" != "${SOURCE_PATH}" ]] && echo "The activation script must be sourced, otherwise the virtual environment will not work." || ( echo "Vars script must be sourced." && exit 1) ;
+if [[ "$0" == "${SOURCE_PATH}" ]]; then
+    echo "This activation script must be sourced, e.g. 'source ${SOURCE_PATH}'."
+    exit 1
+fi
 
-source "${ABSOLUTE_PATH}"/config.sh
-source "${ABSOLUTE_PATH}"/modules.sh
+source "${ABSOLUTE_PATH}/config.sh"
 
-export PYTHONPATH="$(echo "${ENV_DIR}"/lib/python*/site-packages):${PYTHONPATH}"
+if [[ ! -f "${ENV_DIR}/bin/activate" ]]; then
+    echo "Virtual environment not found at ${ENV_DIR}. Run setup.sh first."
+    return 1
+fi
 
-source "${ENV_DIR}"/bin/activate
+source "${ENV_DIR}/bin/activate"
