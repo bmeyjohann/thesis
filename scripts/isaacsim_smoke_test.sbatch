@@ -55,9 +55,9 @@ python fasttd3/fast_sac/train.py \
     --num_envs 16 \
     --num_eval_envs 16 \
     --seed ${JOB_SEED} \
-    --use_wandb False \
-    --compile False \
-    --amp False \
+    --no-use-wandb \
+    --no-compile \
+    --no-amp \
     --exp_name isaaclab_smoke \
     --project smoke-tests \
     --eval_interval 2048 \
