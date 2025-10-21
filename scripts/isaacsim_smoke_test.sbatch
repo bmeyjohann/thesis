@@ -40,13 +40,21 @@ APPTAINER_BASE_CMD=("apptainer" "exec" "--nv" "--bind" "${WORKSPACE_ROOT}:/works
 echo "[$(date)] Verifying Isaac Sim container imports..."
 "${APPTAINER_BASE_CMD[@]}" /isaac-sim/python.sh -c "import isaacsim, isaaclab, torch; print('Imports OK')"
 
+echo "[$(date)] Ensuring container venv is present..."
+"${APPTAINER_BASE_CMD[@]}" /bin/bash -lc 'cd /workspace && if [[ ! -d sc_venv_template_isaaclab/venv ]]; then bash sc_venv_template_isaaclab/setup.sh; else echo "Using existing venv at sc_venv_template_isaaclab/venv"; fi'
+
 echo "[$(date)] Launching FastTD3 IsaacLab smoke training..."
-"${APPTAINER_BASE_CMD[@]}" /isaac-sim/python.sh /workspace/fasttd3/fast_sac/train.py \
+JOB_SEED="${SLURM_JOB_ID:-0}"
+"${APPTAINER_BASE_CMD[@]}" env JOB_SEED="${JOB_SEED}" /bin/bash -lc '
+set -euo pipefail
+cd /workspace
+source sc_venv_template_isaaclab/activate.sh
+python fasttd3/fast_sac/train.py \
     --env_name Isaac-Lift-Cube-Franka-v0 \
     --total_timesteps 2048 \
     --num_envs 16 \
     --num_eval_envs 16 \
-    --seed "${SLURM_JOB_ID:-0}" \
+    --seed ${JOB_SEED} \
     --use_wandb False \
     --compile False \
     --amp False \
@@ -55,6 +63,7 @@ echo "[$(date)] Launching FastTD3 IsaacLab smoke training..."
     --eval_interval 2048 \
     --save_interval 2048 \
     --measure_burnin 0
+'
 
 TRAIN_EXIT_CODE=$?
 
