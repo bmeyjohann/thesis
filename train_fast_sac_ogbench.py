@@ -77,17 +77,39 @@ class MLPBackbone(nn.Module):
 
 
 class PixelBackbone(nn.Module):
-    def __init__(self, input_shape, feature_dim: int):
+    def __init__(
+        self,
+        input_shape,
+        feature_dim: int,
+        conv_channels: tuple[int, ...] | None = None,
+        kernel_sizes: tuple[int, ...] | None = None,
+        strides: tuple[int, ...] | None = None,
+        final_pool: int | None = None,
+    ):
         super().__init__()
         c, h, w = input_shape
-        self.conv = nn.Sequential(
-            nn.Conv2d(c, 32, kernel_size=8, stride=4),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1),
-            nn.ReLU(),
-        )
+        if conv_channels is None or len(conv_channels) == 0:
+            conv_channels = (32, 64, 64)
+        if kernel_sizes is None or len(kernel_sizes) == 0:
+            kernel_sizes = (8, 4, 3)
+        if strides is None or len(strides) == 0:
+            strides = (4, 2, 1)
+        if len(kernel_sizes) < len(conv_channels):
+            kernel_sizes = tuple(list(kernel_sizes) + [kernel_sizes[-1]] * (len(conv_channels) - len(kernel_sizes)))
+        if len(strides) < len(conv_channels):
+            strides = tuple(list(strides) + [strides[-1]] * (len(conv_channels) - len(strides)))
+        layers: list[nn.Module] = []
+        in_channels = c
+        for idx, out_channels in enumerate(conv_channels):
+            k = int(kernel_sizes[idx])
+            s = int(strides[idx])
+            padding = k // 2 if s == 1 else 0
+            layers.append(nn.Conv2d(in_channels, int(out_channels), kernel_size=k, stride=s, padding=padding))
+            layers.append(nn.ReLU())
+            in_channels = int(out_channels)
+        if final_pool is not None and final_pool > 0:
+            layers.append(nn.AdaptiveAvgPool2d(final_pool))
+        self.conv = nn.Sequential(*layers)
         with torch.no_grad():
             dummy = torch.zeros(1, c, h, w)
             flat_dim = self.conv(dummy).view(1, -1).shape[1]
@@ -232,6 +254,14 @@ def parse_args():
                    help='Pixel observation height when obs_mode=pixels')
     p.add_argument('--pixel_camera', type=str, default=None,
                    help='Optional MuJoCo camera name for pixel observations (defaults to env setting)')
+    p.add_argument('--pixel_conv_channels', type=str, default='32,64,64',
+                   help='Comma-separated Conv2d channel sizes for the pixel backbone')
+    p.add_argument('--pixel_kernel_sizes', type=str, default='8,4,3',
+                   help='Comma-separated kernel sizes for each conv layer (defaults to 8,4,3)')
+    p.add_argument('--pixel_strides', type=str, default='4,2,1',
+                   help='Comma-separated strides for each conv layer (defaults to 4,2,1)')
+    p.add_argument('--pixel_final_pool', type=int, default=0,
+                   help='If >0, apply AdaptiveAvgPool2d to this spatial size after conv stack')
     p.add_argument('--store_denied_actions', action='store_true', default=False,
                    help='Add denied student actions to replay buffer with penalty reward')
     p.add_argument('--denied_action_penalty', type=float, default=-1.0,
@@ -350,6 +380,32 @@ def main():
     args = parse_args()
     device = torch.device('cuda' if (args.device=='auto' and torch.cuda.is_available()) or args.device=='cuda' else 'cpu')
 
+    pixel_channels_default = (32, 64, 64)
+    try:
+        pixel_channels_parsed = tuple(
+            int(ch.strip()) for ch in args.pixel_conv_channels.split(',') if ch.strip()
+        )
+    except Exception as exc:  # pragma: no cover - arg parsing guard
+        raise ValueError(f"Invalid --pixel_conv_channels value: {args.pixel_conv_channels}") from exc
+    if not pixel_channels_parsed:
+        pixel_channels_parsed = pixel_channels_default
+    setattr(args, 'pixel_conv_channels_parsed', pixel_channels_parsed)
+
+    def _parse_int_list(raw: str, default: tuple[int, ...]) -> tuple[int, ...]:
+        try:
+            parsed = tuple(int(x.strip()) for x in raw.split(',') if x.strip())
+            if not parsed:
+                return default
+            return parsed
+        except Exception as exc:
+            raise ValueError(f"Invalid integer list value: {raw}") from exc
+
+    kernel_sizes_default = (8, 4, 3)
+    strides_default = (4, 2, 1)
+    setattr(args, 'pixel_kernel_sizes_parsed', _parse_int_list(args.pixel_kernel_sizes, kernel_sizes_default))
+    setattr(args, 'pixel_strides_parsed', _parse_int_list(args.pixel_strides, strides_default))
+    setattr(args, 'pixel_final_pool_parsed', int(max(0, args.pixel_final_pool)))
+
     cf_penalty_target = -abs(float(args.cf_penalty))
     setattr(args, 'cf_penalty_target', cf_penalty_target)
 
@@ -442,6 +498,16 @@ def main():
             pixel_shape = (raw_shape[-1], raw_shape[0], raw_shape[1])
         else:
             raise RuntimeError(f'Unable to determine channel dimension for pixel observations: {raw_shape}')
+        record_progress(
+            "[Init] pixel obs shape=%s, conv_channels=%s, kernel_sizes=%s, strides=%s, pool=%s"
+            % (
+                pixel_shape,
+                args.pixel_conv_channels_parsed,
+                args.pixel_kernel_sizes_parsed,
+                args.pixel_strides_parsed,
+                args.pixel_final_pool_parsed if args.pixel_final_pool_parsed > 0 else None,
+            )
+        )
         obs_normalizer = IdentityNormalizer().to(device)
         critic_obs_normalizer = IdentityNormalizer().to(device)
     else:
@@ -453,7 +519,14 @@ def main():
     def build_backbone(mode, hidden_dim):
         if mode == 'pixels':
             c, h, w = pixel_shape
-            return PixelBackbone((c, h, w), hidden_dim).to(device)
+            return PixelBackbone(
+                (c, h, w),
+                hidden_dim,
+                conv_channels=args.pixel_conv_channels_parsed,
+                kernel_sizes=args.pixel_kernel_sizes_parsed,
+                strides=args.pixel_strides_parsed,
+                final_pool=args.pixel_final_pool_parsed if args.pixel_final_pool_parsed > 0 else None,
+            ).to(device)
         return MLPBackbone(n_obs, hidden_dim).to(device)
 
     shared_backbone = None
@@ -850,6 +923,7 @@ def main():
 
         # Learning warm-up threshold (also reused after any replay reset)
         next_learning_starts_at = int(args.learning_starts)
+        last_update_metrics = None
 
         def save_checkpoint(tag: str, step_value: int):
             save_path = run_model_dir / f"{run_prefix}_{tag}.pt"
@@ -1244,6 +1318,18 @@ def main():
                 b_pref_td = int(base_batch * args.pref_td_sample_ratio) if args.pref_td_buffer_enable else 0
                 main_batch = max(1, base_batch - b_pref - b_pref_td)
 
+                metrics_accumulator = {
+                    'critic_loss': 0.0,
+                    'actor_loss': 0.0,
+                    'alpha_loss': 0.0,
+                    'entropy': 0.0,
+                    'action_norm': 0.0,
+                    'target_q': 0.0,
+                    'q_min_pi': 0.0,
+                    'reward': 0.0,
+                }
+                updates_count = 0
+
                 for i in range(args.num_updates):
                     batch = rb.sample(main_batch)
                     obs_batch = batch['observations']
@@ -1273,6 +1359,7 @@ def main():
                         qf_loss = torch.tensor(0.0, device=device)
                         for q_pred in current_q_list:
                             qf_loss = qf_loss + F.mse_loss(q_pred, target_q)
+                        critic_loss_value = float((qf_loss / max(1, len(current_q_list))).detach().cpu().item())
 
                         # Counterfactual critic penalty
                         if args.cf_buffer_enable and args.cf_q_weight > 0.0 and args.cf_sample_ratio > 0.0 and 'cf_size' in locals() and cf_size > 0:
@@ -1339,6 +1426,12 @@ def main():
                         q_pi_list = critic_heads(actor_critic_features, pi_actions)
                         min_q_pi = torch.min(torch.stack(q_pi_list, dim=0), dim=0).values
                         actor_loss = (log_alpha.exp().detach() * log_pi - min_q_pi).mean()
+                    actor_loss_value = float(actor_loss.detach().cpu().item())
+                    entropy_value = float((-log_pi).detach().mean().cpu().item())
+                    action_norm_value = float(pi_actions.detach().norm(dim=-1).mean().cpu().item())
+                    target_q_mean = float(target_q.detach().mean().cpu().item())
+                    min_q_pi_mean = float(min_q_pi.detach().mean().cpu().item())
+                    reward_mean = float(rewards_batch.detach().mean().cpu().item())
                     scaler.scale(actor_loss).backward()
                     scaler.unscale_(actor_optimizer)
                     if args.arch_shared_trunk and trunk_optimizer is not None:
@@ -1359,6 +1452,7 @@ def main():
                     alpha_loss = -log_alpha.exp() * (log_pi_curr + target_entropy).detach().mean()
                     alpha_loss.backward()
                     alpha_optimizer.step()
+                    alpha_loss_value = float(alpha_loss.detach().cpu().item())
 
                     # Soft update targets
                     source_backbone = actor_backbone if args.arch_shared_trunk else critic_backbone
@@ -1366,6 +1460,19 @@ def main():
                         tgt_param.data.copy_(args.tau * src_param.data + (1 - args.tau) * tgt_param.data)
                     for src_param, tgt_param in zip(critic_heads.parameters(), critic_target_heads.parameters()):
                         tgt_param.data.copy_(args.tau * src_param.data + (1 - args.tau) * tgt_param.data)
+
+                    metrics_accumulator['critic_loss'] += critic_loss_value
+                    metrics_accumulator['actor_loss'] += actor_loss_value
+                    metrics_accumulator['alpha_loss'] += alpha_loss_value
+                    metrics_accumulator['entropy'] += entropy_value
+                    metrics_accumulator['action_norm'] += action_norm_value
+                    metrics_accumulator['target_q'] += target_q_mean
+                    metrics_accumulator['q_min_pi'] += min_q_pi_mean
+                    metrics_accumulator['reward'] += reward_mean
+                    updates_count += 1
+
+                if updates_count > 0:
+                    last_update_metrics = (metrics_accumulator, updates_count)
             should_log = False
             if next_log_step is not None and total_env_steps >= next_log_step:
                 should_log = True
@@ -1385,6 +1492,20 @@ def main():
                 if len(rewbuffer) > 0:
                     logs['Train/mean_reward'] = float(np.mean(rewbuffer[-100:]))
                     logs['Train/mean_episode_length'] = float(np.mean(lenbuffer[-100:]))
+                if last_update_metrics is not None:
+                    metrics_accumulator, updates_count = last_update_metrics
+                    denom = float(max(1, updates_count))
+                    logs['Train/critic_loss'] = metrics_accumulator['critic_loss'] / denom
+                    logs['Train/actor_loss'] = metrics_accumulator['actor_loss'] / denom
+                    logs['Train/alpha_loss'] = metrics_accumulator['alpha_loss'] / denom
+                    logs['Train/policy_entropy'] = metrics_accumulator['entropy'] / denom
+                    logs['Train/action_l2'] = metrics_accumulator['action_norm'] / denom
+                    logs['Train/target_q_mean'] = metrics_accumulator['target_q'] / denom
+                    logs['Train/q_min_pi_mean'] = metrics_accumulator['q_min_pi'] / denom
+                    logs['Train/replay_reward_mean'] = metrics_accumulator['reward'] / denom
+                    logs['Train/updates_per_iter'] = updates_count
+                    last_update_metrics = None
+                logs['Train/alpha'] = float(log_alpha.exp().detach().cpu().item())
                 if 'log' in infos and isinstance(infos['log'], dict):
                     for k, v in infos['log'].items():
                         try:

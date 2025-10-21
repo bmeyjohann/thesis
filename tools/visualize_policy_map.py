@@ -30,6 +30,21 @@ from fast_sac_utils import EmpiricalNormalization  # type: ignore  # noqa: E402
 from ogbench.wrappers import FlexibleObsWrapper  # type: ignore  # noqa: E402
 
 
+def _parse_int_sequence(value, default: tuple[int, ...]) -> tuple[int, ...]:
+    if value is None:
+        return tuple(default)
+    if isinstance(value, (list, tuple)):
+        seq = [int(v) for v in value]
+        return tuple(seq if seq else default)
+    if isinstance(value, (int, np.integer)):
+        return (int(value),)
+    if isinstance(value, str):
+        parts = [p.strip() for p in value.split(',')]
+        seq = [int(p) for p in parts if p]
+        return tuple(seq if seq else default)
+    return tuple(default)
+
+
 class IdentityNormalizer(nn.Module):
     def forward(self, x):
         return x
@@ -48,6 +63,63 @@ class MLPBackbone(nn.Module):
 
     def forward(self, x):
         return self.net(x)
+
+
+class PixelBackbone(nn.Module):
+    def __init__(
+        self,
+        input_shape,
+        feature_dim: int,
+        conv_channels: tuple[int, ...],
+        kernel_sizes: tuple[int, ...],
+        strides: tuple[int, ...],
+        final_pool: int | None = None,
+    ):
+        super().__init__()
+        c, h, w = input_shape
+        channels = list(conv_channels)
+        kernels = list(kernel_sizes)
+        strides_list = list(strides)
+        if len(kernels) < len(channels):
+            kernels.extend([kernels[-1]] * (len(channels) - len(kernels)))
+        if len(strides_list) < len(channels):
+            strides_list.extend([strides_list[-1]] * (len(channels) - len(strides_list)))
+        layers: list[nn.Module] = []
+        in_ch = c
+        for idx, out_ch in enumerate(channels):
+            k = int(kernels[idx])
+            s = int(strides_list[idx])
+            padding = k // 2 if s == 1 else 0
+            layers.append(nn.Conv2d(in_ch, int(out_ch), kernel_size=k, stride=s, padding=padding))
+            layers.append(nn.ReLU())
+            in_ch = int(out_ch)
+        if final_pool is not None and final_pool > 0:
+            layers.append(nn.AdaptiveAvgPool2d(final_pool))
+        self.conv = nn.Sequential(*layers)
+        with torch.no_grad():
+            dummy = torch.zeros(1, c, h, w)
+            flat_dim = self.conv(dummy).view(1, -1).shape[1]
+        self.fc = nn.Sequential(
+            nn.Linear(flat_dim, feature_dim),
+            nn.ReLU(),
+        )
+        self.output_dim = feature_dim
+
+    def forward(self, x):
+        if x.dim() == 4 and x.shape[1] not in (1, 3, 4):
+            x = x.permute(0, 3, 1, 2)
+        x = self.conv(x)
+        x = x.view(x.size(0), -1)
+        return self.fc(x)
+
+
+class PixelNormalizer(nn.Module):
+    def forward(self, x):
+        if x.dtype != torch.float32:
+            x = x.float()
+        if torch.max(x) > 1.0:
+            x = x / 255.0
+        return x
 
 
 class GaussianPolicyHead(nn.Module):
@@ -139,6 +211,42 @@ WALL_TILE_IDS = {1}
 DANGEROUS_TILE_ID = 2
 
 
+class PixelObservationSampler:
+    def __init__(
+        self,
+        env_id: str,
+        width: int,
+        height: int,
+        camera_name: str | None,
+        seed: int,
+        device: torch.device,
+    ):
+        self.env = gym.make(env_id, render_mode="rgb_array", width=width, height=height, camera_name=camera_name)
+        self.device = device
+        self.env.reset(seed=seed)
+
+    def prepare(self, goal_xy: np.ndarray) -> None:
+        self.env.unwrapped.set_goal(goal_xy=goal_xy)
+
+    def sample(self, points: np.ndarray) -> torch.Tensor:
+        frames = []
+        for xy in points:
+            self.env.unwrapped.set_xy(np.array(xy, dtype=np.float32))
+            frame = self.env.render()
+            if frame.dtype != np.uint8:
+                frame = np.clip(frame, 0, 255).astype(np.uint8)
+            frame_chw = np.transpose(frame, (2, 0, 1)).astype(np.float32) / 255.0
+            frames.append(frame_chw)
+        tensor = torch.from_numpy(np.stack(frames, axis=0)).to(self.device)
+        return tensor
+
+    def close(self) -> None:
+        try:
+            self.env.close()
+        except Exception:
+            pass
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate actor/critic on a position grid.")
     parser.add_argument("--model_path", type=Path, required=True,
@@ -212,6 +320,78 @@ def build_networks(ckpt: dict, device: torch.device, policy_type: str):
         return actor, critic, obs_norm, args
 
     obs_mode = args.get('obs_mode', 'state')
+    if obs_mode == 'pixels':
+        pixel_shape = ckpt.get('pixel_shape') or args.get('pixel_shape')
+        if pixel_shape is None:
+            raise ValueError('Pixel checkpoint missing pixel_shape metadata')
+        pixel_shape = tuple(int(x) for x in pixel_shape)
+        if len(pixel_shape) != 3:
+            raise ValueError(f"Unexpected pixel_shape: {pixel_shape}")
+
+        conv_channels = _parse_int_sequence(
+            args.get('pixel_conv_channels_parsed', args.get('pixel_conv_channels')), (32, 64, 64)
+        )
+        kernel_sizes = _parse_int_sequence(
+            args.get('pixel_kernel_sizes_parsed', args.get('pixel_kernel_sizes')), (8, 4, 3)
+        )
+        strides = _parse_int_sequence(
+            args.get('pixel_strides_parsed', args.get('pixel_strides')), (4, 2, 1)
+        )
+        final_pool = args.get('pixel_final_pool_parsed', args.get('pixel_final_pool', 0))
+        if isinstance(final_pool, (list, tuple)):
+            final_pool = final_pool[0] if final_pool else 0
+        final_pool_val = int(final_pool) if final_pool else None
+
+        actor_backbone_state = ckpt['actor_backbone']
+        actor_hidden_dim = args.get('actor_hidden_dim', 512)
+        actor_backbone = PixelBackbone(
+            pixel_shape,
+            actor_hidden_dim,
+            conv_channels,
+            kernel_sizes,
+            strides,
+            final_pool_val,
+        ).to(device)
+        actor_backbone.load_state_dict(actor_backbone_state)
+        actor_backbone.eval()
+
+        actor_head_state = ckpt['actor_head']
+        act_dim = actor_head_state['fc_mu.weight'].shape[0]
+        actor_head = GaussianPolicyHead(actor_backbone.output_dim, act_dim, actor_hidden_dim, args.get('init_scale', 0.01)).to(device)
+        actor_head.load_state_dict(actor_head_state)
+        actor_head.eval()
+        actor = ActorWrapper(actor_backbone, actor_head)
+
+        critic_backbone_state = ckpt.get('critic_backbone') or ckpt.get('shared_backbone')
+        critic_hidden_dim = args.get('critic_hidden_dim', 1024)
+        if critic_backbone_state is None:
+            critic_backbone = actor_backbone
+        else:
+            critic_backbone = PixelBackbone(
+                pixel_shape,
+                critic_hidden_dim,
+                conv_channels,
+                kernel_sizes,
+                strides,
+                final_pool_val,
+            ).to(device)
+            critic_backbone.load_state_dict(critic_backbone_state)
+            critic_backbone.eval()
+
+        critic_heads_state = ckpt['critic_heads']
+        head_keys = [k for k in critic_heads_state.keys() if k.endswith('net.0.weight')]
+        num_heads = len(head_keys)
+        first_head = critic_heads_state['heads.0.net.0.weight']
+        critic_head_hidden = first_head.shape[0]
+        critic_heads = CriticEnsemble(critic_backbone.output_dim, act_dim, critic_head_hidden, num_heads).to(device)
+        critic_heads.load_state_dict(critic_heads_state)
+        critic_heads.eval()
+        critic = CriticWrapper(critic_backbone, critic_heads)
+
+        obs_norm = PixelNormalizer().to(device)
+        obs_norm.eval()
+        return actor, critic, obs_norm, args
+
     if obs_mode != 'state':
         raise NotImplementedError('Policy map supports only state observations for now')
 
@@ -367,7 +547,8 @@ def snap_goal_to_free(goal: np.ndarray,
 def evaluate_grid(actor: Actor, critic: Critic, obs_norm: EmpiricalNormalization,
                   train_args: dict, goal: np.ndarray, xs: np.ndarray, ys: np.ndarray,
                   device: torch.device, free_mask: np.ndarray | None = None,
-                  maze_unit: float | None = None, offsets: tuple[float, float] | None = None) -> dict:
+                  maze_unit: float | None = None, offsets: tuple[float, float] | None = None,
+                  pixel_sampler: "PixelObservationSampler" | None = None) -> dict:
     mesh_x, mesh_y = np.meshgrid(xs, ys)
     pts = np.stack([mesh_x.ravel(), mesh_y.ravel()], axis=-1)
 
@@ -388,8 +569,11 @@ def evaluate_grid(actor: Actor, critic: Critic, obs_norm: EmpiricalNormalization
     else:
         traversable = np.ones(len(pts), dtype=bool)
 
-    obs_np = np.stack([compose_obs(p, goal, train_args) for p in pts], axis=0)
-    obs_tensor = torch.from_numpy(obs_np).to(device)
+    if pixel_sampler is not None:
+        obs_tensor = pixel_sampler.sample(pts)
+    else:
+        obs_np = np.stack([compose_obs(p, goal, train_args) for p in pts], axis=0)
+        obs_tensor = torch.from_numpy(obs_np).to(device)
 
     with torch.no_grad():
         norm_obs = obs_norm(obs_tensor)
@@ -593,6 +777,7 @@ def generate_policy_map(
     device_t = torch.device(device)
     ckpt, policy_type = load_checkpoint(model_path, device_t)
     actor, critic, obs_norm, train_args = build_networks(ckpt, device_t, policy_type)
+    is_pixels = train_args.get("obs_mode", "state") == "pixels"
 
     if goal_override is not None:
         goal_override = np.asarray(goal_override, dtype=np.float32)
@@ -633,19 +818,44 @@ def generate_policy_map(
     if maze_layout is not None:
         free_mask = maze_layout == 0
 
-    results = evaluate_grid(
-        actor,
-        critic,
-        obs_norm,
-        train_args,
-        goal,
-        xs,
-        ys,
-        device_t,
-        free_mask=free_mask,
-        maze_unit=maze_unit,
-        offsets=offsets,
-    )
+    pixel_sampler = None
+    try:
+        if is_pixels:
+            pixel_shape = ckpt.get('pixel_shape') or train_args.get('pixel_shape')
+            if pixel_shape is None:
+                raise ValueError('Pixel checkpoint missing pixel_shape metadata')
+            pixel_shape = tuple(int(x) for x in pixel_shape)
+            env_id_pixels = env_name or train_args.get('env_name')
+            if env_id_pixels is None:
+                raise ValueError('Cannot infer environment id for pixel visualization')
+            camera_name = train_args.get('pixel_camera')
+            pixel_sampler = PixelObservationSampler(
+                env_id_pixels,
+                width=int(pixel_shape[2]),
+                height=int(pixel_shape[1]),
+                camera_name=camera_name,
+                seed=cached_seed,
+                device=device_t,
+            )
+            pixel_sampler.prepare(goal)
+
+        results = evaluate_grid(
+            actor,
+            critic,
+            obs_norm,
+            train_args,
+            goal,
+            xs,
+            ys,
+            device_t,
+            free_mask=free_mask,
+            maze_unit=maze_unit,
+            offsets=offsets,
+            pixel_sampler=pixel_sampler,
+        )
+    finally:
+        if pixel_sampler is not None:
+            pixel_sampler.close()
 
     base_name = f"vis_{model_path.stem}" + (f"_{tag}" if tag else "")
     png_path = plot_maps(
