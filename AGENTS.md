@@ -4,17 +4,13 @@
 - `train_*.py`: Entry points for training (RSL‑RL, PointMaze variants).
 - `eval_interactive.py`: Load a trained model and render episodes.
 - `config/`: YAML configs (e.g., `ogbench_config.yaml`).
-- `rsl_rl/`, `fasttd3/`, `ogbench/`: Vendor/submodules used by training.
+- `rsl_rl/`, `fasttd3/`, `ogbench/`, `IsaacLab/`: Vendor/submodules used by training.
 - `scripts/`: Cluster helpers (copy logs, SSH, allocation).
-- `sc_venv_template/`: Virtual environment setup for HPC.
+- `sc_venv_template/`: Virtual gridworld environment setup for HPC (Isaac Sim and Isaac Lab use an apptainer container instead of a virtual environment).
 - `logs/`, `models/`, `wandb/`: Outputs, artifacts, offline tracking.
 
 ## Build, Test, and Development Commands
-- Env only on cluster, not for local development and tests: `source sc_venv_template/activate.sh` (sets modules, venv, `PYTHONPATH`).
-- Local fallback env: `conda activate fasttd3` (preferred on developer machines).
-- Local run: `python train_rsl_rl_integrated.py --env_name pointmaze-medium-v0`.
-- Evaluate: `python eval_interactive.py --model_path models/<file>.pt --env_name pointmaze-medium-v0`.
-- SLURM: `bash submit_job.sh run_experiment.sbatch` (auto-detects `--account`).
+- See `README.md`
 - Logs: tail `logs/<name>_<JOBID>.log` and `logs/rsl_rl/<experiment>/` for artifacts.
 
 ## Coding Style & Naming Conventions
