@@ -28,7 +28,7 @@ PIXEL_HEIGHT=${PIXEL_HEIGHT:-64}
 DENSE_REWARD_SCALE=${DENSE_REWARD_SCALE:-0.05}
 STEP_PENALTY=${STEP_PENALTY:-0.0}
 LOG_INTERVAL=${LOG_INTERVAL:-2000}
-SAVE_INTERVAL=${SAVE_INTERVAL:-200000}
+SAVE_INTERVAL=${SAVE_INTERVAL:-100000}
 PIXEL_FINAL_POOL=${PIXEL_FINAL_POOL:-8}
 CNN_TINY=${CNN_TINY:-12,24,24}
 KERNEL_TINY=${KERNEL_TINY:-5,5,3}
@@ -54,7 +54,7 @@ BASE_ARGS="--env_name ${ENV_ID} --obs_mode pixels --num_envs ${NUM_ENVS} \
 --pixel_final_pool ${PIXEL_FINAL_POOL} \
 --batch_size ${BATCH_SIZE} --learning_starts ${LEARNING_STARTS} \
 --log_interval ${LOG_INTERVAL} --save_interval ${SAVE_INTERVAL} \
---use_wandb --viz_on_checkpoint --viz_grid_resolution 64 --viz_quiver_stride 2"
+--use_wandb --viz_on_checkpoint --viz_grid_resolution 32 --viz_quiver_stride 2"
 
 echo "Launching baseline visual pixels sweep on ${ENV_ID}"
 

@@ -19,6 +19,8 @@ import numpy as np
 
 os.environ.setdefault("MUJOCO_GL", os.environ.get("MUJOCO_GL", "egl"))
 
+# Defer WANDB mode selection until after args are parsed; default to offline
+# unless the user explicitly enables wandb via --use_wandb
 os.environ.setdefault("WANDB_MODE", "offline")
 os.environ.setdefault("WANDB_CONSOLE", "off")
 os.environ.setdefault("WANDB_SILENT", "true")
@@ -380,6 +382,9 @@ def main():
     args = parse_args()
     device = torch.device('cuda' if (args.device=='auto' and torch.cuda.is_available()) or args.device=='cuda' else 'cpu')
 
+    # Do not override WANDB_MODE here: default is offline (set above).
+    # Users can export WANDB_MODE=run explicitly if they want online logging.
+
     pixel_channels_default = (32, 64, 64)
     try:
         pixel_channels_parsed = tuple(
@@ -508,8 +513,9 @@ def main():
                 args.pixel_final_pool_parsed if args.pixel_final_pool_parsed > 0 else None,
             )
         )
-        obs_normalizer = IdentityNormalizer().to(device)
-        critic_obs_normalizer = IdentityNormalizer().to(device)
+        # Normalize pixel intensities to [0, 1]
+        obs_normalizer = PixelNormalizer().to(device)
+        critic_obs_normalizer = PixelNormalizer().to(device)
     else:
         obs_normalizer = EmpiricalNormalization(shape=n_obs, device=device)
         critic_obs_normalizer = EmpiricalNormalization(shape=n_obs, device=device)
@@ -619,8 +625,16 @@ def main():
             if tensor.ndim == 4:
                 if tensor.shape[-1] in (1, 3, 4) and tensor.shape[1] not in (1, 3, 4):
                     tensor = tensor.permute(0, 3, 1, 2).contiguous()
+            # Ensure pixel range in [0,1] regardless of dtype
             if tensor.dtype in (torch.uint8, torch.int8):
                 tensor = tensor.float().div(255.0)
+            else:
+                # If values are still in 0..255 scale, downscale to 0..1
+                try:
+                    if torch.isfinite(tensor).any() and tensor.max() > 1.0:
+                        tensor = tensor.float().div(255.0)
+                except Exception:
+                    tensor = tensor.float()
         return tensor.view(tensor.shape[0], -1)
 
     def reshape_obs(obs_flat: torch.Tensor):
