@@ -28,6 +28,10 @@ fi
 mkdir -p "${LOG_DIR}" models
 
 # Forward repo into the container at /workspace and make fasttd3 importable.
+unset PYTHONPATH
+unset KIT_PYTHONPATH
+unset ISAACSIM_PYTHON_PATH
+
 export APPTAINERENV_PYTHONPATH="/workspace"
 export APPTAINERENV_WANDB_MODE="offline"
 export APPTAINERENV_WANDB_CONSOLE="off"
