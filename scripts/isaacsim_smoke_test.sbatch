@@ -27,12 +27,18 @@ fi
 
 mkdir -p "${LOG_DIR}" models
 
-# Forward repo into the container at /workspace and make fasttd3 importable.
+# Forward repo into the container at /workspace and make IsaacLab discoverable.
 unset PYTHONPATH
 unset KIT_PYTHONPATH
 unset ISAACSIM_PYTHON_PATH
 
-export APPTAINERENV_PYTHONPATH="/workspace"
+# Persist omniverse cache data on the host to avoid writing into the read-only image.
+KIT_HOST_DIR="${WORKSPACE_ROOT}/.kit"
+KIT_CACHE_HOST_DIR="${KIT_HOST_DIR}/cache"
+ASSET_CACHE_HOST_DIR="${WORKSPACE_ROOT}/isaac_cache"
+mkdir -p "${KIT_CACHE_HOST_DIR}" "${ASSET_CACHE_HOST_DIR}"
+
+export APPTAINERENV_PYTHONPATH="/workspace/IsaacLab/source/isaaclab"
 export APPTAINERENV_WANDB_MODE="offline"
 export APPTAINERENV_WANDB_CONSOLE="off"
 export APPTAINERENV_WANDB_SILENT="true"
@@ -40,8 +46,11 @@ export APPTAINERENV_TORCHDYNAMO_INLINE_INBUILT_NN_MODULES="1"
 export APPTAINERENV_MUJOCO_GL="egl"
 export APPTAINERENV_ACCEPT_EULA="Y"
 export APPTAINERENV_OMNI_KIT_ACCEPT_EULA="yes"
+export APPTAINERENV_OMNI_KIT_USER_DIR="/workspace/.kit"
+export APPTAINERENV_OMNI_USER_CACHE_DIR="/workspace/.kit/cache"
+export APPTAINERENV_OMNI_KIT_ASSET_RESOLVER_SEARCH_PATHS="/workspace/isaac_cache:/workspace/IsaacLab"
 
-APPTAINER_BASE_CMD=("apptainer" "exec" "--nv" "--bind" "${WORKSPACE_ROOT}:/workspace" "${IMAGE_PATH}")
+APPTAINER_BASE_CMD=("apptainer" "exec" "--nv" "--bind" "${WORKSPACE_ROOT}:/workspace" "--bind" "${KIT_HOST_DIR}:/workspace/.kit" "--bind" "${ASSET_CACHE_HOST_DIR}:/workspace/isaac_cache" "${IMAGE_PATH}")
 
 echo "[$(date)] Verifying Isaac Sim container imports..."
 "${APPTAINER_BASE_CMD[@]}" /isaac-sim/python.sh -c "import isaacsim, isaaclab, torch; print('Imports OK')"
@@ -51,7 +60,7 @@ JOB_SEED="${SLURM_JOB_ID:-0}"
 "${APPTAINER_BASE_CMD[@]}" env JOB_SEED="${JOB_SEED}" /bin/bash -lc '
 set -euo pipefail
 cd /workspace
-python fasttd3/fast_sac/train.py \
+/isaac-sim/python.sh fasttd3/fast_sac/train.py \
     --env_name Isaac-Lift-Cube-Franka-v0 \
     --total_timesteps 2048 \
     --num_envs 16 \
