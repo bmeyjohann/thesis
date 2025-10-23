@@ -17,10 +17,17 @@ Navigating challenging terrains without continuous human oversight is critical f
 - Use created cache and tmp dirs (must be absolute paths): `export APPTAINER_TMPDIR="[absolute path to ../apptainer/tmp]" && export APPTAINER_CACHE="[absolute path to ../apptainer/cache]"`
 - Get image using: `apptainer pull ../apptainer/images/isaacsim-5.0.0_base.sif docker://nvcr.io/nvidia/isaac-sim:5.0.0`
 - Copy image before applying any modifications: `cp ../apptainer/images/isaacsim-5.0.0_base.sif ../apptainer/images/isaacsim-5.0.0.sif`
-- Drop into container: `apptainer shell --nv ../apptainer/images/isaacsim-5.0.0.sif`
+- Drop into container: `apptainer shell --nv --cleanenv --writable --containall --fakeroot --bind $PWD:/workspace ../apptainer/images/isaacsim-5.0.0.sif`
 - Python must be executed using `/isaac-sim/python.sh`
 
 ---
 
 See Repository Guidelines for structure, style, and workflows:
 - `AGENTS.md`
+
+---
+
+## SLURM commands
+
+- Start a session: `salloc --partition=booster --account=<your_account> --gres=gpu:1 --time=00:30:00`
+- Enter session: `srun --pty bash -l`
