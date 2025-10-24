@@ -8,8 +8,12 @@ ABSOLUTE_PATH="$(realpath "${RELATIVE_PATH}")"
 source "${ABSOLUTE_PATH}"/config.sh
 source "${ABSOLUTE_PATH}"/modules.sh
 
-python3 -m venv --prompt "$ENV_NAME" --system-site-packages "${ENV_DIR}"
+python3 -m venv --prompt "$ENV_NAME" "${ENV_DIR}"
 
 source "${ABSOLUTE_PATH}"/activate.sh
+
+python3 -m pip install --upgrade pip setuptools wheel
+
+python3 -m pip install isaacsim[all,extscache]==5.0.0 --extra-index-url https://pypi.nvidia.com
 
 python3 -m pip install --upgrade -r "${ABSOLUTE_PATH}"/requirements.txt

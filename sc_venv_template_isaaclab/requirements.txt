@@ -1,4 +1,2 @@
-isaacsim[all,extscache]==5.0.0 --extra-index-url https://pypi.nvidia.com
-
 -e ./ogbench
 -e ./fasttd3
