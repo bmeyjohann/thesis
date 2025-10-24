@@ -1,3 +1,4 @@
+source /etc/profile.d/modules.sh
 module --force purge
 module use $OTHERSTAGES
 
