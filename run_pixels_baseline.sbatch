@@ -18,27 +18,35 @@ source activate.sh
 cd ..
 
 ENV_ID=${ENV_ID:-visual-pointmaze-arena-v0}
-TOTAL_STEPS=${TOTAL_STEPS:-1000000}
+TOTAL_STEPS=${TOTAL_STEPS:-600000}
 NUM_ENVS=${NUM_ENVS:-16}
 BUFFER_SIZE=${BUFFER_SIZE:-256}
 BATCH_SIZE=${BATCH_SIZE:-4096}
 LEARNING_STARTS=${LEARNING_STARTS:-2048}
 PIXEL_WIDTH=${PIXEL_WIDTH:-64}
 PIXEL_HEIGHT=${PIXEL_HEIGHT:-64}
-DENSE_REWARD_SCALE=${DENSE_REWARD_SCALE:-0.05}
+DENSE_REWARD_SCALE=${DENSE_REWARD_SCALE:-1.0}
+DENSE_REWARD_SCALE_TINY=${DENSE_REWARD_SCALE_TINY:-0.2}
+DENSE_REWARD_SCALE_SMALL=${DENSE_REWARD_SCALE_SMALL:-0.5}
+DENSE_REWARD_SCALE_MEDIUM=${DENSE_REWARD_SCALE_MEDIUM:-0.5}
+DENSE_REWARD_SCALE_LARGE=${DENSE_REWARD_SCALE_LARGE:-1.0}
 STEP_PENALTY=${STEP_PENALTY:-0.0}
 LOG_INTERVAL=${LOG_INTERVAL:-2000}
 SAVE_INTERVAL=${SAVE_INTERVAL:-100000}
 PIXEL_FINAL_POOL=${PIXEL_FINAL_POOL:-8}
+ALPHA_MIN=${ALPHA_MIN:-0.05}
+ALPHA_MIN_SMALL=${ALPHA_MIN_SMALL:-0.075}
+ALPHA_MIN_MEDIUM=${ALPHA_MIN_MEDIUM:-0.05}
+ALPHA_MIN_LARGE=${ALPHA_MIN_LARGE:-0.05}
 CNN_TINY=${CNN_TINY:-12,24,24}
 KERNEL_TINY=${KERNEL_TINY:-5,5,3}
 STRIDE_TINY=${STRIDE_TINY:-1,2,2}
 
-CNN_SMALL=${CNN_SMALL:-16,32,32}
-KERNEL_SMALL=${KERNEL_SMALL:-5,5,3}
-STRIDE_SMALL=${STRIDE_SMALL:-1,2,2}
+CNN_SMALL=${CNN_SMALL:-16}
+KERNEL_SMALL=${KERNEL_SMALL:-5}
+STRIDE_SMALL=${STRIDE_SMALL:-1}
 
-CNN_MEDIUM=${CNN_MEDIUM:-24,48,48}
+CNN_MEDIUM=${CNN_MEDIUM:-16,32,32}
 KERNEL_MEDIUM=${KERNEL_MEDIUM:-5,5,3}
 STRIDE_MEDIUM=${STRIDE_MEDIUM:-1,2,2}
 
@@ -54,46 +62,55 @@ BASE_ARGS="--env_name ${ENV_ID} --obs_mode pixels --num_envs ${NUM_ENVS} \
 --pixel_final_pool ${PIXEL_FINAL_POOL} \
 --batch_size ${BATCH_SIZE} --learning_starts ${LEARNING_STARTS} \
 --log_interval ${LOG_INTERVAL} --save_interval ${SAVE_INTERVAL} \
+--alpha_min ${ALPHA_MIN} \
+--viz_first_step 200000 \
 --use_wandb --viz_on_checkpoint --viz_grid_resolution 32 --viz_quiver_stride 2"
 
 echo "Launching baseline visual pixels sweep on ${ENV_ID}"
 
 # Tiny CNN (minimal capacity)
-CUDA_VISIBLE_DEVICES=0 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
+WANDB_MODE=offline CUDA_VISIBLE_DEVICES=0 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
   --pixel_conv_channels ${CNN_TINY} \
   --pixel_kernel_sizes ${KERNEL_TINY} \
   --pixel_strides ${STRIDE_TINY} \
   --pixel_final_pool ${PIXEL_FINAL_POOL} \
+  --dense_reward_scale ${DENSE_REWARD_SCALE_TINY} \
   --exp_name "pixels_dense_tiny_${SLURM_JOB_ID}" \
   2>&1 | tee logs/${ENV_ID}_pixels_dense_tiny_${SLURM_JOB_ID}.log &
 PID_A=$!
 
-# Small CNN
-CUDA_VISIBLE_DEVICES=1 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
-  --pixel_conv_channels ${CNN_SMALL} \
-  --pixel_kernel_sizes ${KERNEL_SMALL} \
-  --pixel_strides ${STRIDE_SMALL} \
-  --pixel_final_pool ${PIXEL_FINAL_POOL} \
+# Small CNN (single-layer)
+WANDB_MODE=offline CUDA_VISIBLE_DEVICES=1 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
+  --pixel_conv_channels ${CNN_LINEAR} \
+  --pixel_kernel_sizes ${KERNEL_LINEAR} \
+  --pixel_strides ${STRIDE_LINEAR} \
+  --pixel_final_pool 0 \
+  --alpha_min ${ALPHA_MIN_SMALL} \
+  --dense_reward_scale ${DENSE_REWARD_SCALE_SMALL} \
   --exp_name "pixels_dense_small_${SLURM_JOB_ID}" \
   2>&1 | tee logs/${ENV_ID}_pixels_dense_small_${SLURM_JOB_ID}.log &
 PID_B=$!
 
 # Medium CNN
-CUDA_VISIBLE_DEVICES=2 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
+WANDB_MODE=offline CUDA_VISIBLE_DEVICES=2 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
   --pixel_conv_channels ${CNN_MEDIUM} \
   --pixel_kernel_sizes ${KERNEL_MEDIUM} \
   --pixel_strides ${STRIDE_MEDIUM} \
   --pixel_final_pool ${PIXEL_FINAL_POOL} \
+  --alpha_min ${ALPHA_MIN_MEDIUM} \
+  --dense_reward_scale ${DENSE_REWARD_SCALE_MEDIUM} \
   --exp_name "pixels_dense_medium_${SLURM_JOB_ID}" \
   2>&1 | tee logs/${ENV_ID}_pixels_dense_medium_${SLURM_JOB_ID}.log &
 PID_C=$!
 
 # Large CNN (default)
-CUDA_VISIBLE_DEVICES=3 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
+WANDB_MODE=offline CUDA_VISIBLE_DEVICES=3 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
   --pixel_conv_channels ${CNN_LARGE} \
   --pixel_kernel_sizes ${KERNEL_LARGE} \
   --pixel_strides ${STRIDE_LARGE} \
   --pixel_final_pool ${PIXEL_FINAL_POOL} \
+  --alpha_min ${ALPHA_MIN_LARGE} \
+  --dense_reward_scale ${DENSE_REWARD_SCALE_LARGE} \
   --exp_name "pixels_dense_large_${SLURM_JOB_ID}" \
   2>&1 | tee logs/${ENV_ID}_pixels_dense_large_${SLURM_JOB_ID}.log &
 PID_D=$!
@@ -111,3 +128,6 @@ if [ $EXIT_A -ne 0 ] || [ $EXIT_B -ne 0 ] || [ $EXIT_C -ne 0 ] || [ $EXIT_D -ne 
 fi
 
 echo "Baseline pixel experiments completed."
+CNN_LINEAR=${CNN_LINEAR:-16}
+KERNEL_LINEAR=${KERNEL_LINEAR:-5}
+STRIDE_LINEAR=${STRIDE_LINEAR:-1}
