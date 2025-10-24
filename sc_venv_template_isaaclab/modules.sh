@@ -1,4 +1,6 @@
-module purge
+module --force purge
+module use $OTHERSTAGES
+
 module load Stages/2024
 module load GCCcore OpenMPI
 module load Python/3.11.3
