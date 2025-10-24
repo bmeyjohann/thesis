@@ -8,9 +8,8 @@ source "${ABSOLUTE_PATH}"/config.sh
 PYTHONWRAPPER="${ABSOLUTE_PATH}"/python
 
 echo '#!/bin/bash
-module purge 2> /dev/null
 deactivate 2> /dev/null
-source '"'${ABSOLUTE_PATH}'"'/activate.sh
+source "'"${ABSOLUTE_PATH}"'"/activate.sh
 python "$@"
 ' > "${PYTHONWRAPPER}"
 
