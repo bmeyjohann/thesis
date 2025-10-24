@@ -1416,13 +1416,14 @@ def main():
                     q_optimizer.zero_grad(set_to_none=True)
 
                     with autocast(device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled):
-                        # Target critic evaluation
-                        next_actions, next_log_pi, _, _ = actor_forward(next_obs_batch)
-                        next_features_target = critic_target_backbone(reshape_obs(next_obs_batch))
-                        target_q_list = critic_target_heads(next_features_target, next_actions)
-                        min_next_q = torch.min(torch.stack(target_q_list, dim=0), dim=0).values
-                        min_next_q = min_next_q - log_alpha.exp() * next_log_pi
-                        target_q = rewards_batch + (1.0 - dones_batch) * (args.gamma * min_next_q)
+                        # Target critic evaluation (detach target path)
+                        with torch.no_grad():
+                            next_actions, next_log_pi, _, _ = actor_forward(next_obs_batch)
+                            next_features_target = critic_target_backbone(reshape_obs(next_obs_batch))
+                            target_q_list = critic_target_heads(next_features_target, next_actions)
+                            min_next_q = torch.min(torch.stack(target_q_list, dim=0), dim=0).values
+                            min_next_q = min_next_q - log_alpha.exp() * next_log_pi
+                            target_q = rewards_batch + (1.0 - dones_batch) * (args.gamma * min_next_q)
 
                         current_features = (actor_backbone if args.arch_shared_trunk else critic_backbone)(reshape_obs(obs_batch))
                         current_q_list = critic_heads(current_features, actions_batch)
@@ -1467,12 +1468,13 @@ def main():
                                 s_a = td_batch['s_a']
                                 s_r = td_batch['s_r'].unsqueeze(-1)
 
-                                next_actions_td, next_log_pi_td, _, _ = actor_forward(t_next_s)
-                                next_features_td = critic_target_backbone(reshape_obs(t_next_s))
-                                q_td_list = critic_target_heads(next_features_td, next_actions_td)
-                                min_q_td = torch.min(torch.stack(q_td_list, dim=0), dim=0).values
-                                min_q_td = min_q_td - log_alpha.exp() * next_log_pi_td
-                                target_teacher = t_r + (1.0 - t_done) * (args.gamma * min_q_td)
+                                with torch.no_grad():
+                                    next_actions_td, next_log_pi_td, _, _ = actor_forward(t_next_s)
+                                    next_features_td = critic_target_backbone(reshape_obs(t_next_s))
+                                    q_td_list = critic_target_heads(next_features_td, next_actions_td)
+                                    min_q_td = torch.min(torch.stack(q_td_list, dim=0), dim=0).values
+                                    min_q_td = min_q_td - log_alpha.exp() * next_log_pi_td
+                                    target_teacher = t_r + (1.0 - t_done) * (args.gamma * min_q_td)
 
                                 teacher_features = (actor_backbone if args.arch_shared_trunk else critic_backbone)(reshape_obs(t_s))
                                 teacher_q_list = critic_heads(teacher_features, t_a)

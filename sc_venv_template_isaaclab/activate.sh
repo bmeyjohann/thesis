@@ -13,4 +13,7 @@ source "${ABSOLUTE_PATH}"/modules.sh
 
 export PYTHONPATH="$(echo "${ENV_DIR}"/lib/python*/site-packages):${PYTHONPATH}"
 
+export ISAACSIM_PATH="${HOME}/${USER}/isaacsim5.1.0"
+export ISAACSIM_PYTHON_PATH="${ISAACSIM_PATH}/python.sh"
+
 source "${ENV_DIR}"/bin/activate
