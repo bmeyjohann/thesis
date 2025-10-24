@@ -98,7 +98,7 @@ class PixelBackbone(nn.Module):
         self.conv = nn.Sequential(*layers)
         with torch.no_grad():
             dummy = torch.zeros(1, c, h, w)
-            flat_dim = self.conv(dummy).view(1, -1).shape[1]
+            flat_dim = self.conv(dummy).reshape(1, -1).shape[1]
         self.fc = nn.Sequential(
             nn.Linear(flat_dim, feature_dim),
             nn.ReLU(),
@@ -109,7 +109,7 @@ class PixelBackbone(nn.Module):
         if x.dim() == 4 and x.shape[1] not in (1, 3, 4):
             x = x.permute(0, 3, 1, 2)
         x = self.conv(x)
-        x = x.view(x.size(0), -1)
+        x = x.reshape(x.size(0), -1)
         return self.fc(x)
 
 
@@ -463,10 +463,20 @@ def infer_goal_and_bounds(train_args: dict, env_name: str | None, seed: int) -> 
     env.close()
 
     goal = None
-    if isinstance(info, dict) and "goal" in info:
-        goal = np.asarray(info["goal"], dtype=np.float32)[:2]
-    if goal is None and train_args.get("include_goal", True) and obs.shape[0] >= 4:
-        goal = np.asarray(obs[2:4], dtype=np.float32)
+    if isinstance(info, dict):
+        goal_candidate = info.get("goal")
+        if goal_candidate is not None:
+            goal_arr = np.asarray(goal_candidate)
+            if goal_arr.ndim == 1 and goal_arr.size == 2:
+                goal = goal_arr.astype(np.float32)
+    if goal is None:
+        obs_mode = train_args.get("obs_mode", "state")
+        if obs_mode == "state" and isinstance(obs, np.ndarray) and obs.ndim == 1 and obs.size >= 4:
+            goal = np.asarray(obs[2:4], dtype=np.float32)
+    if goal is None:
+        goal_attr = getattr(base_env, "cur_goal_xy", None)
+        if goal_attr is not None:
+            goal = np.asarray(goal_attr, dtype=np.float32)
     if goal is None:
         raise RuntimeError("Failed to infer goal position from environment reset")
 
@@ -524,13 +534,15 @@ def snap_goal_to_free(goal: np.ndarray,
                       offsets: tuple[float, float] | None) -> np.ndarray:
     if maze_layout is None or maze_unit is None or offsets is None:
         return goal
+    goal = np.asarray(goal, dtype=np.float64).reshape(-1)
     free_cells = np.argwhere(maze_layout == 0)
     if free_cells.size == 0:
         return goal
-    off_x, off_y = offsets
+    off_x, off_y = float(offsets[0]), float(offsets[1])
     # Convert goal to nearest tile index
-    col = int(round((goal[0] + off_x) / maze_unit))
-    row = int(round((goal[1] + off_y) / maze_unit))
+    unit = float(maze_unit)
+    col = int(round(float((goal[0] + off_x) / unit)))
+    row = int(round(float((goal[1] + off_y) / unit)))
     if (0 <= row < maze_layout.shape[0] and
             0 <= col < maze_layout.shape[1] and
             maze_layout[row, col] == 0):

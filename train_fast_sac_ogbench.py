@@ -264,6 +264,10 @@ def parse_args():
                    help='Comma-separated strides for each conv layer (defaults to 4,2,1)')
     p.add_argument('--pixel_final_pool', type=int, default=0,
                    help='If >0, apply AdaptiveAvgPool2d to this spatial size after conv stack')
+    p.add_argument('--alpha_min', type=float, default=0.05,
+                   help='Minimum entropy temperature (alpha).')
+    p.add_argument('--debug_pixel_dump', action='store_true', default=False,
+                   help='Log raw vs normalized observation stats and sample actions at first step')
     p.add_argument('--store_denied_actions', action='store_true', default=False,
                    help='Add denied student actions to replay buffer with penalty reward')
     p.add_argument('--denied_action_penalty', type=float, default=-1.0,
@@ -344,6 +348,8 @@ def parse_args():
                    help='Device to use when generating policy maps')
     p.add_argument('--viz_seed', type=int, default=0,
                    help='Seed used to sample/lock the visualization goal location')
+    p.add_argument('--viz_first_step', type=int, default=None,
+                   help='Force the first checkpoint/viz at this env-step (even if save_interval is larger)')
     return p.parse_args()
 
 
@@ -386,6 +392,8 @@ def main():
     # Users can export WANDB_MODE=run explicitly if they want online logging.
 
     pixel_channels_default = (32, 64, 64)
+    debug_dump_done = False
+
     try:
         pixel_channels_parsed = tuple(
             int(ch.strip()) for ch in args.pixel_conv_channels.split(',') if ch.strip()
@@ -513,9 +521,9 @@ def main():
                 args.pixel_final_pool_parsed if args.pixel_final_pool_parsed > 0 else None,
             )
         )
-        # Normalize pixel intensities to [0, 1]
-        obs_normalizer = PixelNormalizer().to(device)
-        critic_obs_normalizer = PixelNormalizer().to(device)
+        # Observations are already scaled to [0,1] in prepare_obs
+        obs_normalizer = IdentityNormalizer().to(device)
+        critic_obs_normalizer = IdentityNormalizer().to(device)
     else:
         obs_normalizer = EmpiricalNormalization(shape=n_obs, device=device)
         critic_obs_normalizer = EmpiricalNormalization(shape=n_obs, device=device)
@@ -563,14 +571,14 @@ def main():
         actor_params = list(actor_head.parameters())
         critic_params = list(critic_heads.parameters())
         trunk_optimizer = optim.Adam(trunk_params, lr=args.critic_learning_rate)
-        q_optimizer = optim.AdamW(critic_params, lr=args.critic_learning_rate, weight_decay=0.1)
-        actor_optimizer = optim.AdamW(actor_params, lr=args.actor_learning_rate, weight_decay=0.1)
+        q_optimizer = optim.AdamW(critic_params, lr=args.critic_learning_rate, weight_decay=1e-5)
+        actor_optimizer = optim.AdamW(actor_params, lr=args.actor_learning_rate, weight_decay=1e-5)
     else:
         trunk_optimizer = None
         actor_params = list(actor_backbone.parameters()) + list(actor_head.parameters())
         critic_params = list(critic_backbone.parameters()) + list(critic_heads.parameters())
-        q_optimizer = optim.AdamW(critic_params, lr=args.critic_learning_rate, weight_decay=0.1)
-        actor_optimizer = optim.AdamW(actor_params, lr=args.actor_learning_rate, weight_decay=0.1)
+        q_optimizer = optim.AdamW(critic_params, lr=args.critic_learning_rate, weight_decay=1e-5)
+        actor_optimizer = optim.AdamW(actor_params, lr=args.actor_learning_rate, weight_decay=1e-5)
 
     if args.arch_shared_trunk:
         initial_shared_backbone_state = copy.deepcopy(shared_backbone.state_dict())
@@ -918,6 +926,40 @@ def main():
         obs = prepare_obs(obs_raw)
         n_obs = obs.shape[1]
         record_progress("[Init] envs.reset() returned; entering loop")
+        if args.debug_pixel_dump and not debug_dump_done:
+            raw_tensor = obs_raw if torch.is_tensor(obs_raw) else torch.as_tensor(obs_raw)
+            raw_stats = raw_tensor.float()
+            norm_tensor = obs.float()
+            record_progress(
+                "[Debug] raw_obs shape=%s mean=%.6f std=%.6f min=%.6f max=%.6f"
+                % (
+                    tuple(raw_tensor.shape),
+                    raw_stats.mean().item(),
+                    raw_stats.std().item(),
+                    raw_stats.min().item(),
+                    raw_stats.max().item(),
+                )
+            )
+            record_progress(
+                "[Debug] normalized_obs mean=%.6f std=%.6f min=%.6f max=%.6f"
+                % (
+                    norm_tensor.mean().item(),
+                    norm_tensor.std().item(),
+                    norm_tensor.min().item(),
+                    norm_tensor.max().item(),
+                )
+            )
+            with torch.no_grad():
+                act_sample, log_pi_sample, mean_sample, _ = actor_forward(obs[:1])
+            record_progress(
+                "[Debug] initial_action mean=%s log_pi=%.6f action_l2=%.6f"
+                % (
+                    np.array2string(mean_sample.cpu().numpy(), precision=4),
+                    float(log_pi_sample.detach().cpu().item()),
+                    float(act_sample.detach().norm().cpu().item()),
+                )
+            )
+            debug_dump_done = True
         print("[Init] Env reset complete; starting training loop", flush=True)
         total_env_steps = 0
         iteration_idx = 0
@@ -931,7 +973,11 @@ def main():
         last_denied_samples = 0
         next_log_step = args.log_interval if args.log_interval > 0 else None
         save_interval_current = args.save_interval if args.save_interval > 0 else None
-        next_save_step = save_interval_current if save_interval_current else None
+        first_save_step = args.viz_first_step if (args.viz_first_step is not None and args.viz_first_step > 0) else None
+        if first_save_step is not None:
+            next_save_step = first_save_step
+        else:
+            next_save_step = save_interval_current if save_interval_current else None
 
         run_prefix = current_env_name.replace('-', '_')
 
@@ -1305,11 +1351,11 @@ def main():
                         trunk_params = list(actor_backbone.parameters())
                         trunk_optimizer = optim.Adam(trunk_params, lr=args.critic_learning_rate)
                         critic_params = list(critic_heads.parameters())
-                        q_optimizer = optim.AdamW(critic_params, lr=args.critic_learning_rate, weight_decay=0.1)
+                        q_optimizer = optim.AdamW(critic_params, lr=args.critic_learning_rate, weight_decay=1e-5)
                     else:
                         critic_backbone.load_state_dict(initial_critic_backbone_state)
                         critic_params = list(critic_backbone.parameters()) + list(critic_heads.parameters())
-                        q_optimizer = optim.AdamW(critic_params, lr=args.critic_learning_rate, weight_decay=0.1)
+                        q_optimizer = optim.AdamW(critic_params, lr=args.critic_learning_rate, weight_decay=1e-5)
                     critic_heads.load_state_dict(initial_critic_heads_state)
                     critic_target_backbone.load_state_dict(initial_target_backbone_state)
                     critic_target_heads.load_state_dict(initial_target_heads_state)
@@ -1322,7 +1368,15 @@ def main():
                 tag_name = f"step{total_env_steps}"
                 ckpt_path = save_checkpoint(tag_name, total_env_steps)
                 maybe_render_policy_map(tag_name, total_env_steps, ckpt_path)
-                next_save_step += save_interval_current
+                first_save_done = True
+                if save_interval_current:
+                    # If a custom first save step was provided, align subsequent saves on this cadence
+                    if first_save_step is not None and next_save_step == first_save_step:
+                        next_save_step = first_save_step + save_interval_current
+                    else:
+                        next_save_step += save_interval_current
+                else:
+                    next_save_step = None
 
             # Only learn if we have enough data in replay (also after any reset)
             if total_env_steps >= next_learning_starts_at and getattr(rb, 'ptr', 0) > 0:
@@ -1341,6 +1395,8 @@ def main():
                     'target_q': 0.0,
                     'q_min_pi': 0.0,
                     'reward': 0.0,
+                    'reward_abs': 0.0,
+                    'alpha_value': 0.0,
                 }
                 updates_count = 0
 
@@ -1461,12 +1517,18 @@ def main():
 
                     # Alpha update
                     alpha_optimizer.zero_grad(set_to_none=True)
-                    with torch.no_grad():
-                        _, log_pi_curr, _, _ = actor_forward(obs_batch)
-                    alpha_loss = -log_alpha.exp() * (log_pi_curr + target_entropy).detach().mean()
+                    _, log_pi_curr, _, _ = actor_forward(obs_batch)
+                    log_pi_detached = log_pi_curr.detach()
+                    alpha = log_alpha.exp()
+                    alpha_loss = (alpha * (log_pi_detached + target_entropy)).mean()
                     alpha_loss.backward()
                     alpha_optimizer.step()
+                    with torch.no_grad():
+                        min_log_alpha = np.log(max(1e-6, float(args.alpha_min)))
+                        log_alpha.clamp_(min=min_log_alpha)
+                        alpha = log_alpha.exp()
                     alpha_loss_value = float(alpha_loss.detach().cpu().item())
+                    alpha_value = float(alpha.detach().cpu().item())
 
                     # Soft update targets
                     source_backbone = actor_backbone if args.arch_shared_trunk else critic_backbone
@@ -1483,6 +1545,8 @@ def main():
                     metrics_accumulator['target_q'] += target_q_mean
                     metrics_accumulator['q_min_pi'] += min_q_pi_mean
                     metrics_accumulator['reward'] += reward_mean
+                    metrics_accumulator['reward_abs'] += float(rewards_batch.detach().abs().mean().cpu().item())
+                    metrics_accumulator['alpha_value'] += alpha_value
                     updates_count += 1
 
                 if updates_count > 0:
@@ -1517,9 +1581,12 @@ def main():
                     logs['Train/target_q_mean'] = metrics_accumulator['target_q'] / denom
                     logs['Train/q_min_pi_mean'] = metrics_accumulator['q_min_pi'] / denom
                     logs['Train/replay_reward_mean'] = metrics_accumulator['reward'] / denom
+                    logs['Train/replay_reward_abs_mean'] = metrics_accumulator['reward_abs'] / denom
+                    logs['Train/alpha'] = metrics_accumulator['alpha_value'] / denom
                     logs['Train/updates_per_iter'] = updates_count
                     last_update_metrics = None
-                logs['Train/alpha'] = float(log_alpha.exp().detach().cpu().item())
+                else:
+                    logs['Train/alpha'] = float(log_alpha.exp().detach().cpu().item())
                 if 'log' in infos and isinstance(infos['log'], dict):
                     for k, v in infos['log'].items():
                         try:
