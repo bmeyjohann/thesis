@@ -7,3 +7,9 @@
 [submodule "IsaacLab"]
 	path = IsaacLab
 	url = git@github.com:bmeyjohann/IsaacLab.git
+[submodule "unitree_ros"]
+	path = unitree_ros
+	url = https://github.com/unitreerobotics/unitree_ros.git
+[submodule "unitree_rl_lab"]
+	path = unitree_rl_lab
+	url = git@github.com:bmeyjohann/unitree_rl_lab.git
