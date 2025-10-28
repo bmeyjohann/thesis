@@ -21,8 +21,8 @@ cd ..
 ENV_ID=${ENV_ID:-visual-pointmaze-arena-v0}
 TOTAL_STEPS=${TOTAL_STEPS:-600000}
 NUM_ENVS=${NUM_ENVS:-16}
-BUFFER_SIZE=${BUFFER_SIZE:-256}
-BATCH_SIZE=${BATCH_SIZE:-4096}
+BUFFER_SIZE=${BUFFER_SIZE:-1024}
+BATCH_SIZE=${BATCH_SIZE:-2048}
 LEARNING_STARTS=${LEARNING_STARTS:-2048}
 CRITIC_LR=${CRITIC_LR:-1e-4}
 ACTOR_LR=${ACTOR_LR:-3e-4}
@@ -30,6 +30,9 @@ TAU=${TAU:-0.002}
 MAX_GRAD_NORM=${MAX_GRAD_NORM:-1.0}
 ALPHA_MIN=${ALPHA_MIN:-0.05}
 PIXEL_FINAL_POOL=${PIXEL_FINAL_POOL:-8}
+NUM_UPDATES=${NUM_UPDATES:-1}
+POLICY_FREQUENCY=${POLICY_FREQUENCY:-1}
+VIZ_FIRST_STEP=${VIZ_FIRST_STEP:-10000}
 
 # Reward scales per run
 SCALE_A=${SCALE_A:-0.2}
@@ -62,7 +65,8 @@ BASE_ARGS="--env_name ${ENV_ID} --obs_mode pixels --num_envs ${NUM_ENVS} \
 --critic_learning_rate ${CRITIC_LR} --actor_learning_rate ${ACTOR_LR} \
 --tau ${TAU} --max_grad_norm ${MAX_GRAD_NORM} --alpha_min ${ALPHA_MIN} \
 --pixel_width 64 --pixel_height 64 --pixel_final_pool ${PIXEL_FINAL_POOL} \
---viz_on_checkpoint --viz_first_step 200000 --save_interval 100000 \
+--num_updates ${NUM_UPDATES} --policy_frequency ${POLICY_FREQUENCY} \
+--viz_on_checkpoint --viz_first_step ${VIZ_FIRST_STEP} --save_interval 100000 \
 --use_wandb --viz_grid_resolution 32 --viz_quiver_stride 2"
 
 echo "Launching pixel sweep (reference-stabilized) on ${ENV_ID}"
@@ -112,4 +116,3 @@ if [ $EA -ne 0 ] || [ $EB -ne 0 ] || [ $EC -ne 0 ] || [ $ED -ne 0 ]; then
 fi
 
 echo "Pixel sweep (reference-stabilized) completed."
-

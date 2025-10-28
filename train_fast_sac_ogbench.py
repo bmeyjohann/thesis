@@ -264,8 +264,10 @@ def parse_args():
                    help='Comma-separated strides for each conv layer (defaults to 4,2,1)')
     p.add_argument('--pixel_final_pool', type=int, default=0,
                    help='If >0, apply AdaptiveAvgPool2d to this spatial size after conv stack')
-    p.add_argument('--alpha_min', type=float, default=0.05,
+    p.add_argument('--alpha_min', type=float, default=0.03,
                    help='Minimum entropy temperature (alpha).')
+    p.add_argument('--alpha_max', type=float, default=0.5,
+                   help='Maximum entropy temperature (alpha).')
     p.add_argument('--debug_pixel_dump', action='store_true', default=False,
                    help='Log raw vs normalized observation stats and sample actions at first step')
     p.add_argument('--store_denied_actions', action='store_true', default=False,
@@ -1521,13 +1523,13 @@ def main():
                     alpha_optimizer.zero_grad(set_to_none=True)
                     _, log_pi_curr, _, _ = actor_forward(obs_batch)
                     log_pi_detached = log_pi_curr.detach()
-                    alpha = log_alpha.exp()
-                    alpha_loss = (alpha * (log_pi_detached + target_entropy)).mean()
+                    alpha_loss = (-log_alpha.exp() * (log_pi_detached + target_entropy)).mean()
                     alpha_loss.backward()
                     alpha_optimizer.step()
                     with torch.no_grad():
                         min_log_alpha = np.log(max(1e-6, float(args.alpha_min)))
-                        log_alpha.clamp_(min=min_log_alpha)
+                        max_log_alpha = np.log(float(args.alpha_max))
+                        log_alpha.clamp_(min=min_log_alpha, max=max_log_alpha)
                         alpha = log_alpha.exp()
                     alpha_loss_value = float(alpha_loss.detach().cpu().item())
                     alpha_value = float(alpha.detach().cpu().item())
