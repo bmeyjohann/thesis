@@ -1521,7 +1521,8 @@ def main():
 
                     # Alpha update
                     alpha_optimizer.zero_grad(set_to_none=True)
-                    _, log_pi_curr, _, _ = actor_forward(obs_batch)
+                    with torch.no_grad():
+                        _, log_pi_curr, _, _ = actor_forward(obs_batch)
                     log_pi_detached = log_pi_curr.detach()
                     alpha_loss = (-log_alpha.exp() * (log_pi_detached + target_entropy)).mean()
                     alpha_loss.backward()
