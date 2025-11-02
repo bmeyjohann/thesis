@@ -28,16 +28,18 @@ CRITIC_LR=${CRITIC_LR:-1e-4}
 ACTOR_LR=${ACTOR_LR:-3e-4}
 TAU=${TAU:-0.002}
 MAX_GRAD_NORM=${MAX_GRAD_NORM:-1.0}
-ALPHA_MIN=${ALPHA_MIN:-0.05}
+ALPHA_MIN=${ALPHA_MIN:-0.0}
+ALPHA_MAX=${ALPHA_MAX:-0.2}
+ALPHA_FREEZE=${ALPHA_FREEZE:-0}
 PIXEL_FINAL_POOL=${PIXEL_FINAL_POOL:-8}
 NUM_UPDATES=${NUM_UPDATES:-1}
 POLICY_FREQUENCY=${POLICY_FREQUENCY:-1}
 VIZ_FIRST_STEP=${VIZ_FIRST_STEP:-10000}
 
 # Reward scales per run
-SCALE_A=${SCALE_A:-0.2}
-SCALE_B=${SCALE_B:-0.5}
-SCALE_C=${SCALE_C:-0.5}
+SCALE_A=${SCALE_A:-1.0}
+SCALE_B=${SCALE_B:-1.0}
+SCALE_C=${SCALE_C:-1.0}
 SCALE_D=${SCALE_D:-1.0}
 
 # CNN specs per run
@@ -64,14 +66,15 @@ BASE_ARGS="--env_name ${ENV_ID} --obs_mode pixels --num_envs ${NUM_ENVS} \
 --batch_size ${BATCH_SIZE} --learning_starts ${LEARNING_STARTS} \
 --critic_learning_rate ${CRITIC_LR} --actor_learning_rate ${ACTOR_LR} \
 --tau ${TAU} --max_grad_norm ${MAX_GRAD_NORM} --alpha_min ${ALPHA_MIN} \
+--alpha_max ${ALPHA_MAX} --alpha_freeze_steps ${ALPHA_FREEZE} \
 --pixel_width 64 --pixel_height 64 --pixel_final_pool ${PIXEL_FINAL_POOL} \
 --num_updates ${NUM_UPDATES} --policy_frequency ${POLICY_FREQUENCY} \
---viz_on_checkpoint --viz_first_step ${VIZ_FIRST_STEP} --save_interval 100000 \
+--viz_on_checkpoint --viz_first_step ${VIZ_FIRST_STEP} --save_interval 10000 \
 --use_wandb --viz_grid_resolution 32 --viz_quiver_stride 2"
 
 echo "Launching pixel sweep (reference-stabilized) on ${ENV_ID}"
 
-# A: tiny CNN, dense scale 0.2
+# A: tiny CNN
 WANDB_MODE=offline CUDA_VISIBLE_DEVICES=0 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
   --dense_reward_scale ${SCALE_A} \
   --pixel_conv_channels ${CNN_A} --pixel_kernel_sizes ${KER_A} --pixel_strides ${STR_A} \
@@ -79,7 +82,7 @@ WANDB_MODE=offline CUDA_VISIBLE_DEVICES=0 python -u train_fast_sac_ogbench.py ${
   2>&1 | tee logs/${ENV_ID}_pix_ref_A_tiny_${SLURM_JOB_ID}.log &
 PID_A=$!
 
-# B: single‑conv baseline, dense scale 0.5
+# B: single‑conv baseline
 WANDB_MODE=offline CUDA_VISIBLE_DEVICES=1 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
   --dense_reward_scale ${SCALE_B} \
   --pixel_conv_channels ${CNN_B} --pixel_kernel_sizes ${KER_B} --pixel_strides ${STR_B} \
@@ -88,7 +91,7 @@ WANDB_MODE=offline CUDA_VISIBLE_DEVICES=1 python -u train_fast_sac_ogbench.py ${
   2>&1 | tee logs/${ENV_ID}_pix_ref_B_singleconv_${SLURM_JOB_ID}.log &
 PID_B=$!
 
-# C: medium CNN, dense scale 0.5
+# C: medium CNN
 WANDB_MODE=offline CUDA_VISIBLE_DEVICES=2 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
   --dense_reward_scale ${SCALE_C} \
   --pixel_conv_channels ${CNN_C} --pixel_kernel_sizes ${KER_C} --pixel_strides ${STR_C} \
@@ -96,7 +99,7 @@ WANDB_MODE=offline CUDA_VISIBLE_DEVICES=2 python -u train_fast_sac_ogbench.py ${
   2>&1 | tee logs/${ENV_ID}_pix_ref_C_medium_${SLURM_JOB_ID}.log &
 PID_C=$!
 
-# D: large CNN, dense scale 1.0
+# D: large CNN
 WANDB_MODE=offline CUDA_VISIBLE_DEVICES=3 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
   --dense_reward_scale ${SCALE_D} \
   --pixel_conv_channels ${CNN_D} --pixel_kernel_sizes ${KER_D} --pixel_strides ${STR_D} \

@@ -34,10 +34,12 @@ STEP_PENALTY=${STEP_PENALTY:-0.0}
 LOG_INTERVAL=${LOG_INTERVAL:-2000}
 SAVE_INTERVAL=${SAVE_INTERVAL:-100000}
 PIXEL_FINAL_POOL=${PIXEL_FINAL_POOL:-8}
-ALPHA_MIN=${ALPHA_MIN:-0.05}
-ALPHA_MIN_SMALL=${ALPHA_MIN_SMALL:-0.075}
+ALPHA_MIN=${ALPHA_MIN:-0.0}
+ALPHA_MIN_SMALL=${ALPHA_MIN_SMALL:-0.05}
 ALPHA_MIN_MEDIUM=${ALPHA_MIN_MEDIUM:-0.05}
 ALPHA_MIN_LARGE=${ALPHA_MIN_LARGE:-0.05}
+ALPHA_MAX=${ALPHA_MAX:-0.2}
+ALPHA_FREEZE=${ALPHA_FREEZE:-50000}
 CNN_TINY=${CNN_TINY:-12,24,24}
 KERNEL_TINY=${KERNEL_TINY:-5,5,3}
 STRIDE_TINY=${STRIDE_TINY:-1,2,2}
@@ -62,7 +64,7 @@ BASE_ARGS="--env_name ${ENV_ID} --obs_mode pixels --num_envs ${NUM_ENVS} \
 --pixel_final_pool ${PIXEL_FINAL_POOL} \
 --batch_size ${BATCH_SIZE} --learning_starts ${LEARNING_STARTS} \
 --log_interval ${LOG_INTERVAL} --save_interval ${SAVE_INTERVAL} \
---alpha_min ${ALPHA_MIN} \
+--alpha_min ${ALPHA_MIN} --alpha_max ${ALPHA_MAX} --alpha_freeze_steps ${ALPHA_FREEZE} \
 --viz_first_step 200000 \
 --use_wandb --viz_on_checkpoint --viz_grid_resolution 32 --viz_quiver_stride 2"
 

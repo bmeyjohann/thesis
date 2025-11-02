@@ -7,7 +7,6 @@ Matches CLI style of train_rsl_rl_integrated.py where practical.
 
 import os
 import sys
-import argparse
 import time
 import math
 import json
@@ -26,7 +25,6 @@ os.environ.setdefault("WANDB_CONSOLE", "off")
 os.environ.setdefault("WANDB_SILENT", "true")
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.amp import autocast, GradScaler
@@ -45,152 +43,21 @@ from fast_sac_utils import (
 
 # Register OGBench envs and wrappers
 import ogbench
-from ogbench.wrappers import FlexibleObsWrapper, DetailedRewardWrapper, InterventionWrapper
 from fasttd3.fast_sac.environments.ogbench_env import OGBenchVecEnvAdapter
+
+from ogbench_utils import (
+    CriticEnsemble,
+    GaussianPolicyHead,
+    IdentityNormalizer,
+    MLPBackbone,
+    PixelBackbone,
+    build_ogbench_wrapper,
+    build_train_parser,
+)
 
 TOOLS_PATH = Path(__file__).resolve().parent / "tools"
 if TOOLS_PATH.exists():
     sys.path.append(str(TOOLS_PATH))
-
-
-class PixelNormalizer(nn.Module):
-    def forward(self, x):
-        return x / 255.0
-
-
-class IdentityNormalizer(nn.Module):
-    def forward(self, x):
-        return x
-
-
-class MLPBackbone(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-        )
-        self.output_dim = hidden_dim
-
-    def forward(self, x):
-        return self.net(x)
-
-
-class PixelBackbone(nn.Module):
-    def __init__(
-        self,
-        input_shape,
-        feature_dim: int,
-        conv_channels: tuple[int, ...] | None = None,
-        kernel_sizes: tuple[int, ...] | None = None,
-        strides: tuple[int, ...] | None = None,
-        final_pool: int | None = None,
-    ):
-        super().__init__()
-        c, h, w = input_shape
-        if conv_channels is None or len(conv_channels) == 0:
-            conv_channels = (32, 64, 64)
-        if kernel_sizes is None or len(kernel_sizes) == 0:
-            kernel_sizes = (8, 4, 3)
-        if strides is None or len(strides) == 0:
-            strides = (4, 2, 1)
-        if len(kernel_sizes) < len(conv_channels):
-            kernel_sizes = tuple(list(kernel_sizes) + [kernel_sizes[-1]] * (len(conv_channels) - len(kernel_sizes)))
-        if len(strides) < len(conv_channels):
-            strides = tuple(list(strides) + [strides[-1]] * (len(conv_channels) - len(strides)))
-        layers: list[nn.Module] = []
-        in_channels = c
-        for idx, out_channels in enumerate(conv_channels):
-            k = int(kernel_sizes[idx])
-            s = int(strides[idx])
-            padding = k // 2 if s == 1 else 0
-            layers.append(nn.Conv2d(in_channels, int(out_channels), kernel_size=k, stride=s, padding=padding))
-            layers.append(nn.ReLU())
-            in_channels = int(out_channels)
-        if final_pool is not None and final_pool > 0:
-            layers.append(nn.AdaptiveAvgPool2d(final_pool))
-        self.conv = nn.Sequential(*layers)
-        with torch.no_grad():
-            dummy = torch.zeros(1, c, h, w)
-            flat_dim = self.conv(dummy).view(1, -1).shape[1]
-        self.fc = nn.Sequential(
-            nn.Linear(flat_dim, feature_dim),
-            nn.ReLU(),
-        )
-        self.output_dim = feature_dim
-
-    def forward(self, x):
-        if x.dim() == 4 and x.shape[1] not in (1, 3):
-            x = x.permute(0, 3, 1, 2)
-        x = self.conv(x)
-        x = x.view(x.size(0), -1)
-        return self.fc(x)
-
-
-class GaussianPolicyHead(nn.Module):
-    LOG_STD_MAX = 2
-    LOG_STD_MIN = -5
-
-    def __init__(self, feature_dim: int, action_dim: int, hidden_dim: int, init_scale: float):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(feature_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-        )
-        self.fc_mu = nn.Linear(hidden_dim // 2, action_dim)
-        self.fc_logstd = nn.Linear(hidden_dim // 2, action_dim)
-        nn.init.normal_(self.fc_mu.weight, 0.0, init_scale)
-        nn.init.constant_(self.fc_mu.bias, 0.0)
-
-    def forward(self, features):
-        x = self.net(features)
-        mean = self.fc_mu(x)
-        log_std = self.fc_logstd(x)
-        log_std = torch.tanh(log_std)
-        log_std = self.LOG_STD_MIN + 0.5 * (self.LOG_STD_MAX - self.LOG_STD_MIN) * (log_std + 1)
-        std = log_std.exp()
-        normal = torch.distributions.Normal(mean, std)
-        z = normal.rsample()
-        action = torch.tanh(z)
-        log_prob = normal.log_prob(z) - torch.log(1 - action.pow(2) + 1e-6)
-        log_prob = log_prob.sum(-1, keepdim=True)
-        return action, log_prob, torch.tanh(mean)
-
-
-class CriticHead(nn.Module):
-    def __init__(self, feature_dim: int, action_dim: int, hidden_dim: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(feature_dim + action_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 2, 1),
-        )
-
-    def forward(self, features, actions):
-        x = torch.cat([features, actions], dim=-1)
-        return self.net(x)
-
-
-class CriticEnsemble(nn.Module):
-    def __init__(self, feature_dim: int, action_dim: int, hidden_dim: int, num_heads: int):
-        super().__init__()
-        self.heads = nn.ModuleList([
-            CriticHead(feature_dim, action_dim, hidden_dim) for _ in range(num_heads)
-        ])
-
-    def forward(self, features, actions):
-        return [head(features, actions) for head in self.heads]
-
-    def min_q(self, features, actions):
-        qs = self.forward(features, actions)
-        stacked = torch.stack(qs, dim=0)
-        return torch.min(stacked, dim=0).values
 try:
     from visualize_policy_map import generate_policy_map  # type: ignore
 except Exception:  # pragma: no cover - optional dependency for viz
@@ -198,192 +65,32 @@ except Exception:  # pragma: no cover - optional dependency for viz
 
 
 def parse_args():
-    p = argparse.ArgumentParser()
-    # Env
-    p.add_argument('--env_name', type=str, default='pointmaze-arena-danger-lethal-v0')
-    p.add_argument('--num_envs', type=int, default=64)
-    p.add_argument('--total_timesteps', type=int, default=1_000_000)
-    p.add_argument('--device', type=str, default='auto')
-    # Observations
-    p.add_argument('--include_goal', action='store_true', default=True)
-    p.add_argument('--include_distance', action='store_true', default=False)
-    p.add_argument('--include_direction', action='store_true', default=False)
-    p.add_argument('--include_velocity', action='store_true', default=False)
-    # Rewards
-    p.add_argument('--reward_type', type=str, default='sparse', choices=['sparse','dense','combined'])
-    p.add_argument('--dense_reward_scale', type=float, default=0.01)
-    p.add_argument('--step_penalty', type=float, default=0.0)
-    p.add_argument('--reward_switch_after_steps', type=int, default=0)
-    p.add_argument('--switch_env_name', type=str, default=None,
-                   help='Optional OGBench env id to switch to after a curriculum step')
-    p.add_argument('--switch_env_after_steps', type=int, default=0,
-                   help='Global env steps after which to switch to switch_env_name (0 disables)')
-    # Intervention / Teacher
-    p.add_argument('--use_intervention', action='store_true', default=False)
-    p.add_argument('--intervention_mode', type=str, default='agent', choices=['human','agent'])
-    p.add_argument('--teacher_type', type=str, default='bfs', choices=['bfs'])
-    p.add_argument('--tolerance_type', type=str, default='angle', choices=['angle','l2'])
-    p.add_argument('--tolerance_value', type=float, default=30.0)
-    p.add_argument('--hard_block_lethal', action='store_true', default=True)
-    p.add_argument('--no_hard_block_lethal', dest='hard_block_lethal', action='store_false')
-    p.add_argument('--intervention_enable_after_steps', type=int, default=0)
-    # SAC core (trimmed reasonable defaults)
-    p.add_argument('--actor_learning_rate', type=float, default=3e-4)
-    p.add_argument('--critic_learning_rate', type=float, default=3e-4)
-    p.add_argument('--batch_size', type=int, default=32768)
-    p.add_argument('--buffer_size', type=int, default=1024*50)
-    p.add_argument('--gamma', type=float, default=0.99)
-    p.add_argument('--tau', type=float, default=0.005)
-    p.add_argument('--policy_frequency', type=int, default=2)
-    p.add_argument('--num_updates', type=int, default=2)
-    p.add_argument('--learning_starts', type=int, default=1000)
-    p.add_argument('--max_grad_norm', type=float, default=0.0)
-    p.add_argument('--init_scale', type=float, default=0.01)
-    p.add_argument('--actor_hidden_dim', type=int, default=512)
-    p.add_argument('--critic_hidden_dim', type=int, default=1024)
-
-    p.add_argument('--arch_shared_trunk', action='store_true', default=False,
-                   help='Share an observation trunk between actor and critic(s)')
-    p.add_argument('--shared_hidden_dim', type=int, default=512,
-                   help='Hidden size for shared trunk when enabled')
-    p.add_argument('--num_critics', type=int, default=2,
-                   help='Number of critic heads (2 or 3 supported)')
-    p.add_argument('--obs_mode', type=str, default='state', choices=['state', 'pixels'],
-                   help='Observation mode: vector state or pixel images')
-    p.add_argument('--pixel_width', type=int, default=64,
-                   help='Pixel observation width when obs_mode=pixels')
-    p.add_argument('--pixel_height', type=int, default=64,
-                   help='Pixel observation height when obs_mode=pixels')
-    p.add_argument('--pixel_camera', type=str, default=None,
-                   help='Optional MuJoCo camera name for pixel observations (defaults to env setting)')
-    p.add_argument('--pixel_conv_channels', type=str, default='32,64,64',
-                   help='Comma-separated Conv2d channel sizes for the pixel backbone')
-    p.add_argument('--pixel_kernel_sizes', type=str, default='8,4,3',
-                   help='Comma-separated kernel sizes for each conv layer (defaults to 8,4,3)')
-    p.add_argument('--pixel_strides', type=str, default='4,2,1',
-                   help='Comma-separated strides for each conv layer (defaults to 4,2,1)')
-    p.add_argument('--pixel_final_pool', type=int, default=0,
-                   help='If >0, apply AdaptiveAvgPool2d to this spatial size after conv stack')
-    p.add_argument('--alpha_min', type=float, default=0.03,
-                   help='Minimum entropy temperature (alpha).')
-    p.add_argument('--alpha_max', type=float, default=0.5,
-                   help='Maximum entropy temperature (alpha).')
-    p.add_argument('--debug_pixel_dump', action='store_true', default=False,
-                   help='Log raw vs normalized observation stats and sample actions at first step')
-    p.add_argument('--store_denied_actions', action='store_true', default=False,
-                   help='Add denied student actions to replay buffer with penalty reward')
-    p.add_argument('--denied_action_penalty', type=float, default=-1.0,
-                   help='Reward assigned to denied student actions when stored')
-    # Intervention reward shaping variants
-    p.add_argument('--intervention_reward_mode', type=str, default='none',
-                   choices=['none', 'penalty_student', 'bonus_teacher'],
-                   help='How to shape reward/actions on intervention')
-    p.add_argument('--intervention_reward_value', type=float, default=0.0,
-                   help='Magnitude for intervention reward shaping (e.g., 0.1)')
-    p.add_argument('--bonus_teacher_value', type=float, default=0.0,
-                   help='Additional reward added when teacher action is applied (can combine with penalty modes)')
-    # Logging
-    p.add_argument('--use_wandb', action='store_true', default=False)
-    p.add_argument('--project', type=str, default='ogbench-rsl-rl')
-    p.add_argument('--exp_name', type=str, default=None)
-    p.add_argument('--save_interval', type=int, default=200000,
-                   help='Env-step interval for checkpoint saves (0 disables)')
-    p.add_argument('--log_interval', type=int, default=200)
-    p.add_argument('--post_switch_viz_multiplier', type=int, default=1,
-                   help='Reduce checkpoint/viz interval by this factor after curriculum/env switch (>=1)')
-    p.add_argument('--disagreement_hist_edges', type=str, default='',
-                   help='Comma-separated positive edges for disagreement hist bins (teacher/non-teacher). Empty to disable histogram logging.')
-    p.add_argument('--disagreement_thresholds', type=str, default='0.02,0.05,0.1,0.2,0.3,0.5,0.75,1.0,2.0,5.0',
-                   help='Comma-separated thresholds to log fraction of interventions with disagreement >= threshold')
-    # Misc
-    p.add_argument('--compile', action='store_true', default=False)
-    p.add_argument('--amp', action='store_true', default=True)
-    p.add_argument('--amp_dtype', type=str, default='bf16', choices=['bf16','fp16'])
-    # Counterfactual buffer (student-denied actions) for fast adaptation
-    p.add_argument('--cf_buffer_enable', action='store_true', default=False,
-                   help='Enable counterfactual buffer for denied student actions')
-    p.add_argument('--cf_capacity', type=int, default=100000,
-                   help='Capacity of CF buffer (rows)')
-    p.add_argument('--cf_sample_ratio', type=float, default=0.5,
-                   help='Fraction of batch for CF critic loss (0..1)')
-    p.add_argument('--cf_penalty', type=float, default=1.0,
-                   help='Positive penalty magnitude; critic target becomes -abs(value) for denied actions')
-    p.add_argument('--cf_q_weight', type=float, default=1.0,
-                   help='Weight for CF critic penalty loss')
-    # Preference buffer (pairwise ranking on intervened rows: teacher vs student)
-    p.add_argument('--pref_buffer_enable', action='store_true', default=False,
-                   help='Enable preference buffer storing pairs (s, a_teacher, a_student) and ranking loss')
-    p.add_argument('--pref_capacity', type=int, default=100000,
-                   help='Capacity of preference buffer (pairs)')
-    p.add_argument('--pref_sample_ratio', type=float, default=0.5,
-                   help='Fraction of update batch for preference pairs (0..1)')
-    p.add_argument('--pref_rank_weight', type=float, default=1.0,
-                   help='Weight for the pairwise ranking loss added to critic loss')
-    p.add_argument('--pref_rank_margin', type=float, default=0.1,
-                   help='Margin for ranking loss: softplus(margin - (Qpos - Qneg))')
-    # Preference-TD buffer (balanced TD samples: teacher real transition; student synthetic terminal negative)
-    p.add_argument('--pref_td_buffer_enable', action='store_true', default=False,
-                   help='Enable preference-TD buffer that keeps balanced teacher/student TD transitions')
-    p.add_argument('--pref_td_capacity', type=int, default=100000,
-                   help='Capacity per-role (teacher/student) for preference-TD buffer')
-    p.add_argument('--pref_td_sample_ratio', type=float, default=0.5,
-                   help='Fraction of update batch to draw from preference-TD buffer (split 50/50 teacher/student)')
-    p.add_argument('--pref_td_q_weight', type=float, default=1.0,
-                   help='Weight for additional critic TD loss from preference-TD samples')
-    p.add_argument('--pref_td_penalty_value', type=float, default=0.1,
-                   help='Negative reward assigned to synthetic student terminal in preference-TD buffer')
-    p.add_argument('--pref_td_teacher_bonus_value', type=float, default=0.0,
-                   help='Optional extra reward added to teacher transitions in preference-TD buffer')
-    # Replay buffer reset on curriculum switch
-    p.add_argument('--reset_replay_on_switch', action='store_true', default=False,
-                   help='Reset main replay buffer when reward_switch_after_steps is reached')
-    p.add_argument('--reset_critic_on_switch', action='store_true', default=False,
-                   help='Reload critic weights/optimiser to initial state at curriculum switch')
-    # Policy visualization
-    p.add_argument('--viz_on_checkpoint', action='store_true', default=False,
-                   help='Render policy/critic maps whenever a checkpoint is saved')
-    p.add_argument('--viz_grid_resolution', type=int, default=64,
-                   help='Grid resolution for policy maps if enabled')
-    p.add_argument('--viz_quiver_stride', type=int, default=1,
-                   help='Stride for quiver arrows in policy maps')
-    p.add_argument('--viz_device', type=str, default='cpu',
-                   help='Device to use when generating policy maps')
-    p.add_argument('--viz_seed', type=int, default=0,
-                   help='Seed used to sample/lock the visualization goal location')
-    p.add_argument('--viz_first_step', type=int, default=None,
-                   help='Force the first checkpoint/viz at this env-step (even if save_interval is larger)')
-    return p.parse_args()
+    return build_train_parser().parse_args()
 
 
 def make_wrappers(args):
-    def _apply(env):
-        if args.obs_mode == 'state':
-            env = FlexibleObsWrapper(
-                env,
-                include_goal=args.include_goal,
-                include_distance=args.include_distance,
-                include_direction=args.include_direction,
-                include_velocity=args.include_velocity,
-            )
-        env = DetailedRewardWrapper(
-            env,
-            reward_type=args.reward_type,
-            dense_reward_scale=args.dense_reward_scale,
-            step_penalty=args.step_penalty,
-            switch_reward_to_sparse_after_steps_per_env=(args.reward_switch_after_steps // max(1, args.num_envs)),
-        )
-        if args.use_intervention and args.intervention_mode == 'agent':
-            env = InterventionWrapper(
-                env,
-                mode='agent',
-                teacher_type=args.teacher_type,
-                tolerance_type=args.tolerance_type,
-                tolerance_value=args.tolerance_value,
-                hard_block_lethal=args.hard_block_lethal,
-                enable_after_steps=args.intervention_enable_after_steps,
-            )
-        return env
-    return [_apply]
+    reward_switch = args.reward_switch_after_steps // max(1, args.num_envs)
+    intervention_mode = (
+        args.intervention_mode if args.use_intervention else "none"
+    )
+    wrapper = build_ogbench_wrapper(
+        obs_mode=args.obs_mode,
+        include_goal=args.include_goal,
+        include_distance=args.include_distance,
+        include_direction=args.include_direction,
+        include_velocity=args.include_velocity,
+        reward_type=args.reward_type,
+        dense_reward_scale=args.dense_reward_scale,
+        step_penalty=args.step_penalty,
+        reward_switch_after_steps=reward_switch,
+        intervention_mode=intervention_mode,
+        teacher_type=args.teacher_type,
+        tolerance_type=args.tolerance_type,
+        tolerance_value=args.tolerance_value,
+        hard_block_lethal=args.hard_block_lethal,
+        intervention_enable_after_steps=args.intervention_enable_after_steps,
+    )
+    return [wrapper]
 
 
 def main():
@@ -1519,21 +1226,31 @@ def main():
                         scaler.step(trunk_optimizer)
                     scaler.update()
 
-                    # Alpha update
-                    alpha_optimizer.zero_grad(set_to_none=True)
-                    with torch.no_grad():
+                    # Alpha update (optional freeze / clamping)
+                    if total_env_steps < int(getattr(args, 'alpha_freeze_steps', 0)):
+                        alpha_optimizer.zero_grad(set_to_none=True)
+                        alpha_loss_value = 0.0
+                        alpha_value = float(log_alpha.exp().detach().cpu().item())
+                    else:
+                        alpha_optimizer.zero_grad(set_to_none=True)
                         _, log_pi_curr, _, _ = actor_forward(obs_batch)
-                    log_pi_detached = log_pi_curr.detach()
-                    alpha_loss = (-log_alpha.exp() * (log_pi_detached + target_entropy)).mean()
-                    alpha_loss.backward()
-                    alpha_optimizer.step()
-                    with torch.no_grad():
-                        min_log_alpha = np.log(max(1e-6, float(args.alpha_min)))
-                        max_log_alpha = np.log(float(args.alpha_max))
-                        log_alpha.clamp_(min=min_log_alpha, max=max_log_alpha)
-                        alpha = log_alpha.exp()
-                    alpha_loss_value = float(alpha_loss.detach().cpu().item())
-                    alpha_value = float(alpha.detach().cpu().item())
+                        log_pi_detached = log_pi_curr.detach()
+                        alpha_loss = (-log_alpha.exp() * (log_pi_detached + target_entropy)).mean()
+                        alpha_loss.backward()
+                        alpha_optimizer.step()
+                        with torch.no_grad():
+                            min_log_alpha = None
+                            if float(args.alpha_min) > 0.0:
+                                min_log_alpha = np.log(max(1e-6, float(args.alpha_min)))
+                            max_log_alpha = None
+                            if float(args.alpha_max) > 0.0:
+                                max_log_alpha = np.log(float(args.alpha_max))
+                            lower = min_log_alpha if min_log_alpha is not None else -torch.inf
+                            upper = max_log_alpha if max_log_alpha is not None else torch.inf
+                            if not np.isinf(lower) or not np.isinf(upper):
+                                log_alpha.clamp_(min=lower, max=upper)
+                        alpha_loss_value = float(alpha_loss.detach().cpu().item())
+                        alpha_value = float(log_alpha.exp().detach().cpu().item())
 
                     # Soft update targets
                     source_backbone = actor_backbone if args.arch_shared_trunk else critic_backbone

@@ -5,7 +5,7 @@ ssh -M -S ~/.ssh/juwels-master -f -N meyjohann1@juwels-booster.fz-juelich.de
 
 # Use the master connection for all rsync commands
 rsync -avz --progress -e "ssh -S ~/.ssh/juwels-master" meyjohann1@juwels-booster.fz-juelich.de:/p/home/jusers/meyjohann1/juwels/meyjohann1/thesis/wandb/ ./wandb/
-# rsync -avz --progress -e "ssh -S ~/.ssh/juwels-master" meyjohann1@juwels-booster.fz-juelich.de:/p/home/jusers/meyjohann1/juwels/meyjohann1/thesis/models/ ./models/
+rsync -avz --progress -e "ssh -S ~/.ssh/juwels-master" meyjohann1@juwels-booster.fz-juelich.de:/p/home/jusers/meyjohann1/juwels/meyjohann1/thesis/models/ ./models/
 rsync -avz --progress -e "ssh -S ~/.ssh/juwels-master" meyjohann1@juwels-booster.fz-juelich.de:/p/home/jusers/meyjohann1/juwels/meyjohann1/thesis/logs/ ./logs/
 
 # Close the master connection

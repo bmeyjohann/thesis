@@ -32,93 +32,339 @@ import torch.nn as nn
 import numpy as np
 import gymnasium as gym
 import pygame
+import multiprocessing as mp
 from pathlib import Path
 from datetime import datetime
-from typing import Any, Dict
+from typing import Any, Dict, Optional
+from contextlib import contextmanager
+
+from ogbench_utils import (
+    GaussianPolicyHead,
+    MLPBackbone,
+    PixelBackbone,
+    PixelNormalizer,
+    build_ogbench_wrapper,
+    build_eval_parser,
+)
 
 # Fix WSL window positioning issues  
 os.environ['SDL_VIDEO_CENTERED'] = '1'
 
 
-class PixelNormalizer(nn.Module):
-    def forward(self, x):
-        return x / 255.0
+def _canonical_pixel_shape(shape) -> tuple[int, int, int]:
+    """Return pixel shape as (C, H, W)."""
+    if shape is None:
+        raise ValueError("pixel shape is None")
+    if isinstance(shape, torch.Size):
+        shape = tuple(int(s) for s in shape)
+    elif isinstance(shape, (list, tuple)):
+        shape = tuple(int(s) for s in shape)
+    else:
+        raise TypeError(f"Unsupported pixel shape type: {type(shape)}")
+    if len(shape) != 3:
+        raise ValueError(f"Pixel shape must have 3 dims, got {shape}")
+    c_first = shape[0] in (1, 3, 4)
+    c_last = shape[-1] in (1, 3, 4)
+    if c_first and not c_last:
+        return shape
+    if c_last and not c_first:
+        return (shape[-1], shape[0], shape[1])
+    # Ambiguous but assume already canonical
+    return shape
 
 
-class MLPBackbone(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+def _parse_int_tuple(value, *, allow_single: bool = False) -> tuple[int, ...] | None:
+    """Parse tuples stored as tuple/list/str/int in checkpoints."""
+    if value is None:
+        return None
+    if isinstance(value, tuple):
+        return tuple(int(v) for v in value)
+    if isinstance(value, list):
+        return tuple(int(v) for v in value)
+    if isinstance(value, str):
+        items = [item.strip() for item in value.split(',')]
+        parsed = [int(item) for item in items if item]
+        return tuple(parsed)
+    if isinstance(value, int):
+        if allow_single:
+            return (int(value),)
+        return (int(value),)
+    return None
+
+
+def _parse_optional_int(value) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
+
+
+def unwrap_maze_env(env):
+    """Walk through nested gym wrappers to find the underlying MazeEnv."""
+    visited = set()
+    current = env
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if hasattr(current, "maze_map") and hasattr(current, "xy_to_ij"):
+            return current
+        current = getattr(current, "env", None)
+    return None
+
+
+class BirdsEyeRenderer:
+    """Top-down pygame renderer for maze environments with optional observation panel."""
+
+    def __init__(self, maze_env, initial_obs: np.ndarray | None):
+        if not hasattr(maze_env, "maze_map"):
+            raise ValueError("maze_env must expose maze_map")
+        self.env = maze_env
+        self.grid = np.array(maze_env.maze_map)
+        self.rows, self.cols = self.grid.shape
+        self.maze_unit = float(getattr(maze_env, "_maze_unit", 1.0))
+        self.offset_x = float(getattr(maze_env, "_offset_x", 0.0))
+        self.offset_y = float(getattr(maze_env, "_offset_y", 0.0))
+        self.cell_size = self._suggest_cell_size(self.cols, self.rows)
+        self.grid_width = self.cols * self.cell_size
+        self.grid_height = self.rows * self.cell_size
+
+        self.show_obs_panel = (
+            initial_obs is not None
+            and isinstance(initial_obs, np.ndarray)
+            and initial_obs.ndim >= 2
         )
-        self.output_dim = hidden_dim
+        if self.show_obs_panel:
+            obs = initial_obs
+            if obs.ndim == 1:
+                side = int(np.sqrt(obs.size))
+                obs = obs.reshape(side, side)
+            if obs.ndim == 2:
+                obs = np.stack([obs] * 3, axis=-1)
+            if obs.shape[-1] == 1:
+                obs = np.repeat(obs, 3, axis=-1)
+            self.obs_shape = obs.shape
+            scale = max(2, min(6, 480 // max(obs.shape[0], obs.shape[1])))
+            self.obs_surface_size = (obs.shape[1] * scale, obs.shape[0] * scale)
+        else:
+            self.obs_shape = None
+            self.obs_surface_size = (0, 0)
 
-    def forward(self, x):
-        return self.net(x)
+        total_width = self.grid_width + (self.obs_surface_size[0] + 16 if self.show_obs_panel else 0)
+        total_height = max(self.grid_height, self.obs_surface_size[1])
+        if total_width == 0 or total_height == 0:
+            total_width = max(total_width, 320)
+            total_height = max(total_height, 320)
+        self.surface = pygame.display.set_mode((total_width, total_height))
+        pygame.display.set_caption("Bird's Eye View")
+        self.font = pygame.font.SysFont("Arial", 14)
+
+    @staticmethod
+    def _suggest_cell_size(cols: int, rows: int) -> int:
+        if cols <= 0 or rows <= 0:
+            return 32
+        base = min(960 // max(cols, 1), 720 // max(rows, 1))
+        return int(max(16, min(72, base)))
+
+    def draw(self, pixel_obs: np.ndarray | None = None):
+        if self.surface is None:
+            return
+        self.surface.fill((28, 28, 28))
+        grid_surface = pygame.Surface((self.grid_width, self.grid_height))
+        grid_surface.fill((235, 235, 235))
+
+        for i in range(self.rows):
+            for j in range(self.cols):
+                y_pix = (self.rows - 1 - i) * self.cell_size
+                rect = pygame.Rect(j * self.cell_size, y_pix, self.cell_size, self.cell_size)
+                cell = int(self.grid[i, j])
+                if cell == 1:
+                    color = (60, 60, 60)
+                elif cell == getattr(self.env, "_dangerous_tile_id", 2):
+                    mode = getattr(self.env, "_dangerous_state_mode", "floor")
+                    color = (190, 60, 40) if mode != "wall" else (200, 30, 30)
+                else:
+                    color = (225, 225, 225)
+                pygame.draw.rect(grid_surface, color, rect)
+                pygame.draw.rect(grid_surface, (180, 180, 180), rect, width=1)
+
+        goal_xy = getattr(self.env, "cur_goal_xy", None)
+        if goal_xy is not None:
+            center = self._xy_to_screen(goal_xy)
+            pygame.draw.circle(grid_surface, (50, 120, 255), center, max(6, self.cell_size // 3))
+
+        if hasattr(self.env, "get_xy"):
+            agent_xy = self.env.get_xy()
+            center = self._xy_to_screen(agent_xy)
+            pygame.draw.circle(grid_surface, (30, 30, 220), center, max(6, self.cell_size // 3))
+            pygame.draw.circle(grid_surface, (255, 255, 255), center, max(6, self.cell_size // 3), width=2)
+
+        self.surface.blit(grid_surface, (0, 0))
+
+        if self.show_obs_panel:
+            panel = pygame.Surface(self.obs_surface_size)
+            panel.fill((20, 20, 20))
+            label = self.font.render("Observation", True, (230, 230, 230))
+            panel.blit(label, (4, 4))
+            if pixel_obs is not None:
+                obs_img = pixel_obs
+                if isinstance(obs_img, torch.Tensor):
+                    obs_img = obs_img.detach().cpu().numpy()
+                if obs_img.ndim == 1:
+                    side = int(np.sqrt(obs_img.size))
+                    obs_img = obs_img.reshape(side, side)
+                if obs_img.ndim == 2:
+                    obs_img = np.stack([obs_img] * 3, axis=-1)
+                if obs_img.shape[-1] == 1:
+                    obs_img = np.repeat(obs_img, 3, axis=-1)
+                obs_img = np.asarray(obs_img)
+                if obs_img.dtype != np.uint8:
+                    obs_min = float(np.min(obs_img))
+                    obs_max = float(np.max(obs_img))
+                    if obs_max > obs_min:
+                        obs_img = (obs_img - obs_min) / (obs_max - obs_min)
+                    obs_img = (obs_img * 255.0).clip(0, 255).astype(np.uint8)
+                obs_img = np.ascontiguousarray(obs_img)
+                surf = pygame.surfarray.make_surface(obs_img.swapaxes(0, 1))
+                surf = pygame.transform.smoothscale(surf, self.obs_surface_size)
+                panel.blit(surf, (0, 24))
+            self.surface.blit(panel, (self.grid_width + 16, 0))
+
+        pygame.display.flip()
+
+    def _xy_to_screen(self, xy):
+        x, y = xy
+        col = (x + self.offset_x) / self.maze_unit
+        row = (y + self.offset_y) / self.maze_unit
+        center_x = (col + 0.5) * self.cell_size
+        center_y = (self.rows - (row + 0.5)) * self.cell_size
+        half_cell = 0.5 * self.cell_size
+        center_x = float(np.clip(center_x, half_cell, self.grid_width - half_cell))
+        center_y = float(np.clip(center_y, half_cell, self.grid_height - half_cell))
+        return int(center_x), int(center_y)
+
+@contextmanager
+def mujoco_gl_context(backend: Optional[str]):
+    """Temporarily set the MUJOCO_GL backend (restoring previous value afterwards)."""
+    original = os.environ.get('MUJOCO_GL')
+    try:
+        if backend is None:
+            if 'MUJOCO_GL' in os.environ:
+                del os.environ['MUJOCO_GL']
+        else:
+            os.environ['MUJOCO_GL'] = backend
+        yield
+    finally:
+        if original is None:
+            if 'MUJOCO_GL' in os.environ:
+                del os.environ['MUJOCO_GL']
+        else:
+            os.environ['MUJOCO_GL'] = original
 
 
-class PixelBackbone(nn.Module):
-    def __init__(self, input_shape, feature_dim: int):
-        super().__init__()
-        c, h, w = input_shape
-        self.conv = nn.Sequential(
-            nn.Conv2d(c, 32, kernel_size=8, stride=4),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1),
-            nn.ReLU(),
+def _mirror_env_worker(env_name: str, args_dict: dict, seed: int, action_queue, event_queue):
+    """Run a human-render mirror env in a separate process."""
+    try:
+        args_ns = argparse.Namespace(**args_dict)
+        with mujoco_gl_context('glfw'):
+            env, render_mode = create_env(env_name, args_ns, render_override='human', mirror_mode=True)
+        event_queue.put(('ready', render_mode))
+        obs, info = env.reset(seed=seed)
+        env.render()
+        while True:
+            cmd, payload = action_queue.get()
+            if cmd == 'step':
+                action = np.asarray(payload, dtype=np.float32)
+                _, _, term, trunc, _ = env.step(action)
+                env.render()
+                if term or trunc:
+                    obs, info = env.reset()
+                    env.render()
+                event_queue.put(('step_ok', None))
+            elif cmd == 'reset':
+                obs, info = env.reset()
+                env.render()
+                event_queue.put(('reset_ok', None))
+            elif cmd == 'close':
+                break
+    except Exception as exc:
+        event_queue.put(('error', repr(exc)))
+        import traceback
+        traceback.print_exc()
+    finally:
+        try:
+            env.close()
+        except Exception:
+            pass
+        event_queue.put(('closed', None))
+
+
+class MirrorEnvProcess:
+    def __init__(self, env_name: str, args: argparse.Namespace, seed: int):
+        ctx = mp.get_context('spawn')
+        self._action_queue = ctx.Queue()
+        self._event_queue = ctx.Queue()
+        args_dict = vars(args).copy()
+        self._process = ctx.Process(
+            target=_mirror_env_worker,
+            args=(env_name, args_dict, seed, self._action_queue, self._event_queue),
+            daemon=True,
         )
-        with torch.no_grad():
-            dummy = torch.zeros(1, c, h, w)
-            flat_dim = self.conv(dummy).view(1, -1).shape[1]
-        self.fc = nn.Sequential(
-            nn.Linear(flat_dim, feature_dim),
-            nn.ReLU(),
-        )
-        self.output_dim = feature_dim
+        self._process.start()
+        status, payload = self._event_queue.get()
+        if status == 'ready':
+            self.render_mode = payload
+            print(f"🪞 Mirror process ready (mode={payload})")
+        elif status == 'error':
+            raise RuntimeError(f"Mirror env failed to start: {payload}")
+        else:
+            raise RuntimeError(f"Unexpected mirror startup event: {status}")
 
-    def forward(self, x):
-        if x.dim() == 4 and x.shape[1] not in (1, 3):
-            x = x.permute(0, 3, 1, 2)
-        x = self.conv(x)
-        x = x.view(x.size(0), -1)
-        return self.fc(x)
+    def alive(self) -> bool:
+        return self._process.is_alive()
 
+    def _drain(self):
+        msgs = []
+        while not self._event_queue.empty():
+            status, payload = self._event_queue.get()
+            msgs.append((status, payload))
+        for status, payload in msgs:
+            if status == 'error':
+                raise RuntimeError(f"Mirror env error: {payload}")
+        return msgs
 
-class GaussianPolicyHead(nn.Module):
-    LOG_STD_MAX = 2
-    LOG_STD_MIN = -5
+    def step(self, action: np.ndarray):
+        if not self.alive():
+            return
+        self._action_queue.put(('step', action.tolist()))
+        status, payload = self._event_queue.get()
+        if status == 'error':
+            raise RuntimeError(f"Mirror env error during step: {payload}")
 
-    def __init__(self, feature_dim: int, action_dim: int, hidden_dim: int, init_scale: float):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(feature_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-        )
-        self.fc_mu = nn.Linear(hidden_dim // 2, action_dim)
-        self.fc_logstd = nn.Linear(hidden_dim // 2, action_dim)
-        nn.init.normal_(self.fc_mu.weight, 0.0, init_scale)
-        nn.init.constant_(self.fc_mu.bias, 0.0)
+    def reset(self):
+        if not self.alive():
+            return
+        self._action_queue.put(('reset', None))
+        status, payload = self._event_queue.get()
+        if status == 'error':
+            raise RuntimeError(f"Mirror env error during reset: {payload}")
 
-    def forward(self, features):
-        x = self.net(features)
-        mean = self.fc_mu(x)
-        log_std = self.fc_logstd(x)
-        log_std = torch.tanh(log_std)
-        log_std = self.LOG_STD_MIN + 0.5 * (self.LOG_STD_MAX - self.LOG_STD_MIN) * (log_std + 1)
-        std = log_std.exp()
-        normal = torch.distributions.Normal(mean, std)
-        z = normal.rsample()
-        action = torch.tanh(z)
-        log_prob = normal.log_prob(z) - torch.log(1 - action.pow(2) + 1e-6)
-        log_prob = log_prob.sum(-1, keepdim=True)
-        return action, log_prob, torch.tanh(mean)
+    def close(self):
+        if self.alive():
+            try:
+                self._action_queue.put(('close', None))
+            except Exception:
+                pass
+        if self._process.is_alive():
+            self._process.join(timeout=1.0)
+
 
 # Import ogbench to register environments
 import ogbench
@@ -127,6 +373,14 @@ import ogbench
 
 # Add RSL-RL to path
 sys.path.append('fasttd3/fast_sac')
+
+# Import FastSAC components lazily
+try:
+    from fast_sac import Actor  # type: ignore
+    from fast_sac_utils import EmpiricalNormalization  # type: ignore
+    FASTSAC_AVAILABLE = True
+except ImportError:
+    FASTSAC_AVAILABLE = False
 
 # Import RSL-RL components
 try:
@@ -140,86 +394,7 @@ except ImportError as e:
 
 def get_args():
     """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description='Interactive evaluation of trained RSL-RL agents')
-    
-    # Model and environment
-    parser.add_argument('--model_path', type=str, required=True,
-                        help='Path to the trained model (.pt file)')
-    parser.add_argument('--env_name', type=str, default='pointmaze-medium-v0',
-                        help='OGBench environment name')
-    parser.add_argument('--device', type=str, default='auto',
-                        help='Device to run on (auto, cpu, cuda)')
-    parser.add_argument('--policy_type', type=str, default='auto',
-                        choices=['auto', 'rsl-rl', 'fastsac'],
-                        help='Policy checkpoint format to load')
-    
-    # Visualization
-    parser.add_argument('--render_mode', type=str, default='human',
-                        choices=['human', 'rgb_array'],
-                        help='Rendering mode')
-    parser.add_argument('--width', type=int, default=800,
-                        help='Render width')
-    parser.add_argument('--height', type=int, default=600,
-                        help='Render height')
-    parser.add_argument('--fps', type=int, default=30,
-                        help='Target FPS for rendering')
-    
-    # Observation configuration (match training)
-    parser.add_argument('--include_goal', dest='include_goal', action='store_true', default=True,
-                        help='Include goal coordinates in observations')
-    parser.add_argument('--no_include_goal', dest='include_goal', action='store_false',
-                        help='Exclude goal coordinates from observations')
-    parser.add_argument('--include_distance', action='store_true', default=False,
-                        help='Include distance to goal in observations')
-    parser.add_argument('--include_direction', action='store_true', default=False,
-                        help='Include direction to goal in observations')
-    parser.add_argument('--include_velocity', action='store_true', default=False,
-                        help='Include velocity features in observations')
-
-    # Reward shaping (should mirror training wrapper settings)
-    parser.add_argument('--reward_type', type=str, default='sparse',
-                        choices=['sparse', 'dense', 'combined'],
-                        help='Reward type for DetailedRewardWrapper')
-    parser.add_argument('--dense_reward_scale', type=float, default=0.01,
-                        help='Scale for dense reward shaping (if applicable)')
-    parser.add_argument('--step_penalty', type=float, default=0.0,
-                        help='Per-step penalty applied by DetailedRewardWrapper')
-    parser.add_argument('--reward_switch_after_steps', type=int, default=0,
-                        help='Switch reward to sparse after this many steps (curriculum)')
-
-    # Evaluation
-    parser.add_argument('--max_episode_steps', type=int, default=500,
-                        help='Maximum steps per episode')
-    parser.add_argument('--num_episodes', type=int, default=10,
-                        help='Number of episodes to run (0 = infinite)')
-    parser.add_argument('--seed', type=int, default=42,
-                        help='Random seed')
-    parser.add_argument('--print_interventions', action='store_true', default=True,
-                        help='Print when the teacher intervenes and why')
-
-    # Intervention / Teleop
-    parser.add_argument('--intervention_mode', type=str, default='none',
-                        choices=['none', 'human', 'agent'],
-                        help='Intervention mode: none, human teleop, or agent teacher')
-    parser.add_argument('--teacher_type', type=str, default='bfs', choices=['bfs'],
-                        help='Teacher type when intervention_mode=agent')
-    parser.add_argument('--tolerance_type', type=str, default='angle', choices=['angle', 'l2'],
-                        help='Intervention tolerance metric (agent mode)')
-    parser.add_argument('--tolerance_value', type=float, default=30.0,
-                        help='Tolerance threshold (deg for angle; abs for l2)')
-    parser.add_argument('--hard_block_lethal', action='store_true', default=True,
-                        help='Intervene if student would step into lethal cell')
-    parser.add_argument('--no_hard_block_lethal', dest='hard_block_lethal', action='store_false')
-    parser.add_argument('--intervention_enable_after_steps', type=int, default=0,
-                        help='Warm-up steps before agent teacher interventions engage')
-    
-    # Action processing (should match training settings)
-    parser.add_argument('--action_scale', type=float, default=1.0,
-                        help='Action scaling factor (should match training)')
-    parser.add_argument('--clip_actions', action='store_true', default=True,
-                        help='Clip actions to [-1, 1] (should match training)')
-    
-    return parser.parse_args()
+    return build_eval_parser().parse_args()
 
 class FastSACPolicy:
     """Unified wrapper for FastSAC policies (legacy and new architectures)."""
@@ -233,7 +408,7 @@ class FastSACPolicy:
                  legacy_actor: nn.Module | None = None):
         self.obs_normalizer = obs_normalizer
         self.obs_mode = obs_mode
-        self.pixel_shape = pixel_shape
+        self.pixel_shape = tuple(pixel_shape) if pixel_shape is not None else None
         self.actor_backbone = actor_backbone
         self.actor_head = actor_head
         self.legacy_actor = legacy_actor
@@ -261,33 +436,20 @@ class FastSACPolicy:
                 norm_obs = self._normalize(obs)
                 actions, _, means = self.legacy_actor(norm_obs)
             return means if deterministic else actions
-
         norm_obs = self._normalize(obs)
         if self.obs_mode == "pixels":
             assert self.pixel_shape is not None, "pixel_shape must be provided for pixel observations"
-            obs_input = norm_obs.view(norm_obs.shape[0], *self.pixel_shape)
+            if norm_obs.dim() == 2:
+                obs_input = norm_obs.reshape(norm_obs.shape[0], *self.pixel_shape)
+            else:
+                obs_input = norm_obs
+            if obs_input.dim() == 4 and obs_input.shape[1] not in (1, 3, 4) and obs_input.shape[-1] in (1, 3, 4):
+                obs_input = obs_input.permute(0, 3, 1, 2).contiguous()
         else:
             obs_input = norm_obs
         with torch.no_grad():
             features = self.actor_backbone(obs_input)
             actions, _, means = self.actor_head(features)
-        return means if deterministic else actions
-
-
-    def __init__(self, actor, obs_normalizer):
-        self.actor = actor
-        self.obs_normalizer = obs_normalizer
-        self.device = next(actor.parameters()).device
-
-    def eval(self):
-        self.actor.eval()
-        self.obs_normalizer.eval()
-
-    def act(self, obs_dict, deterministic: bool = True):
-        obs = obs_dict["policy"].to(self.device)
-        with torch.no_grad():
-            norm_obs = self.obs_normalizer(obs, center=True)
-            actions, _, means = self.actor(norm_obs)
         return means if deterministic else actions
 
 
@@ -339,6 +501,8 @@ def load_trained_policy(model_path: str, env, device: torch.device, args):
         policy.eval()
         print("✓ ActorCritic policy loaded")
     elif policy_type == 'fastsac':
+        if not FASTSAC_AVAILABLE:
+            raise ImportError("FastSAC components are unavailable; ensure 'fasttd3/fast_sac' is on PYTHONPATH or installed.")
         actor_hidden = checkpoint.get('args', {}).get('actor_hidden_dim', 512)
         init_scale = checkpoint.get('args', {}).get('init_scale', 0.01)
         actor = Actor(
@@ -363,6 +527,8 @@ def load_trained_policy(model_path: str, env, device: torch.device, args):
         )
         policy.eval()
     else:  # fastsac_v2
+        if not FASTSAC_AVAILABLE:
+            raise ImportError("FastSAC components are unavailable; ensure 'fasttd3/fast_sac' is on PYTHONPATH or installed.")
         train_args = checkpoint.get('args', {}) or {}
         obs_mode = train_args.get('obs_mode', getattr(args, 'obs_mode', 'state'))
         arch_shared = train_args.get('arch_shared_trunk', False)
@@ -371,8 +537,35 @@ def load_trained_policy(model_path: str, env, device: torch.device, args):
         init_scale = train_args.get('init_scale', 0.01)
         feature_dim = shared_hidden if arch_shared else actor_hidden
         if obs_mode == 'pixels':
-            pixel_shape = checkpoint.get('pixel_shape') or obs_space.shape
-            backbone = PixelBackbone((pixel_shape[2], pixel_shape[0], pixel_shape[1]), feature_dim).to(device)
+            pixel_shape_raw = checkpoint.get('pixel_shape') or obs_space.shape
+            pixel_shape = _canonical_pixel_shape(pixel_shape_raw)
+            conv_channels = (
+                _parse_int_tuple(train_args.get('pixel_conv_channels_parsed'))
+                or _parse_int_tuple(train_args.get('pixel_conv_channels'))
+                or (32, 64, 64)
+            )
+            kernel_sizes = (
+                _parse_int_tuple(train_args.get('pixel_kernel_sizes_parsed'))
+                or _parse_int_tuple(train_args.get('pixel_kernel_sizes'))
+                or (8, 4, 3)
+            )
+            strides = (
+                _parse_int_tuple(train_args.get('pixel_strides_parsed'))
+                or _parse_int_tuple(train_args.get('pixel_strides'))
+                or (4, 2, 1)
+            )
+            final_pool = (
+                _parse_optional_int(train_args.get('pixel_final_pool_parsed'))
+                or _parse_optional_int(train_args.get('pixel_final_pool'))
+            )
+            backbone = PixelBackbone(
+                pixel_shape,
+                feature_dim,
+                conv_channels=conv_channels,
+                kernel_sizes=kernel_sizes,
+                strides=strides,
+                final_pool=final_pool,
+            ).to(device)
             obs_normalizer = PixelNormalizer().to(device)
         else:
             pixel_shape = None
@@ -396,15 +589,21 @@ def load_trained_policy(model_path: str, env, device: torch.device, args):
         training_info['obs_mode'] = obs_mode
         training_info['num_critics'] = train_args.get('num_critics', 2)
         training_info['arch_shared_trunk'] = arch_shared
+        if pixel_shape is not None:
+            training_info['pixel_shape'] = pixel_shape
+            training_info['pixel_conv_channels'] = conv_channels
+            training_info['pixel_kernel_sizes'] = kernel_sizes
+            training_info['pixel_strides'] = strides
+            training_info['pixel_final_pool'] = final_pool
 
     # Common training metadata
     args_obj = checkpoint.get('args')
     if isinstance(args_obj, dict):
-        for key in ['env_name', 'reward_type', 'obs_mode', 'shared_hidden_dim']:
+        for key in ['env_name', 'reward_type', 'obs_mode', 'shared_hidden_dim', 'pixel_width', 'pixel_height', 'pixel_camera']:
             if key in args_obj:
                 training_info[key] = args_obj[key]
     elif args_obj is not None:
-        for key in ['env_name', 'reward_type', 'obs_mode', 'shared_hidden_dim']:
+        for key in ['env_name', 'reward_type', 'obs_mode', 'shared_hidden_dim', 'pixel_width', 'pixel_height', 'pixel_camera']:
             if hasattr(args_obj, key):
                 training_info[key] = getattr(args_obj, key)
     for key in ['training_info', 'iteration', 'total_timesteps']:
@@ -415,81 +614,112 @@ def load_trained_policy(model_path: str, env, device: torch.device, args):
     return policy, training_info
 
 
-def create_env(env_name: str, args):
+def create_env(env_name: str, args, *, render_override: str | None = None, mirror_mode: bool = False):
     """Create the evaluation environment with appropriate wrappers."""
     print(f"🏗️  Creating environment: {env_name}")
     
     # Base environment creation parameters
     env_kwargs = {
-        'render_mode': args.render_mode,
         'max_episode_steps': args.max_episode_steps,
     }
-    
-    # Add width/height parameters for OGBench environments that support them
-    if env_name.startswith(('pointmaze-', 'antmaze-', 'humanoidmaze-')):
-        env_kwargs.update({
-            'width': args.width,
-            'height': args.height
-        })
+
+    obs_mode = getattr(args, 'obs_mode', 'state')
+    requested_render_mode = render_override if render_override is not None else args.render_mode
+    render_mode = requested_render_mode
+
+    if obs_mode == 'pixels':
+        if render_mode != 'rgb_array' and not mirror_mode:
+            print(f"ℹ️ Pixel-trained policy detected; overriding render_mode '{render_mode}' -> 'rgb_array' for correct observations.")
+            render_mode = 'rgb_array'
+    env_kwargs['render_mode'] = render_mode
+
+    if render_mode == 'rgb_array':
+        width = getattr(args, 'pixel_width', None) or getattr(args, 'width', None)
+        height = getattr(args, 'pixel_height', None) or getattr(args, 'height', None)
+        if width is not None:
+            env_kwargs['width'] = int(width)
+        if height is not None:
+            env_kwargs['height'] = int(height)
+        if getattr(args, 'pixel_camera', None):
+            env_kwargs['camera_name'] = args.pixel_camera
+    else:
+        # Add width/height parameters for human-renderable OGBench environments
+        if env_name.startswith(('pointmaze-', 'antmaze-', 'humanoidmaze-')) or render_mode == 'human':
+            env_kwargs.update({
+                'width': args.width,
+                'height': args.height
+            })
+    debug_suffix = " (mirror)" if mirror_mode else ""
+    print(f"   render_mode={render_mode}{debug_suffix}")
+    print(f"   env_kwargs={env_kwargs}{debug_suffix}")
     
     try:
         env = gym.make(env_name, **env_kwargs)
-        
-        # Base observation wrapper
-        from ogbench.wrappers import FlexibleObsWrapper, DetailedRewardWrapper, InterventionWrapper
-        if getattr(args, 'obs_mode', 'state') == 'state':
-            env = FlexibleObsWrapper(
-                env,
-                include_goal=args.include_goal,
-                include_distance=args.include_distance,
-                include_direction=args.include_direction,
-                include_velocity=args.include_velocity,
-            )
-            print('Applied FlexibleObsWrapper')
-        env = DetailedRewardWrapper(
-            env,
+
+        teleop = None
+        if args.intervention_mode == 'human':
+            from ogbench.teleop import ControlWindowTeleop
+
+            teleop = ControlWindowTeleop(width=520, height=420, show_debug_info=True)
+
+        wrapper = build_ogbench_wrapper(
+            obs_mode=getattr(args, 'obs_mode', 'state'),
+            include_goal=args.include_goal,
+            include_distance=args.include_distance,
+            include_direction=args.include_direction,
+            include_velocity=args.include_velocity,
             reward_type=args.reward_type,
             dense_reward_scale=args.dense_reward_scale,
             step_penalty=args.step_penalty,
-            switch_reward_to_sparse_after_steps_per_env=args.reward_switch_after_steps,
+            reward_switch_after_steps=args.reward_switch_after_steps,
+            intervention_mode=args.intervention_mode,
+            teacher_type=args.teacher_type,
+            tolerance_type=args.tolerance_type,
+            tolerance_value=args.tolerance_value,
+            hard_block_lethal=args.hard_block_lethal,
+            intervention_enable_after_steps=args.intervention_enable_after_steps,
+            teleop_interface=teleop,
         )
-        print('Applied DetailedRewardWrapper (type={})'.format(args.reward_type))
+        env = wrapper(env)
 
+        if getattr(args, 'obs_mode', 'state') == 'state':
+            print('Applied FlexibleObsWrapper')
+        print('Applied DetailedRewardWrapper (type={})'.format(args.reward_type))
         if args.intervention_mode == 'human':
-            from ogbench.teleop import ControlWindowTeleop
-            teleop = ControlWindowTeleop(width=520, height=420, show_debug_info=True)
-            env = InterventionWrapper(
-                env,
-                teleop_interface=teleop,
-                mode='human',
-                threshold=0.1,
-                hold_time=0.5,
-            )
             print('Applied InterventionWrapper (human teleop)')
         elif args.intervention_mode == 'agent':
-            env = InterventionWrapper(
-                env,
-                mode='agent',
-                teacher_type=args.teacher_type,
-                tolerance_type=args.tolerance_type,
-                tolerance_value=args.tolerance_value,
-                hard_block_lethal=args.hard_block_lethal,
-                enable_after_steps=args.intervention_enable_after_steps,
-            )
             print('Applied InterventionWrapper (agent teacher: {})'.format(args.teacher_type))
 
         print('Environment created successfully')
         print('   Observation space:', env.observation_space)
         print('   Action space:', env.action_space)
-        return env
-        print(f"   Observation space: {env.observation_space}")
-        print(f"   Action space: {env.action_space}")
-        return env
+        return env, render_mode
     except Exception as e:
         print(f"❌ Environment creation failed: {e}")
         raise
 
-def run_interactive_evaluation(policy, env, args, device):
+
+def _format_policy_observation(obs, policy, device):
+    """Match training-time preprocessing for policy inputs."""
+    obs_mode = getattr(policy, 'obs_mode', 'state')
+    obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=device)
+    if obs_mode == 'pixels':
+        if obs_tensor.ndim == 1:
+            obs_tensor = obs_tensor.unsqueeze(0)
+        elif obs_tensor.ndim == 3:
+            obs_tensor = obs_tensor.unsqueeze(0)
+        if obs_tensor.ndim == 4:
+            if obs_tensor.shape[1] not in (1, 3, 4) and obs_tensor.shape[-1] in (1, 3, 4):
+                obs_tensor = obs_tensor.permute(0, 3, 1, 2).contiguous()
+        obs_tensor = obs_tensor.reshape(obs_tensor.shape[0], -1).contiguous()
+    else:
+        if obs_tensor.ndim == 1:
+            obs_tensor = obs_tensor.unsqueeze(0)
+        elif obs_tensor.ndim > 2 or obs_tensor.shape[0] != 1:
+            obs_tensor = obs_tensor.reshape(1, -1).contiguous()
+    return obs_tensor
+
+def run_interactive_evaluation(policy, env, args, device, mirror: MirrorEnvProcess | None):
     """Run interactive evaluation loop."""
     print(f"\n🎮 Starting Interactive Evaluation")
     print(f"Environment: {args.env_name}")
@@ -511,6 +741,23 @@ def run_interactive_evaluation(policy, env, args, device):
     
     # Reset environment
     obs, info = env.reset(seed=args.seed)
+    maze_env = unwrap_maze_env(env)
+    birds_eye = None
+    if maze_env is not None:
+        initial_obs = obs if isinstance(obs, np.ndarray) and obs.ndim >= 2 else None
+        try:
+            birds_eye = BirdsEyeRenderer(maze_env, initial_obs)
+            birds_eye.draw(initial_obs)
+        except Exception as exc:
+            print(f"⚠️ Bird's eye renderer unavailable: {exc}")
+            birds_eye = None
+    if mirror is not None:
+        try:
+            mirror.reset()
+        except Exception as exc:
+            print(f"⚠️ Mirror process initialization failed: {exc}")
+            mirror.close()
+            mirror = None
     episode_reward = 0.0
     episode_length = 0
     episode_count = 0
@@ -535,6 +782,19 @@ def run_interactive_evaluation(policy, env, args, device):
                 elif event.key == pygame.K_SPACE:
                     print(f"🔄 Manual reset triggered")
                     obs, info = env.reset()
+                    if mirror is not None:
+                        try:
+                            mirror.reset()
+                        except Exception as exc:
+                            print(f"⚠️ Mirror reset failed: {exc}")
+                            mirror.close()
+                            mirror = None
+                    if birds_eye is not None:
+                        try:
+                            birds_eye.draw(obs if birds_eye.show_obs_panel else None)
+                        except Exception as exc:
+                            print(f"⚠️ Bird's eye draw failed: {exc}")
+                            birds_eye = None
                     episode_reward = 0.0
                     episode_length = 0
                 elif event.key == pygame.K_r:
@@ -542,10 +802,10 @@ def run_interactive_evaluation(policy, env, args, device):
                     print(f"🔄 Auto-reset: {'ON' if auto_reset else 'OFF'}")
         
         # Convert observation to tensor and add batch dimension
-        obs_tensor = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+        obs_tensor = _format_policy_observation(obs, policy, device)
         obs_dict = TensorDict({
             "policy": obs_tensor,
-        }, batch_size=[1], device=device)
+        }, batch_size=[obs_tensor.shape[0]], device=device)
         
         # Get action from policy
         with torch.no_grad():
@@ -563,11 +823,24 @@ def run_interactive_evaluation(policy, env, args, device):
         # Step environment
         next_obs, reward, terminated, truncated, info = env.step(action)
         done = terminated or truncated
+        if mirror is not None:
+            try:
+                mirror.step(action)
+            except Exception as exc:
+                print(f"⚠️ Mirror step failed: {exc}")
+                mirror.close()
+                mirror = None
         
         # Update episode tracking
         obs = next_obs
         episode_reward += reward
         episode_length += 1
+        if birds_eye is not None:
+            try:
+                birds_eye.draw(obs if birds_eye.show_obs_panel else None)
+            except Exception as exc:
+                print(f"⚠️ Bird's eye draw failed: {exc}")
+                birds_eye = None
         
         # Print intervention events
         step_idx += 1
@@ -628,10 +901,23 @@ def run_interactive_evaluation(policy, env, args, device):
             # Reset for next episode
             if auto_reset:
                 obs, info = env.reset()
+                if mirror is not None:
+                    try:
+                        mirror.reset()
+                    except Exception as exc:
+                        print(f"⚠️ Mirror reset failed: {exc}")
+                        mirror.close()
+                        mirror = None
+                if birds_eye is not None:
+                    try:
+                        birds_eye.draw(obs if birds_eye.show_obs_panel else None)
+                    except Exception as exc:
+                        print(f"⚠️ Bird's eye draw failed: {exc}")
+                        birds_eye = None
             else:
                 print(f"⏸️  Auto-reset disabled. Press SPACE to reset manually.")
                 # Keep current state until manual reset
-            
+
             episode_reward = 0.0
             episode_length = 0
         
@@ -668,14 +954,80 @@ def main():
     if device.type == 'cuda':
         print(f"GPU: {torch.cuda.get_device_name(device)}")
     
+    env = None
+    mirror = None
     try:
         # Peek at checkpoint to recover observation mode
         checkpoint_preview = torch.load(args.model_path, map_location='cpu')
-        args.obs_mode = checkpoint_preview.get('args', {}).get('obs_mode', getattr(args, 'obs_mode', 'state'))
+        checkpoint_args_raw = checkpoint_preview.get('args', {})
+        checkpoint_args: Dict[str, Any] = {}
+        if isinstance(checkpoint_args_raw, dict):
+            checkpoint_args = checkpoint_args_raw
+        elif checkpoint_args_raw is not None:
+            for attr in ['obs_mode', 'pixel_width', 'pixel_height', 'pixel_camera']:
+                if hasattr(checkpoint_args_raw, attr):
+                    checkpoint_args[attr] = getattr(checkpoint_args_raw, attr)
+        args.obs_mode = checkpoint_args.get('obs_mode', getattr(args, 'obs_mode', 'state'))
+        if args.pixel_width is None and checkpoint_args.get('pixel_width') is not None:
+            args.pixel_width = int(checkpoint_args['pixel_width'])
+        if args.pixel_height is None and checkpoint_args.get('pixel_height') is not None:
+            args.pixel_height = int(checkpoint_args['pixel_height'])
+        if args.pixel_camera is None and checkpoint_args.get('pixel_camera') is not None:
+            args.pixel_camera = checkpoint_args['pixel_camera']
         del checkpoint_preview
-
         # Create environment
-        env = create_env(args.env_name, args)
+        if args.policy_mujoco_gl == 'auto':
+            env_default_backend = os.environ.get('MUJOCO_GL')
+            if args.mirror_human_render:
+                policy_backend = 'glfw'
+            elif env_default_backend is not None:
+                policy_backend = env_default_backend
+            elif args.obs_mode == 'pixels':
+                policy_backend = 'egl'
+            else:
+                policy_backend = None
+        elif args.policy_mujoco_gl == 'egl':
+            policy_backend = 'egl'
+        elif args.policy_mujoco_gl == 'glfw':
+            policy_backend = 'glfw'
+        else:
+            policy_backend = None
+        print(f"⚙️  Creating primary env with MUJOCO_GL={policy_backend or 'unset'}")
+        with mujoco_gl_context(policy_backend):
+            env, env_render_mode = create_env(args.env_name, args)
+        args.effective_render_mode = env_render_mode
+        if args.mirror_human_render and env_render_mode != 'rgb_array':
+            print("ℹ️ Mirror window requires rgb_array render mode; disabling mirror.")
+            args.mirror_human_render = False
+
+        mirror = None
+        if args.mirror_human_render:
+            try:
+                print("🪞 Attempting to create mirror env in separate process")
+                mirror = MirrorEnvProcess(args.env_name, args, seed=args.seed)
+            except Exception as mirror_exc:
+                print(f"⚠️ Mirror human render unavailable: {mirror_exc}")
+                import traceback
+                traceback.print_exc()
+                mirror = None
+                if args.policy_mujoco_gl == 'auto' and policy_backend == 'egl':
+                    print("🔁 Retrying with MUJOCO_GL=glfw for both environments")
+                    if env is not None:
+                        try:
+                            env.close()
+                        except Exception:
+                            pass
+                    policy_backend = 'glfw'
+                    with mujoco_gl_context(policy_backend):
+                        env, env_render_mode = create_env(args.env_name, args)
+                    args.effective_render_mode = env_render_mode
+                    try:
+                        mirror = MirrorEnvProcess(args.env_name, args, seed=args.seed)
+                    except Exception as fallback_exc:
+                        print(f"⚠️ Mirror render still unavailable after fallback: {fallback_exc}")
+                        import traceback
+                        traceback.print_exc()
+                        mirror = None
 
         # Load trained policy
         policy, training_info = load_trained_policy(args.model_path, env, device, args)
@@ -685,7 +1037,7 @@ def main():
                 print('   {}: {}'.format(key, value))
 
         # Run interactive evaluation
-        run_interactive_evaluation(policy, env, args, device)
+        run_interactive_evaluation(policy, env, args, device, mirror=mirror)
         
     except Exception as e:
         print(f"❌ Evaluation failed: {e}")
@@ -694,10 +1046,16 @@ def main():
         return 1
     finally:
         # Cleanup
-        try:
-            env.close()
-        except:
-            pass
+        if env is not None:
+            try:
+                env.close()
+            except:
+                pass
+        if mirror is not None:
+            try:
+                mirror.close()
+            except Exception:
+                pass
         pygame.quit()
     
     return 0
