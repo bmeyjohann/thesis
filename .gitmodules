@@ -16,3 +16,6 @@
 [submodule "unitree_model"]
 	path = unitree_model
 	url = https://huggingface.co/datasets/unitreerobotics/unitree_model
+[submodule "safe-locomotion"]
+	path = safe-locomotion
+	url = git@gitlab.kit.edu:kit/aifb/ATKS/research/safeai/safe-locomotion.git
