@@ -1,0 +1,81 @@
+#!/bin/bash
+#SBATCH --job-name=unitree_go2_ppo
+#SBATCH --account=<your_account>
+#SBATCH --partition=<your_partition>
+#SBATCH --qos=<optional_qos>
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=16
+#SBATCH --gres=gpu:1
+#SBATCH --mem=64G
+#SBATCH --time=24:00:00
+#SBATCH --output=logs/unitree_go2_ppo_%j.out
+#SBATCH --error=logs/unitree_go2_ppo_%j.err
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT="${SCRIPT_DIR}"
+cd "${REPO_ROOT}"
+
+mkdir -p logs wandb
+
+export UNITREE_ROS_DIR="${UNITREE_ROS_DIR:-${REPO_ROOT}/unitree_ros/unitree_ros}"
+export GIT_PYTHON_REFRESH=quiet
+unset CUDA_VISIBLE_DEVICES
+
+source "${REPO_ROOT}/sc_venv_template_isaaclab/activate.sh"
+source "${REPO_ROOT}/.venv/bin/activate"
+
+APPTAINER_ROOT=${APPTAINER_ROOT:-/p/project1/hai_1074/meyjohann1/apptainer}
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${APPTAINER_ROOT}/cache}"
+export XDG_DATA_HOME="${XDG_DATA_HOME:-${APPTAINER_ROOT}/data}"
+export KIT_USER_ROOT="${KIT_USER_ROOT:-${APPTAINER_ROOT}/kit}"
+export KIT_USER_DATA="${KIT_USER_DATA:-${APPTAINER_ROOT}/data}"
+export KIT_CACHE_DIR="${KIT_CACHE_DIR:-${APPTAINER_ROOT}/cache}"
+export KIT_DERIVED_DATA_CACHE="${KIT_DERIVED_DATA_CACHE:-${APPTAINER_ROOT}/DerivedDataCache}"
+export KIT_PIP_INSTALL_PATH="${KIT_PIP_INSTALL_PATH:-${APPTAINER_ROOT}/pip3-envs}"
+export OMNI_USER_CACHE_DIR="${OMNI_USER_CACHE_DIR:-${APPTAINER_ROOT}/cache}"
+export OMNI_KIT_USER_DIR="${OMNI_KIT_USER_DIR:-${APPTAINER_ROOT}/kit}"
+export OMNI_KIT_DATA_DIR="${OMNI_KIT_DATA_DIR:-${APPTAINER_ROOT}/data}"
+export OMNI_KIT_CACHE_DIR="${OMNI_KIT_CACHE_DIR:-${APPTAINER_ROOT}/cache}"
+export OMNI_DISABLE_EXTENSIONS="omni.iray.libs,omni.mdl.neuraylib,omni.kit.usd.mdl,carb.scenerenderer-rtx.plugin,omni.rtx.*,omni.hydra.rtx"
+
+export WANDB_MODE=offline
+export WANDB_DIR="${WANDB_DIR:-${REPO_ROOT}/wandb}"
+export WANDB_START_METHOD=thread
+
+TASK=${TASK:-New-Isaac-Velocity-Flat-Unitree-Go2-v0}
+ALGO=${ALGO:-ppo}
+RUN_NAME=${RUN_NAME:-simple_reward_config_ppo_${SLURM_JOB_ID}}
+CONFIG_DIR=${CONFIG_DIR:-${REPO_ROOT}/scripts/configs}
+CONFIG_NAME=${CONFIG_NAME:-simple_reward_config}
+LOGGER=${LOGGER:-wandb}
+ISAAC_PYTHON=${ISAAC_PYTHON:-~/meyjohann1/isaacsim5.1/python.sh}
+
+if [ ! -x "${ISAAC_PYTHON}" ]; then
+  echo "Expected Isaac Sim launcher at ${ISAAC_PYTHON}, but it was not found or not executable." >&2
+  exit 1
+fi
+
+TRAIN_CMD=(
+  "${ISAAC_PYTHON}"
+  "${REPO_ROOT}/scripts/rsl_rl/train.py"
+  --headless
+  --task "${TASK}"
+  --algo "${ALGO}"
+  --run_name "${RUN_NAME}"
+  --config-dir "${CONFIG_DIR}"
+  --config-name "${CONFIG_NAME}"
+  --logger "${LOGGER}"
+)
+
+if [ -n "${TRAIN_ADDITIONAL_ARGS:-}" ]; then
+  # shellcheck disable=SC2206
+  TRAIN_CMD+=(${TRAIN_ADDITIONAL_ARGS})
+fi
+
+echo "Launching ${ALGO} training for ${TASK} with run name ${RUN_NAME}"
+echo "Using Isaac Sim Python: ${ISAAC_PYTHON}"
+
+srun --ntasks=1 "${TRAIN_CMD[@]}"
