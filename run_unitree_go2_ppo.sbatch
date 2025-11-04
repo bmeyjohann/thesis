@@ -35,13 +35,13 @@ export OMNI_KIT_CACHE_DIR="${OMNI_KIT_CACHE_DIR:-${APPTAINER_ROOT}/cache}"
 export OMNI_DISABLE_EXTENSIONS="omni.iray.libs,omni.mdl.neuraylib,omni.kit.usd.mdl,carb.scenerenderer-rtx.plugin,omni.rtx.*,omni.hydra.rtx"
 
 export WANDB_MODE=offline
-export WANDB_DIR="${WANDB_DIR:-${REPO_ROOT}/wandb}"
+export WANDB_DIR="${WANDB_DIR:-wandb}"
 export WANDB_START_METHOD=thread
 
 TASK=${TASK:-New-Isaac-Velocity-Flat-Unitree-Go2-v0}
 ALGO=${ALGO:-ppo}
 RUN_NAME=${RUN_NAME:-simple_reward_config_ppo_${SLURM_JOB_ID}}
-CONFIG_DIR=${CONFIG_DIR:-${REPO_ROOT}/scripts/configs}
+CONFIG_DIR=${CONFIG_DIR:-scripts/configs}
 CONFIG_NAME=${CONFIG_NAME:-simple_reward_config}
 LOGGER=${LOGGER:-wandb}
 ISAAC_PYTHON=${ISAAC_PYTHON:-~/meyjohann1/isaacsim5.1/python.sh}
@@ -53,7 +53,7 @@ fi
 
 TRAIN_CMD=(
   "${ISAAC_PYTHON}"
-  "${REPO_ROOT}/scripts/rsl_rl/train.py"
+  "safe-locomotion/scripts/rsl_rl/train.py"
   --headless
   --task "${TASK}"
   --algo "${ALGO}"
