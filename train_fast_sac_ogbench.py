@@ -2,50 +2,48 @@
 """
 FastSAC training for OGBench environments using VectorizedOGBenchEnv and teacher interventions.
 
-Matches CLI style of train_rsl_rl_integrated.py where practical.
+This entry-point keeps the CLI orchestration minimal and delegates the heavy lifting to helpers in
+``ogbench_utils`` so individual portions of the training pipeline are easier to follow and reuse.
 """
 
 import os
 import sys
-import time
-import math
 import json
 import copy
+import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
-
-os.environ.setdefault("MUJOCO_GL", os.environ.get("MUJOCO_GL", "egl"))
-
-# Defer WANDB mode selection until after args are parsed; default to offline
-# unless the user explicitly enables wandb via --use_wandb
-os.environ.setdefault("WANDB_MODE", "offline")
-os.environ.setdefault("WANDB_CONSOLE", "off")
-os.environ.setdefault("WANDB_SILENT", "true")
-
 import torch
-import torch.nn.functional as F
+import torch.nn as nn
 import torch.optim as optim
 from torch.amp import autocast, GradScaler
 from tensordict import TensorDict
 
+# Ensure EGL is the default MuJoCo backend unless users override it explicitly.
+os.environ.setdefault("MUJOCO_GL", os.environ.get("MUJOCO_GL", "egl"))
+
+# Defer WANDB mode selection until after args are parsed; default to offline unless explicitly enabled.
+os.environ.setdefault("WANDB_MODE", "offline")
+os.environ.setdefault("WANDB_CONSOLE", "off")
+os.environ.setdefault("WANDB_SILENT", "true")
+
 # Add FastSAC path
 sys.path.append('fasttd3/fast_sac')
 
-from fast_sac import Actor, Critic
-from fast_sac_utils import (
+from fast_sac import Actor, Critic  # noqa: E402
+from fast_sac_utils import (  # noqa: E402
     EmpiricalNormalization,
-    RewardNormalizer,
     SimpleReplayBuffer,
-    save_params,
 )
 
-# Register OGBench envs and wrappers
-import ogbench
-from fasttd3.fast_sac.environments.ogbench_env import OGBenchVecEnvAdapter
+import ogbench  # noqa: F401  # Registers environments.
+from fasttd3.fast_sac.environments.ogbench_env import OGBenchVecEnvAdapter  # noqa: E402
 
-from ogbench_utils import (
+from ogbench_utils import (  # noqa: E402
     CriticEnsemble,
     GaussianPolicyHead,
     IdentityNormalizer,
@@ -53,13 +51,24 @@ from ogbench_utils import (
     PixelBackbone,
     build_ogbench_wrapper,
     build_train_parser,
+    prepare_observation,
+    reshape_observation,
+    infer_pixel_shape,
+    CounterfactualBuffer,
+    PreferencePairBuffer,
+    PreferenceTDBuffer,
+    FastSACUpdater,
+    TeacherMetricsAccumulator,
+    TrainingLogger,
+    CheckpointManager,
+    maybe_switch_env,
 )
 
 TOOLS_PATH = Path(__file__).resolve().parent / "tools"
 if TOOLS_PATH.exists():
     sys.path.append(str(TOOLS_PATH))
 try:
-    from visualize_policy_map import generate_policy_map  # type: ignore
+    from visualize_policy_map import generate_policy_map  # type: ignore  # noqa: E402
 except Exception:  # pragma: no cover - optional dependency for viz
     generate_policy_map = None
 
@@ -70,9 +79,7 @@ def parse_args():
 
 def make_wrappers(args):
     reward_switch = args.reward_switch_after_steps // max(1, args.num_envs)
-    intervention_mode = (
-        args.intervention_mode if args.use_intervention else "none"
-    )
+    intervention_mode = args.intervention_mode if args.use_intervention else "none"
     wrapper = build_ogbench_wrapper(
         obs_mode=args.obs_mode,
         include_goal=args.include_goal,
@@ -93,64 +100,105 @@ def make_wrappers(args):
     return [wrapper]
 
 
-def main():
-    args = parse_args()
-    device = torch.device('cuda' if (args.device=='auto' and torch.cuda.is_available()) or args.device=='cuda' else 'cpu')
+@dataclass
+class ModelComponents:
+    actor_backbone: nn.Module
+    actor_head: nn.Module
+    critic_backbone: Optional[nn.Module]
+    critic_heads: nn.Module
+    critic_target_backbone: nn.Module
+    critic_target_heads: nn.Module
+    actor_optimizer: optim.Optimizer
+    critic_optimizer: optim.Optimizer
+    trunk_optimizer: Optional[optim.Optimizer]
+    actor_params: list
+    critic_params: list
+    trunk_params: Optional[list]
+    log_alpha: torch.Tensor
+    alpha_optimizer: optim.Optimizer
+    target_entropy: float
+    critic_feature_backbone: nn.Module
+    initial_shared_backbone_state: Optional[dict]
+    initial_critic_backbone_state: Optional[dict]
+    initial_critic_heads_state: dict
+    initial_target_backbone_state: dict
+    initial_target_heads_state: dict
 
-    # Do not override WANDB_MODE here: default is offline (set above).
-    # Users can export WANDB_MODE=run explicitly if they want online logging.
 
-    pixel_channels_default = (32, 64, 64)
-    debug_dump_done = False
+@dataclass
+class BufferComponents:
+    cf_buffer: Optional[CounterfactualBuffer]
+    pref_buffer: Optional[PreferencePairBuffer]
+    pref_td_buffer: Optional[PreferenceTDBuffer]
 
+
+@dataclass
+class AMPComponents:
+    enabled: bool
+    device_type: str
+    dtype: torch.dtype
+    scaler: GradScaler
+
+
+@dataclass
+class LoggingComponents:
+    teacher_metrics: TeacherMetricsAccumulator
+    training_logger: TrainingLogger
+    checkpoint_manager: CheckpointManager
+
+
+def select_device(args) -> torch.device:
+    if args.device == 'auto':
+        return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    return torch.device(args.device)
+
+
+def parse_pixel_backbone_args(args) -> None:
+    default_channels = (32, 64, 64)
     try:
-        pixel_channels_parsed = tuple(
-            int(ch.strip()) for ch in args.pixel_conv_channels.split(',') if ch.strip()
-        )
-    except Exception as exc:  # pragma: no cover - arg parsing guard
+        parsed_channels = tuple(int(ch.strip()) for ch in args.pixel_conv_channels.split(',') if ch.strip())
+    except Exception as exc:  # pragma: no cover
         raise ValueError(f"Invalid --pixel_conv_channels value: {args.pixel_conv_channels}") from exc
-    if not pixel_channels_parsed:
-        pixel_channels_parsed = pixel_channels_default
-    setattr(args, 'pixel_conv_channels_parsed', pixel_channels_parsed)
+    if not parsed_channels:
+        parsed_channels = default_channels
+    setattr(args, 'pixel_conv_channels_parsed', parsed_channels)
 
-    def _parse_int_list(raw: str, default: tuple[int, ...]) -> tuple[int, ...]:
+    def _parse_int_list(raw: str, default: Tuple[int, ...]) -> Tuple[int, ...]:
         try:
-            parsed = tuple(int(x.strip()) for x in raw.split(',') if x.strip())
-            if not parsed:
-                return default
-            return parsed
-        except Exception as exc:
+            values = tuple(int(x.strip()) for x in raw.split(',') if x.strip())
+            return values or default
+        except Exception as exc:  # pragma: no cover
             raise ValueError(f"Invalid integer list value: {raw}") from exc
 
-    kernel_sizes_default = (8, 4, 3)
-    strides_default = (4, 2, 1)
-    setattr(args, 'pixel_kernel_sizes_parsed', _parse_int_list(args.pixel_kernel_sizes, kernel_sizes_default))
-    setattr(args, 'pixel_strides_parsed', _parse_int_list(args.pixel_strides, strides_default))
+    kernel_default = (8, 4, 3)
+    stride_default = (4, 2, 1)
+    setattr(args, 'pixel_kernel_sizes_parsed', _parse_int_list(args.pixel_kernel_sizes, kernel_default))
+    setattr(args, 'pixel_strides_parsed', _parse_int_list(args.pixel_strides, stride_default))
     setattr(args, 'pixel_final_pool_parsed', int(max(0, args.pixel_final_pool)))
 
-    cf_penalty_target = -abs(float(args.cf_penalty))
-    setattr(args, 'cf_penalty_target', cf_penalty_target)
 
+def ensure_experiment_name(args) -> None:
+    if args.exp_name:
+        return
     default_buffer_size = 1024 * 50
-    if not args.exp_name:
-        env_tag = args.env_name.replace('-v0', '').replace('-', '_')
-        components = [env_tag]
-        components.append(args.reward_type)
-        if args.use_intervention:
-            components.append(f"teacher_tol{int(args.tolerance_value)}")
-            if args.intervention_enable_after_steps > 0:
-                components.append(f"warmup{args.intervention_enable_after_steps}")
-        else:
-            components.append('student')
-        if args.buffer_size != default_buffer_size:
-            components.append(f"buf{args.buffer_size}")
-        if args.store_denied_actions:
-            components.append('denied')
-        components.append(f"nenv{args.num_envs}")
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        components.append(timestamp)
-        args.exp_name = '_'.join(components)
+    env_tag = args.env_name.replace('-v0', '').replace('-', '_')
+    components = [env_tag, args.reward_type]
+    if args.use_intervention:
+        components.append(f"teacher_tol{int(args.tolerance_value)}")
+        if args.intervention_enable_after_steps > 0:
+            components.append(f"warmup{args.intervention_enable_after_steps}")
+    else:
+        components.append('student')
+    if args.buffer_size != default_buffer_size:
+        components.append(f"buf{args.buffer_size}")
+    if args.store_denied_actions:
+        components.append('denied')
+    components.append(f"nenv{args.num_envs}")
+    components.append(datetime.now().strftime('%Y%m%d_%H%M%S'))
+    args.exp_name = '_'.join(components)
 
+
+def prepare_run_dirs(args) -> Tuple[Path, Path, Path, Path, callable, Any]:
     logs_root = Path('logs') / 'fast_sac'
     models_root = Path('models') / 'fast_sac'
     logs_root.mkdir(parents=True, exist_ok=True)
@@ -162,17 +210,12 @@ def main():
     viz_output_dir = run_log_dir / 'policy_maps'
     viz_cache_path = run_log_dir / 'policy_map_goal.json'
 
-    print(f"FastSAC OGBench on {args.env_name} device={device}")
-    print(f"Log directory: {run_log_dir}")
-    print(f"Model directory: {run_model_dir}")
-
-    # Open progress log early so we can write init breadcrumbs
     log_file_path = run_log_dir / 'training.log'
     progress_file = open(log_file_path, 'a', encoding='utf-8')
     progress_file.write(f"# logging started {datetime.now().isoformat()}\n")
     progress_file.flush()
 
-    def record_progress(message: str):
+    def record_progress(message: str) -> None:
         progress_file.write(f"{datetime.now().isoformat()} {message}\n")
         progress_file.flush()
 
@@ -181,32 +224,35 @@ def main():
         json.dump(vars(args), cfg_file, indent=2)
     print(f"Saved run config: {config_path}")
 
+    return run_log_dir, run_model_dir, viz_output_dir, viz_cache_path, record_progress, progress_file
+
+
+def build_environment(
+    args,
+    device: torch.device,
+    record_progress,
+) -> Tuple[OGBenchVecEnvAdapter, list, Optional[Tuple[int, int, int]], Any, Any, int, int]:
     wrappers = make_wrappers(args)
-    current_wrappers = wrappers
-    current_env_name = args.env_name
-    env_make_kwargs = {}
+    env_kwargs: Dict[str, Any] = {}
     if args.obs_mode == 'pixels':
-        env_make_kwargs['render_mode'] = 'rgb_array'
+        env_kwargs['render_mode'] = 'rgb_array'
         if args.pixel_width:
-            env_make_kwargs['width'] = int(args.pixel_width)
+            env_kwargs['width'] = int(args.pixel_width)
         if args.pixel_height:
-            env_make_kwargs['height'] = int(args.pixel_height)
+            env_kwargs['height'] = int(args.pixel_height)
         if args.pixel_camera:
-            env_make_kwargs['camera_name'] = args.pixel_camera
+            env_kwargs['camera_name'] = args.pixel_camera
     record_progress("[Init] constructing vector env adapter")
     envs = OGBenchVecEnvAdapter(
-        env_name=current_env_name,
+        env_name=args.env_name,
         num_envs=args.num_envs,
         device=device,
-        wrappers=current_wrappers,
+        wrappers=wrappers,
         clip_actions=1.0,
-        **env_make_kwargs,
+        **env_kwargs,
     )
     record_progress("[Init] env adapter constructed")
     print("[Init] Env adapter constructed", flush=True)
-
-    n_obs = envs.num_obs
-    n_act = envs.num_actions
 
     raw_obs_space = envs._env.envs[0].observation_space
     pixel_shape = None
@@ -230,17 +276,27 @@ def main():
                 args.pixel_final_pool_parsed if args.pixel_final_pool_parsed > 0 else None,
             )
         )
-        # Observations are already scaled to [0,1] in prepare_obs
         obs_normalizer = IdentityNormalizer().to(device)
         critic_obs_normalizer = IdentityNormalizer().to(device)
     else:
-        obs_normalizer = EmpiricalNormalization(shape=n_obs, device=device)
-        critic_obs_normalizer = EmpiricalNormalization(shape=n_obs, device=device)
+        obs_normalizer = EmpiricalNormalization(shape=envs.num_obs, device=device)
+        critic_obs_normalizer = EmpiricalNormalization(shape=envs.num_obs, device=device)
 
-    reward_normalizer = RewardNormalizer(gamma=args.gamma, device=device, g_max=10.0)
+    return envs, wrappers, pixel_shape, obs_normalizer, critic_obs_normalizer, envs.num_obs, envs.num_actions
 
-    def build_backbone(mode, hidden_dim):
+
+def initialize_models(
+    args,
+    device: torch.device,
+    n_obs: int,
+    n_act: int,
+    pixel_shape: Optional[Tuple[int, int, int]],
+    record_progress,
+) -> ModelComponents:
+    def build_backbone(mode: str, hidden_dim: int) -> nn.Module:
         if mode == 'pixels':
+            if pixel_shape is None:
+                raise ValueError("pixel_shape must be provided when obs_mode='pixels'")
             c, h, w = pixel_shape
             return PixelBackbone(
                 (c, h, w),
@@ -252,9 +308,6 @@ def main():
             ).to(device)
         return MLPBackbone(n_obs, hidden_dim).to(device)
 
-    shared_backbone = None
-    initial_shared_backbone_state = None
-    initial_critic_backbone_state = None
     if args.arch_shared_trunk:
         shared_backbone = build_backbone(args.obs_mode, args.shared_hidden_dim)
         if args.obs_mode == 'pixels' and hasattr(shared_backbone, 'fc'):
@@ -263,120 +316,190 @@ def main():
         actor_head = GaussianPolicyHead(shared_backbone.output_dim, n_act, args.actor_hidden_dim, args.init_scale).to(device)
         critic_backbone = shared_backbone
         critic_heads = CriticEnsemble(shared_backbone.output_dim, n_act, args.critic_hidden_dim, args.num_critics).to(device)
+        trunk_params = list(shared_backbone.parameters())
+        trunk_optimizer = optim.Adam(trunk_params, lr=args.critic_learning_rate)
+        actor_params = list(actor_head.parameters())
+        critic_params = list(critic_heads.parameters())
+        initial_shared_backbone_state = copy.deepcopy(shared_backbone.state_dict())
+        initial_critic_backbone_state = None
     else:
         actor_backbone = build_backbone(args.obs_mode, args.actor_hidden_dim)
         actor_head = GaussianPolicyHead(actor_backbone.output_dim, n_act, args.actor_hidden_dim, args.init_scale).to(device)
         critic_backbone = build_backbone(args.obs_mode, args.critic_hidden_dim)
         critic_heads = CriticEnsemble(critic_backbone.output_dim, n_act, args.critic_hidden_dim, args.num_critics).to(device)
-
-    critic_feature_backbone = actor_backbone if args.arch_shared_trunk else critic_backbone
-    # Target critic components
-    critic_target_backbone = copy.deepcopy(critic_backbone)
-    critic_target_heads = copy.deepcopy(critic_heads)
-
-    # Optimizers
-    if args.arch_shared_trunk:
-        trunk_params = list(shared_backbone.parameters())
-        actor_params = list(actor_head.parameters())
-        critic_params = list(critic_heads.parameters())
-        trunk_optimizer = optim.Adam(trunk_params, lr=args.critic_learning_rate)
-        q_optimizer = optim.AdamW(critic_params, lr=args.critic_learning_rate, weight_decay=1e-5)
-        actor_optimizer = optim.AdamW(actor_params, lr=args.actor_learning_rate, weight_decay=1e-5)
-    else:
+        trunk_params = None
         trunk_optimizer = None
         actor_params = list(actor_backbone.parameters()) + list(actor_head.parameters())
         critic_params = list(critic_backbone.parameters()) + list(critic_heads.parameters())
-        q_optimizer = optim.AdamW(critic_params, lr=args.critic_learning_rate, weight_decay=1e-5)
-        actor_optimizer = optim.AdamW(actor_params, lr=args.actor_learning_rate, weight_decay=1e-5)
-
-    if args.arch_shared_trunk:
-        initial_shared_backbone_state = copy.deepcopy(shared_backbone.state_dict())
-    else:
+        initial_shared_backbone_state = None
         initial_critic_backbone_state = copy.deepcopy(critic_backbone.state_dict())
+
+    critic_feature_backbone = actor_backbone if args.arch_shared_trunk else critic_backbone
+    critic_target_backbone = copy.deepcopy(critic_backbone)
+    critic_target_heads = copy.deepcopy(critic_heads)
+
+    critic_optimizer = optim.AdamW(critic_params, lr=args.critic_learning_rate, weight_decay=1e-5)
+    actor_optimizer = optim.AdamW(actor_params, lr=args.actor_learning_rate, weight_decay=1e-5)
+
     initial_critic_heads_state = copy.deepcopy(critic_heads.state_dict())
     initial_target_backbone_state = copy.deepcopy(critic_target_backbone.state_dict())
     initial_target_heads_state = copy.deepcopy(critic_target_heads.state_dict())
-
-
-    def infer_pixel_shape(obs_input):
-        data = obs_input
-        if isinstance(data, tuple):
-            data = data[0]
-        if isinstance(data, dict):
-            for key in ('policy', 'pixels', 'image', 'observation'):
-                if key in data:
-                    data = data[key]
-                    break
-            else:
-                raise KeyError(f"Unknown observation keys {list(data.keys())}")
-        if isinstance(data, torch.Tensor):
-            sample = data[0]
-        elif isinstance(data, np.ndarray):
-            sample = data[0] if data.ndim == 4 else data
-        else:
-            sample = torch.as_tensor(data)[0]
-        shape = tuple(sample.shape)
-        if len(shape) == 4:
-            shape = shape[1:]
-        if shape[0] in (1, 3, 4):
-            return shape
-        if shape[-1] in (1, 3, 4):
-            return (shape[-1], shape[0], shape[1])
-        raise RuntimeError(f"Unable to determine channel dimension from {shape}")
-
-    def prepare_obs(obs_input):
-        tensor = obs_input
-        if isinstance(tensor, tuple):
-            tensor = tensor[0]
-        if isinstance(tensor, dict):
-            for key in ('policy', 'pixels', 'image', 'observation'):
-                if key in tensor:
-                    tensor = tensor[key]
-                    break
-            else:
-                raise KeyError(f"Unknown observation keys {list(tensor.keys())}")
-        if isinstance(tensor, np.ndarray):
-            tensor = torch.from_numpy(tensor)
-        tensor = tensor.to(device)
-        if args.obs_mode == 'pixels':
-            if tensor.ndim == 4:
-                if tensor.shape[-1] in (1, 3, 4) and tensor.shape[1] not in (1, 3, 4):
-                    tensor = tensor.permute(0, 3, 1, 2).contiguous()
-            # Ensure pixel range in [0,1] regardless of dtype
-            if tensor.dtype in (torch.uint8, torch.int8):
-                tensor = tensor.float().div(255.0)
-            else:
-                # If values are still in 0..255 scale, downscale to 0..1
-                try:
-                    if torch.isfinite(tensor).any() and tensor.max() > 1.0:
-                        tensor = tensor.float().div(255.0)
-                except Exception:
-                    tensor = tensor.float()
-        return tensor.view(tensor.shape[0], -1)
-
-    def reshape_obs(obs_flat: torch.Tensor):
-        if args.obs_mode == 'pixels':
-            return obs_flat.view(obs_flat.shape[0], *pixel_shape)
-        return obs_flat
-
-    def actor_forward(obs_flat: torch.Tensor):
-        obs_in = reshape_obs(obs_flat)
-        features = actor_backbone(obs_in)
-        action, log_pi, mean = actor_head(features)
-        return action, log_pi, mean, features
-
-    def critic_forward(backbone_module, heads_module, obs_flat: torch.Tensor, actions: torch.Tensor):
-        obs_in = reshape_obs(obs_flat)
-        features = backbone_module(obs_in)
-        q_values = heads_module(features, actions)
-        return features, q_values
 
     target_entropy = -float(n_act)
     log_alpha = torch.ones(1, requires_grad=True, device=device)
     log_alpha.data.copy_(torch.tensor([np.log(0.001)], device=device))
     alpha_optimizer = optim.Adam([log_alpha], lr=args.critic_learning_rate)
 
-    rb = SimpleReplayBuffer(
+    return ModelComponents(
+        actor_backbone=actor_backbone,
+        actor_head=actor_head,
+        critic_backbone=critic_backbone,
+        critic_heads=critic_heads,
+        critic_target_backbone=critic_target_backbone,
+        critic_target_heads=critic_target_heads,
+        actor_optimizer=actor_optimizer,
+        critic_optimizer=critic_optimizer,
+        trunk_optimizer=trunk_optimizer,
+        actor_params=actor_params,
+        critic_params=critic_params,
+        trunk_params=trunk_params,
+        log_alpha=log_alpha,
+        alpha_optimizer=alpha_optimizer,
+        target_entropy=target_entropy,
+        critic_feature_backbone=critic_feature_backbone,
+        initial_shared_backbone_state=initial_shared_backbone_state,
+        initial_critic_backbone_state=initial_critic_backbone_state,
+        initial_critic_heads_state=initial_critic_heads_state,
+        initial_target_backbone_state=initial_target_backbone_state,
+        initial_target_heads_state=initial_target_heads_state,
+    )
+
+
+def initialize_buffers(
+    args,
+    device: torch.device,
+    n_obs: int,
+    n_act: int,
+    obs_normalizer,
+) -> BufferComponents:
+    def normalize_obs(x):
+        return obs_normalizer(x)
+
+    cf_buffer = (
+        CounterfactualBuffer(
+            capacity=int(max(1, args.cf_capacity)),
+            obs_dim=n_obs,
+            act_dim=n_act,
+            device=device,
+            normalize_fn=normalize_obs,
+        )
+        if args.cf_buffer_enable
+        else None
+    )
+
+    pref_buffer = (
+        PreferencePairBuffer(
+            capacity=int(max(1, args.pref_capacity)),
+            obs_dim=n_obs,
+            act_dim=n_act,
+            device=device,
+            normalize_fn=normalize_obs,
+        )
+        if args.pref_buffer_enable
+        else None
+    )
+
+    pref_td_buffer = (
+        PreferenceTDBuffer(
+            capacity=int(max(1, args.pref_td_capacity)),
+            obs_dim=n_obs,
+            act_dim=n_act,
+            device=device,
+            normalize_fn=normalize_obs,
+        )
+        if args.pref_td_buffer_enable
+        else None
+    )
+
+    return BufferComponents(cf_buffer=cf_buffer, pref_buffer=pref_buffer, pref_td_buffer=pref_td_buffer)
+
+
+def initialize_amp(args, device: torch.device) -> AMPComponents:
+    amp_enabled = args.amp and device.type == 'cuda'
+    amp_device_type = 'cuda' if device.type == 'cuda' else 'cpu'
+    amp_dtype = torch.bfloat16 if args.amp_dtype == 'bf16' else torch.float16
+    scaler = GradScaler(enabled=amp_enabled and amp_dtype == torch.float16)
+    return AMPComponents(enabled=amp_enabled, device_type=amp_device_type, dtype=amp_dtype, scaler=scaler)
+
+
+def build_teacher_metrics(args, device: torch.device) -> TeacherMetricsAccumulator:
+    hist_edges_tensor = None
+    hist_labels: list[str] = []
+    if args.disagreement_hist_edges:
+        try:
+            parsed_edges = [float(edge.strip()) for edge in args.disagreement_hist_edges.split(',') if edge.strip()]
+            parsed_edges = sorted(edge for edge in parsed_edges if edge > 0.0)
+        except Exception:
+            parsed_edges = []
+        if parsed_edges:
+            hist_edges_tensor = torch.tensor(parsed_edges, dtype=torch.float32, device=device)
+            num_bins = hist_edges_tensor.numel() + 1
+            for idx in range(num_bins):
+                if idx == 0:
+                    hist_labels.append(f"<= {parsed_edges[0]:.2f}")
+                elif idx == num_bins - 1:
+                    hist_labels.append(f">= {parsed_edges[-1]:.2f}")
+                else:
+                    hist_labels.append(f"({parsed_edges[idx-1]:.2f}, {parsed_edges[idx]:.2f}]")
+
+    if args.disagreement_thresholds:
+        try:
+            thresh_vals = [float(x.strip()) for x in args.disagreement_thresholds.split(',') if x.strip()]
+            thresh_vals = sorted(t for t in thresh_vals if t > 0.0)
+        except Exception:
+            thresh_vals = []
+    else:
+        thresh_vals = []
+    thresh_tensor = torch.tensor(thresh_vals, dtype=torch.float32, device=device) if thresh_vals else None
+    return TeacherMetricsAccumulator(
+        device=device,
+        hist_edges_tensor=hist_edges_tensor,
+        hist_labels=hist_labels,
+        thresh_tensor=thresh_tensor,
+        thresh_values=thresh_vals,
+    )
+
+
+def initialize_logging_components(
+    args,
+    record_progress,
+    run_model_dir: Path,
+    viz_output_dir: Path,
+    viz_cache_path: Path,
+    teacher_metrics: TeacherMetricsAccumulator,
+) -> LoggingComponents:
+    training_logger = TrainingLogger(
+        args=args,
+        record_progress=record_progress,
+        teacher_metrics=teacher_metrics,
+    )
+    checkpoint_manager = CheckpointManager(
+        run_model_dir=run_model_dir,
+        viz_output_dir=viz_output_dir,
+        viz_cache_path=viz_cache_path,
+        record_progress=record_progress,
+        args=args,
+        generate_policy_map=generate_policy_map,
+    )
+    return LoggingComponents(
+        teacher_metrics=teacher_metrics,
+        training_logger=training_logger,
+        checkpoint_manager=checkpoint_manager,
+    )
+
+
+def create_replay_buffer(args, device: torch.device, n_obs: int, n_act: int) -> SimpleReplayBuffer:
+    return SimpleReplayBuffer(
         n_env=args.num_envs,
         buffer_size=args.buffer_size,
         n_obs=n_obs,
@@ -389,253 +512,123 @@ def main():
         device=device,
     )
 
-    # Initialize a simple counterfactual buffer (on-device ring buffer) if enabled
-    if args.cf_buffer_enable:
-        cf_capacity = int(max(1, args.cf_capacity))
-        cf_obs = torch.empty((cf_capacity, n_obs), dtype=torch.float32, device=device)
-        cf_act = torch.empty((cf_capacity, n_act), dtype=torch.float32, device=device)
-        cf_ptr = 0
-        cf_size = 0
 
-        def cf_append(s_batch: torch.Tensor, a_batch: torch.Tensor):
-            nonlocal cf_ptr, cf_size
-            if s_batch is None or a_batch is None:
-                return
-            b = int(s_batch.shape[0])
-            if b <= 0:
-                return
-            # If incoming is larger than capacity, keep only the last cf_capacity rows
-            if b > cf_capacity:
-                s_batch = s_batch[-cf_capacity:]
-                a_batch = a_batch[-cf_capacity:]
-                b = cf_capacity
-            end = cf_ptr + b
-            if end <= cf_capacity:
-                cf_obs[cf_ptr:end].copy_(s_batch)
-                cf_act[cf_ptr:end].copy_(a_batch)
-            else:
-                first = cf_capacity - cf_ptr
-                cf_obs[cf_ptr:].copy_(s_batch[:first])
-                cf_act[cf_ptr:].copy_(a_batch[:first])
-                remain = b - first
-                cf_obs[:remain].copy_(s_batch[first:])
-                cf_act[:remain].copy_(a_batch[first:])
-            cf_ptr = (cf_ptr + b) % cf_capacity
-            cf_size = min(cf_size + b, cf_capacity)
+def build_updater_from_components(
+    args,
+    device: torch.device,
+    model: ModelComponents,
+    buffers: BufferComponents,
+    obs_normalizer,
+    pixel_shape: Optional[Tuple[int, int, int]],
+    amp: AMPComponents,
+) -> FastSACUpdater:
+    return FastSACUpdater(
+        args=args,
+        actor_backbone=model.actor_backbone,
+        actor_head=model.actor_head,
+        critic_backbone=model.critic_backbone,
+        critic_heads=model.critic_heads,
+        critic_target_backbone=model.critic_target_backbone,
+        critic_target_heads=model.critic_target_heads,
+        actor_optimizer=model.actor_optimizer,
+        critic_optimizer=model.critic_optimizer,
+        trunk_optimizer=model.trunk_optimizer,
+        alpha_optimizer=model.alpha_optimizer,
+        actor_params=model.actor_params,
+        critic_params=model.critic_params,
+        trunk_params=model.trunk_params,
+        log_alpha=model.log_alpha,
+        reshape_obs_fn=lambda x: reshape_observation(x, obs_mode=args.obs_mode, pixel_shape=pixel_shape),
+        normalize_obs_fn=obs_normalizer,
+        device=device,
+        amp_enabled=amp.enabled,
+        amp_dtype=amp.dtype,
+        amp_device_type=amp.device_type,
+        scaler=amp.scaler,
+        target_entropy=model.target_entropy,
+        cf_buffer=buffers.cf_buffer,
+        pref_buffer=buffers.pref_buffer,
+        pref_td_buffer=buffers.pref_td_buffer,
+    )
 
-        def cf_sample(b: int):
-            if cf_size <= 0:
-                return None, None
-            idx = torch.randint(low=0, high=cf_size, size=(int(b),), device=device)
-            s = cf_obs[idx]
-            a = cf_act[idx]
-            # Normalize states consistently with main replay samples
-            s = _normalize_obs(s)
-            return s, a
-    else:
-        cf_obs = None
-        cf_act = None
-        cf_ptr = 0
-        cf_size = 0
 
-    # Initialize preference pair buffer if enabled: stores (s, a_teacher, a_student)
-    if args.pref_buffer_enable:
-        pref_capacity = int(max(1, args.pref_capacity))
-        pref_s = torch.empty((pref_capacity, n_obs), dtype=torch.float32, device=device)
-        pref_a_pos = torch.empty((pref_capacity, n_act), dtype=torch.float32, device=device)
-        pref_a_neg = torch.empty((pref_capacity, n_act), dtype=torch.float32, device=device)
-        pref_ptr = 0
-        pref_size = 0
+def run_training_loop(
+    args,
+    device: torch.device,
+    envs: OGBenchVecEnvAdapter,
+    wrappers,
+    pixel_shape,
+    obs_normalizer,
+    critic_obs_normalizer,
+    model: ModelComponents,
+    buffers: BufferComponents,
+    amp: AMPComponents,
+    training_logger: TrainingLogger,
+    teacher_metrics: TeacherMetricsAccumulator,
+    checkpoint_manager: CheckpointManager,
+    record_progress,
+    replay_buffer: SimpleReplayBuffer,
+    updater: FastSACUpdater,
+    current_env_name: str,
+):
+    rb = replay_buffer
+    cf_buffer = buffers.cf_buffer
+    pref_buffer = buffers.pref_buffer
+    pref_td_buffer = buffers.pref_td_buffer
 
-        def pref_append(s_batch: torch.Tensor, a_pos: torch.Tensor, a_neg: torch.Tensor):
-            nonlocal pref_ptr, pref_size
-            if s_batch is None or a_pos is None or a_neg is None:
-                return
-            b = int(s_batch.shape[0])
-            if b <= 0:
-                return
-            if b > pref_capacity:
-                s_batch = s_batch[-pref_capacity:]
-                a_pos = a_pos[-pref_capacity:]
-                a_neg = a_neg[-pref_capacity:]
-                b = pref_capacity
-            end = pref_ptr + b
-            if end <= pref_capacity:
-                pref_s[pref_ptr:end].copy_(s_batch)
-                pref_a_pos[pref_ptr:end].copy_(a_pos)
-                pref_a_neg[pref_ptr:end].copy_(a_neg)
-            else:
-                first = pref_capacity - pref_ptr
-                pref_s[pref_ptr:].copy_(s_batch[:first])
-                pref_a_pos[pref_ptr:].copy_(a_pos[:first])
-                pref_a_neg[pref_ptr:].copy_(a_neg[:first])
-                remain = b - first
-                pref_s[:remain].copy_(s_batch[first:])
-                pref_a_pos[:remain].copy_(a_pos[first:])
-                pref_a_neg[:remain].copy_(a_neg[first:])
-            pref_ptr = (pref_ptr + b) % pref_capacity
-            pref_size = min(pref_size + b, pref_capacity)
+    actor_backbone = model.actor_backbone
+    actor_head = model.actor_head
+    critic_backbone = model.critic_backbone
+    critic_heads = model.critic_heads
+    critic_target_backbone = model.critic_target_backbone
+    critic_target_heads = model.critic_target_heads
+    actor_optimizer = model.actor_optimizer
+    q_optimizer = model.critic_optimizer
+    trunk_optimizer = model.trunk_optimizer
+    actor_params = model.actor_params
+    critic_params = model.critic_params
+    trunk_params = model.trunk_params
+    log_alpha = model.log_alpha
+    alpha_optimizer = model.alpha_optimizer
+    target_entropy = model.target_entropy
+    critic_feature_backbone = model.critic_feature_backbone
 
-        def pref_sample(b: int):
-            if pref_size <= 0:
-                return None, None, None
-            idx = torch.randint(low=0, high=pref_size, size=(int(b),), device=device)
-            s = pref_s[idx]
-            a_pos = pref_a_pos[idx]
-            a_neg = pref_a_neg[idx]
-            s = _normalize_obs(s)
-            return s, a_pos, a_neg
-    else:
-        pref_s = pref_a_pos = pref_a_neg = None
-        pref_ptr = 0
-        pref_size = 0
+    initial_shared_backbone_state = model.initial_shared_backbone_state
+    initial_critic_backbone_state = model.initial_critic_backbone_state
+    initial_critic_heads_state = model.initial_critic_heads_state
+    initial_target_backbone_state = model.initial_target_backbone_state
+    initial_target_heads_state = model.initial_target_heads_state
 
-    # Initialize preference-TD buffer if enabled: balanced teacher/student TD samples
-    if args.pref_td_buffer_enable:
-        td_cap = int(max(1, args.pref_td_capacity))
-        # Teacher ring buffers
-        t_s = torch.empty((td_cap, n_obs), dtype=torch.float32, device=device)
-        t_a = torch.empty((td_cap, n_act), dtype=torch.float32, device=device)
-        t_r = torch.empty((td_cap, 1), dtype=torch.float32, device=device)
-        t_next_s = torch.empty((td_cap, n_obs), dtype=torch.float32, device=device)
-        t_done = torch.empty((td_cap, 1), dtype=torch.float32, device=device)
-        t_ptr = 0
-        t_size = 0
-        # Student ring buffers (terminal negatives)
-        s_s = torch.empty((td_cap, n_obs), dtype=torch.float32, device=device)
-        s_a = torch.empty((td_cap, n_act), dtype=torch.float32, device=device)
-        s_r = torch.empty((td_cap, 1), dtype=torch.float32, device=device)
-        s_ptr = 0
-        s_size = 0
+    amp_enabled = amp.enabled
+    amp_device_type = amp.device_type
+    amp_dtype = amp.dtype
+    scaler = amp.scaler
 
-        def pref_td_append_teacher(s_batch, a_batch, r_batch, next_s_batch, done_batch):
-            nonlocal t_ptr, t_size
-            if s_batch is None or a_batch is None:
-                return
-            b = int(s_batch.shape[0])
-            if b <= 0:
-                return
-            if b > td_cap:
-                s_batch = s_batch[-td_cap:]
-                a_batch = a_batch[-td_cap:]
-                r_batch = r_batch[-td_cap:]
-                next_s_batch = next_s_batch[-td_cap:]
-                done_batch = done_batch[-td_cap:]
-                b = td_cap
-            end = t_ptr + b
-            if end <= td_cap:
-                t_s[t_ptr:end].copy_(s_batch)
-                t_a[t_ptr:end].copy_(a_batch)
-                t_r[t_ptr:end].copy_(r_batch.view(-1, 1))
-                t_next_s[t_ptr:end].copy_(next_s_batch)
-                t_done[t_ptr:end].copy_(done_batch.view(-1, 1))
-            else:
-                first = td_cap - t_ptr
-                t_s[t_ptr:].copy_(s_batch[:first])
-                t_a[t_ptr:].copy_(a_batch[:first])
-                t_r[t_ptr:].copy_(r_batch[:first].view(-1, 1))
-                t_next_s[t_ptr:].copy_(next_s_batch[:first])
-                t_done[t_ptr:].copy_(done_batch[:first].view(-1, 1))
-                remain = b - first
-                t_s[:remain].copy_(s_batch[first:])
-                t_a[:remain].copy_(a_batch[first:])
-                t_r[:remain].copy_(r_batch[first:].view(-1, 1))
-                t_next_s[:remain].copy_(next_s_batch[first:])
-                t_done[:remain].copy_(done_batch[first:].view(-1, 1))
-            t_ptr = (t_ptr + b) % td_cap
-            t_size = min(t_size + b, td_cap)
+    env_switch_global_step = (
+        int(max(0, args.switch_env_after_steps)) if args.switch_env_after_steps and args.switch_env_after_steps > 0 else None
+    )
 
-        def pref_td_append_student(s_batch, a_batch, r_batch):
-            nonlocal s_ptr, s_size
-            if s_batch is None or a_batch is None:
-                return
-            b = int(s_batch.shape[0])
-            if b <= 0:
-                return
-            if b > td_cap:
-                s_batch = s_batch[-td_cap:]
-                a_batch = a_batch[-td_cap:]
-                r_batch = r_batch[-td_cap:]
-                b = td_cap
-            end = s_ptr + b
-            if end <= td_cap:
-                s_s[s_ptr:end].copy_(s_batch)
-                s_a[s_ptr:end].copy_(a_batch)
-                s_r[s_ptr:end].copy_(r_batch.view(-1, 1))
-            else:
-                first = td_cap - s_ptr
-                s_s[s_ptr:].copy_(s_batch[:first])
-                s_a[s_ptr:].copy_(a_batch[:first])
-                s_r[s_ptr:].copy_(r_batch[:first].view(-1, 1))
-                remain = b - first
-                s_s[:remain].copy_(s_batch[first:])
-                s_a[:remain].copy_(a_batch[first:])
-                s_r[:remain].copy_(r_batch[first:].view(-1, 1))
-            s_ptr = (s_ptr + b) % td_cap
-            s_size = min(s_size + b, td_cap)
-
-        def pref_td_sample(b: int):
-            b_teacher = max(1, int(b // 2))
-            b_student = max(1, b - b_teacher)
-            if t_size <= 0 or s_size <= 0:
-                return None
-            idx_t = torch.randint(low=0, high=t_size, size=(b_teacher,), device=device)
-            idx_s = torch.randint(low=0, high=s_size, size=(b_student,), device=device)
-            batch = {
-                't_s': _normalize_obs(t_s[idx_t]),
-                't_a': t_a[idx_t],
-                't_r': t_r[idx_t],
-                't_next_s': _normalize_obs(t_next_s[idx_t]),
-                't_done': t_done[idx_t],
-                's_s': _normalize_obs(s_s[idx_s]),
-                's_a': s_a[idx_s],
-                's_r': s_r[idx_s],
-            }
-            return batch
-    else:
-        t_s = t_a = t_r = t_next_s = t_done = None
-        s_s = s_a = s_r = None
-        t_ptr = t_size = s_ptr = s_size = 0
-
-    amp_enabled = args.amp and (device.type=='cuda')
-    amp_device_type = 'cuda' if device.type=='cuda' else 'cpu'
-    amp_dtype = torch.bfloat16 if args.amp_dtype=='bf16' else torch.float16
-    scaler = GradScaler(enabled=amp_enabled and amp_dtype==torch.float16)
-
-    # Compile optional
-    def _normalize_obs(x): return obs_normalizer(x)
-    if args.compile:
-        actor_backbone = torch.compile(actor_backbone)
-        actor_head = torch.compile(actor_head)
-        if not args.arch_shared_trunk:
-            critic_backbone = torch.compile(critic_backbone)
-        critic_heads = torch.compile(critic_heads)
-        critic_target_backbone = torch.compile(critic_target_backbone)
-        critic_target_heads = torch.compile(critic_target_heads)
-        _normalize_obs = torch.compile(_normalize_obs)
+    def normalize_obs(x):
+        return obs_normalizer(x)
 
     try:
-        # Initialize wandb early so runs appear even if logging hasn't triggered yet
-        if args.use_wandb:
-            import wandb
-            wandb_run = wandb.init(
-                project=args.project,
-                name=args.exp_name,
-                id=args.exp_name,
-                config=vars(args),
-                reinit=True,
-                resume="allow",
-            )
-        else:
-            wandb_run = None
         obs_raw = envs.reset()
         if args.obs_mode == 'pixels':
-            pixel_shape = infer_pixel_shape(obs_raw)
-            record_progress(f'[Pixels] inferred pixel shape {pixel_shape}')
-        obs = prepare_obs(obs_raw)
+            pixel_shape_local = infer_pixel_shape(obs_raw)
+            if pixel_shape != pixel_shape_local:
+                pixel_shape = pixel_shape_local
+                record_progress(f'[Pixels] inferred pixel shape {pixel_shape}')
+        obs = prepare_observation(
+            obs_raw,
+            device=device,
+            obs_mode=args.obs_mode,
+            pixel_shape=pixel_shape,
+            flatten=True,
+        )
         n_obs = obs.shape[1]
         record_progress("[Init] envs.reset() returned; entering loop")
-        if args.debug_pixel_dump and not debug_dump_done:
+
+        if args.debug_pixel_dump:
             raw_tensor = obs_raw if torch.is_tensor(obs_raw) else torch.as_tensor(obs_raw)
             raw_stats = raw_tensor.float()
             norm_tensor = obs.float()
@@ -659,193 +652,64 @@ def main():
                 )
             )
             with torch.no_grad():
-                act_sample, log_pi_sample, mean_sample, _ = actor_forward(obs[:1])
+                single_obs = reshape_observation(obs[:1], obs_mode=args.obs_mode, pixel_shape=pixel_shape)
+                features = actor_backbone(single_obs)
+                act_sample, log_pi_sample, mean_sample = actor_head(features)
             record_progress(
                 "[Debug] initial_action mean=%s log_pi=%.6f action_l2=%.6f"
                 % (
-                    np.array2string(mean_sample.cpu().numpy(), precision=4),
+                    np.array2string(mean_sample.detach().cpu().numpy(), precision=4),
                     float(log_pi_sample.detach().cpu().item()),
                     float(act_sample.detach().norm().cpu().item()),
                 )
             )
-            debug_dump_done = True
+
         print("[Init] Env reset complete; starting training loop", flush=True)
+
         total_env_steps = 0
         iteration_idx = 0
         start_time = time.time()
-        # wandb_run may be set above
-        # Episode buffers similar to RSL-RL
+
         cur_reward_sum = torch.zeros(envs.num_envs, dtype=torch.float32, device=device)
         cur_episode_length = torch.zeros(envs.num_envs, dtype=torch.float32, device=device)
-        rewbuffer = []
-        lenbuffer = []
+        rewbuffer: list[float] = []
+        lenbuffer: list[float] = []
         last_denied_samples = 0
-        next_log_step = args.log_interval if args.log_interval > 0 else None
         save_interval_current = args.save_interval if args.save_interval > 0 else None
         first_save_step = args.viz_first_step if (args.viz_first_step is not None and args.viz_first_step > 0) else None
-        if first_save_step is not None:
-            next_save_step = first_save_step
-        else:
-            next_save_step = save_interval_current if save_interval_current else None
+        next_save_step = first_save_step if first_save_step is not None else save_interval_current
 
         run_prefix = current_env_name.replace('-', '_')
-
-        # Learning warm-up threshold (also reused after any replay reset)
         next_learning_starts_at = int(args.learning_starts)
         last_update_metrics = None
-
-        def save_checkpoint(tag: str, step_value: int):
-            save_path = run_model_dir / f"{run_prefix}_{tag}.pt"
-            checkpoint = {
-                'step': step_value,
-                'actor_backbone': actor_backbone.state_dict(),
-                'actor_head': actor_head.state_dict(),
-                'critic_backbone': (None if args.arch_shared_trunk else critic_backbone.state_dict()),
-                'shared_backbone': actor_backbone.state_dict() if args.arch_shared_trunk else None,
-                'critic_heads': critic_heads.state_dict(),
-                'critic_target_backbone': critic_target_backbone.state_dict(),
-                'critic_target_heads': critic_target_heads.state_dict(),
-                'obs_normalizer_state': (obs_normalizer.state_dict() if hasattr(obs_normalizer, 'state_dict') else None),
-                'critic_obs_normalizer_state': (critic_obs_normalizer.state_dict() if hasattr(critic_obs_normalizer, 'state_dict') else None),
-                'log_alpha': log_alpha.detach().cpu().item(),
-                'pixel_shape': pixel_shape,
-                'args': vars(args),
-            }
-            torch.save(checkpoint, save_path, _use_new_zipfile_serialization=True)
-            record_progress(f"[Checkpoint] saved {save_path}")
-            return save_path
-
-        def maybe_render_policy_map(tag: str, step_value: int, checkpoint_path: Path):
-            if not args.viz_on_checkpoint or generate_policy_map is None:
-                return
-            try:
-                png_path, meta_path, _ = generate_policy_map(
-                    model_path=checkpoint_path,
-                    output_dir=viz_output_dir,
-                    tag=tag,
-                    env_name=current_env_name,
-                    device=args.viz_device,
-                    grid_resolution=args.viz_grid_resolution,
-                    quiver_stride=args.viz_quiver_stride,
-                    seed=args.viz_seed,
-                    cache_path=viz_cache_path,
-                )
-                record_progress(f"[Viz] generated {png_path}")
-                if args.use_wandb and wandb_run is not None:
-                    import wandb
-                    wandb_run.log({
-                        "viz/policy_map": wandb.Image(str(png_path), caption=tag),
-                    }, step=step_value)
-            except Exception as exc:  # pragma: no cover - best effort logging
-                record_progress(f"[Viz] failed for {tag}: {exc}")
-
-        print("[Init] Starting training loop", flush=True)
-
-        # Track if we have reset the main replay buffer at the curriculum switch
         did_reset_replay = False
-        did_switch_env = False
-        env_switch_global_step = int(max(0, args.switch_env_after_steps))
-
-        # Disagreement tracking
-        if args.disagreement_hist_edges:
-            try:
-                parsed_edges = [float(edge.strip()) for edge in args.disagreement_hist_edges.split(',') if edge.strip()]
-                parsed_edges = sorted([edge for edge in parsed_edges if edge > 0.0])
-            except Exception:
-                parsed_edges = []
-            if parsed_edges:
-                hist_edges_tensor = torch.tensor(parsed_edges, dtype=torch.float32, device=device)
-                num_hist_bins = hist_edges_tensor.numel() + 1
-                hist_labels = []
-                for idx in range(num_hist_bins):
-                    if idx == 0:
-                        hist_labels.append(f"<= {parsed_edges[0]:.2f}")
-                    elif idx == num_hist_bins - 1:
-                        hist_labels.append(f">= {parsed_edges[-1]:.2f}")
-                    else:
-                        hist_labels.append(f"({parsed_edges[idx-1]:.2f}, {parsed_edges[idx]:.2f}]")
-                teacher_hist_counts = torch.zeros(num_hist_bins, device=device)
-                non_teacher_hist_counts = torch.zeros(num_hist_bins, device=device)
-            else:
-                hist_edges_tensor = None
-                hist_labels = []
-                teacher_hist_counts = None
-                non_teacher_hist_counts = None
-        else:
-            hist_edges_tensor = None
-            hist_labels = []
-            teacher_hist_counts = None
-            non_teacher_hist_counts = None
-
-        teacher_disagreement_sum = 0.0
-        non_teacher_disagreement_sum = 0.0
-        teacher_disagreement_steps = 0.0
-        non_teacher_disagreement_steps = 0.0
-        corr_total_steps = 0.0
-        corr_sum_mask = 0.0
-        corr_sum_dis = 0.0
-        corr_sum_mask_sq = 0.0
-        corr_sum_dis_sq = 0.0
-        corr_sum_mask_dis = 0.0
-
-        # Threshold percentages (fraction of teacher interventions with disagreement >= threshold)
-        if args.disagreement_thresholds:
-            try:
-                thresh_vals = [float(x.strip()) for x in args.disagreement_thresholds.split(',') if x.strip()]
-                thresh_vals = sorted([t for t in thresh_vals if t > 0.0])
-            except Exception:
-                thresh_vals = []
-        else:
-            thresh_vals = []
-        if thresh_vals:
-            thresh_tensor = torch.tensor(thresh_vals, dtype=torch.float32, device=device)
-            teacher_above_counts = torch.zeros(len(thresh_vals), dtype=torch.float32, device=device)
-            teacher_steps_window = 0.0
-        else:
-            thresh_tensor = None
-            teacher_above_counts = None
-            teacher_steps_window = 0.0
-
-        # Q and disagreement running averages for the current log window
-        qmin_sum_all = 0.0
-        qmin_steps_all = 0.0
-        qmin_sum_teacher = 0.0
-        qmin_steps_teacher = 0.0
-        qmin_sum_non = 0.0
-        qmin_steps_non = 0.0
 
         while total_env_steps < args.total_timesteps:
-            norm_obs = _normalize_obs(obs)
-            obs_actor_input = reshape_obs(norm_obs)
+            norm_obs = normalize_obs(obs)
+            obs_actor_input = reshape_observation(norm_obs, obs_mode=args.obs_mode, pixel_shape=pixel_shape)
             with torch.no_grad(), autocast(device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled):
-                if args.obs_mode == 'pixels' and iteration_idx == 0 and total_env_steps == 0:
-                    record_progress(f'[Pixels] actor input shape {obs_actor_input.shape}, pixel_shape {pixel_shape}')
-                try:
-                    features_actor = actor_backbone(obs_actor_input)
-                except RuntimeError as exc:
-                    record_progress(f'[Pixels] backbone failure: input shape {obs_actor_input.shape}, pixel_shape {pixel_shape}')
-                    raise
-                if args.obs_mode == 'pixels' and iteration_idx == 0 and total_env_steps == 0:
-                    record_progress(f'[Pixels] backbone output shape {features_actor.shape}')
-                pi_action, _, _ = actor_head(features_actor)
+                pi_action, _, _ = actor_head(actor_backbone(obs_actor_input))
             next_obs_raw, rewards, dones, infos = envs.step(pi_action.float())
             actions = pi_action
-            next_obs = prepare_obs(next_obs_raw)
-            # Detach copies for any auxiliary buffers before we mutate below
+            next_obs = prepare_observation(
+                next_obs_raw,
+                device=device,
+                obs_mode=args.obs_mode,
+                pixel_shape=pixel_shape,
+                flatten=True,
+            )
             obs_detached_flat = obs.detach()
             next_obs_detached_flat = next_obs.detach()
             truncations = infos.get('time_outs', torch.zeros_like(dones, device=device))
             applied_actions = infos.get('applied_actions', actions)
             student_actions = infos.get('student_actions')
             teacher_mask = infos.get('teacher_intervened_mask')
-            # Build mask if missing by comparing applied vs student actions
             if teacher_mask is None and student_actions is not None and applied_actions is not None:
                 try:
                     teacher_mask = (torch.abs(applied_actions - student_actions).sum(dim=-1) > 1e-6)
                 except Exception:
                     teacher_mask = None
 
-            # Decide actions to store and reward shaping
             rewards_eff = rewards
             used_actions = applied_actions
             dones_eff = dones
@@ -857,14 +721,12 @@ def main():
                     mode = args.intervention_reward_mode
                     val = float(args.intervention_reward_value)
                     if mode == 'penalty_student':
-                        # Store the STUDENT action for intervened rows and apply a negative adjustment
                         if student_actions is not None:
                             used_actions = used_actions.clone()
                             used_actions[denied_ids] = student_actions[denied_ids]
                         if val != 0.0:
                             rewards_eff = rewards_eff.clone()
                             rewards_eff[denied_ids] = rewards_eff[denied_ids] - abs(val)
-                        # Mark these rows as terminal so bootstrapping stops
                         dones_eff = dones_eff.clone()
                         dones_eff[denied_ids] = 1
                     elif mode == 'bonus_teacher' and val != 0.0:
@@ -876,17 +738,18 @@ def main():
                             rewards_eff = rewards_eff.clone()
                         rewards_eff[denied_ids] = rewards_eff[denied_ids] + bonus_val
 
-                    # Append to preference pair buffer (s, a_teacher, a_student)
-                    if args.pref_buffer_enable and student_actions is not None and 'teacher_actions' in infos:
+                    if pref_buffer is not None and student_actions is not None and 'teacher_actions' in infos:
                         try:
                             a_teacher_all = infos['teacher_actions']
-                            s_batch = obs_detached_flat[denied_ids]
-                            pref_append(obs_detached_flat[denied_ids], a_teacher_all[denied_ids], student_actions[denied_ids])
+                            pref_buffer.append(
+                                obs_detached_flat[denied_ids],
+                                a_teacher_all[denied_ids],
+                                student_actions[denied_ids],
+                            )
                         except Exception:
                             pass
 
-                    # Append to preference-TD buffer (balanced TD samples)
-                    if args.pref_td_buffer_enable and student_actions is not None and 'teacher_actions' in infos:
+                    if pref_td_buffer is not None and student_actions is not None and 'teacher_actions' in infos:
                         try:
                             a_teacher_all = infos['teacher_actions']
                             s_now = obs_detached_flat[denied_ids]
@@ -895,22 +758,28 @@ def main():
                             if float(args.pref_td_teacher_bonus_value) != 0.0:
                                 r_teacher = r_teacher + float(args.pref_td_teacher_bonus_value)
                             d_teacher = dones[denied_ids].clone().view(-1, 1).float()
-                            pref_td_append_teacher(s_now, a_teacher_all[denied_ids], r_teacher.squeeze(1), s_next, d_teacher.squeeze(1))
-                            # Student synthetic terminal negatives
+                            pref_td_buffer.append_teacher(
+                                s_now,
+                                a_teacher_all[denied_ids],
+                                r_teacher.squeeze(1),
+                                s_next,
+                                d_teacher.squeeze(1),
+                            )
                             r_student = -abs(float(args.pref_td_penalty_value)) * torch.ones((denied_ids.numel(), 1), device=device, dtype=torch.float32)
-                            pref_td_append_student(s_now, student_actions[denied_ids], r_student.squeeze(1))
+                            pref_td_buffer.append_student(
+                                s_now,
+                                student_actions[denied_ids],
+                                r_student.squeeze(1),
+                            )
                         except Exception:
                             pass
-            
-            # Build transition
-            obs_detached = obs_detached_flat
-            next_obs_detached = next_obs_detached_flat
+
             transition = TensorDict(
                 {
-                    'observations': obs_detached,
+                    'observations': obs_detached_flat,
                     'actions': used_actions.detach(),
                     'next': {
-                        'observations': next_obs_detached,
+                        'observations': next_obs_detached_flat,
                         'rewards': rewards_eff.detach(),
                         'truncations': truncations.long(),
                         'dones': dones_eff.long(),
@@ -921,64 +790,25 @@ def main():
             )
             rb.extend(transition)
 
-            # Critic disagreement logging data (evaluate on executed action)
-            if args.pref_buffer_enable or args.pref_td_buffer_enable or args.cf_buffer_enable or True:
-                with torch.no_grad(), autocast(device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled):
-                    norm_obs_now = _normalize_obs(obs)
-                    features_now = critic_feature_backbone(reshape_obs(norm_obs_now))
-                    q_stack = torch.stack(critic_heads(features_now, used_actions), dim=0).squeeze(-1)
-                    max_q = torch.max(q_stack, dim=0).values
-                    min_q = torch.min(q_stack, dim=0).values
-                    disagreement_step = max_q - min_q
-                    qmin_step = min_q
-                if teacher_mask is not None:
-                    teacher_mask_float = teacher_mask.float()
-                else:
-                    teacher_mask_float = torch.zeros_like(disagreement_step, device=device)
-                non_teacher_mask_float = 1.0 - teacher_mask_float
+            with torch.no_grad(), autocast(device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled):
+                norm_obs_now = normalize_obs(obs)
+                features_now = critic_feature_backbone(
+                    reshape_observation(norm_obs_now, obs_mode=args.obs_mode, pixel_shape=pixel_shape)
+                )
+                q_stack = torch.stack(critic_heads(features_now, used_actions), dim=0).squeeze(-1)
+                max_q = torch.max(q_stack, dim=0).values
+                min_q = torch.min(q_stack, dim=0).values
+                disagreement_step = max_q - min_q
+                qmin_step = min_q
+            teacher_mask_float = teacher_mask.float() if teacher_mask is not None else torch.zeros_like(disagreement_step, device=device)
+            non_teacher_mask_float = 1.0 - teacher_mask_float
+            teacher_metrics.update(disagreement_step, teacher_mask_float, non_teacher_mask_float, qmin_step)
 
-                teacher_disagreement_sum += float((disagreement_step * teacher_mask_float).sum().item())
-                non_teacher_disagreement_sum += float((disagreement_step * non_teacher_mask_float).sum().item())
-                teacher_disagreement_steps += float(teacher_mask_float.sum().item())
-                non_teacher_disagreement_steps += float(non_teacher_mask_float.sum().item())
-
-                corr_total_steps += float(disagreement_step.numel())
-                corr_sum_mask += float(teacher_mask_float.sum().item())
-                corr_sum_dis += float(disagreement_step.sum().item())
-                corr_sum_mask_sq += float(teacher_mask_float.sum().item())
-                corr_sum_dis_sq += float((disagreement_step ** 2).sum().item())
-                corr_sum_mask_dis += float((teacher_mask_float * disagreement_step).sum().item())
-
-                if hist_edges_tensor is not None:
-                    bin_idx = torch.bucketize(disagreement_step, hist_edges_tensor)
-                    teacher_hist_counts.scatter_add_(0, bin_idx, teacher_mask_float)
-                    non_teacher_hist_counts.scatter_add_(0, bin_idx, non_teacher_mask_float)
-
-                if thresh_tensor is not None:
-                    comp = (disagreement_step.unsqueeze(1) >= thresh_tensor.unsqueeze(0)).float()
-                    comp_teacher = comp * teacher_mask_float.unsqueeze(1)
-                    teacher_above_counts += comp_teacher.sum(dim=0)
-                    teacher_steps_window += float(teacher_mask_float.sum().item())
-
-                qmin_sum_all += float(qmin_step.sum().item())
-                qmin_steps_all += float(qmin_step.numel())
-                qmin_sum_teacher += float((qmin_step * teacher_mask_float).sum().item())
-                qmin_steps_teacher += float(teacher_mask_float.sum().item())
-                qmin_sum_non += float((qmin_step * non_teacher_mask_float).sum().item())
-                qmin_steps_non += float(non_teacher_mask_float.sum().item())
-            # Append counterfactual rows to CF buffer (student-denied actions)
-            if args.cf_buffer_enable and teacher_mask is not None and student_actions is not None and cf_obs is not None:
+            if cf_buffer is not None and teacher_mask is not None and student_actions is not None:
                 denied_ids = torch.nonzero(teacher_mask, as_tuple=False).flatten()
                 if denied_ids.numel() > 0:
-                    # Store (s, a_student)
-                    cf_s = obs_detached_flat[denied_ids]
-                    cf_a = student_actions[denied_ids]
-                    # Initialize CF tensors on first use
-                    cf_append(cf_s, cf_a)
-            
-            # We already folded denied penalties into rewards_eff; just expose count via logging
+                    cf_buffer.append(obs_detached_flat[denied_ids], student_actions[denied_ids])
 
-            # Book-keeping for episode stats
             cur_reward_sum += rewards
             cur_episode_length += 1
             done_ids = (dones > 0).nonzero(as_tuple=False).flatten()
@@ -988,47 +818,41 @@ def main():
                 cur_reward_sum[done_ids] = 0
                 cur_episode_length[done_ids] = 0
 
-            # Learn
             iteration_idx += 1
             total_env_steps += envs.num_envs
 
-            if (
-                not did_switch_env
-                and args.switch_env_name
-                and args.switch_env_name != current_env_name
-                and env_switch_global_step > 0
-                and total_env_steps >= env_switch_global_step
-            ):
-                per_env_progress = total_env_steps // envs.num_envs
-                record_progress(
-                    f"[Env] Switching from {current_env_name} to {args.switch_env_name} at total_steps={total_env_steps}"
+            switched, new_env_name, switched_obs_raw, updated_wandb_run = maybe_switch_env(
+                args=args,
+                envs=envs,
+                current_env_name=current_env_name,
+                wrappers=wrappers,
+                total_env_steps=total_env_steps,
+                env_switch_global_step=env_switch_global_step,
+                record_progress=record_progress,
+                wandb_run=training_logger.wandb_run,
+            )
+            if switched:
+                training_logger.wandb_run = updated_wandb_run
+                if args.obs_mode == 'pixels':
+                    pixel_shape = infer_pixel_shape(switched_obs_raw)
+                obs = prepare_observation(
+                    switched_obs_raw,
+                    device=device,
+                    obs_mode=args.obs_mode,
+                    pixel_shape=pixel_shape,
+                    flatten=True,
                 )
-                try:
-                    obs = envs.switch_env(
-                        args.switch_env_name,
-                        wrappers=current_wrappers,
-                        curriculum_steps=per_env_progress,
-                    )
-                except Exception as exc:
-                    record_progress(f"[Env] switch failed: {exc}")
-                    raise
-                current_env_name = args.switch_env_name
+                current_env_name = new_env_name
                 run_prefix = current_env_name.replace('-', '_')
                 cur_reward_sum.zero_()
                 cur_episode_length.zero_()
-                did_switch_env = True
-                if args.use_wandb and wandb_run is not None:
-                    import wandb
-                    wandb_run.log({
-                        "env/switch_event": 1,
-                        "env/current_env": current_env_name,
-                    }, step=total_env_steps)
-                # tighten checkpoint/viz interval after switch
+                teacher_metrics.reset_running_stats()
                 if save_interval_current is not None and args.post_switch_viz_multiplier > 1:
                     save_interval_current = max(1, args.save_interval // args.post_switch_viz_multiplier)
                     next_save_step = total_env_steps + save_interval_current
+            else:
+                obs = next_obs
 
-            # Optionally reset main replay buffer once at reward switch (curriculum)
             if (
                 args.reset_replay_on_switch
                 and not did_reset_replay
@@ -1036,32 +860,20 @@ def main():
                 and total_env_steps >= args.reward_switch_after_steps
             ):
                 record_progress(f"[Replay] Resetting main replay buffer at step {total_env_steps}")
-                rb = SimpleReplayBuffer(
-                    n_env=args.num_envs,
-                    buffer_size=args.buffer_size,
-                    n_obs=n_obs,
-                    n_act=n_act,
-                    n_critic_obs=n_obs,
-                    asymmetric_obs=False,
-                    playground_mode=False,
-                    n_steps=1,
-                    gamma=args.gamma,
-                    device=device,
-                )
+                rb = create_replay_buffer(args, device, n_obs, envs.num_actions)
                 did_reset_replay = True
-                # Reapply warm-up: postpone learning by the same number of steps as initially
                 next_learning_starts_at = total_env_steps + int(args.learning_starts)
                 record_progress(f"[Replay] Post-reset warm-up: learning resumes at env_step >= {next_learning_starts_at}")
 
                 if args.reset_critic_on_switch:
                     record_progress(f"[Critic] Resetting critic weights/optimizer at step {total_env_steps}")
-                    if args.arch_shared_trunk:
+                    if args.arch_shared_trunk and initial_shared_backbone_state is not None:
                         actor_backbone.load_state_dict(initial_shared_backbone_state)
                         trunk_params = list(actor_backbone.parameters())
                         trunk_optimizer = optim.Adam(trunk_params, lr=args.critic_learning_rate)
                         critic_params = list(critic_heads.parameters())
                         q_optimizer = optim.AdamW(critic_params, lr=args.critic_learning_rate, weight_decay=1e-5)
-                    else:
+                    elif initial_critic_backbone_state is not None and critic_backbone is not None:
                         critic_backbone.load_state_dict(initial_critic_backbone_state)
                         critic_params = list(critic_backbone.parameters()) + list(critic_heads.parameters())
                         q_optimizer = optim.AdamW(critic_params, lr=args.critic_learning_rate, weight_decay=1e-5)
@@ -1069,17 +881,50 @@ def main():
                     critic_target_backbone.load_state_dict(initial_target_backbone_state)
                     critic_target_heads.load_state_dict(initial_target_heads_state)
                     critic_feature_backbone = actor_backbone if args.arch_shared_trunk else critic_backbone
+                    model.critic_optimizer = q_optimizer
+                    model.trunk_optimizer = trunk_optimizer
+                    model.trunk_params = trunk_params
+                    model.critic_params = critic_params
+                    model.critic_feature_backbone = critic_feature_backbone
+                    updater = build_updater_from_components(
+                        args=args,
+                        device=device,
+                        model=model,
+                        buffers=buffers,
+                        obs_normalizer=obs_normalizer,
+                        pixel_shape=pixel_shape,
+                        amp=amp,
+                    )
                 if save_interval_current is not None and args.post_switch_viz_multiplier > 1:
                     save_interval_current = max(1, args.save_interval // args.post_switch_viz_multiplier)
                     next_save_step = total_env_steps + save_interval_current
 
             if next_save_step is not None and total_env_steps >= next_save_step:
                 tag_name = f"step{total_env_steps}"
-                ckpt_path = save_checkpoint(tag_name, total_env_steps)
-                maybe_render_policy_map(tag_name, total_env_steps, ckpt_path)
-                first_save_done = True
+                ckpt_path = checkpoint_manager.save(
+                    tag=tag_name,
+                    step_value=total_env_steps,
+                    run_prefix=run_prefix,
+                    actor_backbone=actor_backbone,
+                    actor_head=actor_head,
+                    critic_backbone=None if args.arch_shared_trunk else critic_backbone,
+                    shared_backbone=actor_backbone if args.arch_shared_trunk else None,
+                    critic_heads=critic_heads,
+                    critic_target_backbone=critic_target_backbone,
+                    critic_target_heads=critic_target_heads,
+                    obs_normalizer=obs_normalizer,
+                    critic_obs_normalizer=critic_obs_normalizer,
+                    log_alpha=log_alpha,
+                    pixel_shape=pixel_shape,
+                )
+                checkpoint_manager.maybe_render_policy_map(
+                    tag=tag_name,
+                    step_value=total_env_steps,
+                    checkpoint_path=ckpt_path,
+                    current_env_name=current_env_name,
+                    wandb_run=training_logger.wandb_run,
+                )
                 if save_interval_current:
-                    # If a custom first save step was provided, align subsequent saves on this cadence
                     if first_save_step is not None and next_save_step == first_save_step:
                         next_save_step = first_save_step + save_interval_current
                     else:
@@ -1087,336 +932,169 @@ def main():
                 else:
                     next_save_step = None
 
-            # Only learn if we have enough data in replay (also after any reset)
             if total_env_steps >= next_learning_starts_at and getattr(rb, 'ptr', 0) > 0:
                 base_batch = args.batch_size // max(1, args.num_envs)
-                # Compute sub-batch allocations for auxiliary buffers
-                b_pref = int(base_batch * args.pref_sample_ratio) if args.pref_buffer_enable else 0
-                b_pref_td = int(base_batch * args.pref_td_sample_ratio) if args.pref_td_buffer_enable else 0
+                b_pref = int(base_batch * args.pref_sample_ratio) if pref_buffer is not None else 0
+                b_pref_td = int(base_batch * args.pref_td_sample_ratio) if pref_td_buffer is not None else 0
                 main_batch = max(1, base_batch - b_pref - b_pref_td)
 
-                metrics_accumulator = {
-                    'critic_loss': 0.0,
-                    'actor_loss': 0.0,
-                    'alpha_loss': 0.0,
-                    'entropy': 0.0,
-                    'action_norm': 0.0,
-                    'target_q': 0.0,
-                    'q_min_pi': 0.0,
-                    'reward': 0.0,
-                    'reward_abs': 0.0,
-                    'alpha_value': 0.0,
-                }
-                updates_count = 0
-
-                for i in range(args.num_updates):
-                    batch = rb.sample(main_batch)
-                    obs_batch = batch['observations']
-                    next_obs_batch = batch['next']['observations']
-                    actions_batch = batch['actions']
-                    rewards_batch = batch['next']['rewards'].unsqueeze(-1)
-                    dones_batch = batch['next']['dones'].float().unsqueeze(-1)
-
-                    obs_batch = _normalize_obs(obs_batch)
-                    next_obs_batch = _normalize_obs(next_obs_batch)
-
-                    if args.arch_shared_trunk and trunk_optimizer is not None:
-                        trunk_optimizer.zero_grad(set_to_none=True)
-                    q_optimizer.zero_grad(set_to_none=True)
-
-                    with autocast(device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled):
-                        # Target critic evaluation (detach target path)
-                        with torch.no_grad():
-                            next_actions, next_log_pi, _, _ = actor_forward(next_obs_batch)
-                            next_features_target = critic_target_backbone(reshape_obs(next_obs_batch))
-                            target_q_list = critic_target_heads(next_features_target, next_actions)
-                            min_next_q = torch.min(torch.stack(target_q_list, dim=0), dim=0).values
-                            min_next_q = min_next_q - log_alpha.exp() * next_log_pi
-                            target_q = rewards_batch + (1.0 - dones_batch) * (args.gamma * min_next_q)
-
-                        current_features = (actor_backbone if args.arch_shared_trunk else critic_backbone)(reshape_obs(obs_batch))
-                        current_q_list = critic_heads(current_features, actions_batch)
-                        qf_loss = torch.tensor(0.0, device=device)
-                        for q_pred in current_q_list:
-                            qf_loss = qf_loss + F.mse_loss(q_pred, target_q)
-                        critic_loss_value = float((qf_loss / max(1, len(current_q_list))).detach().cpu().item())
-
-                        # Counterfactual critic penalty
-                        if args.cf_buffer_enable and args.cf_q_weight > 0.0 and args.cf_sample_ratio > 0.0 and 'cf_size' in locals() and cf_size > 0:
-                            cf_b = max(1, int(base_batch * args.cf_sample_ratio))
-                            s_cf, a_cf = cf_sample(cf_b)
-                            if s_cf is not None:
-                                cf_features = (actor_backbone if args.arch_shared_trunk else critic_backbone)(reshape_obs(s_cf))
-                                cf_q_list = critic_heads(cf_features, a_cf)
-                                for q_cf in cf_q_list:
-                                    qf_loss = qf_loss + args.cf_q_weight * F.mse_loss(q_cf, torch.full_like(q_cf, cf_penalty_target))
-
-                        # Preference ranking loss (teacher > student at s)
-                        if args.pref_buffer_enable and args.pref_rank_weight > 0.0 and b_pref > 0 and 'pref_size' in locals() and pref_size > 0:
-                            s_pair, a_pos, a_neg = pref_sample(b_pref)
-                            if s_pair is not None:
-                                pref_features = (actor_backbone if args.arch_shared_trunk else critic_backbone)(reshape_obs(s_pair))
-                                q_pos = critic_heads(pref_features, a_pos)
-                                q_neg = critic_heads(pref_features, a_neg)
-                                qpos_min = torch.min(torch.stack(q_pos, dim=0), dim=0).values
-                                qneg_min = torch.min(torch.stack(q_neg, dim=0), dim=0).values
-                                margin = float(args.pref_rank_margin)
-                                rank_loss = torch.nn.functional.softplus(margin - (qpos_min - qneg_min)).mean()
-                                qf_loss = qf_loss + float(args.pref_rank_weight) * rank_loss
-
-                        # Preference-TD balanced critic loss
-                        if args.pref_td_buffer_enable and args.pref_td_q_weight > 0.0 and b_pref_td > 0 and 't_size' in locals() and t_size > 0 and s_size > 0:
-                            td_batch = pref_td_sample(b_pref_td)
-                            if td_batch is not None:
-                                t_s = td_batch['t_s']
-                                t_next_s = td_batch['t_next_s']
-                                t_a = td_batch['t_a']
-                                t_r = td_batch['t_r'].unsqueeze(-1)
-                                t_done = td_batch['t_done'].unsqueeze(-1)
-                                s_s = td_batch['s_s']
-                                s_a = td_batch['s_a']
-                                s_r = td_batch['s_r'].unsqueeze(-1)
-
-                                with torch.no_grad():
-                                    next_actions_td, next_log_pi_td, _, _ = actor_forward(t_next_s)
-                                    next_features_td = critic_target_backbone(reshape_obs(t_next_s))
-                                    q_td_list = critic_target_heads(next_features_td, next_actions_td)
-                                    min_q_td = torch.min(torch.stack(q_td_list, dim=0), dim=0).values
-                                    min_q_td = min_q_td - log_alpha.exp() * next_log_pi_td
-                                    target_teacher = t_r + (1.0 - t_done) * (args.gamma * min_q_td)
-
-                                teacher_features = (actor_backbone if args.arch_shared_trunk else critic_backbone)(reshape_obs(t_s))
-                                teacher_q_list = critic_heads(teacher_features, t_a)
-                                loss_teacher = sum(F.mse_loss(q_t, target_teacher) for q_t in teacher_q_list)
-
-                                student_features = (actor_backbone if args.arch_shared_trunk else critic_backbone)(reshape_obs(s_s))
-                                student_q_list = critic_heads(student_features, s_a)
-                                loss_student = sum(F.mse_loss(q_s, s_r) for q_s in student_q_list)
-                                qf_loss = qf_loss + float(args.pref_td_q_weight) * (loss_teacher + loss_student)
-
-                    scaler.scale(qf_loss).backward()
-                    scaler.unscale_(q_optimizer)
-                    torch.nn.utils.clip_grad_norm_(critic_params, max_norm=args.max_grad_norm if args.max_grad_norm > 0 else float('inf'))
-                    scaler.step(q_optimizer)
-
-                    # Actor update
-                    actor_optimizer.zero_grad(set_to_none=True)
-                    with autocast(device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled):
-                        pi_actions, log_pi, _, _ = actor_forward(obs_batch)
-                        actor_critic_features = (actor_backbone if args.arch_shared_trunk else critic_backbone)(reshape_obs(obs_batch))
-                        q_pi_list = critic_heads(actor_critic_features, pi_actions)
-                        min_q_pi = torch.min(torch.stack(q_pi_list, dim=0), dim=0).values
-                        actor_loss = (log_alpha.exp().detach() * log_pi - min_q_pi).mean()
-                    actor_loss_value = float(actor_loss.detach().cpu().item())
-                    entropy_value = float((-log_pi).detach().mean().cpu().item())
-                    action_norm_value = float(pi_actions.detach().norm(dim=-1).mean().cpu().item())
-                    target_q_mean = float(target_q.detach().mean().cpu().item())
-                    min_q_pi_mean = float(min_q_pi.detach().mean().cpu().item())
-                    reward_mean = float(rewards_batch.detach().mean().cpu().item())
-                    scaler.scale(actor_loss).backward()
-                    scaler.unscale_(actor_optimizer)
-                    if args.arch_shared_trunk and trunk_optimizer is not None:
-                        scaler.unscale_(trunk_optimizer)
-                    torch.nn.utils.clip_grad_norm_(actor_params, max_norm=args.max_grad_norm if args.max_grad_norm > 0 else float('inf'))
-                    if args.arch_shared_trunk and trunk_optimizer is not None:
-                        torch.nn.utils.clip_grad_norm_(trunk_params, max_norm=args.max_grad_norm if args.max_grad_norm > 0 else float('inf'))
-                    scaler.step(actor_optimizer)
-
-                    if args.arch_shared_trunk and trunk_optimizer is not None:
-                        scaler.step(trunk_optimizer)
-                    scaler.update()
-
-                    # Alpha update (optional freeze / clamping)
-                    if total_env_steps < int(getattr(args, 'alpha_freeze_steps', 0)):
-                        alpha_optimizer.zero_grad(set_to_none=True)
-                        alpha_loss_value = 0.0
-                        alpha_value = float(log_alpha.exp().detach().cpu().item())
-                    else:
-                        alpha_optimizer.zero_grad(set_to_none=True)
-                        _, log_pi_curr, _, _ = actor_forward(obs_batch)
-                        log_pi_detached = log_pi_curr.detach()
-                        alpha_loss = (-log_alpha.exp() * (log_pi_detached + target_entropy)).mean()
-                        alpha_loss.backward()
-                        alpha_optimizer.step()
-                        with torch.no_grad():
-                            min_log_alpha = None
-                            if float(args.alpha_min) > 0.0:
-                                min_log_alpha = np.log(max(1e-6, float(args.alpha_min)))
-                            max_log_alpha = None
-                            if float(args.alpha_max) > 0.0:
-                                max_log_alpha = np.log(float(args.alpha_max))
-                            lower = min_log_alpha if min_log_alpha is not None else -torch.inf
-                            upper = max_log_alpha if max_log_alpha is not None else torch.inf
-                            if not np.isinf(lower) or not np.isinf(upper):
-                                log_alpha.clamp_(min=lower, max=upper)
-                        alpha_loss_value = float(alpha_loss.detach().cpu().item())
-                        alpha_value = float(log_alpha.exp().detach().cpu().item())
-
-                    # Soft update targets
-                    source_backbone = actor_backbone if args.arch_shared_trunk else critic_backbone
-                    for src_param, tgt_param in zip(source_backbone.parameters(), critic_target_backbone.parameters()):
-                        tgt_param.data.copy_(args.tau * src_param.data + (1 - args.tau) * tgt_param.data)
-                    for src_param, tgt_param in zip(critic_heads.parameters(), critic_target_heads.parameters()):
-                        tgt_param.data.copy_(args.tau * src_param.data + (1 - args.tau) * tgt_param.data)
-
-                    metrics_accumulator['critic_loss'] += critic_loss_value
-                    metrics_accumulator['actor_loss'] += actor_loss_value
-                    metrics_accumulator['alpha_loss'] += alpha_loss_value
-                    metrics_accumulator['entropy'] += entropy_value
-                    metrics_accumulator['action_norm'] += action_norm_value
-                    metrics_accumulator['target_q'] += target_q_mean
-                    metrics_accumulator['q_min_pi'] += min_q_pi_mean
-                    metrics_accumulator['reward'] += reward_mean
-                    metrics_accumulator['reward_abs'] += float(rewards_batch.detach().abs().mean().cpu().item())
-                    metrics_accumulator['alpha_value'] += alpha_value
-                    updates_count += 1
-
+                metrics_accumulator, updates_count = updater.update(
+                    replay_buffer=rb,
+                    total_env_steps=total_env_steps,
+                    main_batch=main_batch,
+                    base_batch=base_batch,
+                    b_pref=b_pref,
+                    b_pref_td=b_pref_td,
+                )
                 if updates_count > 0:
                     last_update_metrics = (metrics_accumulator, updates_count)
-            should_log = False
-            if next_log_step is not None and total_env_steps >= next_log_step:
-                should_log = True
-                next_log_step += args.log_interval
-            if total_env_steps >= args.total_timesteps:
-                should_log = True
 
-            if should_log:
+            log_requested = training_logger.should_log(total_env_steps) or total_env_steps >= args.total_timesteps
+            if log_requested:
                 collection_time = time.time() - start_time
-                fps = int(total_env_steps / max(1e-6, collection_time))
-                logs = {
-                    'Perf/total_fps': fps,
-                    'Perf/collection_time_sec': collection_time,
-                    'Perf/env_steps': total_env_steps,
-                    'Perf/iterations': iteration_idx,
-                }
-                if len(rewbuffer) > 0:
-                    logs['Train/mean_reward'] = float(np.mean(rewbuffer[-100:]))
-                    logs['Train/mean_episode_length'] = float(np.mean(lenbuffer[-100:]))
-                if last_update_metrics is not None:
-                    metrics_accumulator, updates_count = last_update_metrics
-                    denom = float(max(1, updates_count))
-                    logs['Train/critic_loss'] = metrics_accumulator['critic_loss'] / denom
-                    logs['Train/actor_loss'] = metrics_accumulator['actor_loss'] / denom
-                    logs['Train/alpha_loss'] = metrics_accumulator['alpha_loss'] / denom
-                    logs['Train/policy_entropy'] = metrics_accumulator['entropy'] / denom
-                    logs['Train/action_l2'] = metrics_accumulator['action_norm'] / denom
-                    logs['Train/target_q_mean'] = metrics_accumulator['target_q'] / denom
-                    logs['Train/q_min_pi_mean'] = metrics_accumulator['q_min_pi'] / denom
-                    logs['Train/replay_reward_mean'] = metrics_accumulator['reward'] / denom
-                    logs['Train/replay_reward_abs_mean'] = metrics_accumulator['reward_abs'] / denom
-                    logs['Train/alpha'] = metrics_accumulator['alpha_value'] / denom
-                    logs['Train/updates_per_iter'] = updates_count
-                    last_update_metrics = None
-                else:
-                    logs['Train/alpha'] = float(log_alpha.exp().detach().cpu().item())
-                if 'log' in infos and isinstance(infos['log'], dict):
-                    for k, v in infos['log'].items():
-                        try:
-                            logs[k] = float(v.float().mean().item())
-                        except Exception:
-                            pass
-                if args.store_denied_actions:
-                    logs['/Teacher/denied_transition_samples'] = float(last_denied_samples)
-                if teacher_disagreement_steps > 0:
-                    logs['/Teacher/mean_disagreement_intervened'] = float(teacher_disagreement_sum / max(1e-8, teacher_disagreement_steps))
-                if non_teacher_disagreement_steps > 0:
-                    logs['/Teacher/mean_disagreement_no_intervention'] = float(non_teacher_disagreement_sum / max(1e-8, non_teacher_disagreement_steps))
-                # Global disagreement average across all steps in the window
-                total_dis_sum = teacher_disagreement_sum + non_teacher_disagreement_sum
-                total_dis_steps = teacher_disagreement_steps + non_teacher_disagreement_steps
-                if total_dis_steps > 0:
-                    logs['/Critic/mean_disagreement_all'] = float(total_dis_sum / max(1e-8, total_dis_steps))
-                if args.pref_buffer_enable:
-                    logs['/Buffers/pref_pairs'] = float(pref_size)
-                if args.pref_td_buffer_enable:
-                    logs['/Buffers/pref_td_teacher'] = float(t_size)
-                    logs['/Buffers/pref_td_student'] = float(s_size)
-                if corr_total_steps > 0:
-                    numer = corr_total_steps * corr_sum_mask_dis - corr_sum_mask * corr_sum_dis
-                    denom_part_x = corr_total_steps * corr_sum_mask_sq - (corr_sum_mask ** 2)
-                    denom_part_y = corr_total_steps * corr_sum_dis_sq - (corr_sum_dis ** 2)
-                    if denom_part_x > 1e-8 and denom_part_y > 1e-8:
-                        corr_value = numer / math.sqrt(denom_part_x * denom_part_y)
-                        logs['/Teacher/corr(disagreement, intervention)'] = float(corr_value)
-                if hist_edges_tensor is not None:
-                    teacher_hist_cpu = teacher_hist_counts.detach().cpu()
-                    non_teacher_hist_cpu = non_teacher_hist_counts.detach().cpu()
-                    for idx, label in enumerate(hist_labels):
-                        logs[f"/Teacher/disagreement_hist_teacher_{label}"] = float(teacher_hist_cpu[idx].item())
-                        logs[f"/Teacher/disagreement_hist_non_teacher_{label}"] = float(non_teacher_hist_cpu[idx].item())
-                    teacher_hist_counts.zero_()
-                    non_teacher_hist_counts.zero_()
-                # Threshold percentages since last log (teacher only)
-                if thresh_tensor is not None and teacher_steps_window > 0:
-                    pct = (teacher_above_counts / max(1.0, teacher_steps_window)).detach().cpu().numpy()
-                    for i, thr in enumerate(thresh_vals):
-                        logs[f"/Teacher/frac_interventions_dis_ge_{thr}"] = float(pct[i])
-                    teacher_above_counts.zero_()
-                    teacher_steps_window = 0.0
+                pref_size = pref_buffer.size if pref_buffer is not None else -1
+                pref_td_teacher_size = pref_td_buffer.teacher_size if pref_td_buffer is not None else -1
+                pref_td_student_size = pref_td_buffer.student_size if pref_td_buffer is not None else -1
+                training_logger.log(
+                    total_env_steps=total_env_steps,
+                    total_timesteps=args.total_timesteps,
+                    iteration_idx=iteration_idx,
+                    collection_time=collection_time,
+                    rewbuffer=rewbuffer,
+                    lenbuffer=lenbuffer,
+                    last_update_metrics=last_update_metrics,
+                    infos=infos,
+                    log_alpha=log_alpha,
+                    last_denied_samples=last_denied_samples,
+                    pref_size=pref_size,
+                    pref_td_teacher_size=pref_td_teacher_size,
+                    pref_td_student_size=pref_td_student_size,
+                )
+                last_update_metrics = None
 
-                # Mean Q(s, a_used) summaries (min over heads)
-                if qmin_steps_all > 0:
-                    logs['/Critic/mean_q_min_all'] = float(qmin_sum_all / max(1e-8, qmin_steps_all))
-                if qmin_steps_teacher > 0:
-                    logs['/Critic/mean_q_min_intervened'] = float(qmin_sum_teacher / max(1e-8, qmin_steps_teacher))
-                if qmin_steps_non > 0:
-                    logs['/Critic/mean_q_min_no_intervention'] = float(qmin_sum_non / max(1e-8, qmin_steps_non))
-                # Reset Q-window accumulators
-                qmin_sum_all = qmin_steps_all = qmin_sum_teacher = qmin_steps_teacher = qmin_sum_non = qmin_steps_non = 0.0
+        final_ckpt = checkpoint_manager.save(
+            tag='final',
+            step_value=total_env_steps,
+            run_prefix=run_prefix,
+            actor_backbone=actor_backbone,
+            actor_head=actor_head,
+            critic_backbone=None if args.arch_shared_trunk else critic_backbone,
+            shared_backbone=actor_backbone if args.arch_shared_trunk else None,
+            critic_heads=critic_heads,
+            critic_target_backbone=critic_target_backbone,
+            critic_target_heads=critic_target_heads,
+            obs_normalizer=obs_normalizer,
+            critic_obs_normalizer=critic_obs_normalizer,
+            log_alpha=log_alpha,
+            pixel_shape=pixel_shape,
+        )
+        checkpoint_manager.maybe_render_policy_map(
+            tag='final',
+            step_value=total_env_steps,
+            checkpoint_path=final_ckpt,
+            current_env_name=current_env_name,
+            wandb_run=training_logger.wandb_run,
+        )
 
-                log_line_parts = [
-                    f"env_steps {total_env_steps}/{args.total_timesteps}",
-                    f"iter {iteration_idx}",
-                    f"fps {fps}",
-                ]
-                if 'Train/mean_reward' in logs:
-                    log_line_parts.append(f"mean_reward {logs['Train/mean_reward']:.2f}")
-                if '/Episode/goal_success_rate' in logs:
-                    log_line_parts.append(f"success {logs['/Episode/goal_success_rate']:.2f}")
-                if '/Teacher/teacher_fraction_steps' in logs:
-                    log_line_parts.append(f"teacher_frac {logs['/Teacher/teacher_fraction_steps']:.2f}")
-                if args.store_denied_actions and last_denied_samples > 0:
-                    log_line_parts.append(f"denied {last_denied_samples}")
-                console_line = "[FastSAC] " + " | ".join(log_line_parts)
-                print(console_line, flush=True)
-                record_progress(console_line)
-
-                if args.use_wandb:
-                    import wandb
-                    if wandb_run is None:
-                        wandb_run = wandb.init(
-                            project=args.project,
-                            name=args.exp_name,
-                            id=args.exp_name,
-                            config=vars(args),
-                            reinit=True,
-                            resume="allow",
-                        )
-                    wandb_run.log(logs, step=total_env_steps)
-
-            obs = next_obs
-        # Save final
-        final_ckpt = save_checkpoint('final', total_env_steps)
-        maybe_render_policy_map('final', total_env_steps, final_ckpt)
-        if wandb_run is not None:
-            try:
-                wandb_run.finish()
-            except Exception:
-                pass
         total_time = time.time() - start_time
         summary_line = (
             "✅ FastSAC training complete"
             f" env_steps={total_env_steps}"
             f" iterations={iteration_idx}"
             f" duration_sec={total_time:.1f}"
-            f" models_dir={run_model_dir}"
+            f" models_dir={checkpoint_manager.run_model_dir}"
         )
         print("=" * 80)
         print(summary_line)
         record_progress(summary_line)
+        return total_env_steps, iteration_idx, total_time
+    finally:
+        training_logger.finish()
+
+
+def main():
+    args = parse_args()
+    device = select_device(args)
+    parse_pixel_backbone_args(args)
+    args.cf_penalty_target = -abs(float(args.cf_penalty))
+    ensure_experiment_name(args)
+
+    run_log_dir, run_model_dir, viz_output_dir, viz_cache_path, record_progress, progress_file = prepare_run_dirs(args)
+    print(f"FastSAC OGBench on {args.env_name} device={device}")
+    print(f"Log directory: {run_log_dir}")
+    print(f"Model directory: {run_model_dir}")
+
+    envs, wrappers, pixel_shape, obs_normalizer, critic_obs_normalizer, n_obs, n_act = build_environment(
+        args,
+        device,
+        record_progress,
+    )
+
+    model = initialize_models(args, device, n_obs, n_act, pixel_shape, record_progress)
+    amp = initialize_amp(args, device)
+
+    if args.compile:
+        model.actor_backbone = torch.compile(model.actor_backbone)
+        model.actor_head = torch.compile(model.actor_head)
+        if model.critic_backbone is not None and not args.arch_shared_trunk:
+            model.critic_backbone = torch.compile(model.critic_backbone)
+        model.critic_heads = torch.compile(model.critic_heads)
+        model.critic_target_backbone = torch.compile(model.critic_target_backbone)
+        model.critic_target_heads = torch.compile(model.critic_target_heads)
+        obs_normalizer_compiled = torch.compile(obs_normalizer)
+        critic_obs_normalizer_compiled = torch.compile(critic_obs_normalizer)
+        obs_normalizer = obs_normalizer_compiled
+        critic_obs_normalizer = critic_obs_normalizer_compiled
+
+    buffers = initialize_buffers(args, device, n_obs, n_act, obs_normalizer)
+    replay_buffer = create_replay_buffer(args, device, n_obs, n_act)
+    updater = build_updater_from_components(
+        args=args,
+        device=device,
+        model=model,
+        buffers=buffers,
+        obs_normalizer=obs_normalizer,
+        pixel_shape=pixel_shape,
+        amp=amp,
+    )
+
+    teacher_metrics = build_teacher_metrics(args, device)
+    logging_components = initialize_logging_components(
+        args=args,
+        record_progress=record_progress,
+        run_model_dir=run_model_dir,
+        viz_output_dir=viz_output_dir,
+        viz_cache_path=viz_cache_path,
+        teacher_metrics=teacher_metrics,
+    )
+
+    try:
+        run_training_loop(
+            args=args,
+            device=device,
+            envs=envs,
+            wrappers=wrappers,
+            pixel_shape=pixel_shape,
+            obs_normalizer=obs_normalizer,
+            critic_obs_normalizer=critic_obs_normalizer,
+            model=model,
+            buffers=buffers,
+            amp=amp,
+            training_logger=logging_components.training_logger,
+            teacher_metrics=logging_components.teacher_metrics,
+            checkpoint_manager=logging_components.checkpoint_manager,
+            record_progress=record_progress,
+            replay_buffer=replay_buffer,
+            updater=updater,
+            current_env_name=args.env_name,
+        )
     finally:
         try:
             progress_file.close()
+        except Exception:
+            pass
+        try:
+            envs.close()
         except Exception:
             pass
 
