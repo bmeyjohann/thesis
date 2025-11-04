@@ -20,18 +20,18 @@ unset CUDA_VISIBLE_DEVICES
 source "sc_venv_template_isaaclab/activate.sh"
 source ".venv/bin/activate"
 
-APPTAINER_ROOT=${APPTAINER_ROOT:-/p/project1/hai_1074/meyjohann1/apptainer}
-export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${APPTAINER_ROOT}/cache}"
-export XDG_DATA_HOME="${XDG_DATA_HOME:-${APPTAINER_ROOT}/data}"
-export KIT_USER_ROOT="${KIT_USER_ROOT:-${APPTAINER_ROOT}/kit}"
-export KIT_USER_DATA="${KIT_USER_DATA:-${APPTAINER_ROOT}/data}"
-export KIT_CACHE_DIR="${KIT_CACHE_DIR:-${APPTAINER_ROOT}/cache}"
-export KIT_DERIVED_DATA_CACHE="${KIT_DERIVED_DATA_CACHE:-${APPTAINER_ROOT}/DerivedDataCache}"
-export KIT_PIP_INSTALL_PATH="${KIT_PIP_INSTALL_PATH:-${APPTAINER_ROOT}/pip3-envs}"
-export OMNI_USER_CACHE_DIR="${OMNI_USER_CACHE_DIR:-${APPTAINER_ROOT}/cache}"
-export OMNI_KIT_USER_DIR="${OMNI_KIT_USER_DIR:-${APPTAINER_ROOT}/kit}"
-export OMNI_KIT_DATA_DIR="${OMNI_KIT_DATA_DIR:-${APPTAINER_ROOT}/data}"
-export OMNI_KIT_CACHE_DIR="${OMNI_KIT_CACHE_DIR:-${APPTAINER_ROOT}/cache}"
+export XDG_CACHE_HOME=/p/project1/hai_1074/meyjohann1/apptainer/cache \
+export XDG_DATA_HOME=/p/project1/hai_1074/meyjohann1/apptainer/data \
+export KIT_USER_ROOT=/p/project1/hai_1074/meyjohann1/apptainer/kit \
+export KIT_USER_DATA=/p/project1/hai_1074/meyjohann1/apptainer/data \
+export KIT_CACHE_DIR=/p/project1/hai_1074/meyjohann1/apptainer/cache \
+export KIT_DERIVED_DATA_CACHE=/p/project1/hai_1074/meyjohann1/apptainer/DerivedDataCache \
+export KIT_PIP_INSTALL_PATH=/p/project1/hai_1074/meyjohann1/apptainer/pip3-envs \
+export OMNI_USER_CACHE_DIR=/p/project1/hai_1074/meyjohann1/apptainer/cache \
+export OMNI_KIT_USER_DIR=/p/project1/hai_1074/meyjohann1/apptainer/kit \
+export OMNI_KIT_DATA_DIR=/p/project1/hai_1074/meyjohann1/apptainer/data \
+export OMNI_KIT_CACHE_DIR=/p/project1/hai_1074/meyjohann1/apptainer/cache
+
 export OMNI_DISABLE_EXTENSIONS="omni.iray.libs,omni.mdl.neuraylib,omni.kit.usd.mdl,carb.scenerenderer-rtx.plugin,omni.rtx.*,omni.hydra.rtx"
 
 export WANDB_MODE=offline
