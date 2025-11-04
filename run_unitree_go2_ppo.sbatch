@@ -17,8 +17,8 @@ export UNITREE_ROS_DIR="${UNITREE_ROS_DIR:-unitree_ros/unitree_ros}"
 export GIT_PYTHON_REFRESH=quiet
 unset CUDA_VISIBLE_DEVICES
 
-source "sc_venv_template_isaaclab/activate.sh"
-source ".venv/bin/activate"
+source sc_venv_template_isaaclab/activate.sh
+source .venv/bin/activate
 
 export XDG_CACHE_HOME=/p/project1/hai_1074/meyjohann1/apptainer/cache \
 export XDG_DATA_HOME=/p/project1/hai_1074/meyjohann1/apptainer/data \
