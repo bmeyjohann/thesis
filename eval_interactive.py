@@ -45,6 +45,8 @@ from ogbench_utils import (
     PixelNormalizer,
     build_ogbench_wrapper,
     build_eval_parser,
+    prepare_observation,
+    reshape_observation,
 )
 
 # Fix WSL window positioning issues  
@@ -437,16 +439,7 @@ class FastSACPolicy:
                 actions, _, means = self.legacy_actor(norm_obs)
             return means if deterministic else actions
         norm_obs = self._normalize(obs)
-        if self.obs_mode == "pixels":
-            assert self.pixel_shape is not None, "pixel_shape must be provided for pixel observations"
-            if norm_obs.dim() == 2:
-                obs_input = norm_obs.reshape(norm_obs.shape[0], *self.pixel_shape)
-            else:
-                obs_input = norm_obs
-            if obs_input.dim() == 4 and obs_input.shape[1] not in (1, 3, 4) and obs_input.shape[-1] in (1, 3, 4):
-                obs_input = obs_input.permute(0, 3, 1, 2).contiguous()
-        else:
-            obs_input = norm_obs
+        obs_input = reshape_observation(norm_obs, obs_mode=self.obs_mode, pixel_shape=self.pixel_shape)
         with torch.no_grad():
             features = self.actor_backbone(obs_input)
             actions, _, means = self.actor_head(features)
@@ -702,22 +695,14 @@ def create_env(env_name: str, args, *, render_override: str | None = None, mirro
 def _format_policy_observation(obs, policy, device):
     """Match training-time preprocessing for policy inputs."""
     obs_mode = getattr(policy, 'obs_mode', 'state')
-    obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=device)
-    if obs_mode == 'pixels':
-        if obs_tensor.ndim == 1:
-            obs_tensor = obs_tensor.unsqueeze(0)
-        elif obs_tensor.ndim == 3:
-            obs_tensor = obs_tensor.unsqueeze(0)
-        if obs_tensor.ndim == 4:
-            if obs_tensor.shape[1] not in (1, 3, 4) and obs_tensor.shape[-1] in (1, 3, 4):
-                obs_tensor = obs_tensor.permute(0, 3, 1, 2).contiguous()
-        obs_tensor = obs_tensor.reshape(obs_tensor.shape[0], -1).contiguous()
-    else:
-        if obs_tensor.ndim == 1:
-            obs_tensor = obs_tensor.unsqueeze(0)
-        elif obs_tensor.ndim > 2 or obs_tensor.shape[0] != 1:
-            obs_tensor = obs_tensor.reshape(1, -1).contiguous()
-    return obs_tensor
+    pixel_shape = getattr(policy, 'pixel_shape', None)
+    return prepare_observation(
+        obs_input=obs,
+        device=device,
+        obs_mode=obs_mode,
+        pixel_shape=pixel_shape,
+        flatten=True,
+    )
 
 def run_interactive_evaluation(policy, env, args, device, mirror: MirrorEnvProcess | None):
     """Run interactive evaluation loop."""
@@ -940,116 +925,36 @@ def run_interactive_evaluation(policy, env, args, device, mirror: MirrorEnvProce
     print(f"\n✅ Evaluation completed!")
 
 def main():
-    """Main evaluation function."""
     args = get_args()
-    
-    # Device selection
-    if args.device == 'auto':
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    else:
-        device = torch.device(args.device)
-    
-    print(f"🚀 Interactive Policy Evaluation")
+    device = select_device(args.device)
+
+    print("🚀 Interactive Policy Evaluation")
     print(f"Device: {device}")
     if device.type == 'cuda':
         print(f"GPU: {torch.cuda.get_device_name(device)}")
-    
-    env = None
-    mirror = None
+
+    env: Optional[gym.Env] = None
+    mirror: Optional[MirrorEnvProcess] = None
     try:
-        # Peek at checkpoint to recover observation mode
-        checkpoint_preview = torch.load(args.model_path, map_location='cpu')
-        checkpoint_args_raw = checkpoint_preview.get('args', {})
-        checkpoint_args: Dict[str, Any] = {}
-        if isinstance(checkpoint_args_raw, dict):
-            checkpoint_args = checkpoint_args_raw
-        elif checkpoint_args_raw is not None:
-            for attr in ['obs_mode', 'pixel_width', 'pixel_height', 'pixel_camera']:
-                if hasattr(checkpoint_args_raw, attr):
-                    checkpoint_args[attr] = getattr(checkpoint_args_raw, attr)
-        args.obs_mode = checkpoint_args.get('obs_mode', getattr(args, 'obs_mode', 'state'))
-        if args.pixel_width is None and checkpoint_args.get('pixel_width') is not None:
-            args.pixel_width = int(checkpoint_args['pixel_width'])
-        if args.pixel_height is None and checkpoint_args.get('pixel_height') is not None:
-            args.pixel_height = int(checkpoint_args['pixel_height'])
-        if args.pixel_camera is None and checkpoint_args.get('pixel_camera') is not None:
-            args.pixel_camera = checkpoint_args['pixel_camera']
-        del checkpoint_preview
-        # Create environment
-        if args.policy_mujoco_gl == 'auto':
-            env_default_backend = os.environ.get('MUJOCO_GL')
-            if args.mirror_human_render:
-                policy_backend = 'glfw'
-            elif env_default_backend is not None:
-                policy_backend = env_default_backend
-            elif args.obs_mode == 'pixels':
-                policy_backend = 'egl'
-            else:
-                policy_backend = None
-        elif args.policy_mujoco_gl == 'egl':
-            policy_backend = 'egl'
-        elif args.policy_mujoco_gl == 'glfw':
-            policy_backend = 'glfw'
-        else:
-            policy_backend = None
-        print(f"⚙️  Creating primary env with MUJOCO_GL={policy_backend or 'unset'}")
-        with mujoco_gl_context(policy_backend):
-            env, env_render_mode = create_env(args.env_name, args)
-        args.effective_render_mode = env_render_mode
-        if args.mirror_human_render and env_render_mode != 'rgb_array':
-            print("ℹ️ Mirror window requires rgb_array render mode; disabling mirror.")
-            args.mirror_human_render = False
-
-        mirror = None
-        if args.mirror_human_render:
-            try:
-                print("🪞 Attempting to create mirror env in separate process")
-                mirror = MirrorEnvProcess(args.env_name, args, seed=args.seed)
-            except Exception as mirror_exc:
-                print(f"⚠️ Mirror human render unavailable: {mirror_exc}")
-                import traceback
-                traceback.print_exc()
-                mirror = None
-                if args.policy_mujoco_gl == 'auto' and policy_backend == 'egl':
-                    print("🔁 Retrying with MUJOCO_GL=glfw for both environments")
-                    if env is not None:
-                        try:
-                            env.close()
-                        except Exception:
-                            pass
-                    policy_backend = 'glfw'
-                    with mujoco_gl_context(policy_backend):
-                        env, env_render_mode = create_env(args.env_name, args)
-                    args.effective_render_mode = env_render_mode
-                    try:
-                        mirror = MirrorEnvProcess(args.env_name, args, seed=args.seed)
-                    except Exception as fallback_exc:
-                        print(f"⚠️ Mirror render still unavailable after fallback: {fallback_exc}")
-                        import traceback
-                        traceback.print_exc()
-                        mirror = None
-
-        # Load trained policy
+        update_args_from_checkpoint(args)
+        env, mirror = setup_environment(args)
         policy, training_info = load_trained_policy(args.model_path, env, device, args)
         if training_info:
-            print('Training info:')
+            print("Training info:")
             for key, value in training_info.items():
-                print('   {}: {}'.format(key, value))
-
-        # Run interactive evaluation
+                print(f"   {key}: {value}")
         run_interactive_evaluation(policy, env, args, device, mirror=mirror)
-        
-    except Exception as e:
-        print(f"❌ Evaluation failed: {e}")
+    except Exception as exc:
+        print(f"❌ Evaluation failed: {exc}")
         import traceback
+
         traceback.print_exc()
         return 1
     finally:
-        # Cleanup
         if env is not None:
             try:
                 env.close()
-            except:
+            except Exception:
                 pass
         if mirror is not None:
             try:
@@ -1057,7 +962,7 @@ def main():
             except Exception:
                 pass
         pygame.quit()
-    
+
     return 0
 
 if __name__ == "__main__":
