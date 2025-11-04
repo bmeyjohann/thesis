@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=unitree_go2_ppo
 #SBATCH --account=<your_account>
-#SBATCH --partition=<your_partition>
+#SBATCH --partition=booster
 #SBATCH --qos=<optional_qos>
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
