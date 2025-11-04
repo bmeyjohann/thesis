@@ -10,6 +10,7 @@
 - `logs/`, `models/`, `wandb/`: Outputs, artifacts, offline tracking.
 
 ## Build, Test, and Development Commands
+- To run/test anything locally, activate the local virtual env first: `conda activate fasttd3`
 - See `README.md`
 - Start jobs on cluster with automatic account detection: `bash submit_job.sh [experiment_name].sbatch`
 - Logs: tail `logs/<name>_<JOBID>.log` and `logs/rsl_rl/<experiment>/` for artifacts.
