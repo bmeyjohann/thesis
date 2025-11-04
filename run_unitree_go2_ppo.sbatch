@@ -11,18 +11,14 @@
 
 set -euo pipefail
 
-SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT="${SCRIPT_DIR}"
-cd "${REPO_ROOT}"
-
 mkdir -p logs wandb
 
-export UNITREE_ROS_DIR="${UNITREE_ROS_DIR:-${REPO_ROOT}/unitree_ros/unitree_ros}"
+export UNITREE_ROS_DIR="${UNITREE_ROS_DIR:-unitree_ros/unitree_ros}"
 export GIT_PYTHON_REFRESH=quiet
 unset CUDA_VISIBLE_DEVICES
 
-source "${REPO_ROOT}/sc_venv_template_isaaclab/activate.sh"
-source "${REPO_ROOT}/.venv/bin/activate"
+source "sc_venv_template_isaaclab/activate.sh"
+source ".venv/bin/activate"
 
 APPTAINER_ROOT=${APPTAINER_ROOT:-/p/project1/hai_1074/meyjohann1/apptainer}
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${APPTAINER_ROOT}/cache}"
