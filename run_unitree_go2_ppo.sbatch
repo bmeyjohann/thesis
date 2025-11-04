@@ -11,49 +11,65 @@
 
 set -euo pipefail
 
+# Get the directory where this script is located (should be thesis root)
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT="${SCRIPT_DIR}"
+cd "${REPO_ROOT}"
+
+# Create log directories
 mkdir -p logs wandb
 
-export UNITREE_ROS_DIR="${UNITREE_ROS_DIR:-unitree_ros/unitree_ros}"
+# Environment setup matching the README
+export UNITREE_ROS_DIR="${UNITREE_ROS_DIR:-${REPO_ROOT}/unitree_ros/unitree_ros}"
 export GIT_PYTHON_REFRESH=quiet
 unset CUDA_VISIBLE_DEVICES
 
-source sc_venv_template_isaaclab/activate.sh
-source .venv/bin/activate
+# Activate Isaac Lab virtual environment
+source "${REPO_ROOT}/sc_venv_template_isaaclab/activate.sh"
 
-export XDG_CACHE_HOME=/p/project1/hai_1074/meyjohann1/apptainer/cache \
-export XDG_DATA_HOME=/p/project1/hai_1074/meyjohann1/apptainer/data \
-export KIT_USER_ROOT=/p/project1/hai_1074/meyjohann1/apptainer/kit \
-export KIT_USER_DATA=/p/project1/hai_1074/meyjohann1/apptainer/data \
-export KIT_CACHE_DIR=/p/project1/hai_1074/meyjohann1/apptainer/cache \
-export KIT_DERIVED_DATA_CACHE=/p/project1/hai_1074/meyjohann1/apptainer/DerivedDataCache \
-export KIT_PIP_INSTALL_PATH=/p/project1/hai_1074/meyjohann1/apptainer/pip3-envs \
-export OMNI_USER_CACHE_DIR=/p/project1/hai_1074/meyjohann1/apptainer/cache \
-export OMNI_KIT_USER_DIR=/p/project1/hai_1074/meyjohann1/apptainer/kit \
-export OMNI_KIT_DATA_DIR=/p/project1/hai_1074/meyjohann1/apptainer/data \
+# Activate project virtual environment
+source "${REPO_ROOT}/.venv/bin/activate"
+
+# Isaac Sim cache directories (no backslashes needed - one export per line)
+export XDG_CACHE_HOME=/p/project1/hai_1074/meyjohann1/apptainer/cache
+export XDG_DATA_HOME=/p/project1/hai_1074/meyjohann1/apptainer/data
+export KIT_USER_ROOT=/p/project1/hai_1074/meyjohann1/apptainer/kit
+export KIT_USER_DATA=/p/project1/hai_1074/meyjohann1/apptainer/data
+export KIT_CACHE_DIR=/p/project1/hai_1074/meyjohann1/apptainer/cache
+export KIT_DERIVED_DATA_CACHE=/p/project1/hai_1074/meyjohann1/apptainer/DerivedDataCache
+export KIT_PIP_INSTALL_PATH=/p/project1/hai_1074/meyjohann1/apptainer/pip3-envs
+export OMNI_USER_CACHE_DIR=/p/project1/hai_1074/meyjohann1/apptainer/cache
+export OMNI_KIT_USER_DIR=/p/project1/hai_1074/meyjohann1/apptainer/kit
+export OMNI_KIT_DATA_DIR=/p/project1/hai_1074/meyjohann1/apptainer/data
 export OMNI_KIT_CACHE_DIR=/p/project1/hai_1074/meyjohann1/apptainer/cache
 
+# Disable RTX extensions
 export OMNI_DISABLE_EXTENSIONS="omni.iray.libs,omni.mdl.neuraylib,omni.kit.usd.mdl,carb.scenerenderer-rtx.plugin,omni.rtx.*,omni.hydra.rtx"
 
+# Weights & Biases configuration
 export WANDB_MODE=offline
-export WANDB_DIR="${WANDB_DIR:-wandb}"
+export WANDB_DIR="${REPO_ROOT}/wandb"
 export WANDB_START_METHOD=thread
 
+# Training configuration
 TASK=${TASK:-New-Isaac-Velocity-Flat-Unitree-Go2-v0}
 ALGO=${ALGO:-ppo}
 RUN_NAME=${RUN_NAME:-simple_reward_config_ppo_${SLURM_JOB_ID}}
-CONFIG_DIR=${CONFIG_DIR:-scripts/configs}
+CONFIG_DIR=${CONFIG_DIR:-${REPO_ROOT}/safe-locomotion/scripts/configs}
 CONFIG_NAME=${CONFIG_NAME:-simple_reward_config}
 LOGGER=${LOGGER:-wandb}
 ISAAC_PYTHON=${ISAAC_PYTHON:-~/meyjohann1/isaacsim5.1/python.sh}
 
+# Verify Isaac Sim Python exists
 if [ ! -x "${ISAAC_PYTHON}" ]; then
   echo "Expected Isaac Sim launcher at ${ISAAC_PYTHON}, but it was not found or not executable." >&2
   exit 1
 fi
 
+# Build training command
 TRAIN_CMD=(
   "${ISAAC_PYTHON}"
-  "safe-locomotion/scripts/rsl_rl/train.py"
+  "${REPO_ROOT}/safe-locomotion/scripts/rsl_rl/train.py"
   --headless
   --task "${TASK}"
   --algo "${ALGO}"
@@ -63,12 +79,19 @@ TRAIN_CMD=(
   --logger "${LOGGER}"
 )
 
+# Add any additional arguments
 if [ -n "${TRAIN_ADDITIONAL_ARGS:-}" ]; then
   # shellcheck disable=SC2206
   TRAIN_CMD+=(${TRAIN_ADDITIONAL_ARGS})
 fi
 
-echo "Launching ${ALGO} training for ${TASK} with run name ${RUN_NAME}"
-echo "Using Isaac Sim Python: ${ISAAC_PYTHON}"
+echo "=========================================="
+echo "Launching ${ALGO} training for ${TASK}"
+echo "Run name: ${RUN_NAME}"
+echo "Isaac Sim Python: ${ISAAC_PYTHON}"
+echo "Config: ${CONFIG_DIR}/${CONFIG_NAME}.yaml"
+echo "Working directory: ${REPO_ROOT}"
+echo "=========================================="
 
+# Run the training command
 srun --ntasks=1 "${TRAIN_CMD[@]}"
