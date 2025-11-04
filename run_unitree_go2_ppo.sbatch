@@ -62,8 +62,8 @@ export WANDB_START_METHOD=thread
 TASK=${TASK:-New-Isaac-Velocity-Flat-Unitree-Go2-v0}
 ALGO=${ALGO:-ppo}
 RUN_NAME=${RUN_NAME:-simple_reward_config_ppo_${SLURM_JOB_ID}}
-# CONFIG_DIR=${CONFIG_DIR:-${REPO_ROOT}/safe-locomotion/scripts/configs}
-# CONFIG_NAME=${CONFIG_NAME:-simple_reward_config}
+CONFIG_DIR=${CONFIG_DIR:-${REPO_ROOT}/safe-locomotion/scripts/configs}
+CONFIG_NAME=${CONFIG_NAME:-simple_reward_config}
 LOGGER=${LOGGER:-wandb}
 ISAAC_PYTHON=${ISAAC_PYTHON:-~/meyjohann1/isaacsim5.1/python.sh}
 
@@ -81,8 +81,8 @@ TRAIN_CMD=(
   --task "${TASK}"
   --algo "${ALGO}"
   --run_name "${RUN_NAME}"
-  --config-dir "${CONFIG_DIR}"
-  --config-name "${CONFIG_NAME}"
+  # --config-dir "${CONFIG_DIR}"
+  # --config-name "${CONFIG_NAME}"
   --logger "${LOGGER}"
 )
 
