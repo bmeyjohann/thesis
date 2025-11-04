@@ -2,12 +2,9 @@
 #SBATCH --job-name=unitree_go2_ppo
 #SBATCH --account=<your_account>
 #SBATCH --partition=booster
-#SBATCH --qos=<optional_qos>
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
-#SBATCH --gres=gpu:1
-#SBATCH --mem=64G
+#SBATCH --gres=gpu:4
 #SBATCH --time=24:00:00
 #SBATCH --output=logs/unitree_go2_ppo_%j.out
 #SBATCH --error=logs/unitree_go2_ppo_%j.err
