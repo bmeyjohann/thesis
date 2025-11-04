@@ -28,8 +28,11 @@ export UNITREE_ROS_DIR="${UNITREE_ROS_DIR:-${REPO_ROOT}/unitree_ros/unitree_ros}
 export GIT_PYTHON_REFRESH=quiet
 unset CUDA_VISIBLE_DEVICES
 
-# Activate Isaac Lab virtual environment
-source "${REPO_ROOT}/sc_venv_template_isaaclab/activate.sh"
+# Activate Isaac Lab virtual environment (contains Isaac Sim Python 3.11)
+# We need to cd into the directory first, then source, because activate.sh uses BASH_SOURCE
+cd "${REPO_ROOT}/sc_venv_template_isaaclab"
+source activate.sh
+cd "${REPO_ROOT}"
 
 # Activate project virtual environment
 source "${REPO_ROOT}/.venv/bin/activate"
