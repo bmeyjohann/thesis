@@ -180,7 +180,7 @@ def parse_pixel_backbone_args(args) -> None:
 def ensure_experiment_name(args) -> None:
     if args.exp_name:
         return
-    default_buffer_size = 1024 * 50
+    default_buffer_size = 1_000_000
     env_tag = args.env_name.replace('-v0', '').replace('-', '_')
     components = [env_tag, args.reward_type]
     if args.use_intervention:
@@ -231,7 +231,16 @@ def build_environment(
     args,
     device: torch.device,
     record_progress,
-) -> Tuple[OGBenchVecEnvAdapter, list, Optional[Tuple[int, int, int]], Any, Any, int, int]:
+) -> Tuple[
+    OGBenchVecEnvAdapter,
+    list,
+    Optional[Tuple[int, int, int]],
+    Any,
+    Any,
+    int,
+    int,
+    torch.Tensor | None,
+]:
     wrappers = make_wrappers(args)
     env_kwargs: Dict[str, Any] = {}
     if args.obs_mode == 'pixels':
@@ -253,19 +262,12 @@ def build_environment(
     )
     record_progress("[Init] env adapter constructed")
     print("[Init] Env adapter constructed", flush=True)
+    initial_obs_raw = envs.reset()
+    record_progress("[Init] env reset for initial observation sample")
 
-    raw_obs_space = envs._env.envs[0].observation_space
     pixel_shape = None
     if args.obs_mode == 'pixels':
-        if len(raw_obs_space.shape) != 3:
-            raise RuntimeError('Pixel observation expected to have 3 dims')
-        raw_shape = raw_obs_space.shape
-        if raw_shape[0] in (1, 3, 4):
-            pixel_shape = raw_shape
-        elif raw_shape[-1] in (1, 3, 4):
-            pixel_shape = (raw_shape[-1], raw_shape[0], raw_shape[1])
-        else:
-            raise RuntimeError(f'Unable to determine channel dimension for pixel observations: {raw_shape}')
+        pixel_shape = infer_pixel_shape(initial_obs_raw)
         record_progress(
             "[Init] pixel obs shape=%s, conv_channels=%s, kernel_sizes=%s, strides=%s, pool=%s"
             % (
@@ -278,11 +280,22 @@ def build_environment(
         )
         obs_normalizer = IdentityNormalizer().to(device)
         critic_obs_normalizer = IdentityNormalizer().to(device)
+        obs_dim = int(np.prod(pixel_shape)) if pixel_shape is not None else envs.num_obs
     else:
-        obs_normalizer = EmpiricalNormalization(shape=envs.num_obs, device=device)
-        critic_obs_normalizer = EmpiricalNormalization(shape=envs.num_obs, device=device)
+        obs_dim = envs.num_obs
+        obs_normalizer = EmpiricalNormalization(shape=obs_dim, device=device)
+        critic_obs_normalizer = EmpiricalNormalization(shape=obs_dim, device=device)
 
-    return envs, wrappers, pixel_shape, obs_normalizer, critic_obs_normalizer, envs.num_obs, envs.num_actions
+    return (
+        envs,
+        wrappers,
+        pixel_shape,
+        obs_normalizer,
+        critic_obs_normalizer,
+        obs_dim,
+        envs.num_actions,
+        initial_obs_raw,
+    )
 
 
 def initialize_models(
@@ -549,6 +562,8 @@ def build_updater_from_components(
         cf_buffer=buffers.cf_buffer,
         pref_buffer=buffers.pref_buffer,
         pref_td_buffer=buffers.pref_td_buffer,
+        pixel_shape=pixel_shape,
+        pixel_random_shift_pad=args.pixel_random_shift_pad,
     )
 
 
@@ -570,6 +585,7 @@ def run_training_loop(
     replay_buffer: SimpleReplayBuffer,
     updater: FastSACUpdater,
     current_env_name: str,
+    initial_obs_raw: torch.Tensor | None,
 ):
     rb = replay_buffer
     cf_buffer = buffers.cf_buffer
@@ -612,7 +628,7 @@ def run_training_loop(
         return obs_normalizer(x)
 
     try:
-        obs_raw = envs.reset()
+        obs_raw = initial_obs_raw if initial_obs_raw is not None else envs.reset()
         if args.obs_mode == 'pixels':
             pixel_shape_local = infer_pixel_shape(obs_raw)
             if pixel_shape != pixel_shape_local:
@@ -1024,7 +1040,16 @@ def main():
     print(f"Log directory: {run_log_dir}")
     print(f"Model directory: {run_model_dir}")
 
-    envs, wrappers, pixel_shape, obs_normalizer, critic_obs_normalizer, n_obs, n_act = build_environment(
+    (
+        envs,
+        wrappers,
+        pixel_shape,
+        obs_normalizer,
+        critic_obs_normalizer,
+        n_obs,
+        n_act,
+        initial_obs_raw,
+    ) = build_environment(
         args,
         device,
         record_progress,
@@ -1087,6 +1112,7 @@ def main():
             replay_buffer=replay_buffer,
             updater=updater,
             current_env_name=args.env_name,
+            initial_obs_raw=initial_obs_raw,
         )
     finally:
         try:

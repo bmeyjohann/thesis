@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 
 import numpy as np
 import torch
@@ -43,6 +43,8 @@ class FastSACUpdater:
         cf_buffer: CounterfactualBuffer | None = None,
         pref_buffer: PreferencePairBuffer | None = None,
         pref_td_buffer: PreferenceTDBuffer | None = None,
+        pixel_shape: Optional[Tuple[int, int, int]] = None,
+        pixel_random_shift_pad: int = 0,
     ):
         self.args = args
         self.actor_backbone = actor_backbone
@@ -70,6 +72,20 @@ class FastSACUpdater:
         self.cf_buffer = cf_buffer
         self.pref_buffer = pref_buffer
         self.pref_td_buffer = pref_td_buffer
+        self.pixel_shape = pixel_shape
+        self.pixel_random_shift_pad = int(max(0, pixel_random_shift_pad))
+        self._random_shift_base_grid: Dict[Tuple[torch.device, torch.dtype], torch.Tensor] = {}
+        if (
+            getattr(args, "obs_mode", "state") == "pixels"
+            and self.pixel_shape is not None
+            and self.pixel_random_shift_pad > 0
+        ):
+            self.random_shift_enabled = True
+            c, h, w = self.pixel_shape
+            self._pixel_flat_dim = c * h * w
+        else:
+            self.random_shift_enabled = False
+            self._pixel_flat_dim = None
 
     def actor_forward(self, obs_flat: torch.Tensor):
         obs_in = self.reshape_obs(obs_flat)
@@ -82,6 +98,60 @@ class FastSACUpdater:
         features = backbone_module(obs_in)
         q_values = heads_module(features, actions)
         return features, q_values
+
+    def _apply_random_shift_flat(self, obs_flat: torch.Tensor) -> torch.Tensor:
+        if not self.random_shift_enabled:
+            return obs_flat
+        if obs_flat is None or obs_flat.ndim != 2:
+            return obs_flat
+        if self._pixel_flat_dim is None or obs_flat.shape[1] != self._pixel_flat_dim:
+            return obs_flat
+        obs_view = self.reshape_obs(obs_flat)
+        shifted = self._random_shift(obs_view)
+        return shifted.view(obs_flat.shape[0], -1)
+
+    def _random_shift(self, obs: torch.Tensor) -> torch.Tensor:
+        pad = self.pixel_random_shift_pad
+        if pad <= 0 or self.pixel_shape is None:
+            return obs
+        obs_padded = F.pad(obs, (pad, pad, pad, pad), mode="replicate")
+        n = obs_padded.shape[0]
+        base_grid = self._get_random_shift_base_grid(obs_padded.device, obs_padded.dtype)
+        base_grid = base_grid.expand(n, -1, -1, -1)
+        offsets = torch.randint(-pad, pad + 1, size=(n, 2), device=obs_padded.device).to(base_grid.dtype)
+        height = self.pixel_shape[1] + 2 * pad
+        width = self.pixel_shape[2] + 2 * pad
+        shift_y = offsets[:, 0] * (2.0 / max(1, height))
+        shift_x = offsets[:, 1] * (2.0 / max(1, width))
+        shift = torch.stack((shift_x, shift_y), dim=-1).view(n, 1, 1, 2)
+        grid = base_grid + shift
+        return F.grid_sample(obs_padded, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
+
+    def _get_random_shift_base_grid(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        key = (device, dtype)
+        cached = self._random_shift_base_grid.get(key)
+        if cached is not None:
+            return cached
+        if self.pixel_shape is None:
+            raise RuntimeError("Pixel shape must be provided for random shift augmentation")
+        pad = self.pixel_random_shift_pad
+        _, h, w = self.pixel_shape
+        total_h = h + 2 * pad
+        total_w = w + 2 * pad
+        eps_y = 1.0 / max(1, total_h)
+        eps_x = 1.0 / max(1, total_w)
+        y_coords = torch.linspace(-1.0 + eps_y, 1.0 - eps_y, total_h, device=device, dtype=dtype)
+        x_coords = torch.linspace(-1.0 + eps_x, 1.0 - eps_x, total_w, device=device, dtype=dtype)
+        try:
+            grid_y, grid_x = torch.meshgrid(y_coords, x_coords, indexing="ij")
+        except TypeError:  # PyTorch < 1.10 fallback
+            grid_y, grid_x = torch.meshgrid(y_coords, x_coords)
+        base_grid = torch.stack((grid_x, grid_y), dim=-1)
+        if pad > 0:
+            base_grid = base_grid[pad:-pad, pad:-pad, :]
+        base_grid = base_grid.unsqueeze(0)
+        self._random_shift_base_grid[key] = base_grid
+        return base_grid
 
     def update(
         self,
@@ -119,6 +189,9 @@ class FastSACUpdater:
             obs_batch = self.normalize_obs(obs_batch)
             next_obs_batch = self.normalize_obs(next_obs_batch)
 
+            obs_batch = self._apply_random_shift_flat(obs_batch)
+            next_obs_batch = self._apply_random_shift_flat(next_obs_batch)
+
             if args.arch_shared_trunk and self.trunk_optimizer is not None:
                 self.trunk_optimizer.zero_grad(set_to_none=True)
             self.critic_optimizer.zero_grad(set_to_none=True)
@@ -151,7 +224,8 @@ class FastSACUpdater:
                     cf_b = max(1, int(base_batch * args.cf_sample_ratio))
                     cf_sample = self.cf_buffer.sample(cf_b)
                     if cf_sample is not None:
-                        cf_features = current_backbone(self.reshape_obs(cf_sample.states))
+                        cf_states = self._apply_random_shift_flat(cf_sample.states)
+                        cf_features = current_backbone(self.reshape_obs(cf_states))
                         cf_q_list = self.critic_heads(cf_features, cf_sample.actions)
                         for q_cf in cf_q_list:
                             qf_loss = qf_loss + args.cf_q_weight * F.mse_loss(
@@ -167,7 +241,8 @@ class FastSACUpdater:
                 ):
                     pref_sample = self.pref_buffer.sample(b_pref)
                     if pref_sample is not None:
-                        pref_features = current_backbone(self.reshape_obs(pref_sample.states))
+                        pref_states = self._apply_random_shift_flat(pref_sample.states)
+                        pref_features = current_backbone(self.reshape_obs(pref_states))
                         q_pos = self.critic_heads(pref_features, pref_sample.teacher_actions)
                         q_neg = self.critic_heads(pref_features, pref_sample.student_actions)
                         qpos_min = torch.min(torch.stack(q_pos, dim=0), dim=0).values
@@ -194,6 +269,10 @@ class FastSACUpdater:
                         s_s = td_batch["s_states"]
                         s_a = td_batch["s_actions"]
                         s_r = td_batch["s_rewards"]
+
+                        t_s = self._apply_random_shift_flat(t_s)
+                        t_next_s = self._apply_random_shift_flat(t_next_s)
+                        s_s = self._apply_random_shift_flat(s_s)
 
                         with torch.no_grad():
                             next_actions_td, next_log_pi_td, _, _ = self.actor_forward(t_next_s)

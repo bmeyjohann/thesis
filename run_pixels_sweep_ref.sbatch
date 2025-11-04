@@ -19,22 +19,23 @@ cd ..
 
 # Base knobs (override via sbatch VAR=...)
 ENV_ID=${ENV_ID:-visual-pointmaze-arena-v0}
-TOTAL_STEPS=${TOTAL_STEPS:-600000}
+TOTAL_STEPS=${TOTAL_STEPS:-800000}
 NUM_ENVS=${NUM_ENVS:-16}
-BUFFER_SIZE=${BUFFER_SIZE:-1024}
-BATCH_SIZE=${BATCH_SIZE:-2048}
-LEARNING_STARTS=${LEARNING_STARTS:-2048}
+BUFFER_SIZE=${BUFFER_SIZE:-1000000}
+BATCH_SIZE=${BATCH_SIZE:-1024}
+LEARNING_STARTS=${LEARNING_STARTS:-10000}
 CRITIC_LR=${CRITIC_LR:-1e-4}
 ACTOR_LR=${ACTOR_LR:-3e-4}
-TAU=${TAU:-0.002}
-MAX_GRAD_NORM=${MAX_GRAD_NORM:-1.0}
+TAU=${TAU:-0.01}
+MAX_GRAD_NORM=${MAX_GRAD_NORM:-10.0}
 ALPHA_MIN=${ALPHA_MIN:-0.0}
-ALPHA_MAX=${ALPHA_MAX:-0.2}
-ALPHA_FREEZE=${ALPHA_FREEZE:-0}
+ALPHA_MAX=${ALPHA_MAX:-1.0}
+ALPHA_FREEZE=${ALPHA_FREEZE:-5000}
 PIXEL_FINAL_POOL=${PIXEL_FINAL_POOL:-8}
 NUM_UPDATES=${NUM_UPDATES:-1}
 POLICY_FREQUENCY=${POLICY_FREQUENCY:-1}
-VIZ_FIRST_STEP=${VIZ_FIRST_STEP:-10000}
+VIZ_FIRST_STEP=${VIZ_FIRST_STEP:-20000}
+PIXEL_RANDOM_SHIFT_PAD=${PIXEL_RANDOM_SHIFT_PAD:-4}
 
 # Reward scales per run
 SCALE_A=${SCALE_A:-1.0}
@@ -69,6 +70,7 @@ BASE_ARGS="--env_name ${ENV_ID} --obs_mode pixels --num_envs ${NUM_ENVS} \
 --alpha_max ${ALPHA_MAX} --alpha_freeze_steps ${ALPHA_FREEZE} \
 --pixel_width 64 --pixel_height 64 --pixel_final_pool ${PIXEL_FINAL_POOL} \
 --num_updates ${NUM_UPDATES} --policy_frequency ${POLICY_FREQUENCY} \
+--pixel_random_shift_pad ${PIXEL_RANDOM_SHIFT_PAD} \
 --viz_on_checkpoint --viz_first_step ${VIZ_FIRST_STEP} --save_interval 10000 \
 --use_wandb --viz_grid_resolution 32 --viz_quiver_stride 2"
 

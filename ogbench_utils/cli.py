@@ -35,14 +35,14 @@ def build_train_parser() -> argparse.ArgumentParser:
     # SAC core (trimmed reasonable defaults)
     p.add_argument('--actor_learning_rate', type=float, default=3e-4)
     p.add_argument('--critic_learning_rate', type=float, default=3e-4)
-    p.add_argument('--batch_size', type=int, default=32768)
-    p.add_argument('--buffer_size', type=int, default=1024*50)
+    p.add_argument('--batch_size', type=int, default=1024)
+    p.add_argument('--buffer_size', type=int, default=1_000_000)
     p.add_argument('--gamma', type=float, default=0.99)
-    p.add_argument('--tau', type=float, default=0.005)
-    p.add_argument('--policy_frequency', type=int, default=2)
-    p.add_argument('--num_updates', type=int, default=2)
-    p.add_argument('--learning_starts', type=int, default=1000)
-    p.add_argument('--max_grad_norm', type=float, default=0.0)
+    p.add_argument('--tau', type=float, default=0.01)
+    p.add_argument('--policy_frequency', type=int, default=1)
+    p.add_argument('--num_updates', type=int, default=1)
+    p.add_argument('--learning_starts', type=int, default=10_000)
+    p.add_argument('--max_grad_norm', type=float, default=10.0)
     p.add_argument('--init_scale', type=float, default=0.01)
     p.add_argument('--actor_hidden_dim', type=int, default=512)
     p.add_argument('--critic_hidden_dim', type=int, default=1024)
@@ -69,9 +69,11 @@ def build_train_parser() -> argparse.ArgumentParser:
                    help='Comma-separated strides for each conv layer (defaults to 4,2,1)')
     p.add_argument('--pixel_final_pool', type=int, default=0,
                    help='If >0, apply AdaptiveAvgPool2d to this spatial size after conv stack')
+    p.add_argument('--pixel_random_shift_pad', type=int, default=4,
+                   help='Pad size for DrQ-style random shifts (set to 0 to disable)')
     p.add_argument('--alpha_min', type=float, default=0.0,
                    help='Minimum entropy temperature (alpha). Set to 0 to disable lower clamp.')
-    p.add_argument('--alpha_max', type=float, default=0.5,
+    p.add_argument('--alpha_max', type=float, default=1.0,
                    help='Maximum entropy temperature (alpha).')
     p.add_argument('--alpha_freeze_steps', type=int, default=0,
                    help='Disable alpha updates until this many env steps have elapsed (0 disables).')
