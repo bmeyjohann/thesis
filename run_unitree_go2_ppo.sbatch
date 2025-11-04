@@ -14,10 +14,25 @@ set -euo pipefail
 # Get the directory where this script is located (should be thesis root)
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT="${SCRIPT_DIR}"
+
+echo "=========================================="
+echo "DEBUG: Script location and paths"
+echo "SCRIPT_DIR: ${SCRIPT_DIR}"
+echo "REPO_ROOT: ${REPO_ROOT}"
+echo "Current directory before cd: $(pwd)"
+echo "=========================================="
+
 cd "${REPO_ROOT}"
+echo "Current directory after cd: $(pwd)"
+echo "Contents of REPO_ROOT:"
+ls -la "${REPO_ROOT}" | head -20
+echo "=========================================="
 
 # Create log directories
+echo "Creating directories: ${REPO_ROOT}/logs and ${REPO_ROOT}/wandb"
 mkdir -p logs wandb
+echo "Directory creation result: $?"
+echo "=========================================="
 
 # Environment setup matching the README
 export UNITREE_ROS_DIR="${UNITREE_ROS_DIR:-${REPO_ROOT}/unitree_ros/unitree_ros}"
