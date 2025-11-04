@@ -511,7 +511,13 @@ def initialize_logging_components(
     )
 
 
-def create_replay_buffer(args, device: torch.device, n_obs: int, n_act: int) -> SimpleReplayBuffer:
+def create_replay_buffer(
+    args,
+    device: torch.device,
+    n_obs: int,
+    n_act: int,
+    pixel_shape: Optional[Tuple[int, int, int]],
+) -> SimpleReplayBuffer:
     return SimpleReplayBuffer(
         n_env=args.num_envs,
         buffer_size=args.buffer_size,
@@ -523,6 +529,7 @@ def create_replay_buffer(args, device: torch.device, n_obs: int, n_act: int) -> 
         n_steps=1,
         gamma=args.gamma,
         device=device,
+        pixel_shape=pixel_shape if args.obs_mode == 'pixels' else None,
     )
 
 
@@ -876,7 +883,7 @@ def run_training_loop(
                 and total_env_steps >= args.reward_switch_after_steps
             ):
                 record_progress(f"[Replay] Resetting main replay buffer at step {total_env_steps}")
-                rb = create_replay_buffer(args, device, n_obs, envs.num_actions)
+                rb = create_replay_buffer(args, device, n_obs, envs.num_actions, pixel_shape)
                 did_reset_replay = True
                 next_learning_starts_at = total_env_steps + int(args.learning_starts)
                 record_progress(f"[Replay] Post-reset warm-up: learning resumes at env_step >= {next_learning_starts_at}")
@@ -1072,7 +1079,7 @@ def main():
         critic_obs_normalizer = critic_obs_normalizer_compiled
 
     buffers = initialize_buffers(args, device, n_obs, n_act, obs_normalizer)
-    replay_buffer = create_replay_buffer(args, device, n_obs, n_act)
+    replay_buffer = create_replay_buffer(args, device, n_obs, n_act, pixel_shape)
     updater = build_updater_from_components(
         args=args,
         device=device,
