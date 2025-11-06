@@ -1,14 +1,10 @@
 #!/bin/bash
 #SBATCH --job-name=unitree_go2_nav
 #SBATCH --account=<your_account>
-#SBATCH --partition=<your_partition>
-#SBATCH --qos=<optional_qos>
+#SBATCH --partition=booster
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
-#SBATCH --gres=gpu:1
-#SBATCH --mem=64G
-#SBATCH --time=24:00:00
+#SBATCH --time=02:00:00
 #SBATCH --output=logs/unitree_go2_nav_%j.out
 #SBATCH --error=logs/unitree_go2_nav_%j.err
 
