@@ -53,6 +53,111 @@ from ogbench_utils import (
 os.environ['SDL_VIDEO_CENTERED'] = '1'
 
 
+def select_device(device_arg: str) -> torch.device:
+    """Choose execution device, mirroring training entrypoint behavior."""
+    if device_arg == 'auto':
+        return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    return torch.device(device_arg)
+
+
+def _coerce_args_dict(raw: Any) -> dict[str, Any]:
+    """Normalize checkpoint args to a plain dict."""
+    if raw is None:
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    try:
+        return {k: v for k, v in vars(raw).items() if not k.startswith('_')}
+    except TypeError:
+        return {}
+
+
+_CLI_FLAG_ALIASES: dict[str, tuple[str, ...]] = {
+    'include_goal': ('--include_goal', '--no_include_goal'),
+    'include_distance': ('--include_distance',),
+    'include_direction': ('--include_direction',),
+    'include_velocity': ('--include_velocity',),
+    'reward_type': ('--reward_type',),
+    'dense_reward_scale': ('--dense_reward_scale',),
+    'step_penalty': ('--step_penalty',),
+    'reward_switch_after_steps': ('--reward_switch_after_steps',),
+    'tolerance_type': ('--tolerance_type',),
+    'tolerance_value': ('--tolerance_value',),
+    'hard_block_lethal': ('--hard_block_lethal', '--no_hard_block_lethal'),
+    'intervention_enable_after_steps': ('--intervention_enable_after_steps',),
+    'pixel_width': ('--pixel_width',),
+    'pixel_height': ('--pixel_height',),
+    'pixel_camera': ('--pixel_camera',),
+}
+
+
+def _cli_flag_provided(flags: tuple[str, ...]) -> bool:
+    argv = sys.argv[1:]
+    for flag in flags:
+        if flag in argv:
+            return True
+        prefix = flag + '='
+        for arg in argv:
+            if arg.startswith(prefix):
+                return True
+    return False
+
+
+def update_args_from_checkpoint(args, checkpoint: dict[str, Any]) -> dict[str, Any]:
+    """Populate evaluation args with metadata saved during training."""
+    ckpt_args = _coerce_args_dict(checkpoint.get('args'))
+    if not ckpt_args:
+        return ckpt_args
+
+    obs_mode_ckpt = ckpt_args.get('obs_mode', 'state')
+    if getattr(args, 'obs_mode', None) is None:
+        args.obs_mode = obs_mode_ckpt
+    elif args.obs_mode != obs_mode_ckpt:
+        print(f"⚠️ CLI obs_mode={args.obs_mode} overrides checkpoint obs_mode={obs_mode_ckpt}")
+
+    keys_to_sync = [
+        'include_goal',
+        'include_distance',
+        'include_direction',
+        'include_velocity',
+        'reward_type',
+        'dense_reward_scale',
+        'step_penalty',
+        'reward_switch_after_steps',
+        'teacher_type',
+        'tolerance_type',
+        'tolerance_value',
+        'hard_block_lethal',
+        'intervention_enable_after_steps',
+        'pixel_width',
+        'pixel_height',
+        'pixel_camera',
+        'pixel_conv_channels',
+        'pixel_kernel_sizes',
+        'pixel_strides',
+        'pixel_final_pool',
+    ]
+    for key in keys_to_sync:
+        if key not in ckpt_args or not hasattr(args, key):
+            continue
+        flags = _CLI_FLAG_ALIASES.get(key)
+        if flags and _cli_flag_provided(flags):
+            continue
+            setattr(args, key, ckpt_args[key])
+    # Intervention mode is opt-in for evaluation; only adopt checkpoint value if caller left it unspecified
+    if hasattr(args, 'intervention_mode') and 'intervention_mode' in ckpt_args:
+        current = getattr(args, 'intervention_mode', None)
+        if current in (None, 'auto'):
+            setattr(args, 'intervention_mode', ckpt_args['intervention_mode'])
+
+    pixel_shape = checkpoint.get('pixel_shape')
+    if pixel_shape is not None:
+        args.pixel_shape_from_checkpoint = tuple(int(v) for v in pixel_shape)
+    else:
+        args.pixel_shape_from_checkpoint = None
+    return ckpt_args
+
+
 def _canonical_pixel_shape(shape) -> tuple[int, int, int]:
     """Return pixel shape as (C, H, W)."""
     if shape is None:
@@ -394,6 +499,49 @@ except ImportError as e:
     print("Make sure RSL-RL is installed: pip install rsl_rl")
     sys.exit(1)
 
+
+def setup_environment(args: argparse.Namespace) -> tuple[gym.Env, Optional[MirrorEnvProcess]]:
+    """Construct the evaluation environment (and optional mirror renderer)."""
+    if args.headless:
+        args.render_mode = 'rgb_array'
+        args.mirror_human_render = False
+        os.environ.setdefault('SDL_VIDEODRIVER', 'dummy')
+
+    backend = args.policy_mujoco_gl
+    env = None
+    mirror = None
+    try:
+        mujoco_backend = None
+        if backend == 'auto':
+            wants_glfw = False
+            if not args.headless:
+                if args.obs_mode != 'pixels' and args.render_mode == 'human':
+                    wants_glfw = True
+                elif args.mirror_human_render:
+                    wants_glfw = True
+            mujoco_backend = 'glfw' if wants_glfw else 'egl'
+        else:
+            mujoco_backend = backend
+
+        with mujoco_gl_context(mujoco_backend):
+            env, render_mode = create_env(args.env_name, args)
+        args.render_mode = render_mode
+
+        if args.mirror_human_render and not args.headless and render_mode == 'rgb_array':
+            try:
+                mirror = MirrorEnvProcess(args.env_name, args, args.seed)
+            except Exception as exc:
+                print(f"⚠️ Mirror process unavailable: {exc}")
+                mirror = None
+        return env, mirror
+    except Exception:
+        if env is not None:
+            try:
+                env.close()
+            except Exception:
+                pass
+        raise
+
 def get_args():
     """Parse command line arguments."""
     return build_eval_parser().parse_args()
@@ -457,22 +605,39 @@ def _resolve_policy_type(args_policy_type: str, checkpoint: Dict[str, Any]) -> s
     return 'rsl-rl'
 
 
-def load_trained_policy(model_path: str, env, device: torch.device, args):
+def load_trained_policy(
+    model_path: str,
+    env,
+    device: torch.device,
+    args,
+    *,
+    checkpoint: Optional[dict[str, Any]] = None,
+):
     """Load a trained policy and return (policy, training_metadata)."""
     print(f"\n🔄 Loading model from: {model_path}")
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model file not found: {model_path}")
 
-    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+    if checkpoint is None:
+        checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
     print("✓ Checkpoint loaded")
 
     policy_type = _resolve_policy_type(args.policy_type, checkpoint)
     print(f"📦 Detected policy format: {policy_type}")
 
     training_info: Dict[str, Any] = {}
+    train_args = _coerce_args_dict(checkpoint.get('args'))
     obs_space = env.observation_space
     act_dim = env.action_space.shape[0]
-    obs_dim = int(np.prod(obs_space.shape))
+    if hasattr(obs_space, 'shape') and obs_space.shape is not None:
+        obs_dim = int(np.prod(obs_space.shape))
+    elif hasattr(obs_space, 'spaces'):
+        policy_space = obs_space.spaces.get('policy')
+        if policy_space is None:
+            policy_space = next(iter(obs_space.spaces.values()))
+        obs_dim = int(np.prod(policy_space.shape))
+    else:
+        raise RuntimeError(f"Unsupported observation space type: {type(obs_space)}")
 
     if policy_type == 'rsl-rl':
         dummy_obs = torch.zeros(1, obs_dim, device=device)
@@ -496,8 +661,8 @@ def load_trained_policy(model_path: str, env, device: torch.device, args):
     elif policy_type == 'fastsac':
         if not FASTSAC_AVAILABLE:
             raise ImportError("FastSAC components are unavailable; ensure 'fasttd3/fast_sac' is on PYTHONPATH or installed.")
-        actor_hidden = checkpoint.get('args', {}).get('actor_hidden_dim', 512)
-        init_scale = checkpoint.get('args', {}).get('init_scale', 0.01)
+        actor_hidden = train_args.get('actor_hidden_dim', 512)
+        init_scale = train_args.get('init_scale', 0.01)
         actor = Actor(
             n_obs=obs_dim,
             n_act=act_dim,
@@ -522,7 +687,6 @@ def load_trained_policy(model_path: str, env, device: torch.device, args):
     else:  # fastsac_v2
         if not FASTSAC_AVAILABLE:
             raise ImportError("FastSAC components are unavailable; ensure 'fasttd3/fast_sac' is on PYTHONPATH or installed.")
-        train_args = checkpoint.get('args', {}) or {}
         obs_mode = train_args.get('obs_mode', getattr(args, 'obs_mode', 'state'))
         arch_shared = train_args.get('arch_shared_trunk', False)
         actor_hidden = train_args.get('actor_hidden_dim', 512)
@@ -530,35 +694,73 @@ def load_trained_policy(model_path: str, env, device: torch.device, args):
         init_scale = train_args.get('init_scale', 0.01)
         feature_dim = shared_hidden if arch_shared else actor_hidden
         if obs_mode == 'pixels':
-            pixel_shape_raw = checkpoint.get('pixel_shape') or obs_space.shape
+            pixel_shape_raw = (
+                checkpoint.get('pixel_shape')
+                or getattr(args, 'pixel_shape_from_checkpoint', None)
+                or obs_space.shape
+            )
             pixel_shape = _canonical_pixel_shape(pixel_shape_raw)
-            conv_channels = (
-                _parse_int_tuple(train_args.get('pixel_conv_channels_parsed'))
-                or _parse_int_tuple(train_args.get('pixel_conv_channels'))
-                or (32, 64, 64)
-            )
-            kernel_sizes = (
-                _parse_int_tuple(train_args.get('pixel_kernel_sizes_parsed'))
-                or _parse_int_tuple(train_args.get('pixel_kernel_sizes'))
-                or (8, 4, 3)
-            )
-            strides = (
-                _parse_int_tuple(train_args.get('pixel_strides_parsed'))
-                or _parse_int_tuple(train_args.get('pixel_strides'))
-                or (4, 2, 1)
-            )
-            final_pool = (
-                _parse_optional_int(train_args.get('pixel_final_pool_parsed'))
-                or _parse_optional_int(train_args.get('pixel_final_pool'))
-            )
-            backbone = PixelBackbone(
-                pixel_shape,
-                feature_dim,
-                conv_channels=conv_channels,
-                kernel_sizes=kernel_sizes,
-                strides=strides,
-                final_pool=final_pool,
-            ).to(device)
+            backbone_state = checkpoint['actor_backbone']
+            conv_channels: list[int] = []
+            kernel_sizes: list[int] = []
+            layer_idx = 0
+            while True:
+                weight_key = f'conv.{2 * layer_idx}.weight'
+                if weight_key not in backbone_state:
+                    break
+                weight = backbone_state[weight_key]
+                conv_channels.append(int(weight.shape[0]))
+                kernel_sizes.append(int(weight.shape[2]))
+                layer_idx += 1
+            if not conv_channels:
+                raise RuntimeError("Checkpoint missing convolutional layers for pixel backbone")
+            stride_values = _parse_int_tuple(train_args.get('pixel_strides')) or (4, 2, 1)
+            stride_list = list(stride_values)
+            if not stride_list:
+                stride_list = [1]
+            if len(stride_list) < len(conv_channels):
+                stride_list.extend([stride_list[-1]] * (len(conv_channels) - len(stride_list)))
+            strides = tuple(stride_list[: len(conv_channels)])
+            fc_in_features = backbone_state['fc.0.weight'].shape[1]
+            pool_sources = [
+                train_args.get('pixel_final_pool_parsed'),
+                train_args.get('pixel_final_pool'),
+                getattr(args, 'pixel_final_pool', None),
+                getattr(args, 'pixel_final_pool_parsed', None),
+            ]
+            pool_candidates: list[int | None] = []
+            for source in pool_sources:
+                parsed = _parse_optional_int(source)
+                if parsed is not None and parsed > 0:
+                    pool_candidates.append(parsed)
+            pool_candidates.extend([None, 2, 4, 8])
+            chosen_backbone = None
+            chosen_pool: int | None = None
+            for pool_candidate in pool_candidates:
+                pool_value = pool_candidate if pool_candidate and pool_candidate > 0 else None
+                candidate = PixelBackbone(
+                    pixel_shape,
+                    feature_dim,
+                    conv_channels=conv_channels,
+                    kernel_sizes=kernel_sizes,
+                    strides=strides,
+                    final_pool=pool_value,
+                )
+                flat_dim = candidate.fc[0].weight.shape[1]
+                if flat_dim == fc_in_features:
+                    chosen_backbone = candidate.to(device)
+                    chosen_pool = pool_value
+                    break
+            if chosen_backbone is None:
+                raise RuntimeError(
+                    f"Unable to reconstruct pixel backbone (expected fc in-features {fc_in_features}); "
+                    "pass --pixel_final_pool to disambiguate."
+                )
+            backbone = chosen_backbone
+            final_pool = chosen_pool
+            conv_channels = tuple(conv_channels)
+            kernel_sizes = tuple(kernel_sizes)
+            strides = tuple(strides)
             obs_normalizer = PixelNormalizer().to(device)
         else:
             pixel_shape = None
@@ -703,6 +905,76 @@ def _format_policy_observation(obs, policy, device):
         pixel_shape=pixel_shape,
         flatten=True,
     )
+
+
+def run_headless_evaluation(policy, env, args, device):
+    """Minimal evaluation loop without pygame for automated tests."""
+    print("\n🧪 Running headless evaluation")
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+
+    target_episodes = args.num_episodes if args.num_episodes and args.num_episodes > 0 else 1
+    max_steps = args.max_episode_steps
+    episode_rewards: list[float] = []
+    episode_lengths: list[int] = []
+
+    for episode_idx in range(target_episodes):
+        obs, info = env.reset(seed=args.seed + episode_idx)
+        done = False
+        ep_reward = 0.0
+        steps = 0
+        while not done and steps < max_steps:
+            obs_tensor = _format_policy_observation(obs, policy, device)
+            obs_dict = TensorDict({"policy": obs_tensor}, batch_size=[obs_tensor.shape[0]], device=device)
+            with torch.no_grad():
+                actions = policy.act(obs_dict, deterministic=True)
+            action = actions.cpu().numpy()[0]
+            if args.action_scale != 1.0:
+                action *= args.action_scale
+            if args.clip_actions:
+                action = np.clip(action, -1.0, 1.0)
+            obs, reward, terminated, truncated, info = env.step(action)
+            ep_reward += float(reward)
+            steps += 1
+            done = bool(terminated or truncated)
+
+        episode_rewards.append(ep_reward)
+        episode_lengths.append(steps)
+        print(f"   Episode {episode_idx + 1}: reward={ep_reward:.3f} len={steps}")
+
+    if episode_rewards:
+        avg_reward = float(np.mean(episode_rewards))
+        avg_length = float(np.mean(episode_lengths))
+        print(
+            f"\n📊 Headless summary over {len(episode_rewards)} episode(s): "
+            f"avg_reward={avg_reward:.3f} avg_len={avg_length:.1f}"
+        )
+    print("✅ Headless evaluation completed")
+
+
+def _evaluate_goal_reached(info: Any, *, distance_epsilon: float) -> tuple[bool, Optional[float]]:
+    """Determine whether goal was reached using wrapper metadata."""
+    def _iter_infos(entry: Any):
+        if isinstance(entry, dict):
+            yield entry
+            nested = entry.get('final_info')
+            if isinstance(nested, dict):
+                yield nested
+
+    goal_flag = False
+    distance = None
+    for entry in _iter_infos(info):
+        if not goal_flag and 'goal_reached' in entry:
+            goal_flag = bool(entry['goal_reached'])
+        if distance is None and 'distance_to_goal' in entry:
+            try:
+                distance = float(entry['distance_to_goal'])
+            except (TypeError, ValueError):
+                distance = None
+    if not goal_flag and distance is not None and distance <= distance_epsilon:
+        goal_flag = True
+    return goal_flag, distance
+
 
 def run_interactive_evaluation(policy, env, args, device, mirror: MirrorEnvProcess | None):
     """Run interactive evaluation loop."""
@@ -869,10 +1141,14 @@ def run_interactive_evaluation(policy, env, args, device, mirror: MirrorEnvProce
                 print(f"   Worst Reward: {min(episode_rewards):8.3f}")
                 print(f"   Reward Std: {np.std(episode_rewards):8.3f}")
             
-            # Goal achievement check (sparse reward > 0 indicates goal reached)
-            goal_reached = reward > 0 or episode_reward > 0.5  # Adjust threshold as needed
+            goal_reached, distance_to_goal = _evaluate_goal_reached(info, distance_epsilon=args.success_distance_epsilon)
             if goal_reached:
-                print(f"🎯 GOAL REACHED! 🎉")
+                if distance_to_goal is not None:
+                    print(f"🎯 GOAL REACHED! 🎉 (distance={distance_to_goal:.3f})")
+                else:
+                    print("🎯 GOAL REACHED! 🎉")
+            elif distance_to_goal is not None:
+                print(f"   Final distance to goal: {distance_to_goal:.3f}")
             
             # If teacher metrics available, print summary
             if isinstance(info, dict) and 'teacher_num_interventions' in info:
@@ -936,14 +1212,24 @@ def main():
     env: Optional[gym.Env] = None
     mirror: Optional[MirrorEnvProcess] = None
     try:
-        update_args_from_checkpoint(args)
+        checkpoint = torch.load(args.model_path, map_location='cpu')
+        ckpt_args = update_args_from_checkpoint(args, checkpoint)
         env, mirror = setup_environment(args)
-        policy, training_info = load_trained_policy(args.model_path, env, device, args)
+        policy, training_info = load_trained_policy(
+            args.model_path,
+            env,
+            device,
+            args,
+            checkpoint=checkpoint,
+        )
         if training_info:
             print("Training info:")
             for key, value in training_info.items():
                 print(f"   {key}: {value}")
-        run_interactive_evaluation(policy, env, args, device, mirror=mirror)
+        if args.headless:
+            run_headless_evaluation(policy, env, args, device)
+        else:
+            run_interactive_evaluation(policy, env, args, device, mirror=mirror)
     except Exception as exc:
         print(f"❌ Evaluation failed: {exc}")
         import traceback
@@ -961,7 +1247,8 @@ def main():
                 mirror.close()
             except Exception:
                 pass
-        pygame.quit()
+        if not args.headless and pygame.get_init():
+            pygame.quit()
 
     return 0
 

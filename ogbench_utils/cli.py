@@ -190,6 +190,8 @@ def build_eval_parser() -> argparse.ArgumentParser:
                         help='Target FPS for rendering')
     
     # Observation configuration (match training)
+    parser.add_argument('--obs_mode', type=str, default=None, choices=['state', 'pixels'],
+                        help='Observation mode override (defaults to checkpoint metadata)')
     parser.add_argument('--include_goal', dest='include_goal', action='store_true', default=True,
                         help='Include goal coordinates in observations')
     parser.add_argument('--no_include_goal', dest='include_goal', action='store_false',
@@ -236,6 +238,8 @@ def build_eval_parser() -> argparse.ArgumentParser:
                         help='Random seed')
     parser.add_argument('--print_interventions', action='store_true', default=True,
                         help='Print when the teacher intervenes and why')
+    parser.add_argument('--success_distance_epsilon', type=float, default=0.05,
+                        help='Distance threshold (in env units) to count a terminal state as goal reached')
 
     # Intervention / Teleop
     parser.add_argument('--intervention_mode', type=str, default='none',
@@ -258,5 +262,7 @@ def build_eval_parser() -> argparse.ArgumentParser:
                         help='Action scaling factor (should match training)')
     parser.add_argument('--clip_actions', action='store_true', default=True,
                         help='Clip actions to [-1, 1] (should match training)')
+    parser.add_argument('--headless', action='store_true', default=False,
+                        help='Run evaluation without pygame windows (forces rgb_array render)')
     
     return parser

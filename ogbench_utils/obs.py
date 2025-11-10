@@ -97,7 +97,9 @@ def _to_tensor(obs_input: Any, *, device: torch.device) -> torch.Tensor:
         tensor = torch.from_numpy(data)
     else:
         tensor = torch.as_tensor(data)
-    if tensor.ndim == 3:
+    if tensor.ndim == 1:
+        tensor = tensor.unsqueeze(0)
+    elif tensor.ndim == 3:
         tensor = tensor.unsqueeze(0)
     return tensor.to(device)
 
