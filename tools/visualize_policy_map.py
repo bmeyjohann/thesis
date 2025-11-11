@@ -124,13 +124,40 @@ class PixelNormalizer(nn.Module):
 
 
 class DrQPixelPreprocessor(nn.Module):
+    def __init__(self, target_channels: int):
+        super().__init__()
+        self.target_channels = int(target_channels)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dim() == 4 and x.shape[1] not in (1, 3, 4):
-            x = x.permute(0, 3, 1, 2)
+        if x.dim() == 3:
+            x = x.unsqueeze(0)
+        if x.dim() != 4:
+            raise ValueError(f"Expected 3D/4D tensor for pixel observations, got shape={tuple(x.shape)}")
+        valid_channels = {self.target_channels, 3, 4, 1}
+        if x.shape[1] not in valid_channels:
+            # Try to locate a channel axis among spatial dims (2 or 3)
+            promoted = False
+            for candidate in (self.target_channels, 3, 4, 1):
+                for axis in (1, 2, 3):
+                    if x.shape[axis] == candidate:
+                        if axis != 1:
+                            axes = [0, axis] + [i for i in range(1, 4) if i != axis]
+                            x = x.permute(*axes)
+                        promoted = True
+                        break
+                if promoted:
+                    break
+            if not promoted:
+                x = x.permute(0, 3, 1, 2)
         if x.dtype != torch.float32:
             x = x.float()
         if torch.max(x) <= 1.0:
             x = x * 255.0
+        if x.shape[1] != self.target_channels:
+            if self.target_channels % x.shape[1] != 0:
+                raise ValueError(f"Cannot broadcast pixels with {x.shape[1]} channels to {self.target_channels} (tensor shape={tuple(x.shape)})")
+            repeat = self.target_channels // x.shape[1]
+            x = x.repeat(1, repeat, 1, 1)
         return x
 
 
@@ -400,7 +427,7 @@ def build_networks(ckpt: dict, device: torch.device, policy_type: str):
         critic.load_state_dict(ckpt['drq_critic'])
         critic.eval()
 
-        preproc = DrQPixelPreprocessor().to(device)
+        preproc = DrQPixelPreprocessor(pixel_shape[0]).to(device)
         actor_wrapper = DrQActorWrapper(encoder, actor, eval_std, preproc)
         critic_wrapper = DrQCriticWrapper(encoder, critic, preproc)
         return actor_wrapper, critic_wrapper, preproc, args

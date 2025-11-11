@@ -32,6 +32,9 @@ FRAME_STACK=${FRAME_STACK:-3}
 ACTION_REPEAT=${ACTION_REPEAT:-2}
 FEATURE_DIM=${FEATURE_DIM:-50}
 HIDDEN_DIM=${HIDDEN_DIM:-1024}
+VIZ_FIRST_STEP=${VIZ_FIRST_STEP:-0}
+VIZ_GRID_RES=${VIZ_GRID_RES:-32}
+VIZ_QUIVER_STRIDE=${VIZ_QUIVER_STRIDE:-2}
 
 BASE_ARGS="--obs_mode pixels --pixel_width 84 --pixel_height 84 \
 --total_timesteps ${TOTAL_STEPS} --learning_rate ${LEARNING_RATE} \
@@ -39,7 +42,8 @@ BASE_ARGS="--obs_mode pixels --pixel_width 84 --pixel_height 84 \
 --eval_every_frames ${EVAL_EVERY} --project ${PROJECT} \
 --frame_stack ${FRAME_STACK} --action_repeat ${ACTION_REPEAT} \
 --drq_feature_dim ${FEATURE_DIM} --drq_hidden_dim ${HIDDEN_DIM} \
---use_wandb --viz_on_checkpoint --viz_first_step ${SAVE_INTERVAL}"
+--use_wandb --viz_on_checkpoint --viz_first_step ${VIZ_FIRST_STEP} \
+--viz_grid_resolution ${VIZ_GRID_RES} --viz_quiver_stride ${VIZ_QUIVER_STRIDE}"
 
 echo "Launching DrQ-v2 visual arena (${ENV_A}) and danger (${ENV_B}) runs"
 

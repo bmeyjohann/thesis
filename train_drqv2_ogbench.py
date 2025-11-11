@@ -75,7 +75,7 @@ def build_arg_parser():
         dense_reward_scale=1.0,
         batch_size=512,
         save_interval=50_000,
-        viz_first_step=50_000,
+        viz_first_step=0,
     )
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--action_repeat", type=int, default=2)
@@ -310,10 +310,10 @@ class DrQCheckpointManager:
         self.paths.record_progress(f"[Checkpoint] saved {save_path}")
         return save_path
 
-    def maybe_render_policy_map(self, *, checkpoint_path: Path, step_value: int) -> None:
+    def maybe_render_policy_map(self, *, checkpoint_path: Path, step_value: int, force: bool = False) -> None:
         if not self.args.viz_on_checkpoint or generate_policy_map is None:
             return
-        if self.args.viz_first_step and step_value < self.args.viz_first_step:
+        if (self.args.viz_first_step and step_value < self.args.viz_first_step) and not force:
             return
         try:
             generate_policy_map(
@@ -575,6 +575,9 @@ def train():
     action_spec = train_env.action_spec()
     obs_shape = obs_spec.shape
     action_shape = action_spec.shape
+    if len(obs_shape) != 3:
+        raise ValueError(f"DrQ-v2 trainer expects 3D pixel observations, got shape {obs_shape}")
+    pixel_shape_tuple = tuple(int(x) for x in obs_shape)
     agent = DrQV2Agent(
         obs_shape=obs_shape,
         action_shape=action_shape,
@@ -612,10 +615,19 @@ def train():
         nstep=args.nstep,
         discount=args.discount,
     )
-    replay_iter = iter(replay_loader)
+    replay_iter = None
 
     time_step = train_env.reset()
     replay_storage.add(time_step)
+
+    initial_ckpt = checkpoint_mgr.save(
+        tag="step0",
+        step_value=0,
+        agent=agent,
+        pixel_shape=pixel_shape_tuple,
+        action_shape=action_shape,
+    )
+    checkpoint_mgr.maybe_render_policy_map(checkpoint_path=initial_ckpt, step_value=0, force=True)
 
     total_env_steps = 0
     episode_reward = 0.0
@@ -649,7 +661,15 @@ def train():
         time_step = next_time_step
 
         if total_env_steps >= args.num_expl_steps:
-            metrics = agent.update(replay_iter, total_env_steps)
+            if replay_storage.num_episodes() == 0:
+                continue
+            if replay_iter is None:
+                replay_iter = iter(replay_loader)
+            try:
+                metrics = agent.update(replay_iter, total_env_steps)
+            except StopIteration:
+                replay_iter = iter(replay_loader)
+                metrics = agent.update(replay_iter, total_env_steps)
             if metrics:
                 for key, value in metrics.items():
                     metrics_accum[key] = metrics_accum.get(key, 0.0) + float(value)
@@ -674,7 +694,7 @@ def train():
                 tag=f"step{total_env_steps}",
                 step_value=total_env_steps,
                 agent=agent,
-                pixel_shape=(obs_shape[0], obs_shape[1], obs_shape[2]),
+                pixel_shape=pixel_shape_tuple,
                 action_shape=action_shape,
             )
             checkpoint_mgr.maybe_render_policy_map(checkpoint_path=ckpt, step_value=total_env_steps)
@@ -700,7 +720,7 @@ def train():
         tag="final",
         step_value=total_env_steps,
         agent=agent,
-        pixel_shape=(obs_shape[0], obs_shape[1], obs_shape[2]),
+        pixel_shape=pixel_shape_tuple,
         action_shape=action_shape,
     )
     checkpoint_mgr.maybe_render_policy_map(checkpoint_path=final_ckpt, step_value=total_env_steps)
