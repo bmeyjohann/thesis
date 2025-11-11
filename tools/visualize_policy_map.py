@@ -27,6 +27,7 @@ if str(FAST_SAC_PATH) not in sys.path:
 
 from fast_sac import Actor, Critic  # type: ignore  # noqa: E402
 from fast_sac_utils import EmpiricalNormalization  # type: ignore  # noqa: E402
+from drqv2.drqv2 import Encoder as DrQEncoder, Actor as DrQActor, Critic as DrQCritic  # type: ignore  # noqa: E402
 from ogbench.wrappers import FlexibleObsWrapper  # type: ignore  # noqa: E402
 
 
@@ -120,6 +121,57 @@ class PixelNormalizer(nn.Module):
         if torch.max(x) > 1.0:
             x = x / 255.0
         return x
+
+
+class DrQPixelPreprocessor(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 4 and x.shape[1] not in (1, 3, 4):
+            x = x.permute(0, 3, 1, 2)
+        if x.dtype != torch.float32:
+            x = x.float()
+        if torch.max(x) <= 1.0:
+            x = x * 255.0
+        return x
+
+
+class DrQActorWrapper(nn.Module):
+    def __init__(self, encoder: DrQEncoder, actor: DrQActor, eval_std: float, preproc: nn.Module):
+        super().__init__()
+        self.encoder = encoder
+        self.actor = actor
+        self.eval_std = float(eval_std)
+        self.preproc = preproc
+
+    def eval(self):
+        self.encoder.eval()
+        self.actor.eval()
+
+    def forward(self, obs: torch.Tensor):
+        obs_proc = self.preproc(obs)
+        repr_obs = self.encoder(obs_proc)
+        std = torch.as_tensor(self.eval_std, device=obs_proc.device)
+        dist = self.actor(repr_obs, std)
+        mean = dist.mean
+        dummy_log = torch.zeros(mean.shape[0], 1, device=mean.device)
+        return mean, dummy_log, mean
+
+
+class DrQCriticWrapper(nn.Module):
+    def __init__(self, encoder: DrQEncoder, critic: DrQCritic, preproc: nn.Module):
+        super().__init__()
+        self.encoder = encoder
+        self.critic = critic
+        self.preproc = preproc
+
+    def eval(self):
+        self.encoder.eval()
+        self.critic.eval()
+
+    def forward(self, obs: torch.Tensor, actions: torch.Tensor):
+        obs_proc = self.preproc(obs)
+        repr_obs = self.encoder(obs_proc)
+        q1, q2 = self.critic(repr_obs, actions)
+        return [q1, q2]
 
 
 class GaussianPolicyHead(nn.Module):
@@ -278,6 +330,8 @@ def parse_args() -> argparse.Namespace:
 
 def load_checkpoint(model_path: Path, device: torch.device):
     ckpt = torch.load(model_path, map_location=device)
+    if 'drq_encoder' in ckpt:
+        return ckpt, 'drqv2'
     if 'actor_backbone' in ckpt:
         return ckpt, 'fastsac_v2'
     required = {"actor_state_dict", "qnet_state_dict", "obs_normalizer_state", "args"}
@@ -318,6 +372,38 @@ def build_networks(ckpt: dict, device: torch.device, policy_type: str):
         obs_norm.eval()
 
         return actor, critic, obs_norm, args
+
+    if policy_type == 'drqv2':
+        pixel_shape = ckpt.get('pixel_shape') or args.get('pixel_shape')
+        if pixel_shape is None:
+            raise ValueError("DrQ checkpoint missing pixel_shape metadata")
+        pixel_shape = tuple(int(x) for x in pixel_shape)
+        if len(pixel_shape) != 3:
+            raise ValueError(f"Unexpected pixel_shape for DrQ checkpoint: {pixel_shape}")
+        action_shape = ckpt.get('action_shape') or args.get('action_shape')
+        if action_shape is None:
+            raise ValueError("DrQ checkpoint missing action_shape metadata")
+        action_shape = tuple(int(x) for x in action_shape)
+        feature_dim = args.get('drq_feature_dim', 50)
+        hidden_dim = args.get('drq_hidden_dim', 1024)
+        eval_std = float(args.get('viz_eval_std', 0.0))
+
+        encoder = DrQEncoder(pixel_shape).to(device)
+        encoder.load_state_dict(ckpt['drq_encoder'])
+        encoder.eval()
+
+        actor = DrQActor(encoder.repr_dim, action_shape, feature_dim, hidden_dim).to(device)
+        actor.load_state_dict(ckpt['drq_actor'])
+        actor.eval()
+
+        critic = DrQCritic(encoder.repr_dim, action_shape, feature_dim, hidden_dim).to(device)
+        critic.load_state_dict(ckpt['drq_critic'])
+        critic.eval()
+
+        preproc = DrQPixelPreprocessor().to(device)
+        actor_wrapper = DrQActorWrapper(encoder, actor, eval_std, preproc)
+        critic_wrapper = DrQCriticWrapper(encoder, critic, preproc)
+        return actor_wrapper, critic_wrapper, preproc, args
 
     obs_mode = args.get('obs_mode', 'state')
     if obs_mode == 'pixels':

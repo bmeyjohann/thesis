@@ -20,3 +20,6 @@
 	path = safe-locomotion
 	url = git@gitlab.kit.edu:uvxur/safe-locomotion.git
 	branch = fb_navigation
+[submodule "drqv2"]
+	path = drqv2
+	url = git@github.com:bmeyjohann/drqv2.git
