@@ -17,6 +17,9 @@ cd sc_venv_template
 source activate.sh
 cd ..
 
+export MPLCONFIGDIR="${TMPDIR:-/tmp}/mplcache_${SLURM_JOB_ID}"
+mkdir -p "${MPLCONFIGDIR}"
+
 ENV_A=${ENV_A:-visual-pointmaze-arena-v0}
 ENV_B=${ENV_B:-visual-pointmaze-arena-danger-lethal-v0}
 TOTAL_STEPS=${TOTAL_STEPS:-800000}
