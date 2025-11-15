@@ -108,6 +108,19 @@ def build_arg_parser():
                         help="Override total timesteps for very short smoke tests (0 disables override)")
     return parser
 
+def clip_action_l2(actions: np.ndarray, max_norm: float = 1.0) -> np.ndarray:
+    if not isinstance(actions, np.ndarray):
+        actions = np.asarray(actions, dtype=np.float32)
+    if actions.ndim == 1:
+        norm = np.linalg.norm(actions)
+        if norm > max_norm and norm > 0:
+            actions = actions / norm
+        return actions
+    norms = np.linalg.norm(actions, axis=-1, keepdims=True)
+    mask = norms > max_norm
+    result = actions.copy()
+    result[mask & (norms > 0)] = result[mask & (norms > 0)] / norms[mask & (norms > 0)]
+    return result
 
 def parse_args():
     parser = build_arg_parser()
@@ -289,9 +302,10 @@ def prepare_run_dirs(args) -> RunPaths:
 
 
 class DrQCheckpointManager:
-    def __init__(self, *, args, run_paths: RunPaths):
+    def __init__(self, *, args, run_paths: RunPaths, logger: DrQLogger | None):
         self.args = args
         self.paths = run_paths
+        self.logger = logger
 
     def save(self, *, tag: str, step_value: int, agent: DrQV2Agent, pixel_shape: Tuple[int, int, int], action_shape: Tuple[int, ...]) -> Path:
         save_path = self.paths.model_dir / f"{self.args.exp_name}_{tag}.pt"
@@ -316,7 +330,7 @@ class DrQCheckpointManager:
         if (self.args.viz_first_step and step_value < self.args.viz_first_step) and not force:
             return
         try:
-            generate_policy_map(
+            png_path, _, _ = generate_policy_map(
                 model_path=checkpoint_path,
                 output_dir=self.paths.policy_map_dir,
                 tag=f"{step_value}",
@@ -328,6 +342,8 @@ class DrQCheckpointManager:
                 cache_path=self.paths.policy_cache_path,
             )
             self.paths.record_progress(f"[Viz] generated policy map for step {step_value}")
+            if self.logger is not None:
+                self.logger.log_policy_map(image_path=png_path, step=step_value)
         except Exception as exc:  # pragma: no cover - viz is best-effort
             self.paths.record_progress(f"[Viz] failed at step {step_value}: {exc}")
 
@@ -341,6 +357,7 @@ class DrQLogger:
         self.start_time = time.perf_counter()
         self.last_log_time = self.start_time
         self.wandb_run = None
+        self._env_metric_accum: Dict[str, Dict[str, float]] = {}
 
     def maybe_log(
         self,
@@ -398,6 +415,8 @@ class DrQLogger:
         for thr, pct in teacher_snapshot.threshold_percentages.items():
             logs[f"/Teacher/frac_interventions_dis_ge_{thr}"] = pct
 
+        self._flush_env_metrics(logs)
+
         msg_parts = [
             f"env_steps {total_env_steps}/{total_timesteps}",
             f"fps {int(fps)}",
@@ -408,19 +427,7 @@ class DrQLogger:
             msg_parts.append(f"len {logs['Train/episode_length_mean']:.1f}")
         self.record_progress("[DrQ] " + " | ".join(msg_parts))
 
-        if self.args.use_wandb:
-            import wandb  # type: ignore
-
-            if self.wandb_run is None:
-                self.wandb_run = wandb.init(
-                    project=self.args.project,
-                    name=self.args.exp_name,
-                    id=self.args.exp_name,
-                    config=vars(self.args),
-                    reinit=True,
-                    resume="allow",
-                )
-            self.wandb_run.log(logs, step=total_env_steps)
+        self._log_to_wandb(logs, step=total_env_steps)
 
         self.teacher_metrics.reset_after_log()
         self.last_log_time = now
@@ -434,8 +441,70 @@ class DrQLogger:
             "Eval/episode_length": length,
         }
         self.record_progress(f"[Eval] steps={total_env_steps} reward={reward:.2f} length={length:.1f}")
-        if self.args.use_wandb and self.wandb_run is not None:
-            self.wandb_run.log(payload, step=total_env_steps)
+        self._log_to_wandb(payload, step=total_env_steps)
+
+    def log_policy_map(self, *, image_path: Path, step: int) -> None:
+        if not self.args.use_wandb:
+            return
+        run = self._ensure_wandb_run()
+        if run is None:
+            return
+        import wandb  # type: ignore
+
+        run.log(
+            {
+                "viz/policy_map": wandb.Image(str(image_path), caption=f"policy_map_step_{step}"),
+            },
+            step=step,
+        )
+
+    def accumulate_env_metrics(self, infos) -> None:
+        log_dict = None
+        if isinstance(infos, dict):
+            log_dict = infos.get("log")
+        if not isinstance(log_dict, dict):
+            return
+        for key, value in log_dict.items():
+            try:
+                tensor = value
+                if hasattr(tensor, "float"):
+                    tensor = tensor.float()
+                metric_value = float(torch.as_tensor(tensor).mean().item())
+            except Exception:
+                continue
+            slot = self._env_metric_accum.setdefault(key, {"sum": 0.0, "count": 0})
+            slot["sum"] += metric_value
+            slot["count"] += 1
+
+    def _flush_env_metrics(self, logs: Dict[str, float]) -> None:
+        if not self._env_metric_accum:
+            return
+        for key, data in self._env_metric_accum.items():
+            if data["count"] > 0:
+                logs[key] = data["sum"] / data["count"]
+        self._env_metric_accum.clear()
+
+    def _ensure_wandb_run(self):
+        if not self.args.use_wandb:
+            return None
+        if self.wandb_run is not None:
+            return self.wandb_run
+        import wandb  # type: ignore
+
+        self.wandb_run = wandb.init(
+            project=self.args.project,
+            name=self.args.exp_name,
+            id=self.args.exp_name,
+            config=vars(self.args),
+            reinit=True,
+            resume="allow",
+        )
+        return self.wandb_run
+
+    def _log_to_wandb(self, payload: Dict[str, float], *, step: int) -> None:
+        run = self._ensure_wandb_run()
+        if run is not None:
+            run.log(payload, step=step)
 
     def finish(self):
         if self.wandb_run is not None:
@@ -596,7 +665,7 @@ def train():
     run_paths = prepare_run_dirs(args)
     teacher_metrics = build_teacher_metrics(args, device)
     logger = DrQLogger(args=args, record_progress=run_paths.record_progress, teacher_metrics=teacher_metrics)
-    checkpoint_mgr = DrQCheckpointManager(args=args, run_paths=run_paths)
+    checkpoint_mgr = DrQCheckpointManager(args=args, run_paths=run_paths, logger=logger)
 
     data_specs = (
         train_env.observation_spec(),
@@ -651,8 +720,10 @@ def train():
         obs = time_step.observation
         with torch.no_grad(), utils.eval_mode(agent):
             action = agent.act(obs, step=total_env_steps, eval_mode=False)
+        action = clip_action_l2(action)
         next_time_step = train_env.step(action)
         info = getattr(train_env, "last_info", lambda: {})() or {}
+        logger.accumulate_env_metrics(info)
         replay_storage.add(next_time_step)
 
         episode_reward += float(next_time_step.reward)
