@@ -15,6 +15,7 @@ import os
 import sys
 import json
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -157,15 +158,50 @@ class OGBenchPixelsEnv(dm_env.Environment):
         width: int,
         height: int,
         camera_name: Optional[str],
+        pixel_camera_mode: str,
+        pixel_local_view_size: float,
+        pixel_local_camera_height: Optional[float],
+        pixel_first_person_distance: float,
+        pixel_first_person_height: float,
+        pixel_first_person_lookahead: float,
+        pixel_first_person_pitch: float,
         seed: int,
     ):
-        base_env = gym.make(
-            env_name,
+        env_kwargs = dict(
             render_mode="rgb_array",
             width=width,
             height=height,
             camera_name=camera_name,
+            pixel_camera_mode=pixel_camera_mode,
+            pixel_local_view_size=pixel_local_view_size,
+            pixel_local_camera_height=pixel_local_camera_height,
+            pixel_first_person_distance=pixel_first_person_distance,
+            pixel_first_person_height=pixel_first_person_height,
+            pixel_first_person_lookahead=pixel_first_person_lookahead,
+            pixel_first_person_pitch=pixel_first_person_pitch,
         )
+        try:
+            base_env = gym.make(env_name, **env_kwargs)
+        except TypeError as exc:
+            # Fallback for environments that don't yet support the new kwargs.
+            drop_keys = [
+                'pixel_camera_mode',
+                'pixel_local_view_size',
+                'pixel_local_camera_height',
+                'pixel_first_person_distance',
+                'pixel_first_person_height',
+                'pixel_first_person_lookahead',
+                'pixel_first_person_pitch',
+            ]
+            if any(key in str(exc) for key in drop_keys):
+                for key in drop_keys:
+                    env_kwargs.pop(key, None)
+                warnings.warn(
+                    f"{env_name} does not accept pixel camera kwargs; falling back to default camera behaviour."
+                )
+                base_env = gym.make(env_name, **env_kwargs)
+            else:
+                raise
         for wrap in wrappers:
             base_env = wrap(base_env)
         self._env = base_env
@@ -576,6 +612,13 @@ def build_env(args, wrappers, seed: int) -> dm_env.Environment:
         width=int(args.pixel_width),
         height=int(args.pixel_height),
         camera_name=args.pixel_camera,
+        pixel_camera_mode=args.pixel_camera_mode,
+        pixel_local_view_size=float(args.pixel_local_view_size),
+        pixel_local_camera_height=args.pixel_local_camera_height,
+        pixel_first_person_distance=float(args.pixel_first_person_distance),
+        pixel_first_person_height=float(args.pixel_first_person_height),
+        pixel_first_person_lookahead=float(args.pixel_first_person_lookahead),
+        pixel_first_person_pitch=float(args.pixel_first_person_pitch),
         seed=seed,
     )
     return env

@@ -251,6 +251,14 @@ def build_environment(
             env_kwargs['height'] = int(args.pixel_height)
         if args.pixel_camera:
             env_kwargs['camera_name'] = args.pixel_camera
+        else:
+            env_kwargs['pixel_camera_mode'] = args.pixel_camera_mode
+            env_kwargs['pixel_local_view_size'] = args.pixel_local_view_size
+            env_kwargs['pixel_local_camera_height'] = args.pixel_local_camera_height
+            env_kwargs['pixel_first_person_distance'] = args.pixel_first_person_distance
+            env_kwargs['pixel_first_person_height'] = args.pixel_first_person_height
+            env_kwargs['pixel_first_person_lookahead'] = args.pixel_first_person_lookahead
+            env_kwargs['pixel_first_person_pitch'] = args.pixel_first_person_pitch
     record_progress("[Init] constructing vector env adapter")
     envs = OGBenchVecEnvAdapter(
         env_name=args.env_name,

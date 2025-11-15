@@ -27,8 +27,11 @@ Controls:
 import os
 import sys
 import argparse
+import math
+import time
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import gymnasium as gym
 import pygame
@@ -51,6 +54,11 @@ from ogbench_utils import (
 
 # Fix WSL window positioning issues  
 os.environ['SDL_VIDEO_CENTERED'] = '1'
+
+# Ensure DRQv2 package is importable
+DRQV2_PATH = Path(__file__).resolve().parent / "drqv2"
+if DRQV2_PATH.exists():
+    sys.path.append(str(DRQV2_PATH))
 
 
 def select_device(device_arg: str) -> torch.device:
@@ -88,6 +96,13 @@ _CLI_FLAG_ALIASES: dict[str, tuple[str, ...]] = {
     'pixel_width': ('--pixel_width',),
     'pixel_height': ('--pixel_height',),
     'pixel_camera': ('--pixel_camera',),
+    'pixel_camera_mode': ('--pixel_camera_mode',),
+    'pixel_local_view_size': ('--pixel_local_view_size',),
+    'pixel_local_camera_height': ('--pixel_local_camera_height',),
+    'pixel_first_person_distance': ('--pixel_first_person_distance',),
+    'pixel_first_person_height': ('--pixel_first_person_height',),
+    'pixel_first_person_lookahead': ('--pixel_first_person_lookahead',),
+    'pixel_first_person_pitch': ('--pixel_first_person_pitch',),
 }
 
 
@@ -136,6 +151,13 @@ def update_args_from_checkpoint(args, checkpoint: dict[str, Any]) -> dict[str, A
         'pixel_kernel_sizes',
         'pixel_strides',
         'pixel_final_pool',
+        'pixel_camera_mode',
+        'pixel_local_view_size',
+        'pixel_local_camera_height',
+        'pixel_first_person_distance',
+        'pixel_first_person_height',
+        'pixel_first_person_lookahead',
+        'pixel_first_person_pitch',
     ]
     for key in keys_to_sync:
         if key not in ckpt_args or not hasattr(args, key):
@@ -143,7 +165,7 @@ def update_args_from_checkpoint(args, checkpoint: dict[str, Any]) -> dict[str, A
         flags = _CLI_FLAG_ALIASES.get(key)
         if flags and _cli_flag_provided(flags):
             continue
-            setattr(args, key, ckpt_args[key])
+        setattr(args, key, ckpt_args[key])
     # Intervention mode is opt-in for evaluation; only adopt checkpoint value if caller left it unspecified
     if hasattr(args, 'intervention_mode') and 'intervention_mode' in ckpt_args:
         current = getattr(args, 'intervention_mode', None)
@@ -213,6 +235,25 @@ def _parse_optional_int(value) -> int | None:
         except ValueError:
             return None
     return None
+
+
+def clip_action_l2_tensor(actions: torch.Tensor, max_norm: float = 1.0) -> torch.Tensor:
+    norms = actions.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+    mask = norms > max_norm
+    if mask.any():
+        scale = torch.ones_like(norms)
+        scale[mask] = max_norm / norms[mask]
+        actions = actions * scale
+    return actions
+
+
+def maybe_reset_policy_state(policy) -> None:
+    reset_fn = getattr(policy, "reset", None)
+    if callable(reset_fn):
+        try:
+            reset_fn()
+        except TypeError:
+            reset_fn(policy)
 
 
 def unwrap_maze_env(env):
@@ -489,6 +530,12 @@ try:
 except ImportError:
     FASTSAC_AVAILABLE = False
 
+try:
+    from drqv2.drqv2 import Encoder as DrQEncoder, Actor as DrQActor  # type: ignore
+    DRQV2_AVAILABLE = True
+except ImportError:
+    DRQV2_AVAILABLE = False
+
 # Import RSL-RL components
 try:
     from rsl_rl.modules import ActorCritic  # ActorCritic is in modules, not algorithms!
@@ -594,10 +641,220 @@ class FastSACPolicy:
         return means if deterministic else actions
 
 
+class DrQPolicy:
+    """Wrapper for DrQ-v2 pixel policies."""
+
+    def __init__(self, *, encoder: DrQEncoder, actor: DrQActor, pixel_shape: tuple[int, int, int], device: torch.device, eval_std: float = 0.0):
+        self.encoder = encoder.to(device)
+        self.actor = actor.to(device)
+        self.pixel_shape = pixel_shape
+        self.target_channels, self.target_height, self.target_width = pixel_shape
+        base_channels = 3 if self.target_channels % 3 == 0 else self.target_channels
+        stack = max(1, self.target_channels // base_channels)
+        if stack < 1:
+            stack = 1
+        self.base_channels = base_channels
+        self.frame_stack = stack
+        self.device = device
+        self.eval_std = float(eval_std)
+        self.obs_mode = 'pixels'
+        self.encoder.eval()
+        self.actor.eval()
+        self._frame_buffer: list[torch.Tensor] = []
+
+    def eval(self):
+        self.encoder.eval()
+        self.actor.eval()
+        self.reset()
+
+    def reset(self):
+        self._frame_buffer = []
+
+    def prepare_obs(self, obs, device):
+        data = obs
+        if isinstance(data, dict):
+            data = data.get("policy", data)
+        tensor = torch.as_tensor(data, device=device)
+        if tensor.ndim == 3:
+            tensor = tensor.unsqueeze(0)
+        elif tensor.ndim == 1:
+            tensor = tensor.unsqueeze(0)
+        return tensor.float()
+
+    def _reshape_obs(self, obs: torch.Tensor) -> torch.Tensor:
+        if obs.ndim == 2:
+            obs = self._unflatten_frame(obs)
+        if obs.ndim == 4:
+            if obs.shape[1] not in (1, 3, 4, self.base_channels, self.target_channels) and obs.shape[-1] in (1, 3, 4):
+                obs = obs.permute(0, 3, 1, 2).contiguous()
+            elif obs.shape[1] not in (1, 3, 4, self.base_channels, self.target_channels):
+                raise ValueError(f"Unexpected channels axis for DrQ obs: {tuple(obs.shape)}")
+        else:
+            raise ValueError(f"Unexpected observation tensor shape for DrQ policy: {tuple(obs.shape)}")
+
+        if obs.shape[1] == self.target_channels:
+            return obs
+
+        if obs.shape[1] != self.base_channels:
+            raise ValueError(f"Unexpected channel count {obs.shape[1]} for DrQ policy (expected {self.base_channels} per frame)")
+
+        frame = self._resize_frame(obs)
+        return self._stack_frames(frame)
+
+    def _unflatten_frame(self, obs: torch.Tensor) -> torch.Tensor:
+        batch, total = obs.shape
+        base_channels = self.base_channels
+        if total % base_channels != 0:
+            base_channels = 3 if total % 3 == 0 else total
+            self.base_channels = base_channels
+            self.frame_stack = max(1, self.target_channels // self.base_channels)
+        per_frame = total // base_channels
+        side = int(math.sqrt(per_frame))
+        if side * side * base_channels != total:
+            raise ValueError(f"Cannot reshape flattened observation of size {total} into channels={base_channels}")
+        frame = obs.view(batch, base_channels, side, side)
+        return frame
+
+    def _resize_frame(self, frame: torch.Tensor) -> torch.Tensor:
+        _, _, h, w = frame.shape
+        if h == self.target_height and w == self.target_width:
+            return frame
+        return F.interpolate(frame, size=(self.target_height, self.target_width), mode='bilinear', align_corners=False)
+
+    def _stack_frames(self, frame: torch.Tensor) -> torch.Tensor:
+        if self.frame_stack <= 1:
+            return frame
+        cloned = frame.clone()
+        if len(self._frame_buffer) < self.frame_stack:
+            while len(self._frame_buffer) < self.frame_stack:
+                self._frame_buffer.append(cloned)
+        else:
+            self._frame_buffer.pop(0)
+            self._frame_buffer.append(cloned)
+        return torch.cat(self._frame_buffer, dim=1)
+
+    def act(self, obs_dict, deterministic: bool = True):
+        obs = obs_dict["policy"].to(self.device)
+        obs = self._reshape_obs(obs)
+        with torch.no_grad():
+            features = self.encoder(obs)
+            dist = self.actor(features, self.eval_std)
+            if deterministic:
+                action = dist.mean
+            else:
+                action = dist.sample(clip=None)
+        return action
+
+
+def _infer_pixel_shape_from_space(space) -> tuple[int, int, int] | None:
+    """Best-effort inference of (C, H, W) from a gym space."""
+    if hasattr(space, 'spaces'):
+        policy_space = space.spaces.get('policy')
+        if policy_space is None and space.spaces:
+            policy_space = next(iter(space.spaces.values()))
+        if policy_space is not None:
+            return _infer_pixel_shape_from_space(policy_space)
+        return None
+    shape = getattr(space, 'shape', None)
+    if shape is None or len(shape) != 3:
+        return None
+    if shape[0] in (1, 3, 4):
+        return (int(shape[0]), int(shape[1]), int(shape[2]))
+    if shape[-1] in (1, 3, 4):
+        return (int(shape[-1]), int(shape[0]), int(shape[1]))
+    return None
+
+
+class _ControllerPolicyBase:
+    """Base class for simple controllers that mimic the policy API."""
+
+    def __init__(self, *, action_space: gym.spaces.Box, obs_mode: str, pixel_shape, device: torch.device):
+        if not isinstance(action_space, gym.spaces.Box):
+            raise TypeError("Controller policies require a continuous Box action space.")
+        self.action_dim = int(np.prod(action_space.shape))
+        self.device = device
+        self.obs_mode = obs_mode
+        self.pixel_shape = pixel_shape
+
+    def eval(self):
+        return self
+
+    def reset(self):
+        return None
+
+
+class RandomControllerPolicy(_ControllerPolicyBase):
+    """Uniform random actions in [-1, 1]."""
+
+    def act(self, obs_dict, deterministic: bool = True):
+        batch = obs_dict["policy"].shape[0]
+        return torch.empty(batch, self.action_dim, device=self.device).uniform_(-1.0, 1.0)
+
+
+class IdleControllerPolicy(_ControllerPolicyBase):
+    """Always output zero actions (use with human teleop overrides)."""
+
+    def act(self, obs_dict, deterministic: bool = True):
+        batch = obs_dict["policy"].shape[0]
+        return torch.zeros(batch, self.action_dim, device=self.device)
+
+
+class InlineEvalTeleop:
+    """Keyboard teleop that shares the main pygame window (no extra display)."""
+
+    def __init__(self, threshold: float = 0.05, hold_time: float = 0.25):
+        pygame.init()
+        self.threshold = float(threshold)
+        self.hold_time = float(hold_time)
+        self._last_action = np.zeros(2, dtype=np.float32)
+        self._last_active_ts = 0.0
+
+    def get_action(self):
+        pygame.event.pump()
+        keys = pygame.key.get_pressed()
+        action = np.zeros(2, dtype=np.float32)
+        if keys[pygame.K_UP] or keys[pygame.K_w]:
+            action[1] = 1.0
+        if keys[pygame.K_DOWN] or keys[pygame.K_s]:
+            action[1] = -1.0
+        if keys[pygame.K_LEFT] or keys[pygame.K_a]:
+            action[0] = -1.0
+        if keys[pygame.K_RIGHT] or keys[pygame.K_d]:
+            action[0] = 1.0
+
+        magnitude = float(np.linalg.norm(action))
+        now = time.perf_counter()
+        if magnitude > self.threshold:
+            self._last_action = action
+            self._last_active_ts = now
+            return action
+        if now - self._last_active_ts < self.hold_time:
+            return self._last_action
+        return None
+
+    def update_state(self, obs, info, step_count):
+        return None
+
+    def reset(self):
+        self._last_action[:] = 0.0
+        self._last_active_ts = 0.0
+
+    def should_quit(self):
+        return False
+
+    def close(self):
+        return None
+
+    def print_controls(self):
+        print("🎮 Inline teleop active – focus the render window and use WASD/arrow keys.")
+
+
 def _resolve_policy_type(args_policy_type: str, checkpoint: Dict[str, Any]) -> str:
     if args_policy_type != 'auto':
         return args_policy_type
     keys = set(checkpoint.keys())
+    if {'drq_encoder', 'drq_actor'} <= keys:
+        return 'drqv2'
     if {'actor_backbone', 'actor_head'} <= keys:
         return 'fastsac_v2'
     if {'actor_state_dict', 'qnet_state_dict'} <= keys:
@@ -682,6 +939,28 @@ def load_trained_policy(
             obs_mode='state',
             pixel_shape=None,
             legacy_actor=actor,
+        )
+        policy.eval()
+    elif policy_type == 'drqv2':
+        if not DRQV2_AVAILABLE:
+            raise ImportError("DRQ-v2 components unavailable; ensure drqv2 module is on PYTHONPATH.")
+        pixel_shape = checkpoint.get('pixel_shape') or getattr(args, 'pixel_shape_from_checkpoint', None) or obs_space.shape
+        pixel_shape = _canonical_pixel_shape(pixel_shape)
+        feature_dim = train_args.get('drq_feature_dim', 50)
+        hidden_dim = train_args.get('drq_hidden_dim', 1024)
+        encoder = DrQEncoder(pixel_shape).to(device)
+        encoder.load_state_dict(checkpoint['drq_encoder'])
+        encoder.eval()
+        action_shape = env.action_space.shape
+        actor = DrQActor(encoder.repr_dim, action_shape, feature_dim, hidden_dim).to(device)
+        actor.load_state_dict(checkpoint['drq_actor'])
+        actor.eval()
+        policy = DrQPolicy(
+            encoder=encoder,
+            actor=actor,
+            pixel_shape=pixel_shape,
+            device=device,
+            eval_std=float(train_args.get('eval_std', 0.0)),
         )
         policy.eval()
     else:  # fastsac_v2
@@ -794,11 +1073,41 @@ def load_trained_policy(
     # Common training metadata
     args_obj = checkpoint.get('args')
     if isinstance(args_obj, dict):
-        for key in ['env_name', 'reward_type', 'obs_mode', 'shared_hidden_dim', 'pixel_width', 'pixel_height', 'pixel_camera']:
+        for key in [
+            'env_name',
+            'reward_type',
+            'obs_mode',
+            'shared_hidden_dim',
+            'pixel_width',
+            'pixel_height',
+            'pixel_camera',
+            'pixel_camera_mode',
+            'pixel_local_view_size',
+            'pixel_local_camera_height',
+            'pixel_first_person_distance',
+            'pixel_first_person_height',
+            'pixel_first_person_lookahead',
+            'pixel_first_person_pitch',
+        ]:
             if key in args_obj:
                 training_info[key] = args_obj[key]
     elif args_obj is not None:
-        for key in ['env_name', 'reward_type', 'obs_mode', 'shared_hidden_dim', 'pixel_width', 'pixel_height', 'pixel_camera']:
+        for key in [
+            'env_name',
+            'reward_type',
+            'obs_mode',
+            'shared_hidden_dim',
+            'pixel_width',
+            'pixel_height',
+            'pixel_camera',
+            'pixel_camera_mode',
+            'pixel_local_view_size',
+            'pixel_local_camera_height',
+            'pixel_first_person_distance',
+            'pixel_first_person_height',
+            'pixel_first_person_lookahead',
+            'pixel_first_person_pitch',
+        ]:
             if hasattr(args_obj, key):
                 training_info[key] = getattr(args_obj, key)
     for key in ['training_info', 'iteration', 'total_timesteps']:
@@ -837,6 +1146,15 @@ def create_env(env_name: str, args, *, render_override: str | None = None, mirro
             env_kwargs['height'] = int(height)
         if getattr(args, 'pixel_camera', None):
             env_kwargs['camera_name'] = args.pixel_camera
+        else:
+            # Only forward dynamic camera controls when not using a fixed MuJoCo camera
+            env_kwargs['pixel_camera_mode'] = getattr(args, 'pixel_camera_mode', 'global')
+            env_kwargs['pixel_local_view_size'] = getattr(args, 'pixel_local_view_size', 12.0)
+            env_kwargs['pixel_local_camera_height'] = getattr(args, 'pixel_local_camera_height', None)
+            env_kwargs['pixel_first_person_distance'] = getattr(args, 'pixel_first_person_distance', 3.0)
+            env_kwargs['pixel_first_person_height'] = getattr(args, 'pixel_first_person_height', 1.0)
+            env_kwargs['pixel_first_person_lookahead'] = getattr(args, 'pixel_first_person_lookahead', 2.0)
+            env_kwargs['pixel_first_person_pitch'] = getattr(args, 'pixel_first_person_pitch', -15.0)
     else:
         # Add width/height parameters for human-renderable OGBench environments
         if env_name.startswith(('pointmaze-', 'antmaze-', 'humanoidmaze-')) or render_mode == 'human':
@@ -853,9 +1171,13 @@ def create_env(env_name: str, args, *, render_override: str | None = None, mirro
 
         teleop = None
         if args.intervention_mode == 'human':
-            from ogbench.teleop import ControlWindowTeleop
+            if args.headless:
+                from ogbench.teleop import ControlWindowTeleop
 
-            teleop = ControlWindowTeleop(width=520, height=420, show_debug_info=True)
+                teleop = ControlWindowTeleop(width=520, height=420, show_debug_info=True)
+            else:
+                teleop = InlineEvalTeleop()
+                teleop.print_controls()
 
         wrapper = build_ogbench_wrapper(
             obs_mode=getattr(args, 'obs_mode', 'state'),
@@ -896,6 +1218,8 @@ def create_env(env_name: str, args, *, render_override: str | None = None, mirro
 
 def _format_policy_observation(obs, policy, device):
     """Match training-time preprocessing for policy inputs."""
+    if isinstance(policy, DrQPolicy):
+        return policy.prepare_obs(obs, device)
     obs_mode = getattr(policy, 'obs_mode', 'state')
     pixel_shape = getattr(policy, 'pixel_shape', None)
     return prepare_observation(
@@ -920,6 +1244,7 @@ def run_headless_evaluation(policy, env, args, device):
 
     for episode_idx in range(target_episodes):
         obs, info = env.reset(seed=args.seed + episode_idx)
+        maybe_reset_policy_state(policy)
         done = False
         ep_reward = 0.0
         steps = 0
@@ -928,6 +1253,7 @@ def run_headless_evaluation(policy, env, args, device):
             obs_dict = TensorDict({"policy": obs_tensor}, batch_size=[obs_tensor.shape[0]], device=device)
             with torch.no_grad():
                 actions = policy.act(obs_dict, deterministic=True)
+                actions = clip_action_l2_tensor(actions)
             action = actions.cpu().numpy()[0]
             if args.action_scale != 1.0:
                 action *= args.action_scale
@@ -980,7 +1306,9 @@ def run_interactive_evaluation(policy, env, args, device, mirror: MirrorEnvProce
     """Run interactive evaluation loop."""
     print(f"\n🎮 Starting Interactive Evaluation")
     print(f"Environment: {args.env_name}")
-    print(f"Model: {args.model_path}")
+    model_label = args.model_path if args.model_path else "None"
+    print(f"Model: {model_label}")
+    print(f"Controller: {getattr(args, 'controller', 'policy')}")
     print(f"Device: {device}")
     print(f"\n🎮 Controls:")
     print(f"   ESC/Q: Exit")
@@ -998,6 +1326,7 @@ def run_interactive_evaluation(policy, env, args, device, mirror: MirrorEnvProce
     
     # Reset environment
     obs, info = env.reset(seed=args.seed)
+    maybe_reset_policy_state(policy)
     maze_env = unwrap_maze_env(env)
     birds_eye = None
     if maze_env is not None:
@@ -1039,6 +1368,7 @@ def run_interactive_evaluation(policy, env, args, device, mirror: MirrorEnvProce
                 elif event.key == pygame.K_SPACE:
                     print(f"🔄 Manual reset triggered")
                     obs, info = env.reset()
+                    maybe_reset_policy_state(policy)
                     if mirror is not None:
                         try:
                             mirror.reset()
@@ -1066,7 +1396,8 @@ def run_interactive_evaluation(policy, env, args, device, mirror: MirrorEnvProce
         
         # Get action from policy
         with torch.no_grad():
-            actions = policy.act(obs_dict, deterministic=True)  # Use deterministic for evaluation
+            actions = policy.act(obs_dict, deterministic=True)
+            actions = clip_action_l2_tensor(actions)
         
         # Convert action to numpy and remove batch dimension
         action = actions.cpu().numpy()[0]
@@ -1162,6 +1493,7 @@ def run_interactive_evaluation(policy, env, args, device, mirror: MirrorEnvProce
             # Reset for next episode
             if auto_reset:
                 obs, info = env.reset()
+                maybe_reset_policy_state(policy)
                 if mirror is not None:
                     try:
                         mirror.reset()
@@ -1208,20 +1540,61 @@ def main():
     print(f"Device: {device}")
     if device.type == 'cuda':
         print(f"GPU: {torch.cuda.get_device_name(device)}")
+    if args.controller == 'human' and args.intervention_mode != 'human':
+        print("ℹ️ Enabling human teleop intervention wrapper for manual control.")
+        args.intervention_mode = 'human'
 
     env: Optional[gym.Env] = None
     mirror: Optional[MirrorEnvProcess] = None
+    policy = None
+    training_info: dict[str, Any] = {}
+    checkpoint = None
     try:
-        checkpoint = torch.load(args.model_path, map_location='cpu')
-        ckpt_args = update_args_from_checkpoint(args, checkpoint)
+        if args.controller == 'policy':
+            if not args.model_path:
+                raise ValueError("A --model_path must be provided when controller='policy'.")
+            checkpoint = torch.load(args.model_path, map_location='cpu')
+            ckpt_args = update_args_from_checkpoint(args, checkpoint)
+        else:
+            ckpt_args = None
+            if args.model_path:
+                print("⚠️ controller!='policy'; ignoring provided --model_path.")
         env, mirror = setup_environment(args)
-        policy, training_info = load_trained_policy(
-            args.model_path,
-            env,
-            device,
-            args,
-            checkpoint=checkpoint,
-        )
+        if args.controller == 'policy':
+            policy, training_info = load_trained_policy(
+                args.model_path,
+                env,
+                device,
+                args,
+                checkpoint=checkpoint,
+            )
+        else:
+            obs_mode = getattr(args, 'obs_mode', 'state') or 'state'
+            pixel_shape_hint = None
+            if obs_mode == 'pixels':
+                try:
+                    pixel_shape_hint = _infer_pixel_shape_from_space(env.observation_space)
+                except Exception:
+                    pixel_shape_hint = None
+            if args.controller == 'random':
+                policy = RandomControllerPolicy(
+                    action_space=env.action_space,
+                    obs_mode=obs_mode,
+                    pixel_shape=pixel_shape_hint,
+                    device=device,
+                )
+            elif args.controller == 'human':
+                policy = IdleControllerPolicy(
+                    action_space=env.action_space,
+                    obs_mode=obs_mode,
+                    pixel_shape=pixel_shape_hint,
+                    device=device,
+                )
+            else:
+                raise ValueError(f"Unknown controller '{args.controller}'")
+            training_info = {'controller': args.controller}
+        if hasattr(policy, 'eval'):
+            policy.eval()
         if training_info:
             print("Training info:")
             for key, value in training_info.items():

@@ -7,7 +7,7 @@ import argparse
 import json
 from pathlib import Path
 import sys
-from typing import Tuple
+from typing import Optional, Tuple
 
 import gymnasium as gym
 import matplotlib
@@ -299,8 +299,31 @@ class PixelObservationSampler:
         camera_name: str | None,
         seed: int,
         device: torch.device,
+        pixel_camera_mode: str = 'global',
+        pixel_local_view_size: float = 12.0,
+        pixel_local_camera_height: Optional[float] = None,
+        pixel_first_person_distance: float = 3.0,
+        pixel_first_person_height: float = 1.0,
+        pixel_first_person_lookahead: float = 2.0,
+        pixel_first_person_pitch: float = -15.0,
     ):
-        self.env = gym.make(env_id, render_mode="rgb_array", width=width, height=height, camera_name=camera_name)
+        env_kwargs = dict(
+            render_mode="rgb_array",
+            width=width,
+            height=height,
+            camera_name=camera_name,
+        )
+        if camera_name is None:
+            env_kwargs.update(
+                pixel_camera_mode=pixel_camera_mode,
+                pixel_local_view_size=pixel_local_view_size,
+                pixel_local_camera_height=pixel_local_camera_height,
+                pixel_first_person_distance=pixel_first_person_distance,
+                pixel_first_person_height=pixel_first_person_height,
+                pixel_first_person_lookahead=pixel_first_person_lookahead,
+                pixel_first_person_pitch=pixel_first_person_pitch,
+            )
+        self.env = gym.make(env_id, **env_kwargs)
         self.device = device
         self.env.reset(seed=seed)
 
@@ -954,11 +977,19 @@ def generate_policy_map(
             if env_id_pixels is None:
                 raise ValueError('Cannot infer environment id for pixel visualization')
             camera_name = train_args.get('pixel_camera')
+            camera_mode = train_args.get('pixel_camera_mode', 'global')
             pixel_sampler = PixelObservationSampler(
                 env_id_pixels,
                 width=int(pixel_shape[2]),
                 height=int(pixel_shape[1]),
                 camera_name=camera_name,
+                pixel_camera_mode=camera_mode,
+                pixel_local_view_size=float(train_args.get('pixel_local_view_size', 12.0)),
+                pixel_local_camera_height=train_args.get('pixel_local_camera_height'),
+                pixel_first_person_distance=float(train_args.get('pixel_first_person_distance', 3.0)),
+                pixel_first_person_height=float(train_args.get('pixel_first_person_height', 1.0)),
+                pixel_first_person_lookahead=float(train_args.get('pixel_first_person_lookahead', 2.0)),
+                pixel_first_person_pitch=float(train_args.get('pixel_first_person_pitch', -15.0)),
                 seed=cached_seed,
                 device=device_t,
             )

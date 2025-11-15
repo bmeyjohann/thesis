@@ -61,6 +61,21 @@ def build_train_parser() -> argparse.ArgumentParser:
                    help='Pixel observation height when obs_mode=pixels')
     p.add_argument('--pixel_camera', type=str, default=None,
                    help='Optional MuJoCo camera name for pixel observations (defaults to env setting)')
+    p.add_argument('--pixel_camera_mode', type=str, default='global',
+                   choices=['global', 'agent_local', 'first_person'],
+                   help='Camera behaviour when using pixel observations without an explicit camera_name')
+    p.add_argument('--pixel_local_view_size', type=float, default=12.0,
+                   help="World-space width/height (in meters) of the local bird's-eye crop")
+    p.add_argument('--pixel_local_camera_height', type=float, default=None,
+                   help='Optional override for camera height when using agent_local mode (defaults to derived value)')
+    p.add_argument('--pixel_first_person_distance', type=float, default=3.0,
+                   help='Distance between camera and lookat point for first_person mode')
+    p.add_argument('--pixel_first_person_height', type=float, default=1.0,
+                   help='Height offset applied to the camera and lookat point for first_person mode')
+    p.add_argument('--pixel_first_person_lookahead', type=float, default=2.0,
+                   help='Forward offset (in meters) added to the lookat point for first_person mode')
+    p.add_argument('--pixel_first_person_pitch', type=float, default=-15.0,
+                   help='Camera pitch (degrees) applied in first_person mode (negative looks down)')
     p.add_argument('--pixel_conv_channels', type=str, default='32,64,64',
                    help='Comma-separated Conv2d channel sizes for the pixel backbone')
     p.add_argument('--pixel_kernel_sizes', type=str, default='8,4,3',
@@ -168,15 +183,18 @@ def build_eval_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Interactive evaluation of trained RSL-RL agents')
     
     # Model and environment
-    parser.add_argument('--model_path', type=str, required=True,
-                        help='Path to the trained model (.pt file)')
+    parser.add_argument('--model_path', type=str, default=None,
+                        help='Path to the trained model (.pt file). Optional when using --controller random/human.')
     parser.add_argument('--env_name', type=str, default='pointmaze-medium-v0',
                         help='OGBench environment name')
     parser.add_argument('--device', type=str, default='auto',
                         help='Device to run on (auto, cpu, cuda)')
     parser.add_argument('--policy_type', type=str, default='auto',
-                        choices=['auto', 'rsl-rl', 'fastsac'],
+                        choices=['auto', 'rsl-rl', 'fastsac', 'fastsac_v2', 'drqv2'],
                         help='Policy checkpoint format to load')
+    parser.add_argument('--controller', type=str, default='policy',
+                        choices=['policy', 'random', 'human'],
+                        help='Source of actions: trained policy, random actions, or human-only (zero-action baseline)')
     
     # Visualization
     parser.add_argument('--render_mode', type=str, default='human',
@@ -210,6 +228,21 @@ def build_eval_parser() -> argparse.ArgumentParser:
                         help='Pixel observation height (defaults to training checkpoint)')
     parser.add_argument('--pixel_camera', type=str, default=None,
                         help='Camera name for pixel observations (defaults to training checkpoint)')
+    parser.add_argument('--pixel_camera_mode', type=str, default='global',
+                        choices=['global', 'agent_local', 'first_person'],
+                        help='Camera behaviour when relying on the dynamic MuJoCo free camera')
+    parser.add_argument('--pixel_local_view_size', type=float, default=12.0,
+                        help="World-space width/height (in meters) captured by the local bird's-eye view")
+    parser.add_argument('--pixel_local_camera_height', type=float, default=None,
+                        help='Override camera height for agent_local mode (default derives from view size)')
+    parser.add_argument('--pixel_first_person_distance', type=float, default=3.0,
+                        help='Distance between camera and lookat point for first_person mode')
+    parser.add_argument('--pixel_first_person_height', type=float, default=1.0,
+                        help='Height offset applied to the camera and lookat point for first_person mode')
+    parser.add_argument('--pixel_first_person_lookahead', type=float, default=2.0,
+                        help='Forward offset (meters) for the lookat point in first_person mode')
+    parser.add_argument('--pixel_first_person_pitch', type=float, default=-15.0,
+                        help='Camera pitch (degrees, negative looks down) for first_person mode')
     parser.add_argument('--mirror_human_render', dest='mirror_human_render', action='store_true', default=False,
                         help='Mirror rgb_array rollouts to a separate human-rendered window')
     parser.add_argument('--no_mirror_human_render', dest='mirror_human_render', action='store_false',
