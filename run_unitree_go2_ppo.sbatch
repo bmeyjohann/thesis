@@ -23,11 +23,6 @@ cd "${REPO_ROOT}"
 # Create log directories
 mkdir -p logs wandb
 
-# Environment setup matching the README
-export UNITREE_ROS_DIR="${UNITREE_ROS_DIR:-${REPO_ROOT}/unitree_ros/unitree_ros}"
-export GIT_PYTHON_REFRESH=quiet
-unset CUDA_VISIBLE_DEVICES
-
 # Activate container-focused env (Python deps, PYTHONPATH)
 source "${REPO_ROOT}/sc_venv_template_isaaclab_container/activate.sh"
 
@@ -50,9 +45,7 @@ if [ ! -f "${APPTAINER_IMG}" ]; then
   exit 1
 fi
 
-export WANDB_MODE=offline
 export WANDB_DIR="${REPO_ROOT}/wandb"
-export WANDB_START_METHOD=thread
 
 TASK=${TASK:-New-Isaac-Velocity-Flat-Unitree-Go2-v0}
 ALGO=${ALGO:-ppo}
@@ -91,6 +84,9 @@ ENV_ARGS=(
   --env WANDB_MODE=offline
   --env WANDB_DIR="${WANDB_DIR}"
   --env WANDB_START_METHOD=thread
+  --env UNITREE_ROS_DIR="${UNITREE_ROS_DIR:-${REPO_ROOT}/unitree_ros/unitree_ros}"
+  --env GIT_PYTHON_REFRESH=quiet
+  --env CUDA_VISIBLE_DEVICES=
 )
 
 TRAIN_ARGS=(

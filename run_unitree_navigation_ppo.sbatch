@@ -26,10 +26,6 @@ cd "${REPO_ROOT}"
 
 mkdir -p logs wandb
 
-export UNITREE_ROS_DIR="${UNITREE_ROS_DIR:-${REPO_ROOT}/unitree_ros/unitree_ros}"
-export GIT_PYTHON_REFRESH=quiet
-unset CUDA_VISIBLE_DEVICES
-
 # Activate container-focused env (Python deps, PYTHONPATH)
 source "${REPO_ROOT}/sc_venv_template_isaaclab_container/activate.sh"
 
@@ -47,9 +43,7 @@ mkdir -p "${ISAAC_ROOT}/isaac-cache"/{ov,matplotlib,fontconfig,nvidia,warp}
 mkdir -p "${OVERLAY}/py310/omni"/{cache,data}
 mkdir -p "${OVERLAY}/py311/omni"/{cache,data}
 
-export WANDB_MODE=offline
 export WANDB_DIR="${REPO_ROOT}/wandb"
-export WANDB_START_METHOD=thread
 
 TASK=${TASK:-Isaac-Navigation-Flat-Go2-v0}
 ALGO=${ALGO:-ppo}
@@ -94,6 +88,12 @@ ENV_ARGS=(
   --env OMNI_KIT_DATA_DIR=/workspace/.kit/data
   --env OMNI_KIT_CACHE_DIR=/workspace/.kit/cache
   --env OMNI_KIT_ARGS="--portable-root=/workspace/.kit --/app/dataDir=/workspace/.kit/data --/app/cacheDir=/workspace/.kit/cache --/app/derivedData/cachePath=/workspace/.kit/DerivedDataCache --/rtx/shaderdb/cachePath=/workspace/.kit/cache/nv_shadercache --/exts/omni.kit.pipapi/enable=0"
+  --env WANDB_MODE=offline
+  --env WANDB_DIR="${WANDB_DIR}"
+  --env WANDB_START_METHOD=thread
+  --env UNITREE_ROS_DIR="${UNITREE_ROS_DIR:-${REPO_ROOT}/unitree_ros/unitree_ros}"
+  --env GIT_PYTHON_REFRESH=quiet
+  --env CUDA_VISIBLE_DEVICES=
 )
 
 TRAIN_ARGS=(
