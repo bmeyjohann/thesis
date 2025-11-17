@@ -23,6 +23,9 @@ cd "${REPO_ROOT}"
 # Create log directories
 mkdir -p logs wandb
 
+export MPLCONFIGDIR="${TMPDIR:-/tmp}/mplcache_${SLURM_JOB_ID}"
+mkdir -p "${MPLCONFIGDIR}"
+
 # Activate container-focused env (Python deps, PYTHONPATH)
 source "${REPO_ROOT}/sc_venv_template_isaaclab_container/activate.sh"
 
@@ -45,7 +48,10 @@ if [ ! -f "${APPTAINER_IMG}" ]; then
   exit 1
 fi
 
+export WANDB_MODE=offline
 export WANDB_DIR="${REPO_ROOT}/wandb"
+export WANDB_START_METHOD=thread
+export OMNI_DISABLE_EXTENSIONS="omni.iray.libs,omni.mdl.neuraylib,omni.kit.usd.mdl,carb.scenerenderer-rtx.plugin,omni.rtx.*,omni.hydra.rtx"
 
 TASK=${TASK:-New-Isaac-Velocity-Flat-Unitree-Go2-v0}
 ALGO=${ALGO:-ppo}
@@ -84,9 +90,10 @@ ENV_ARGS=(
   --env WANDB_MODE=offline
   --env WANDB_DIR="${WANDB_DIR}"
   --env WANDB_START_METHOD=thread
-  --env UNITREE_ROS_DIR="${UNITREE_ROS_DIR:-${REPO_ROOT}/unitree_ros/unitree_ros}"
+  --env MPLCONFIGDIR="${MPLCONFIGDIR}"
+  --env OMNI_DISABLE_EXTENSIONS="${OMNI_DISABLE_EXTENSIONS}"
+  --env UNITREE_ROS_DIR="${UNITREE_ROS_DIR}"
   --env GIT_PYTHON_REFRESH=quiet
-  --env CUDA_VISIBLE_DEVICES=
 )
 
 TRAIN_ARGS=(
@@ -133,4 +140,9 @@ echo "Task: ${TASK}"
 echo "Run name: ${RUN_NAME}"
 echo "=========================================="
 
-srun --ntasks=1 "${APPTAINER_CMD[@]}"
+TRAIN_LOG="logs/unitree_go2_ppo_${SLURM_JOB_ID}.train.log"
+(
+  srun --ntasks=1 "${APPTAINER_CMD[@]}" 2>&1
+) | tee "${TRAIN_LOG}"
+EXIT_CODE=${PIPESTATUS[0]}
+exit "${EXIT_CODE}"

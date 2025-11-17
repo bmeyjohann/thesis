@@ -26,6 +26,9 @@ cd "${REPO_ROOT}"
 
 mkdir -p logs wandb
 
+export MPLCONFIGDIR="${TMPDIR:-/tmp}/mplcache_${SLURM_JOB_ID}"
+mkdir -p "${MPLCONFIGDIR}"
+
 # Activate container-focused env (Python deps, PYTHONPATH)
 source "${REPO_ROOT}/sc_venv_template_isaaclab_container/activate.sh"
 
@@ -43,13 +46,15 @@ mkdir -p "${ISAAC_ROOT}/isaac-cache"/{ov,matplotlib,fontconfig,nvidia,warp}
 mkdir -p "${OVERLAY}/py310/omni"/{cache,data}
 mkdir -p "${OVERLAY}/py311/omni"/{cache,data}
 
-export WANDB_DIR="${REPO_ROOT}/wandb"
-
 TASK=${TASK:-Isaac-Navigation-Flat-Go2-v0}
 ALGO=${ALGO:-ppo}
 RUN_NAME=${RUN_NAME:-navigation_ppo_${SLURM_JOB_ID}}
 LOGGER=${LOGGER:-wandb}
 
+LOW_LEVEL_POLICY_FILE=${LOW_LEVEL_POLICY_FILE:-${REPO_ROOT}/low_level_policy_path.txt}
+if [ -z "${LOW_LEVEL_POLICY_PATH:-}" ] && [ -f "${LOW_LEVEL_POLICY_FILE}" ]; then
+  LOW_LEVEL_POLICY_PATH=$(<"${LOW_LEVEL_POLICY_FILE}")
+fi
 if [ -z "${LOW_LEVEL_POLICY_PATH:-}" ]; then
   echo "LOW_LEVEL_POLICY_PATH is not set. Provide the exported low-level locomotion policy (.pt)." >&2
   exit 1
@@ -91,9 +96,9 @@ ENV_ARGS=(
   --env WANDB_MODE=offline
   --env WANDB_DIR="${WANDB_DIR}"
   --env WANDB_START_METHOD=thread
+  --env MPLCONFIGDIR="${MPLCONFIGDIR}"
   --env UNITREE_ROS_DIR="${UNITREE_ROS_DIR:-${REPO_ROOT}/unitree_ros/unitree_ros}"
   --env GIT_PYTHON_REFRESH=quiet
-  --env CUDA_VISIBLE_DEVICES=
 )
 
 TRAIN_ARGS=(
@@ -142,4 +147,9 @@ echo "Run name: ${RUN_NAME}"
 echo "Low-level policy: ${LOW_LEVEL_POLICY_PATH}"
 echo "=========================================="
 
-srun --ntasks=1 "${APPTAINER_CMD[@]}"
+TRAIN_LOG="logs/unitree_go2_nav_${SLURM_JOB_ID}.train.log"
+(
+  srun --ntasks=1 "${APPTAINER_CMD[@]}" 2>&1
+) | tee "${TRAIN_LOG}"
+EXIT_CODE=${PIPESTATUS[0]}
+exit "${EXIT_CODE}"
