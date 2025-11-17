@@ -46,6 +46,11 @@ mkdir -p "${ISAAC_ROOT}/isaac-cache"/{ov,matplotlib,fontconfig,nvidia,warp}
 mkdir -p "${OVERLAY}/py310/omni"/{cache,data}
 mkdir -p "${OVERLAY}/py311/omni"/{cache,data}
 
+export WANDB_MODE=offline
+export WANDB_DIR="${REPO_ROOT}/wandb"
+export WANDB_START_METHOD=thread
+export OMNI_DISABLE_EXTENSIONS="omni.iray.libs,omni.mdl.neuraylib,omni.kit.usd.mdl,carb.scenerenderer-rtx.plugin,omni.rtx.*,omni.hydra.rtx"
+
 TASK=${TASK:-Isaac-Navigation-Flat-Go2-v0}
 ALGO=${ALGO:-ppo}
 RUN_NAME=${RUN_NAME:-navigation_ppo_${SLURM_JOB_ID}}
