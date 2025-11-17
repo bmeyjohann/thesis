@@ -97,7 +97,6 @@ ENV_ARGS=(
   --env WANDB_DIR="${WANDB_DIR}"
   --env WANDB_START_METHOD=thread
   --env MPLCONFIGDIR="${MPLCONFIGDIR}"
-  --env UNITREE_ROS_DIR="${UNITREE_ROS_DIR:-${REPO_ROOT}/unitree_ros/unitree_ros}"
   --env GIT_PYTHON_REFRESH=quiet
 )
 
