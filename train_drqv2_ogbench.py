@@ -51,6 +51,7 @@ except Exception:  # pragma: no cover - optional dependency
 from drqv2.drqv2 import DrQV2Agent  # noqa: E402
 from drqv2 import utils  # noqa: E402
 from drqv2.replay_buffer import ReplayBufferStorage, make_replay_loader  # noqa: E402
+from drqv2.pref_buffer import PreferencePairStorage, PreferencePairDataset  # noqa: E402
 
 from ogbench_utils import (  # noqa: E402
     TeacherMetricsAccumulator,
@@ -107,6 +108,12 @@ def build_arg_parser():
     parser.add_argument("--eval_every_frames", type=int, default=50_000)
     parser.add_argument("--smoke_test_steps", type=int, default=0,
                         help="Override total timesteps for very short smoke tests (0 disables override)")
+    parser.add_argument("--pref_loss_type", type=str, default="margin", choices=["margin", "bradley_terry"],
+                        help="Preference loss formulation applied to the critic")
+    parser.add_argument("--pref_chunk_size", type=int, default=64,
+                        help="Number of preference events per on-disk shard")
+    parser.add_argument("--pref_fetch_every", type=int, default=512,
+                        help="How often (in samples) to attempt loading new preference shards")
     return parser
 
 def clip_action_l2(actions: np.ndarray, max_norm: float = 1.0) -> np.ndarray:
@@ -223,7 +230,7 @@ class OGBenchPixelsEnv(dm_env.Environment):
         # Probe observation shape for spec construction.
         obs_sample, info = self._env.reset(seed=self._seed)
         self._last_info = info or {}
-        obs_array = self._to_pixels(obs_sample)
+        obs_array = self._render_pixels(obs_sample)
         self._obs_key = "pixels"
         self._obs_shape = obs_array.shape
         self._obs_spec = {
@@ -253,6 +260,20 @@ class OGBenchPixelsEnv(dm_env.Environment):
             arr = arr.astype(np.uint8)
         return arr
 
+    def _render_pixels(self, raw_obs: Any) -> np.ndarray:
+        try:
+            frame = self._env.render()
+        except Exception:
+            frame = None
+        if frame is None:
+            frame = raw_obs
+        if isinstance(frame, dict):
+            for key in ("pixels", "image", "policy", "observation"):
+                if key in frame:
+                    frame = frame[key]
+                    break
+        return self._to_pixels(frame)
+
     def reset(self) -> dm_env.TimeStep:
         if self._next_seed is not None:
             obs, info = self._env.reset(seed=self._next_seed)
@@ -260,13 +281,13 @@ class OGBenchPixelsEnv(dm_env.Environment):
         else:
             obs, info = self._env.reset()
         self._last_info = info or {}
-        pixels = self._to_pixels(obs)
+        pixels = self._render_pixels(obs)
         return dm_env.restart({self._obs_key: pixels})
 
     def step(self, action: np.ndarray) -> dm_env.TimeStep:
         obs, reward, terminated, truncated, info = self._env.step(action)
         self._last_info = info or {}
-        pixels = self._to_pixels(obs)
+        pixels = self._render_pixels(obs)
         done = bool(terminated or truncated)
         step_type = dm_env.StepType.LAST if done else dm_env.StepType.MID
         discount = np.array(0.0 if done else 1.0, dtype=np.float32)
@@ -405,6 +426,8 @@ class DrQLogger:
         update_metrics: Dict[str, float],
         update_count: int,
         log_alpha: float = 0.0,
+        last_denied_samples: int = 0,
+        pref_buffer_size: int = -1,
     ) -> bool:
         if self.next_log_step is None or total_env_steps < self.next_log_step:
             return False
@@ -428,6 +451,11 @@ class DrQLogger:
                 logs[f"Train/{key}"] = float(value / max(1, update_count))
         else:
             logs["Train/alpha"] = float(np.exp(log_alpha))
+
+        if last_denied_samples > 0:
+            logs["/Teacher/denied_transition_samples"] = float(last_denied_samples)
+        if pref_buffer_size >= 0:
+            logs["/Buffers/pref_pairs"] = float(pref_buffer_size)
 
         teacher_snapshot = self.teacher_metrics.snapshot()
         if teacher_snapshot.mean_disagreement_teacher is not None:
@@ -729,6 +757,22 @@ def train():
     )
     replay_iter = None
 
+    pref_storage = None
+    pref_dataset = None
+    if args.pref_buffer_enable:
+        pref_dir = run_paths.log_dir / "pref_pairs"
+        pref_storage = PreferencePairStorage(
+            obs_shape=obs_shape,
+            action_shape=action_shape,
+            storage_dir=pref_dir,
+            chunk_size=args.pref_chunk_size,
+        )
+        pref_dataset = PreferencePairDataset(
+            storage_dir=pref_dir,
+            max_size=args.pref_capacity,
+            fetch_every=args.pref_fetch_every,
+        )
+
     time_step = train_env.reset()
     replay_storage.add(time_step)
 
@@ -752,6 +796,7 @@ def train():
     log_alpha = 0.0
 
     while total_env_steps < args.total_timesteps:
+        last_denied_samples = 0
         if time_step.last():
             rewbuffer.append(episode_reward)
             lenbuffer.append(episode_length)
@@ -769,6 +814,26 @@ def train():
         logger.accumulate_env_metrics(info)
         replay_storage.add(next_time_step)
 
+        teacher_intervened = bool(info.get("teacher_intervened"))
+        if teacher_intervened:
+            last_denied_samples = 1
+        if pref_storage is not None and teacher_intervened:
+            teacher_action = info.get("teacher_actions")
+            if teacher_action is None:
+                teacher_action = info.get("applied_actions")
+            student_action = info.get("student_actions")
+            if student_action is None:
+                student_action = action
+            if teacher_action is not None and student_action is not None:
+                try:
+                    pref_storage.add(
+                        np.asarray(obs).copy(),
+                        np.asarray(teacher_action, dtype=np.float32),
+                        np.asarray(student_action, dtype=np.float32),
+                    )
+                except Exception as exc:
+                    run_paths.record_progress(f"[PrefBuffer] append failed: {exc}")
+
         episode_reward += float(next_time_step.reward)
         episode_length += 1
         total_env_steps += 1
@@ -779,11 +844,33 @@ def train():
                 continue
             if replay_iter is None:
                 replay_iter = iter(replay_loader)
+            pref_batch_np = None
+            if (
+                pref_dataset is not None
+                and args.pref_rank_weight > 0.0
+                and args.pref_sample_ratio > 0.0
+            ):
+                pref_batch_size = max(1, int(args.batch_size * args.pref_sample_ratio))
+                pref_batch_np = pref_dataset.sample(pref_batch_size)
             try:
-                metrics = agent.update(replay_iter, total_env_steps)
+                metrics = agent.update(
+                    replay_iter,
+                    total_env_steps,
+                    pref_batch=pref_batch_np,
+                    pref_weight=args.pref_rank_weight,
+                    pref_margin=args.pref_rank_margin,
+                    pref_loss_type=args.pref_loss_type,
+                )
             except StopIteration:
                 replay_iter = iter(replay_loader)
-                metrics = agent.update(replay_iter, total_env_steps)
+                metrics = agent.update(
+                    replay_iter,
+                    total_env_steps,
+                    pref_batch=pref_batch_np,
+                    pref_weight=args.pref_rank_weight,
+                    pref_margin=args.pref_rank_margin,
+                    pref_loss_type=args.pref_loss_type,
+                )
             if metrics:
                 for key, value in metrics.items():
                     metrics_accum[key] = metrics_accum.get(key, 0.0) + float(value)
@@ -813,6 +900,7 @@ def train():
             )
             checkpoint_mgr.maybe_render_policy_map(checkpoint_path=ckpt, step_value=total_env_steps)
 
+        pref_buffer_size = pref_storage.num_pairs() if pref_storage is not None else -1
         logged = logger.maybe_log(
             total_env_steps=total_env_steps,
             total_timesteps=args.total_timesteps,
@@ -821,6 +909,8 @@ def train():
             update_metrics=metrics_accum,
             update_count=metrics_updates,
             log_alpha=log_alpha,
+            last_denied_samples=last_denied_samples,
+            pref_buffer_size=pref_buffer_size,
         )
         if logged and metrics_updates > 0:
             metrics_accum = {}
@@ -838,6 +928,8 @@ def train():
         action_shape=action_shape,
     )
     checkpoint_mgr.maybe_render_policy_map(checkpoint_path=final_ckpt, step_value=total_env_steps)
+    if pref_storage is not None:
+        pref_storage.close()
     logger.finish()
 
 
