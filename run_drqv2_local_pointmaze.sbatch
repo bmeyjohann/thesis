@@ -61,16 +61,21 @@ launch_run () {
     --exp_name "drqv2_${ENV_NAME}_${EXP_SUFFIX}_${SLURM_JOB_ID}" \
     ${RUN_ARGS} \
     2>&1 | tee "logs/${ENV_NAME}_${EXP_SUFFIX}_drqv2_${SLURM_JOB_ID}.log" &
-  echo $!
+  LAUNCHED_PID=$!
+  echo "Started ${ENV_NAME}/${EXP_SUFFIX} on GPU ${GPU_ID} (PID ${LAUNCHED_PID})"
 }
 
 echo "Launching DrQ-v2 local-view runs (view sizes 25 and 50)"
 
 PIDS=()
-PIDS+=("$(launch_run 0 "${ENV_A}" close 25.0 "")")
-PIDS+=("$(launch_run 1 "${ENV_B}" close 25.0 "")")
-PIDS+=("$(launch_run 2 "${ENV_A}" wide 50.0 "")")
-PIDS+=("$(launch_run 3 "${ENV_B}" wide 50.0 "")")
+launch_run 0 "${ENV_A}" close 25.0 ""
+PIDS+=(${LAUNCHED_PID})
+launch_run 1 "${ENV_B}" close 25.0 ""
+PIDS+=(${LAUNCHED_PID})
+launch_run 2 "${ENV_A}" wide 50.0 ""
+PIDS+=(${LAUNCHED_PID})
+launch_run 3 "${ENV_B}" wide 50.0 ""
+PIDS+=(${LAUNCHED_PID})
 
 EXIT_CODES=()
 for PID in "${PIDS[@]}"; do
