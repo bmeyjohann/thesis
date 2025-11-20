@@ -20,8 +20,8 @@ cd ..
 export MPLCONFIGDIR="${TMPDIR:-/tmp}/mplcache_${SLURM_JOB_ID}"
 mkdir -p "${MPLCONFIGDIR}"
 
-SAFE_ENV=${SAFE_ENV:-pointmaze-arena-v0}
-DANGER_ENV=${DANGER_ENV:-pointmaze-arena-danger-lethal-v0}
+SAFE_ENV=${SAFE_ENV:-visual-pointmaze-arena-v0}
+DANGER_ENV=${DANGER_ENV:-visual-pointmaze-arena-danger-lethal-v0}
 TOTAL_STEPS=${TOTAL_STEPS:-1200000}
 LEARNING_RATE=${LEARNING_RATE:-1e-4}
 NUM_EXPL_STEPS=${NUM_EXPL_STEPS:-20000}

@@ -20,7 +20,7 @@ cd ..
 export MPLCONFIGDIR="${TMPDIR:-/tmp}/mplcache_${SLURM_JOB_ID}"
 mkdir -p "${MPLCONFIGDIR}"
 
-OGBENCH_ENV=${OGBENCH_ENV:-pointmaze-arena-danger-lethal-v0}
+OGBENCH_ENV=${OGBENCH_ENV:-visual-pointmaze-arena-danger-lethal-v0}
 TOTAL_STEPS=${TOTAL_STEPS:-1200000}
 LEARNING_RATE=${LEARNING_RATE:-1e-4}
 NUM_EXPL_STEPS=${NUM_EXPL_STEPS:-20000}
