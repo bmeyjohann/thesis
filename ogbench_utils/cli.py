@@ -166,9 +166,9 @@ def build_train_parser() -> argparse.ArgumentParser:
     # Policy visualization
     p.add_argument('--viz_on_checkpoint', action='store_true', default=False,
                    help='Render policy/critic maps whenever a checkpoint is saved')
-    p.add_argument('--viz_grid_resolution', type=int, default=64,
+    p.add_argument('--viz_grid_resolution', type=int, default=32,
                    help='Grid resolution for policy maps if enabled')
-    p.add_argument('--viz_quiver_stride', type=int, default=1,
+    p.add_argument('--viz_quiver_stride', type=int, default=2,
                    help='Stride for quiver arrows in policy maps')
     p.add_argument('--viz_device', type=str, default='cpu',
                    help='Device to use when generating policy maps')

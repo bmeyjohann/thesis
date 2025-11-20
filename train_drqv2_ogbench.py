@@ -78,6 +78,8 @@ def build_arg_parser():
         batch_size=512,
         save_interval=50_000,
         viz_first_step=0,
+        viz_grid_resolution=32,
+        viz_quiver_stride=2,
     )
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--action_repeat", type=int, default=2)
@@ -525,8 +527,21 @@ class DrQLogger:
     def accumulate_env_metrics(self, infos) -> None:
         log_dict = None
         if isinstance(infos, dict):
-            log_dict = infos.get("log")
-        if not isinstance(log_dict, dict):
+            candidate = infos.get("log")
+            if isinstance(candidate, dict):
+                log_dict = candidate
+            else:
+                teacher_keys = (
+                    "teacher_fraction_steps",
+                    "teacher_avg_burst_len",
+                    "teacher_num_interventions",
+                    "teacher_intervention_steps",
+                    "teacher_num_safety_interventions",
+                    "teacher_num_divergence_interventions",
+                )
+                if any(key in infos for key in teacher_keys):
+                    log_dict = {key: infos[key] for key in teacher_keys if key in infos}
+        if not isinstance(log_dict, dict) or not log_dict:
             return
         for key, value in log_dict.items():
             try:
@@ -807,32 +822,39 @@ def train():
 
         obs = time_step.observation
         with torch.no_grad(), utils.eval_mode(agent):
-            action = agent.act(obs, step=total_env_steps, eval_mode=False)
-        action = clip_action_l2(action)
-        next_time_step = train_env.step(action)
+            policy_action = agent.act(obs, step=total_env_steps, eval_mode=False)
+        policy_action = clip_action_l2(policy_action)
+        next_time_step = train_env.step(policy_action)
         info = getattr(train_env, "last_info", lambda: {})() or {}
         logger.accumulate_env_metrics(info)
-        replay_storage.add(next_time_step)
 
         teacher_intervened = bool(info.get("teacher_intervened"))
+        teacher_action = info.get("teacher_action")
+        student_action = info.get("student_action", policy_action)
+        applied_action = (
+            teacher_action if (teacher_intervened and teacher_action is not None) else student_action
+        )
+        applied_action_np = np.asarray(applied_action, dtype=np.float32)
+        action_for_logging = applied_action_np.copy()
+        next_time_step = next_time_step._replace(action=applied_action_np)
+        replay_storage.add(next_time_step)
+
         if teacher_intervened:
             last_denied_samples = 1
-        if pref_storage is not None and teacher_intervened:
-            teacher_action = info.get("teacher_actions")
-            if teacher_action is None:
-                teacher_action = info.get("applied_actions")
-            student_action = info.get("student_actions")
-            if student_action is None:
-                student_action = action
-            if teacher_action is not None and student_action is not None:
-                try:
-                    pref_storage.add(
-                        np.asarray(obs).copy(),
-                        np.asarray(teacher_action, dtype=np.float32),
-                        np.asarray(student_action, dtype=np.float32),
-                    )
-                except Exception as exc:
-                    run_paths.record_progress(f"[PrefBuffer] append failed: {exc}")
+        if (
+            pref_storage is not None
+            and teacher_intervened
+            and teacher_action is not None
+            and student_action is not None
+        ):
+            try:
+                pref_storage.add(
+                    np.asarray(obs).copy(),
+                    np.asarray(teacher_action, dtype=np.float32),
+                    np.asarray(student_action, dtype=np.float32),
+                )
+            except Exception as exc:
+                run_paths.record_progress(f"[PrefBuffer] append failed: {exc}")
 
         episode_reward += float(next_time_step.reward)
         episode_length += 1
@@ -878,7 +900,7 @@ def train():
 
         with torch.no_grad(), utils.eval_mode(agent):
             obs_tensor = ensure_tensor(obs, device)
-            act_tensor = torch.as_tensor(action, device=device).view(1, -1)
+            act_tensor = torch.as_tensor(action_for_logging, device=device).view(1, -1)
             repr_obs = agent.encoder(obs_tensor)
             q1, q2 = agent.critic(repr_obs, act_tensor)
             disagreement = torch.abs(q1 - q2).view(-1)
