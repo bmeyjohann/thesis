@@ -1,13 +1,13 @@
 #!/bin/bash
-#SBATCH --job-name=drqv2_pref_reward
+#SBATCH --job-name=drqv2_pref_reward_arena
 #SBATCH --account=<your_account>
 #SBATCH --nodes=1
 #SBATCH --ntasks=2
 #SBATCH --gres=gpu:2
 #SBATCH --time=06:00:00
 #SBATCH --partition=booster
-#SBATCH --output=logs/drqv2_pref_reward_%j.out
-#SBATCH --error=logs/drqv2_pref_reward_%j.err
+#SBATCH --output=logs/drqv2_pref_reward_arena_%j.out
+#SBATCH --error=logs/drqv2_pref_reward_arena_%j.err
 
 set -euo pipefail
 
@@ -20,7 +20,7 @@ cd ..
 export MPLCONFIGDIR="${TMPDIR:-/tmp}/mplcache_${SLURM_JOB_ID}"
 mkdir -p "${MPLCONFIGDIR}"
 
-ENV_NAME=${ENV_NAME:-pointmaze-arena-danger-lethal-v0}
+OGBENCH_ENV=${OGBENCH_ENV:-pointmaze-arena-v0}
 TOTAL_STEPS=${TOTAL_STEPS:-1200000}
 LEARNING_RATE=${LEARNING_RATE:-1e-4}
 NUM_EXPL_STEPS=${NUM_EXPL_STEPS:-20000}
@@ -48,28 +48,28 @@ BASE_ARGS="--obs_mode pixels --pixel_width 84 --pixel_height 84 \
 --use_intervention --intervention_mode agent --teacher_type bfs \
 --tolerance_type angle --tolerance_value ${TOLERANCE}"
 
-launch_reward_run () {
+launch_reward_run_arena () {
   local GPU_ID=$1
   local REWARD_MODE=$2
   local EXTRA_ARGS=$3
 
   WANDB_MODE=offline CUDA_VISIBLE_DEVICES=${GPU_ID} python -u train_drqv2_ogbench.py \
-    --env_name "${ENV_NAME}" \
+    --env_name "${OGBENCH_ENV}" \
     --reward_type ${REWARD_MODE} \
     ${EXTRA_ARGS} \
     ${BASE_ARGS} \
-    --exp_name "drqv2_${ENV_NAME}_${REWARD_MODE}_${SLURM_JOB_ID}" \
-    2>&1 | tee "logs/${ENV_NAME}_${REWARD_MODE}_drqv2_${SLURM_JOB_ID}.log" &
+    --exp_name "drqv2_${OGBENCH_ENV}_${REWARD_MODE}_${SLURM_JOB_ID}" \
+    2>&1 | tee "logs/${OGBENCH_ENV}_${REWARD_MODE}_drqv2_${SLURM_JOB_ID}.log" &
   LAUNCHED_PID=$!
-  echo "Started ${REWARD_MODE} reward run on GPU ${GPU_ID} (PID ${LAUNCHED_PID})"
+  echo "Started arena ${REWARD_MODE} reward run on GPU ${GPU_ID} (PID ${LAUNCHED_PID})"
 }
 
-echo "Launching DrQ-v2 preference runs for sparse vs dense reward"
+echo "Launching DrQ-v2 preference runs for sparse vs dense reward (arena)"
 
 PIDS=()
-launch_reward_run 0 dense "--dense_reward_scale 0.05"
+launch_reward_run_arena 0 dense "--dense_reward_scale 0.05"
 PIDS+=(${LAUNCHED_PID})
-launch_reward_run 1 sparse "--dense_reward_scale 0.0"
+launch_reward_run_arena 1 sparse "--dense_reward_scale 0.0"
 PIDS+=(${LAUNCHED_PID})
 
 EXIT_CODES=()
@@ -86,8 +86,8 @@ for CODE in "${EXIT_CODES[@]}"; do
 done
 
 if [ "${FAIL}" -ne 0 ]; then
-  echo "One or more reward-mode runs failed (codes: ${EXIT_CODES[*]})"
+  echo "One or more arena reward-mode runs failed (codes: ${EXIT_CODES[*]})"
   exit 1
 fi
 
-echo "DrQ-v2 reward-mode comparison completed successfully."
+echo "DrQ-v2 arena reward-mode comparison completed successfully."
