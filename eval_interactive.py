@@ -48,8 +48,11 @@ from ogbench_utils import (
     PixelNormalizer,
     build_ogbench_wrapper,
     build_eval_parser,
+)
+from ogbench_utils.obs import (
     prepare_observation,
     reshape_observation,
+    POLICY_OBS_KEYS,
 )
 
 # Fix WSL window positioning issues  
@@ -104,6 +107,64 @@ _CLI_FLAG_ALIASES: dict[str, tuple[str, ...]] = {
     'pixel_first_person_lookahead': ('--pixel_first_person_lookahead',),
     'pixel_first_person_pitch': ('--pixel_first_person_pitch',),
 }
+
+
+def _to_pixels_array(arr: Any) -> np.ndarray:
+    """Normalize arrays to uint8 HWC format."""
+    array = np.asarray(arr)
+    if array.ndim == 3 and array.shape[0] in (1, 3, 4) and array.shape[2] not in (1, 3, 4):
+        array = np.transpose(array, (1, 2, 0))
+    if array.dtype != np.uint8:
+        array = np.clip(array, 0.0, 255.0)
+        if array.max() <= 1.0:
+            array = array * 255.0
+        array = array.astype(np.uint8)
+    return array
+
+
+class RenderedPixelsWrapper(gym.Wrapper):
+    """Rebuild observation['pixels'] from env.render(), mirroring training."""
+
+    def __init__(self, env: gym.Env, *, width: Optional[int], height: Optional[int]):
+        super().__init__(env)
+        self._width = width
+        self._height = height
+
+    def _inject_pixels(self, obs: Any, pixels: np.ndarray):
+        if isinstance(obs, dict):
+            obs = dict(obs)
+            obs['pixels'] = pixels
+            return obs
+        return {'pixels': pixels}
+
+    def _grab_pixels(self, fallback: Any = None) -> np.ndarray:
+        frame = None
+        try:
+            frame = self.env.render()
+        except Exception:
+            frame = None
+        if frame is None:
+            if isinstance(fallback, dict) and 'pixels' in fallback:
+                frame = fallback['pixels']
+            elif fallback is not None:
+                frame = fallback
+        if frame is None:
+            width = self._width if self._width is not None else 84
+            height = self._height if self._height is not None else 84
+            frame = np.zeros((height, width, 3), dtype=np.uint8)
+        return _to_pixels_array(frame)
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        pixels = self._grab_pixels(obs)
+        obs = self._inject_pixels(obs, pixels)
+        return obs, info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        pixels = self._grab_pixels(obs)
+        obs = self._inject_pixels(obs, pixels)
+        return obs, reward, terminated, truncated, info
 
 
 def _cli_flag_provided(flags: tuple[str, ...]) -> bool:
@@ -247,6 +308,37 @@ def clip_action_l2_tensor(actions: torch.Tensor, max_norm: float = 1.0) -> torch
     return actions
 
 
+def _extract_pixel_panel(obs: Any) -> np.ndarray | None:
+    """Return an HxWx3 uint8 image when obs includes pixel data."""
+    if obs is None:
+        return None
+    data = obs
+    if isinstance(data, tuple) and data:
+        data = data[0]
+    if isinstance(data, dict):
+        for key in ("pixels", "image", "policy", "observation"):
+            if key in data:
+                data = data[key]
+                break
+        else:
+            return None
+    arr = np.asarray(data)
+    if arr.ndim == 4:
+        arr = arr[0]
+    if arr.ndim == 3 and arr.shape[-1] in (1, 3, 4):
+        if arr.dtype != np.uint8:
+            arr = np.clip(arr, 0, 255).astype(np.uint8)
+        if arr.shape[-1] == 1:
+            arr = np.repeat(arr, 3, axis=-1)
+        elif arr.shape[-1] == 4:
+            arr = arr[..., :3]
+        return arr
+    if arr.ndim == 3 and arr.shape[0] in (1, 3, 4):
+        arr = np.transpose(arr, (1, 2, 0))
+        return _extract_pixel_panel(arr)
+    return None
+
+
 def maybe_reset_policy_state(policy) -> None:
     reset_fn = getattr(policy, "reset", None)
     if callable(reset_fn):
@@ -284,20 +376,10 @@ class BirdsEyeRenderer:
         self.grid_width = self.cols * self.cell_size
         self.grid_height = self.rows * self.cell_size
 
-        self.show_obs_panel = (
-            initial_obs is not None
-            and isinstance(initial_obs, np.ndarray)
-            and initial_obs.ndim >= 2
-        )
+        pixel_panel = _extract_pixel_panel(initial_obs)
+        self.show_obs_panel = pixel_panel is not None
         if self.show_obs_panel:
-            obs = initial_obs
-            if obs.ndim == 1:
-                side = int(np.sqrt(obs.size))
-                obs = obs.reshape(side, side)
-            if obs.ndim == 2:
-                obs = np.stack([obs] * 3, axis=-1)
-            if obs.shape[-1] == 1:
-                obs = np.repeat(obs, 3, axis=-1)
+            obs = pixel_panel
             self.obs_shape = obs.shape
             scale = max(2, min(6, 480 // max(obs.shape[0], obs.shape[1])))
             self.obs_surface_size = (obs.shape[1] * scale, obs.shape[0] * scale)
@@ -313,6 +395,14 @@ class BirdsEyeRenderer:
         self.surface = pygame.display.set_mode((total_width, total_height))
         pygame.display.set_caption("Bird's Eye View")
         self.font = pygame.font.SysFont("Arial", 14)
+        self.legend_lines = [
+            "Controls:",
+            "ESC/Q: Exit",
+            "SPACE: Reset",
+            "N: Next goal",
+            "S/F: Slow/Fast",
+            "R: Toggle auto-reset",
+        ]
 
     @staticmethod
     def _suggest_cell_size(cols: int, rows: int) -> int:
@@ -356,29 +446,21 @@ class BirdsEyeRenderer:
 
         self.surface.blit(grid_surface, (0, 0))
 
+        legend_height = len(self.legend_lines) * 18 + 12
+        legend_surface = pygame.Surface((self.grid_width, legend_height), pygame.SRCALPHA)
+        legend_surface.fill((15, 15, 15, 200))
+        for idx, line in enumerate(self.legend_lines):
+            label = self.font.render(line, True, (230, 230, 230))
+            legend_surface.blit(label, (8, 4 + idx * 18))
+        self.surface.blit(legend_surface, (0, max(0, self.grid_height - legend_height)))
+
         if self.show_obs_panel:
             panel = pygame.Surface(self.obs_surface_size)
             panel.fill((20, 20, 20))
             label = self.font.render("Observation", True, (230, 230, 230))
             panel.blit(label, (4, 4))
-            if pixel_obs is not None:
-                obs_img = pixel_obs
-                if isinstance(obs_img, torch.Tensor):
-                    obs_img = obs_img.detach().cpu().numpy()
-                if obs_img.ndim == 1:
-                    side = int(np.sqrt(obs_img.size))
-                    obs_img = obs_img.reshape(side, side)
-                if obs_img.ndim == 2:
-                    obs_img = np.stack([obs_img] * 3, axis=-1)
-                if obs_img.shape[-1] == 1:
-                    obs_img = np.repeat(obs_img, 3, axis=-1)
-                obs_img = np.asarray(obs_img)
-                if obs_img.dtype != np.uint8:
-                    obs_min = float(np.min(obs_img))
-                    obs_max = float(np.max(obs_img))
-                    if obs_max > obs_min:
-                        obs_img = (obs_img - obs_min) / (obs_max - obs_min)
-                    obs_img = (obs_img * 255.0).clip(0, 255).astype(np.uint8)
+            obs_img = _extract_pixel_panel(pixel_obs)
+            if obs_img is not None:
                 obs_img = np.ascontiguousarray(obs_img)
                 surf = pygame.surfarray.make_surface(obs_img.swapaxes(0, 1))
                 surf = pygame.transform.smoothscale(surf, self.obs_surface_size)
@@ -672,13 +754,22 @@ class DrQPolicy:
 
     def prepare_obs(self, obs, device):
         data = obs
+        if isinstance(data, tuple):
+            data = data[0]
         if isinstance(data, dict):
-            data = data.get("policy", data)
+            for key in POLICY_OBS_KEYS:
+                if key in data:
+                    data = data[key]
+                    break
+            else:
+                data = next(iter(data.values()))
         tensor = torch.as_tensor(data, device=device)
         if tensor.ndim == 3:
             tensor = tensor.unsqueeze(0)
         elif tensor.ndim == 1:
             tensor = tensor.unsqueeze(0)
+        if tensor.ndim == 4 and tensor.shape[1] not in (1, 3, 4) and tensor.shape[-1] in (1, 3, 4):
+            tensor = tensor.permute(0, 3, 1, 2).contiguous()
         return tensor.float()
 
     def _reshape_obs(self, obs: torch.Tensor) -> torch.Tensor:
@@ -1131,23 +1222,28 @@ def create_env(env_name: str, args, *, render_override: str | None = None, mirro
     requested_render_mode = render_override if render_override is not None else args.render_mode
     render_mode = requested_render_mode
 
+    policy_width = getattr(args, 'pixel_width', None)
+    policy_height = getattr(args, 'pixel_height', None)
+
     if obs_mode == 'pixels':
-        if render_mode != 'rgb_array' and not mirror_mode:
-            print(f"ℹ️ Pixel-trained policy detected; overriding render_mode '{render_mode}' -> 'rgb_array' for correct observations.")
-            render_mode = 'rgb_array'
-    env_kwargs['render_mode'] = render_mode
+        render_mode = 'rgb_array'
+        env_kwargs['render_mode'] = 'rgb_array'
+        env_kwargs['width'] = int(policy_width or 84)
+        env_kwargs['height'] = int(policy_height or 84)
+    else:
+        env_kwargs['render_mode'] = render_mode
+        if render_mode == 'rgb_array':
+            width = getattr(args, 'pixel_width', None) or getattr(args, 'width', None)
+            height = getattr(args, 'pixel_height', None) or getattr(args, 'height', None)
+            if width is not None:
+                env_kwargs['width'] = int(width)
+            if height is not None:
+                env_kwargs['height'] = int(height)
 
     if render_mode == 'rgb_array':
-        width = getattr(args, 'pixel_width', None) or getattr(args, 'width', None)
-        height = getattr(args, 'pixel_height', None) or getattr(args, 'height', None)
-        if width is not None:
-            env_kwargs['width'] = int(width)
-        if height is not None:
-            env_kwargs['height'] = int(height)
         if getattr(args, 'pixel_camera', None):
             env_kwargs['camera_name'] = args.pixel_camera
         else:
-            # Only forward dynamic camera controls when not using a fixed MuJoCo camera
             env_kwargs['pixel_camera_mode'] = getattr(args, 'pixel_camera_mode', 'global')
             env_kwargs['pixel_local_view_size'] = getattr(args, 'pixel_local_view_size', 12.0)
             env_kwargs['pixel_local_camera_height'] = getattr(args, 'pixel_local_camera_height', None)
@@ -1155,13 +1251,10 @@ def create_env(env_name: str, args, *, render_override: str | None = None, mirro
             env_kwargs['pixel_first_person_height'] = getattr(args, 'pixel_first_person_height', 1.0)
             env_kwargs['pixel_first_person_lookahead'] = getattr(args, 'pixel_first_person_lookahead', 2.0)
             env_kwargs['pixel_first_person_pitch'] = getattr(args, 'pixel_first_person_pitch', -15.0)
-    else:
-        # Add width/height parameters for human-renderable OGBench environments
-        if env_name.startswith(('pointmaze-', 'antmaze-', 'humanoidmaze-')) or render_mode == 'human':
-            env_kwargs.update({
-                'width': args.width,
-                'height': args.height
-            })
+
+    if (render_mode == 'human' or requested_render_mode == 'human') and obs_mode != 'pixels':
+        env_kwargs['width'] = args.width
+        env_kwargs['height'] = args.height
     debug_suffix = " (mirror)" if mirror_mode else ""
     print(f"   render_mode={render_mode}{debug_suffix}")
     print(f"   env_kwargs={env_kwargs}{debug_suffix}")
@@ -1206,6 +1299,13 @@ def create_env(env_name: str, args, *, render_override: str | None = None, mirro
             print('Applied InterventionWrapper (human teleop)')
         elif args.intervention_mode == 'agent':
             print('Applied InterventionWrapper (agent teacher: {})'.format(args.teacher_type))
+        if getattr(args, 'obs_mode', 'state') == 'pixels' and not mirror_mode:
+            env = RenderedPixelsWrapper(
+                env,
+                width=env_kwargs.get('width'),
+                height=env_kwargs.get('height'),
+            )
+            print('Applied RenderedPixelsWrapper for pixel observations')
 
         print('Environment created successfully')
         print('   Observation space:', env.observation_space)
@@ -1313,12 +1413,18 @@ def run_interactive_evaluation(policy, env, args, device, mirror: MirrorEnvProce
     print(f"\n🎮 Controls:")
     print(f"   ESC/Q: Exit")
     print(f"   SPACE: Reset environment")
+    print(f"   N: Skip to next goal")
+    print(f"   S: Slow down  |  F: Speed up")
     print(f"   R: Toggle auto-reset")
     print(f"   Click the window and use keys!")
-    
+
     # Initialize pygame for event handling
     pygame.init()
     clock = pygame.time.Clock()
+    current_fps = float(max(1, args.fps))
+    FPS_MIN = 1.0
+    FPS_MAX = 240.0
+    FPS_SCALE = 1.5
     
     # Set random seed
     torch.manual_seed(args.seed)
@@ -1330,7 +1436,7 @@ def run_interactive_evaluation(policy, env, args, device, mirror: MirrorEnvProce
     maze_env = unwrap_maze_env(env)
     birds_eye = None
     if maze_env is not None:
-        initial_obs = obs if isinstance(obs, np.ndarray) and obs.ndim >= 2 else None
+        initial_obs = _extract_pixel_panel(obs)
         try:
             birds_eye = BirdsEyeRenderer(maze_env, initial_obs)
             birds_eye.draw(initial_obs)
@@ -1350,13 +1456,35 @@ def run_interactive_evaluation(policy, env, args, device, mirror: MirrorEnvProce
     total_reward = 0.0
     running = True
     auto_reset = True
-    
+
     print(f"\n🚀 Starting evaluation...")
     
     episode_rewards = []
     episode_lengths = []
     step_idx = 0
     
+    def reset_environment(reason: Optional[str] = None):
+        nonlocal obs, info, episode_reward, episode_length, mirror, birds_eye
+        if reason:
+            print(reason)
+        obs, info = env.reset()
+        maybe_reset_policy_state(policy)
+        if mirror is not None:
+            try:
+                mirror.reset()
+            except Exception as exc:
+                print(f"⚠️ Mirror reset failed: {exc}")
+                mirror.close()
+                mirror = None
+        if birds_eye is not None:
+            try:
+                birds_eye.draw(obs)
+            except Exception as exc:
+                print(f"⚠️ Bird's eye draw failed: {exc}")
+                birds_eye = None
+        episode_reward = 0.0
+        episode_length = 0
+
     while running and (args.num_episodes == 0 or episode_count < args.num_episodes):
         # Handle pygame events
         for event in pygame.event.get():
@@ -1366,27 +1494,18 @@ def run_interactive_evaluation(policy, env, args, device, mirror: MirrorEnvProce
                 if event.key == pygame.K_ESCAPE or event.key == pygame.K_q:
                     running = False
                 elif event.key == pygame.K_SPACE:
-                    print(f"🔄 Manual reset triggered")
-                    obs, info = env.reset()
-                    maybe_reset_policy_state(policy)
-                    if mirror is not None:
-                        try:
-                            mirror.reset()
-                        except Exception as exc:
-                            print(f"⚠️ Mirror reset failed: {exc}")
-                            mirror.close()
-                            mirror = None
-                    if birds_eye is not None:
-                        try:
-                            birds_eye.draw(obs if birds_eye.show_obs_panel else None)
-                        except Exception as exc:
-                            print(f"⚠️ Bird's eye draw failed: {exc}")
-                            birds_eye = None
-                    episode_reward = 0.0
-                    episode_length = 0
+                    reset_environment("🔄 Manual reset triggered")
+                elif event.key == pygame.K_n:
+                    reset_environment("⏭️  Skipping to next goal")
                 elif event.key == pygame.K_r:
                     auto_reset = not auto_reset
                     print(f"🔄 Auto-reset: {'ON' if auto_reset else 'OFF'}")
+                elif event.key == pygame.K_s:
+                    current_fps = max(FPS_MIN, current_fps / FPS_SCALE)
+                    print(f"🐢 Slowdown: target FPS {current_fps:.1f}")
+                elif event.key == pygame.K_f:
+                    current_fps = min(FPS_MAX, current_fps * FPS_SCALE)
+                    print(f"⚡ Speedup: target FPS {current_fps:.1f}")
         
         # Convert observation to tensor and add batch dimension
         obs_tensor = _format_policy_observation(obs, policy, device)
@@ -1425,7 +1544,7 @@ def run_interactive_evaluation(policy, env, args, device, mirror: MirrorEnvProce
         episode_length += 1
         if birds_eye is not None:
             try:
-                birds_eye.draw(obs if birds_eye.show_obs_panel else None)
+                birds_eye.draw(obs)
             except Exception as exc:
                 print(f"⚠️ Bird's eye draw failed: {exc}")
                 birds_eye = None
@@ -1492,21 +1611,7 @@ def run_interactive_evaluation(policy, env, args, device, mirror: MirrorEnvProce
 
             # Reset for next episode
             if auto_reset:
-                obs, info = env.reset()
-                maybe_reset_policy_state(policy)
-                if mirror is not None:
-                    try:
-                        mirror.reset()
-                    except Exception as exc:
-                        print(f"⚠️ Mirror reset failed: {exc}")
-                        mirror.close()
-                        mirror = None
-                if birds_eye is not None:
-                    try:
-                        birds_eye.draw(obs if birds_eye.show_obs_panel else None)
-                    except Exception as exc:
-                        print(f"⚠️ Bird's eye draw failed: {exc}")
-                        birds_eye = None
+                reset_environment(None)
             else:
                 print(f"⏸️  Auto-reset disabled. Press SPACE to reset manually.")
                 # Keep current state until manual reset
@@ -1515,7 +1620,7 @@ def run_interactive_evaluation(policy, env, args, device, mirror: MirrorEnvProce
             episode_length = 0
         
         # Control frame rate
-        clock.tick(args.fps)
+        clock.tick(current_fps)
     
     # Final statistics
     if episode_rewards:
