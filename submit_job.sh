@@ -147,6 +147,12 @@ echo "Use: squeue -j $JOB_ID"
 printf 'export SLURM_ACCOUNT="%s"\n' "$ACCOUNT" > .slurm_account
 
 if [[ "$SYNC_WANDB" -eq 1 ]]; then
-    source_sc_env || true
-    monitor_wandb "$JOB_ID" "$WAND_DIR" "$WAND_INTERVAL"
+    mkdir -p logs
+    LOG_PATH="logs/wandb_sync_${JOB_ID}.log"
+    echo "📡 Launching background wandb sync (log: ${LOG_PATH})"
+    (
+        source_sc_env || true
+        monitor_wandb "$JOB_ID" "$WAND_DIR" "$WAND_INTERVAL"
+    ) >"${LOG_PATH}" 2>&1 < /dev/null &
+    disown
 fi
