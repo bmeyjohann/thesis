@@ -16,6 +16,7 @@ import sys
 import json
 import time
 import warnings
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -131,6 +132,20 @@ def clip_action_l2(actions: np.ndarray, max_norm: float = 1.0) -> np.ndarray:
     result = actions.copy()
     result[mask & (norms > 0)] = result[mask & (norms > 0)] / norms[mask & (norms > 0)]
     return result
+
+
+def init_action_history(action_dim: int, stack: int) -> deque:
+    history = deque(maxlen=stack)
+    zero = np.zeros(action_dim, dtype=np.float32)
+    for _ in range(stack):
+        history.append(zero.copy())
+    return history
+
+
+def flatten_action_history(history: deque) -> np.ndarray:
+    if not history:
+        return np.zeros(0, dtype=np.float32)
+    return np.concatenate(list(history), axis=0).astype(np.float32, copy=False)
 
 def parse_args():
     parser = build_arg_parser()
@@ -324,6 +339,8 @@ class RunPaths:
     policy_map_dir: Path
     policy_cache_path: Path
     record_progress: Any
+    log_args_path: Path
+    model_args_path: Path
 
 
 def prepare_run_dirs(args) -> RunPaths:
@@ -343,13 +360,20 @@ def prepare_run_dirs(args) -> RunPaths:
     progress_fp.write(f"# logging started {time.strftime('%Y-%m-%dT%H:%M:%S')}\n")
     progress_fp.flush()
 
+    args_payload = vars(args)
+
     def _record(msg: str) -> None:
         stamp = time.strftime('%Y-%m-%dT%H:%M:%S')
         progress_fp.write(f"{stamp} {msg}\n")
         progress_fp.flush()
 
-    with open(run_log_dir / "args.json", "w", encoding="utf-8") as fp:
-        json.dump(vars(args), fp, indent=2)
+    log_args_path = run_log_dir / "args.json"
+    with open(log_args_path, "w", encoding="utf-8") as fp:
+        json.dump(args_payload, fp, indent=2)
+
+    model_args_path = run_model_dir / "args.json"
+    with open(model_args_path, "w", encoding="utf-8") as fp:
+        json.dump(args_payload, fp, indent=2)
 
     return RunPaths(
         log_dir=run_log_dir,
@@ -357,6 +381,8 @@ def prepare_run_dirs(args) -> RunPaths:
         policy_map_dir=viz_dir,
         policy_cache_path=cache_path,
         record_progress=_record,
+        log_args_path=log_args_path,
+        model_args_path=model_args_path,
     )
 
 
@@ -677,19 +703,31 @@ def wrap_env_for_drq(env: dm_env.Environment, args) -> dm_env.Environment:
     return env
 
 
-def run_evaluation(env, agent: DrQV2Agent, num_episodes: int, device: torch.device) -> Tuple[float, float]:
+def run_evaluation(env,
+                   agent: DrQV2Agent,
+                   num_episodes: int,
+                   device: torch.device,
+                   action_dim: int,
+                   history_len: int) -> Tuple[float, float]:
     total_reward = 0.0
     total_length = 0
     for _ in range(num_episodes):
+        action_history = init_action_history(action_dim, history_len)
+        prev_stack = flatten_action_history(action_history)
         time_step = env.reset()
         done = False
         episode_reward = 0.0
         episode_len = 0
         while not time_step.last():
-            obs = ensure_tensor(time_step.observation, device)
+            obs = time_step.observation
             with torch.no_grad(), utils.eval_mode(agent):
-                action = agent.act(obs.squeeze(0).cpu().numpy(), step=0, eval_mode=True)
+                action = agent.act(obs,
+                                   step=0,
+                                   eval_mode=True,
+                                   prev_actions=prev_stack)
             time_step = env.step(action)
+            action_history.append(np.asarray(action, dtype=np.float32).copy())
+            prev_stack = flatten_action_history(action_history)
             episode_reward += float(time_step.reward)
             episode_len += 1
         total_reward += episode_reward
@@ -733,6 +771,9 @@ def train():
     if len(obs_shape) != 3:
         raise ValueError(f"DrQ-v2 trainer expects 3D pixel observations, got shape {obs_shape}")
     pixel_shape_tuple = tuple(int(x) for x in obs_shape)
+    action_history_len = max(1, int(args.frame_stack))
+    action_dim = int(np.prod(action_shape))
+    prev_action_dim = action_dim * action_history_len
     agent = DrQV2Agent(
         obs_shape=obs_shape,
         action_shape=action_shape,
@@ -746,6 +787,7 @@ def train():
         stddev_schedule=args.stddev_schedule,
         stddev_clip=args.stddev_clip,
         use_tb=False,
+        action_history_len=action_history_len,
     )
 
     run_paths = prepare_run_dirs(args)
@@ -753,12 +795,17 @@ def train():
     logger = DrQLogger(args=args, record_progress=run_paths.record_progress, teacher_metrics=teacher_metrics)
     checkpoint_mgr = DrQCheckpointManager(args=args, run_paths=run_paths, logger=logger)
 
-    data_specs = (
-        train_env.observation_spec(),
+    data_specs_list = [train_env.observation_spec()]
+    if prev_action_dim > 0:
+        data_specs_list.append(
+            specs.Array((prev_action_dim,), np.float32, "prev_actions")
+        )
+    data_specs_list.extend([
         train_env.action_spec(),
         specs.Array((1,), np.float32, "reward"),
         specs.Array((1,), np.float32, "discount"),
-    )
+    ])
+    data_specs = tuple(data_specs_list)
     replay_dir = run_paths.log_dir / "buffer"
     replay_storage = ReplayBufferStorage(data_specs, replay_dir)
     replay_loader = make_replay_loader(
@@ -779,6 +826,7 @@ def train():
         pref_storage = PreferencePairStorage(
             obs_shape=obs_shape,
             action_shape=action_shape,
+            prev_action_shape=(prev_action_dim,),
             storage_dir=pref_dir,
             chunk_size=args.pref_chunk_size,
         )
@@ -786,9 +834,14 @@ def train():
             storage_dir=pref_dir,
             max_size=args.pref_capacity,
             fetch_every=args.pref_fetch_every,
+            prev_action_shape=(prev_action_dim,),
         )
 
+    action_history = init_action_history(action_dim, action_history_len)
     time_step = train_env.reset()
+    time_step = time_step._replace(
+        prev_actions=flatten_action_history(action_history)
+    )
     replay_storage.add(time_step)
 
     initial_ckpt = checkpoint_mgr.save(
@@ -815,14 +868,24 @@ def train():
         if time_step.last():
             rewbuffer.append(episode_reward)
             lenbuffer.append(episode_length)
+            action_history = init_action_history(action_dim, action_history_len)
             time_step = train_env.reset()
+            time_step = time_step._replace(
+                prev_actions=flatten_action_history(action_history)
+            )
             replay_storage.add(time_step)
             episode_reward = 0.0
             episode_length = 0
 
         obs = time_step.observation
+        prev_action_stack = time_step.prev_actions
         with torch.no_grad(), utils.eval_mode(agent):
-            policy_action = agent.act(obs, step=total_env_steps, eval_mode=False)
+            policy_action = agent.act(
+                obs,
+                step=total_env_steps,
+                eval_mode=False,
+                prev_actions=prev_action_stack,
+            )
         policy_action = clip_action_l2(policy_action)
         next_time_step = train_env.step(policy_action)
         info = getattr(train_env, "last_info", lambda: {})() or {}
@@ -836,7 +899,10 @@ def train():
         )
         applied_action_np = np.asarray(applied_action, dtype=np.float32)
         action_for_logging = applied_action_np.copy()
-        next_time_step = next_time_step._replace(action=applied_action_np)
+        action_history.append(applied_action_np.copy())
+        next_prev_stack = flatten_action_history(action_history)
+        next_time_step = next_time_step._replace(action=applied_action_np,
+                                                prev_actions=next_prev_stack)
         replay_storage.add(next_time_step)
 
         if teacher_intervened:
@@ -850,6 +916,7 @@ def train():
             try:
                 pref_storage.add(
                     np.asarray(obs).copy(),
+                    np.asarray(prev_action_stack, dtype=np.float32).copy(),
                     np.asarray(teacher_action, dtype=np.float32),
                     np.asarray(student_action, dtype=np.float32),
                 )
@@ -902,7 +969,12 @@ def train():
             obs_tensor = ensure_tensor(obs, device)
             act_tensor = torch.as_tensor(action_for_logging, device=device).view(1, -1)
             repr_obs = agent.encoder(obs_tensor)
-            q1, q2 = agent.critic(repr_obs, act_tensor)
+            if agent.prev_action_dim > 0:
+                prev_tensor = torch.as_tensor(prev_action_stack,
+                                              device=device).view(1, -1)
+            else:
+                prev_tensor = None
+            q1, q2 = agent.critic(repr_obs, prev_tensor, act_tensor)
             disagreement = torch.abs(q1 - q2).view(-1)
             qmin = torch.min(q1, q2).view(-1)
         teacher_flag = torch.tensor(
@@ -939,7 +1011,14 @@ def train():
             metrics_updates = 0
 
         if args.eval_every_frames and total_env_steps % args.eval_every_frames == 0:
-            eval_reward, eval_length = run_evaluation(eval_env, agent, args.num_eval_episodes, device)
+            eval_reward, eval_length = run_evaluation(
+                eval_env,
+                agent,
+                args.num_eval_episodes,
+                device,
+                action_dim,
+                action_history_len,
+            )
             logger.log_eval(total_env_steps=total_env_steps, reward=eval_reward, length=eval_length)
 
     final_ckpt = checkpoint_mgr.save(

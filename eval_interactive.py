@@ -27,6 +27,7 @@ Controls:
 import os
 import sys
 import argparse
+import json
 import math
 import time
 import torch
@@ -84,6 +85,7 @@ def _coerce_args_dict(raw: Any) -> dict[str, Any]:
 
 
 _CLI_FLAG_ALIASES: dict[str, tuple[str, ...]] = {
+    'env_name': ('--env_name',),
     'include_goal': ('--include_goal', '--no_include_goal'),
     'include_distance': ('--include_distance',),
     'include_direction': ('--include_direction',),
@@ -106,6 +108,8 @@ _CLI_FLAG_ALIASES: dict[str, tuple[str, ...]] = {
     'pixel_first_person_height': ('--pixel_first_person_height',),
     'pixel_first_person_lookahead': ('--pixel_first_person_lookahead',),
     'pixel_first_person_pitch': ('--pixel_first_person_pitch',),
+    'teacher_type': ('--teacher_type',),
+    'intervention_mode': ('--intervention_mode',),
 }
 
 
@@ -179,6 +183,97 @@ def _cli_flag_provided(flags: tuple[str, ...]) -> bool:
     return False
 
 
+def _load_model_config_dict(model_path: Optional[str]) -> tuple[Optional[Path], dict[str, Any]]:
+    if not model_path:
+        return None, {}
+    try:
+        resolved = Path(model_path).resolve()
+    except Exception:
+        return None, {}
+    candidates = []
+    exp_dir = resolved.parent
+    candidates.append(exp_dir / "args.json")
+    # Mirror logs/<subdir>/<exp>/args.json if structure matches models/<subdir>/<exp>
+    if len(exp_dir.parts) >= 2:
+        maybe_subdir = exp_dir.parent.name
+        log_candidate = Path("logs") / maybe_subdir / exp_dir.name / "args.json"
+        candidates.append(log_candidate)
+    for cand in candidates:
+        if cand.is_file():
+            try:
+                with cand.open('r', encoding='utf-8') as fp:
+                    return cand, json.load(fp)
+            except Exception as exc:
+                print(f"⚠️ Failed to read config {cand}: {exc}")
+    return None, {}
+
+
+def apply_model_config_defaults(args) -> Optional[dict[str, Any]]:
+    config_path, config_dict = _load_model_config_dict(getattr(args, 'model_path', None))
+    if not config_dict:
+        return None
+    applied_keys: list[str] = []
+    for key, value in config_dict.items():
+        if not hasattr(args, key):
+            continue
+        if key == 'model_path':
+            continue
+        flags = _CLI_FLAG_ALIASES.get(key)
+        if flags and _cli_flag_provided(flags):
+            continue
+        setattr(args, key, value)
+        applied_keys.append(key)
+    return {
+        'path': config_path,
+        'applied_keys': sorted(applied_keys),
+        'config': config_dict,
+    }
+
+
+def log_eval_configuration(args, *, config_info=None, checkpoint_args=None) -> None:
+    print("\n⚙️ Evaluation configuration summary")
+    if config_info and config_info.get('path'):
+        applied = config_info.get('applied_keys') or []
+        applied_str = ', '.join(applied) if applied else 'none'
+        print(f"   Loaded model config: {config_info['path']} (applied: {applied_str})")
+    if checkpoint_args:
+        print("   Checkpoint metadata found; synced observation/camera settings.")
+    fields = [
+        ("Environment", 'env_name'),
+        ("Observation Mode", 'obs_mode'),
+        ("Include Goal", 'include_goal'),
+        ("Include Distance", 'include_distance'),
+        ("Include Direction", 'include_direction'),
+        ("Include Velocity", 'include_velocity'),
+        ("Reward Type", 'reward_type'),
+        ("Dense Reward Scale", 'dense_reward_scale'),
+        ("Step Penalty", 'step_penalty'),
+        ("Teacher", 'teacher_type'),
+        ("Intervention Mode", 'intervention_mode'),
+        ("Tolerance Type", 'tolerance_type'),
+        ("Tolerance Value", 'tolerance_value'),
+    ]
+    for label, attr in fields:
+        if hasattr(args, attr):
+            print(f"   {label}: {getattr(args, attr)}")
+    if getattr(args, 'obs_mode', 'state') == 'pixels':
+        pixel_fields = [
+            ("Pixel Size", f"{getattr(args, 'pixel_width', 84)}x{getattr(args, 'pixel_height', 84)}"),
+            ("Camera Mode", getattr(args, 'pixel_camera_mode', 'global')),
+            ("Camera Name", getattr(args, 'pixel_camera', None)),
+            ("Local View Size", getattr(args, 'pixel_local_view_size', None)),
+            ("Local Camera Height", getattr(args, 'pixel_local_camera_height', None)),
+            ("First-Person distance", getattr(args, 'pixel_first_person_distance', None)),
+            ("First-Person height", getattr(args, 'pixel_first_person_height', None)),
+            ("First-Person lookahead", getattr(args, 'pixel_first_person_lookahead', None)),
+            ("First-Person pitch", getattr(args, 'pixel_first_person_pitch', None)),
+        ]
+        for label, value in pixel_fields:
+            if value is not None:
+                print(f"   {label}: {value}")
+    print("")
+
+
 def update_args_from_checkpoint(args, checkpoint: dict[str, Any]) -> dict[str, Any]:
     """Populate evaluation args with metadata saved during training."""
     ckpt_args = _coerce_args_dict(checkpoint.get('args'))
@@ -192,6 +287,7 @@ def update_args_from_checkpoint(args, checkpoint: dict[str, Any]) -> dict[str, A
         print(f"⚠️ CLI obs_mode={args.obs_mode} overrides checkpoint obs_mode={obs_mode_ckpt}")
 
     keys_to_sync = [
+        'env_name',
         'include_goal',
         'include_distance',
         'include_direction',
@@ -1649,21 +1745,24 @@ def main():
         print("ℹ️ Enabling human teleop intervention wrapper for manual control.")
         args.intervention_mode = 'human'
 
+    config_info = apply_model_config_defaults(args) if args.model_path else None
+
     env: Optional[gym.Env] = None
     mirror: Optional[MirrorEnvProcess] = None
     policy = None
     training_info: dict[str, Any] = {}
     checkpoint = None
+    ckpt_args_dict = None
     try:
         if args.controller == 'policy':
             if not args.model_path:
                 raise ValueError("A --model_path must be provided when controller='policy'.")
             checkpoint = torch.load(args.model_path, map_location='cpu')
-            ckpt_args = update_args_from_checkpoint(args, checkpoint)
+            ckpt_args_dict = update_args_from_checkpoint(args, checkpoint)
         else:
-            ckpt_args = None
             if args.model_path:
                 print("⚠️ controller!='policy'; ignoring provided --model_path.")
+        log_eval_configuration(args, config_info=config_info, checkpoint_args=ckpt_args_dict)
         env, mirror = setup_environment(args)
         if args.controller == 'policy':
             policy, training_info = load_trained_policy(
