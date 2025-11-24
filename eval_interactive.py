@@ -37,6 +37,7 @@ import numpy as np
 import gymnasium as gym
 import pygame
 import multiprocessing as mp
+from collections import deque
 from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, Optional
@@ -108,6 +109,9 @@ _CLI_FLAG_ALIASES: dict[str, tuple[str, ...]] = {
     'pixel_first_person_height': ('--pixel_first_person_height',),
     'pixel_first_person_lookahead': ('--pixel_first_person_lookahead',),
     'pixel_first_person_pitch': ('--pixel_first_person_pitch',),
+    'frame_stack': ('--frame_stack',),
+    'use_local_actions': ('--use_local_actions', '--no_use_local_actions'),
+    'se2_translation_scale': ('--se2_translation_scale',),
     'teacher_type': ('--teacher_type',),
     'intervention_mode': ('--intervention_mode',),
 }
@@ -245,6 +249,9 @@ def log_eval_configuration(args, *, config_info=None, checkpoint_args=None) -> N
         ("Include Distance", 'include_distance'),
         ("Include Direction", 'include_direction'),
         ("Include Velocity", 'include_velocity'),
+        ("Frame Stack", 'frame_stack'),
+        ("Use Local Actions", 'use_local_actions'),
+        ("SE(2) Translation Scale", 'se2_translation_scale'),
         ("Reward Type", 'reward_type'),
         ("Dense Reward Scale", 'dense_reward_scale'),
         ("Step Penalty", 'step_penalty'),
@@ -709,7 +716,8 @@ except ImportError:
     FASTSAC_AVAILABLE = False
 
 try:
-    from drqv2.drqv2 import Encoder as DrQEncoder, Actor as DrQActor  # type: ignore
+    from drqv2.drqv2 import DrQV2Agent  # type: ignore
+    from drqv2.recurrent_agent import DrQV2RecurrentAgent  # type: ignore
     DRQV2_AVAILABLE = True
 except ImportError:
     DRQV2_AVAILABLE = False
@@ -804,7 +812,7 @@ class FastSACPolicy:
         except TypeError:
             return self.obs_normalizer(obs)
 
-    def act(self, obs_dict, deterministic: bool = True):
+    def act(self, obs_dict, deterministic: bool = True, prev_actions: torch.Tensor | None = None):
         obs = obs_dict["policy"].to(self.device)
         if self.legacy_actor is not None:
             with torch.no_grad():
@@ -820,33 +828,37 @@ class FastSACPolicy:
 
 
 class DrQPolicy:
-    """Wrapper for DrQ-v2 pixel policies."""
+    """Wrapper around DrQV2Agent/DrQV2RecurrentAgent for pixel observations."""
 
-    def __init__(self, *, encoder: DrQEncoder, actor: DrQActor, pixel_shape: tuple[int, int, int], device: torch.device, eval_std: float = 0.0):
-        self.encoder = encoder.to(device)
-        self.actor = actor.to(device)
-        self.pixel_shape = pixel_shape
-        self.target_channels, self.target_height, self.target_width = pixel_shape
+    def __init__(self, *, agent, pixel_shape: tuple[int, int, int], device: torch.device):
+        self.agent = agent
+        self.device = device
+        self.pixel_shape = tuple(int(x) for x in pixel_shape)
+        self.target_channels, self.target_height, self.target_width = self.pixel_shape
         base_channels = 3 if self.target_channels % 3 == 0 else self.target_channels
         stack = max(1, self.target_channels // base_channels)
-        if stack < 1:
-            stack = 1
         self.base_channels = base_channels
         self.frame_stack = stack
-        self.device = device
-        self.eval_std = float(eval_std)
         self.obs_mode = 'pixels'
-        self.encoder.eval()
-        self.actor.eval()
         self._frame_buffer: list[torch.Tensor] = []
+        self._step = 0
+        self.use_se2_warp = bool(getattr(agent, 'use_se2_warp', False))
+        self.prev_action_dim = int(getattr(agent, 'prev_action_dim', 0))
+        raw_hist = getattr(agent, 'action_history_len', 0) or 0
+        self.action_history_len = max(0, int(raw_hist))
+        self.agent_variant = getattr(agent, 'recurrent_type', 'standard') if hasattr(agent, 'recurrent_type') else 'standard'
+        self.agent.train(False)
 
     def eval(self):
-        self.encoder.eval()
-        self.actor.eval()
+        self.agent.train(False)
         self.reset()
 
     def reset(self):
         self._frame_buffer = []
+        self._step = 0
+        reset_fn = getattr(self.agent, 'reset_memory', None)
+        if callable(reset_fn):
+            reset_fn()
 
     def prepare_obs(self, obs, device):
         data = obs
@@ -920,17 +932,27 @@ class DrQPolicy:
             self._frame_buffer.append(cloned)
         return torch.cat(self._frame_buffer, dim=1)
 
-    def act(self, obs_dict, deterministic: bool = True):
+    def act(self, obs_dict, deterministic: bool = True, prev_actions: torch.Tensor | None = None):
         obs = obs_dict["policy"].to(self.device)
         obs = self._reshape_obs(obs)
+        obs_np = obs.detach().cpu().numpy()[0]
+        prev_np = None
+        if prev_actions is not None:
+            prev_np = prev_actions.detach().cpu().numpy()[0]
         with torch.no_grad():
-            features = self.encoder(obs)
-            dist = self.actor(features, self.eval_std)
-            if deterministic:
-                action = dist.mean
-            else:
-                action = dist.sample(clip=None)
-        return action
+            action = self.agent.act(
+                obs_np,
+                step=self._step,
+                eval_mode=True,
+                prev_actions=prev_np,
+            )
+        self._step += 1
+        return torch.as_tensor(action, device=self.device, dtype=torch.float32).view(1, -1)
+
+    def register_pending_warp(self, warp_params: np.ndarray):
+        fn = getattr(self.agent, 'register_pending_warp', None)
+        if callable(fn):
+            fn(warp_params)
 
 
 def _infer_pixel_shape_from_space(space) -> tuple[int, int, int] | None:
@@ -973,7 +995,7 @@ class _ControllerPolicyBase:
 class RandomControllerPolicy(_ControllerPolicyBase):
     """Uniform random actions in [-1, 1]."""
 
-    def act(self, obs_dict, deterministic: bool = True):
+    def act(self, obs_dict, deterministic: bool = True, prev_actions: torch.Tensor | None = None):
         batch = obs_dict["policy"].shape[0]
         return torch.empty(batch, self.action_dim, device=self.device).uniform_(-1.0, 1.0)
 
@@ -981,7 +1003,7 @@ class RandomControllerPolicy(_ControllerPolicyBase):
 class IdleControllerPolicy(_ControllerPolicyBase):
     """Always output zero actions (use with human teleop overrides)."""
 
-    def act(self, obs_dict, deterministic: bool = True):
+    def act(self, obs_dict, deterministic: bool = True, prev_actions: torch.Tensor | None = None):
         batch = obs_dict["policy"].shape[0]
         return torch.zeros(batch, self.action_dim, device=self.device)
 
@@ -1131,24 +1153,66 @@ def load_trained_policy(
     elif policy_type == 'drqv2':
         if not DRQV2_AVAILABLE:
             raise ImportError("DRQ-v2 components unavailable; ensure drqv2 module is on PYTHONPATH.")
-        pixel_shape = checkpoint.get('pixel_shape') or getattr(args, 'pixel_shape_from_checkpoint', None) or obs_space.shape
-        pixel_shape = _canonical_pixel_shape(pixel_shape)
-        feature_dim = train_args.get('drq_feature_dim', 50)
-        hidden_dim = train_args.get('drq_hidden_dim', 1024)
-        encoder = DrQEncoder(pixel_shape).to(device)
-        encoder.load_state_dict(checkpoint['drq_encoder'])
-        encoder.eval()
-        action_shape = env.action_space.shape
-        actor = DrQActor(encoder.repr_dim, action_shape, feature_dim, hidden_dim).to(device)
-        actor.load_state_dict(checkpoint['drq_actor'])
-        actor.eval()
-        policy = DrQPolicy(
-            encoder=encoder,
-            actor=actor,
-            pixel_shape=pixel_shape,
+        pixel_shape_raw = checkpoint.get('pixel_shape') or getattr(args, 'pixel_shape_from_checkpoint', None) or obs_space.shape
+        pixel_shape = _canonical_pixel_shape(pixel_shape_raw)
+        action_shape = tuple(int(x) for x in env.action_space.shape)
+        frame_stack = int(train_args.get('frame_stack', 1) or 1)
+        action_history_len = max(1, frame_stack)
+        agent_variant = train_args.get('agent_variant', 'standard')
+        agent_kwargs = dict(
+            obs_shape=pixel_shape,
+            action_shape=action_shape,
             device=device,
-            eval_std=float(train_args.get('eval_std', 0.0)),
+            lr=float(train_args.get('learning_rate', 1e-4)),
+            feature_dim=int(train_args.get('drq_feature_dim', 50)),
+            hidden_dim=int(train_args.get('drq_hidden_dim', 1024)),
+            critic_target_tau=float(train_args.get('critic_target_tau', 0.01)),
+            num_expl_steps=int(train_args.get('num_expl_steps', 2000)),
+            update_every_steps=int(train_args.get('update_every_steps', 1)),
+            stddev_schedule=str(train_args.get('stddev_schedule', "linear(1.0,0.1,1e5)")),
+            stddev_clip=float(train_args.get('stddev_clip', 0.3)),
+            use_tb=False,
         )
+
+        def _instantiate_agent(hist_len: int):
+            kwargs = dict(agent_kwargs)
+            kwargs['action_history_len'] = max(0, hist_len)
+            if agent_variant == 'recurrent':
+                return DrQV2RecurrentAgent(
+                    recurrent_type=train_args.get('recurrent_type', 'convgru'),
+                    recurrent_hidden_dim=int(train_args.get('recurrent_hidden_dim', 512)),
+                    conv_hidden_channels=int(train_args.get('recurrent_conv_channels', 32)),
+                    use_se2_warp=bool(train_args.get('recurrent_use_se2_warp', False)),
+                    **kwargs,
+                )
+            return DrQV2Agent(**kwargs)
+
+        history_candidate = max(1, action_history_len)
+        tried_zero = False
+        while True:
+            agent = _instantiate_agent(history_candidate)
+            encoder_module = getattr(agent, 'encoder', None)
+            if encoder_module is None:
+                encoder_module = getattr(agent, 'core', None)
+            if encoder_module is None:
+                raise AttributeError("DrQ agent is missing encoder/core module")
+            encoder_module.load_state_dict(checkpoint['drq_encoder'])
+            try:
+                agent.actor.load_state_dict(checkpoint['drq_actor'])
+                break
+            except RuntimeError as exc:
+                if history_candidate > 0 and not tried_zero:
+                    print("⚠️ Actor input mismatch (prev-action history); retrying without prev-actions.")
+                    history_candidate = 0
+                    tried_zero = True
+                    continue
+                raise
+        if 'drq_critic' in checkpoint:
+            agent.critic.load_state_dict(checkpoint['drq_critic'])
+        if 'drq_critic_target' in checkpoint:
+            agent.critic_target.load_state_dict(checkpoint['drq_critic_target'])
+        agent.train(False)
+        policy = DrQPolicy(agent=agent, pixel_shape=pixel_shape, device=device)
         policy.eval()
     else:  # fastsac_v2
         if not FASTSAC_AVAILABLE:
@@ -1275,6 +1339,12 @@ def load_trained_policy(
             'pixel_first_person_height',
             'pixel_first_person_lookahead',
             'pixel_first_person_pitch',
+            'frame_stack',
+            'use_local_actions',
+            'se2_translation_scale',
+            'agent_variant',
+            'recurrent_type',
+            'recurrent_use_se2_warp',
         ]:
             if key in args_obj:
                 training_info[key] = args_obj[key]
@@ -1294,12 +1364,26 @@ def load_trained_policy(
             'pixel_first_person_height',
             'pixel_first_person_lookahead',
             'pixel_first_person_pitch',
+            'frame_stack',
+            'use_local_actions',
+            'se2_translation_scale',
+            'agent_variant',
+            'recurrent_type',
+            'recurrent_use_se2_warp',
         ]:
             if hasattr(args_obj, key):
                 training_info[key] = getattr(args_obj, key)
     for key in ['training_info', 'iteration', 'total_timesteps']:
         if key in checkpoint:
             training_info[key] = checkpoint[key]
+
+    training_info['frame_stack'] = int(train_args.get('frame_stack', training_info.get('frame_stack', 1) or 1))
+    training_info['use_local_actions'] = bool(train_args.get('use_local_actions', training_info.get('use_local_actions', False)))
+    training_info['se2_translation_scale'] = float(train_args.get('se2_translation_scale', training_info.get('se2_translation_scale', 0.2)))
+    training_info['agent_variant'] = train_args.get('agent_variant', training_info.get('agent_variant', 'standard'))
+    if training_info['agent_variant'] == 'recurrent':
+        training_info['recurrent_type'] = train_args.get('recurrent_type', training_info.get('recurrent_type', 'convgru'))
+        training_info['recurrent_use_se2_warp'] = bool(train_args.get('recurrent_use_se2_warp', training_info.get('recurrent_use_se2_warp', False)))
 
     print("✓ Policy set to evaluation mode")
     return policy, training_info
@@ -1427,6 +1511,110 @@ def _format_policy_observation(obs, policy, device):
     )
 
 
+def _init_action_history(action_dim: int, stack: int) -> deque:
+    length = max(0, int(stack))
+    if length <= 0:
+        return deque()
+    history = deque(maxlen=length)
+    zero = np.zeros(action_dim, dtype=np.float32)
+    for _ in range(length):
+        history.append(zero.copy())
+    return history
+
+
+def _flatten_action_history(history: deque) -> np.ndarray:
+    if not history:
+        return np.zeros(0, dtype=np.float32)
+    return np.concatenate(list(history), axis=0).astype(np.float32, copy=False)
+
+
+class ActionFrameTransformer:
+    """Convert between local (agent-centric) and global action frames."""
+
+    def __init__(self, use_local: bool, translation_scale: float = 0.2):
+        self.use_local = bool(use_local)
+        self.translation_scale = float(translation_scale)
+        self.heading = np.array([1.0, 0.0], dtype=np.float32)
+        self.last_action = np.array([1.0, 0.0], dtype=np.float32)
+        self._last_xy: np.ndarray | None = None
+
+    def reset(self):
+        self.heading[:] = np.array([1.0, 0.0], dtype=np.float32)
+        self.last_action[:] = np.array([1.0, 0.0], dtype=np.float32)
+        self._last_xy = None
+
+    def to_global(self, action: np.ndarray) -> np.ndarray:
+        if not self.use_local:
+            return np.asarray(action, dtype=np.float32)
+        local = np.asarray(action, dtype=np.float32)
+        cos_h, sin_h = self.heading
+        rot = np.array([[cos_h, -sin_h], [sin_h, cos_h]], dtype=np.float32)
+        return (rot @ local.reshape(-1, 1)).reshape(local.shape)
+
+    def to_local(self, action: np.ndarray) -> np.ndarray:
+        if not self.use_local:
+            return np.asarray(action, dtype=np.float32)
+        glob = np.asarray(action, dtype=np.float32)
+        cos_h, sin_h = self.heading
+        rot = np.array([[cos_h, sin_h], [-sin_h, cos_h]], dtype=np.float32)
+        return (rot @ glob.reshape(-1, 1)).reshape(glob.shape)
+
+    def update_heading(self, info: dict | None):
+        if not isinstance(info, dict):
+            return
+        delta = None
+        prev_qpos = info.get('prev_qpos')
+        qpos = info.get('qpos')
+        if prev_qpos is not None and qpos is not None:
+            delta = np.asarray(qpos[:2], dtype=np.float32) - np.asarray(prev_qpos[:2], dtype=np.float32)
+        elif 'xy' in info:
+            xy = np.asarray(info['xy'], dtype=np.float32)
+            if self._last_xy is not None:
+                delta = xy - self._last_xy
+            self._last_xy = xy.copy()
+        if delta is not None and delta.shape[0] >= 2:
+            norm = np.linalg.norm(delta[:2])
+            if norm > 1e-6:
+                self.heading[:] = delta[:2] / norm
+
+    def compute_warp_from_action(self, action_local: np.ndarray) -> np.ndarray:
+        vec = np.asarray(action_local, dtype=np.float32)
+        warp = np.zeros(3, dtype=np.float32)
+        warp[:2] = vec[:2] * self.translation_scale
+        prev = self.last_action
+        norm_prev = np.linalg.norm(prev)
+        norm_new = np.linalg.norm(vec)
+        heading_prev = np.arctan2(prev[1], prev[0]) if norm_prev > 1e-6 else 0.0
+        heading_new = np.arctan2(vec[1], vec[0]) if norm_new > 1e-6 else heading_prev
+        warp[2] = float(heading_new - heading_prev)
+        if norm_new > 1e-6:
+            self.last_action[:] = vec
+        return warp
+
+
+def clip_action_l2_np(action: np.ndarray, max_norm: float = 1.0) -> np.ndarray:
+    vec = np.asarray(action, dtype=np.float32)
+    norm = np.linalg.norm(vec)
+    if norm > max_norm and norm > 0:
+        vec = vec / norm
+    return vec
+
+
+def _resolve_action_history_len(args, policy) -> int:
+    if hasattr(policy, 'action_history_len'):
+        try:
+            return max(0, int(getattr(policy, 'action_history_len')))
+        except Exception:
+            pass
+    frame_stack = getattr(args, 'frame_stack', None)
+    if frame_stack is not None:
+        try:
+            return max(0, int(frame_stack))
+        except Exception:
+            return 1
+    return 1
+
+
 def run_headless_evaluation(policy, env, args, device):
     """Minimal evaluation loop without pygame for automated tests."""
     print("\n🧪 Running headless evaluation")
@@ -1437,10 +1625,23 @@ def run_headless_evaluation(policy, env, args, device):
     max_steps = args.max_episode_steps
     episode_rewards: list[float] = []
     episode_lengths: list[int] = []
+    action_dim = int(np.prod(env.action_space.shape))
+    history_len = _resolve_action_history_len(args, policy)
+    prev_action_dim = int(getattr(policy, 'prev_action_dim', 0))
+    if prev_action_dim <= 0:
+        history_len = 0
+    use_local_actions = bool(getattr(args, 'use_local_actions', False))
+    translation_scale = float(getattr(args, 'se2_translation_scale', 0.2))
+    policy_has_warp = bool(getattr(policy, 'use_se2_warp', False))
+    action_history = _init_action_history(action_dim, history_len)
+    transformer = ActionFrameTransformer(use_local_actions, translation_scale)
 
     for episode_idx in range(target_episodes):
         obs, info = env.reset(seed=args.seed + episode_idx)
         maybe_reset_policy_state(policy)
+        action_history = _init_action_history(action_dim, history_len)
+        transformer.reset()
+        transformer.update_heading(info if isinstance(info, dict) else None)
         done = False
         ep_reward = 0.0
         steps = 0
@@ -1448,14 +1649,27 @@ def run_headless_evaluation(policy, env, args, device):
             obs_tensor = _format_policy_observation(obs, policy, device)
             obs_dict = TensorDict({"policy": obs_tensor}, batch_size=[obs_tensor.shape[0]], device=device)
             with torch.no_grad():
-                actions = policy.act(obs_dict, deterministic=True)
+                if history_len > 0 and action_history:
+                    prev_stack = _flatten_action_history(action_history)
+                    prev_tensor = torch.as_tensor(prev_stack, device=device).view(1, -1)
+                else:
+                    prev_tensor = None
+                actions = policy.act(obs_dict, deterministic=True, prev_actions=prev_tensor)
                 actions = clip_action_l2_tensor(actions)
-            action = actions.cpu().numpy()[0]
+            action_local = actions.cpu().numpy()[0]
+            if policy_has_warp and hasattr(policy, 'register_pending_warp'):
+                warp = transformer.compute_warp_from_action(action_local)
+                policy.register_pending_warp(warp)
+            action = transformer.to_global(action_local)
+            action = clip_action_l2_np(action)
             if args.action_scale != 1.0:
                 action *= args.action_scale
             if args.clip_actions:
                 action = np.clip(action, -1.0, 1.0)
             obs, reward, terminated, truncated, info = env.step(action)
+            if history_len > 0 and action_history is not None:
+                action_history.append(action_local.copy())
+            transformer.update_heading(info if isinstance(info, dict) else None)
             ep_reward += float(reward)
             steps += 1
             done = bool(terminated or truncated)
@@ -1526,9 +1740,23 @@ def run_interactive_evaluation(policy, env, args, device, mirror: MirrorEnvProce
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     
+    action_dim = int(np.prod(env.action_space.shape))
+    history_len = _resolve_action_history_len(args, policy)
+    prev_action_dim = int(getattr(policy, 'prev_action_dim', 0))
+    if prev_action_dim <= 0:
+        history_len = 0
+    use_local_actions = bool(getattr(args, 'use_local_actions', False))
+    translation_scale = float(getattr(args, 'se2_translation_scale', 0.2))
+    policy_has_warp = bool(getattr(policy, 'use_se2_warp', False))
+    action_history = _init_action_history(action_dim, history_len)
+    transformer = ActionFrameTransformer(use_local_actions, translation_scale)
+
     # Reset environment
     obs, info = env.reset(seed=args.seed)
     maybe_reset_policy_state(policy)
+    action_history = _init_action_history(action_dim, history_len)
+    transformer.reset()
+    transformer.update_heading(info if isinstance(info, dict) else None)
     maze_env = unwrap_maze_env(env)
     birds_eye = None
     if maze_env is not None:
@@ -1560,11 +1788,14 @@ def run_interactive_evaluation(policy, env, args, device, mirror: MirrorEnvProce
     step_idx = 0
     
     def reset_environment(reason: Optional[str] = None):
-        nonlocal obs, info, episode_reward, episode_length, mirror, birds_eye
+        nonlocal obs, info, episode_reward, episode_length, mirror, birds_eye, action_history, transformer
         if reason:
             print(reason)
         obs, info = env.reset()
         maybe_reset_policy_state(policy)
+        action_history = _init_action_history(action_dim, history_len)
+        transformer.reset()
+        transformer.update_heading(info if isinstance(info, dict) else None)
         if mirror is not None:
             try:
                 mirror.reset()
@@ -1611,28 +1842,40 @@ def run_interactive_evaluation(policy, env, args, device, mirror: MirrorEnvProce
         
         # Get action from policy
         with torch.no_grad():
-            actions = policy.act(obs_dict, deterministic=True)
+            if history_len > 0 and action_history:
+                prev_stack = _flatten_action_history(action_history)
+                prev_tensor = torch.as_tensor(prev_stack, device=device).view(1, -1)
+            else:
+                prev_tensor = None
+            actions = policy.act(obs_dict, deterministic=True, prev_actions=prev_tensor)
             actions = clip_action_l2_tensor(actions)
-        
-        # Convert action to numpy and remove batch dimension
-        action = actions.cpu().numpy()[0]
+        action_local = actions.cpu().numpy()[0]
+        warp_params = None
+        if policy_has_warp and hasattr(policy, 'register_pending_warp'):
+            warp_params = transformer.compute_warp_from_action(action_local)
+            policy.register_pending_warp(warp_params)
+        action_global = transformer.to_global(action_local)
+        action_global = clip_action_l2_np(action_global)
         
         # Apply action processing (matching training settings)
         if args.action_scale != 1.0:
-            action *= args.action_scale
+            action_global *= args.action_scale
         if args.clip_actions:
-            action = np.clip(action, -1.0, 1.0)
+            action_global = np.clip(action_global, -1.0, 1.0)
         
         # Step environment
-        next_obs, reward, terminated, truncated, info = env.step(action)
+        next_obs, reward, terminated, truncated, info = env.step(action_global)
         done = terminated or truncated
         if mirror is not None:
             try:
-                mirror.step(action)
+                mirror.step(action_global)
             except Exception as exc:
                 print(f"⚠️ Mirror step failed: {exc}")
                 mirror.close()
                 mirror = None
+        if history_len > 0 and action_history is not None:
+            action_history.append(action_local.copy())
+        transformer.update_heading(info if isinstance(info, dict) else None)
         
         # Update episode tracking
         obs = next_obs

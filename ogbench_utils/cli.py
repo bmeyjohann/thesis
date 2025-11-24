@@ -220,6 +220,14 @@ def build_eval_parser() -> argparse.ArgumentParser:
                         help='Include direction to goal in observations')
     parser.add_argument('--include_velocity', action='store_true', default=False,
                         help='Include velocity features in observations')
+    parser.add_argument('--frame_stack', type=int, default=None,
+                        help='Number of stacked frames expected by the policy (defaults to checkpoint metadata)')
+    parser.add_argument('--use_local_actions', action='store_true', default=False,
+                        help='Interpret actions in the agent-local frame (auto-filled from checkpoint if available)')
+    parser.add_argument('--no_use_local_actions', dest='use_local_actions', action='store_false',
+                        help='Force global actions even if checkpoint requested local frame')
+    parser.add_argument('--se2_translation_scale', type=float, default=0.2,
+                        help='Scale factor for SE(2) latent warps when local actions are enabled')
 
     # Pixel observation overrides (auto-filled from checkpoint if available)
     parser.add_argument('--pixel_width', type=int, default=None,
