@@ -232,6 +232,8 @@ def parse_args():
         args.eval_every_frames = max(1, args.smoke_test_steps // 2)
         args.save_interval = max(1, args.smoke_test_steps)
         args.num_eval_episodes = 1
+    if not getattr(args, "use_intervention", False):
+        args.intervention_mode = "none"
     return args
 
 
