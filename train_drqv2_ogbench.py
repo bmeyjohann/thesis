@@ -52,7 +52,7 @@ except Exception:  # pragma: no cover - optional dependency
 from drqv2.drqv2 import DrQV2Agent  # noqa: E402
 from drqv2.recurrent_agent import DrQV2RecurrentAgent  # noqa: E402
 from drqv2 import utils  # noqa: E402
-from drqv2.replay_buffer import ReplayBufferStorage, make_replay_loader  # noqa: E402
+from drqv2.replay_buffer import ReplayBufferStorage, make_replay_loader, make_sequence_replay_loader  # noqa: E402
 from drqv2.pref_buffer import PreferencePairStorage, PreferencePairDataset  # noqa: E402
 
 from ogbench_utils import (  # noqa: E402
@@ -111,6 +111,10 @@ def build_arg_parser():
                         help="Number of hidden channels for ConvGRU variant")
     parser.add_argument("--recurrent_use_se2_warp", action="store_true", default=False,
                         help="Enable SE(2) warp of the recurrent latent map between steps")
+    parser.add_argument("--recurrent_unroll_length", type=int, default=8,
+                        help="Number of time steps to unroll the recurrent core during updates")
+    parser.add_argument("--recurrent_burn_in", type=int, default=4,
+                        help="Burn-in steps to warm up hidden state before computing losses")
     parser.add_argument("--se2_translation_scale", type=float, default=0.2,
                         help="Scale factor applied to action x/y when computing SE(2) translation (in latent pixels)")
     parser.add_argument("--use_local_actions", action="store_true", default=False,
@@ -901,9 +905,11 @@ def train():
             recurrent_hidden_dim=args.recurrent_hidden_dim,
             conv_hidden_channels=args.recurrent_conv_channels,
             use_se2_warp=args.recurrent_use_se2_warp,
+            unroll_length=args.recurrent_unroll_length,
+            burn_in=args.recurrent_burn_in,
         )
         hidden_state_shape = tuple(int(x) for x in agent.hidden_state_shape)
-        warp_dim = agent.warp_dim if agent.use_se2_warp else 0
+        warp_dim = 0
     else:
         agent = DrQV2Agent(
             obs_shape=obs_shape,
@@ -933,14 +939,6 @@ def train():
         data_specs_list.append(
             specs.Array((prev_action_dim,), np.float32, "prev_actions")
         )
-    if is_recurrent_agent:
-        data_specs_list.append(
-            specs.Array(hidden_state_shape, np.float32, "hidden_state")
-        )
-        if warp_dim > 0:
-            data_specs_list.append(
-                specs.Array((warp_dim,), np.float32, "warp_params")
-            )
     data_specs_list.extend([
         train_env.action_spec(),
         specs.Array((1,), np.float32, "reward"),
@@ -949,15 +947,26 @@ def train():
     data_specs = tuple(data_specs_list)
     replay_dir = run_paths.log_dir / "buffer"
     replay_storage = ReplayBufferStorage(data_specs, replay_dir)
-    replay_loader = make_replay_loader(
-        replay_dir,
-        max_size=args.replay_buffer_size,
-        batch_size=args.batch_size,
-        num_workers=args.replay_buffer_num_workers,
-        save_snapshot=args.save_snapshot,
-        nstep=args.nstep,
-        discount=args.discount,
-    )
+    if is_recurrent_agent:
+        replay_loader = make_sequence_replay_loader(
+            replay_dir,
+            max_size=args.replay_buffer_size,
+            batch_size=args.batch_size,
+            num_workers=args.replay_buffer_num_workers,
+            save_snapshot=args.save_snapshot,
+            sequence_length=args.recurrent_unroll_length,
+            burn_in=args.recurrent_burn_in,
+        )
+    else:
+        replay_loader = make_replay_loader(
+            replay_dir,
+            max_size=args.replay_buffer_size,
+            batch_size=args.batch_size,
+            num_workers=args.replay_buffer_num_workers,
+            save_snapshot=args.save_snapshot,
+            nstep=args.nstep,
+            discount=args.discount,
+        )
     replay_iter = None
 
     pref_storage = None
@@ -970,16 +979,16 @@ def train():
             prev_action_shape=(prev_action_dim,),
             storage_dir=pref_dir,
             chunk_size=args.pref_chunk_size,
-            hidden_state_shape=hidden_state_shape if is_recurrent_agent else None,
-            warp_param_dim=warp_dim if (is_recurrent_agent and warp_dim > 0) else 0,
+            hidden_state_shape=None,
+            warp_param_dim=0,
         )
         pref_dataset = PreferencePairDataset(
             storage_dir=pref_dir,
             max_size=args.pref_capacity,
             fetch_every=args.pref_fetch_every,
             prev_action_shape=(prev_action_dim,),
-            hidden_state_shape=hidden_state_shape if is_recurrent_agent else None,
-            warp_param_dim=warp_dim if (is_recurrent_agent and warp_dim > 0) else 0,
+            hidden_state_shape=None,
+            warp_param_dim=0,
         )
 
     action_history = init_action_history(action_dim, action_history_len)
@@ -992,11 +1001,6 @@ def train():
     time_step = time_step._replace(
         prev_actions=flatten_action_history(action_history)
     )
-    if is_recurrent_agent:
-        agent.reset_memory()
-        init_hidden = agent.export_state()
-        init_warp = np.zeros((warp_dim,), dtype=np.float32) if warp_dim > 0 else None
-        time_step = time_step._replace(hidden_state=init_hidden, warp_params=init_warp)
     replay_storage.add(time_step)
 
     initial_ckpt = checkpoint_mgr.save(
@@ -1081,16 +1085,6 @@ def train():
         next_prev_stack = flatten_action_history(action_history)
         next_time_step = next_time_step._replace(action=applied_action_local,
                                                 prev_actions=next_prev_stack)
-        if is_recurrent_agent:
-            next_hidden = agent.export_state()
-            warp_to_store = None
-            if warp_dim > 0:
-                if getattr(agent, 'use_se2_warp', False):
-                    warp_to_store = np.asarray(warp_params_local, dtype=np.float32)
-                else:
-                    warp_to_store = np.zeros((warp_dim,), dtype=np.float32)
-            next_time_step = next_time_step._replace(hidden_state=next_hidden,
-                                                    warp_params=warp_to_store)
         if next_time_step.last():
             distance_val = info.get("distance_to_goal")
             if distance_val is not None:
@@ -1108,15 +1102,13 @@ def train():
             and student_action_local is not None
         ):
             try:
-                pref_hidden = getattr(time_step, 'hidden_state', None) if is_recurrent_agent else None
-                pref_warp = getattr(time_step, 'warp_params', None) if (is_recurrent_agent and warp_dim > 0) else None
                 pref_storage.add(
                     np.asarray(obs).copy(),
                     np.asarray(prev_action_stack, dtype=np.float32).copy(),
                     teacher_action_local.copy(),
                     student_action_local.copy(),
-                    hidden_state=pref_hidden if pref_hidden is not None else None,
-                    warp_params=pref_warp if pref_warp is not None else None,
+                    hidden_state=None,
+                    warp_params=None,
                 )
             except Exception as exc:
                 run_paths.record_progress(f"[PrefBuffer] append failed: {exc}")
