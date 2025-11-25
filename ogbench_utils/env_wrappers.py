@@ -3,6 +3,13 @@ from __future__ import annotations
 from typing import Callable, Optional
 
 from ogbench.wrappers import FlexibleObsWrapper, DetailedRewardWrapper, InterventionWrapper
+import numpy as np
+
+_GOAL_COLOR_MAP = {
+    "red": (0.85, 0.2, 0.2, 1.0),
+    "green": (0.1, 0.8, 0.2, 1.0),
+    "blue": (0.2, 0.5, 1.0, 1.0),
+}
 
 
 def build_ogbench_wrapper(
@@ -63,3 +70,36 @@ def build_ogbench_wrapper(
         return env
 
     return _apply
+
+
+def maybe_set_goal_color(env, color_name: str) -> bool:
+    if not color_name:
+        return False
+    normalized = color_name.strip().lower()
+    if normalized in ("", "auto", "default"):
+        return False
+    rgba = _GOAL_COLOR_MAP.get(normalized)
+    if rgba is None:
+        return False
+
+    base = env
+    visited = set()
+    while hasattr(base, "unwrapped") and getattr(base, "unwrapped") is not base and getattr(base, "unwrapped") not in visited:
+        visited.add(base)
+        base = base.unwrapped
+    model = getattr(base, "model", None)
+    if model is None:
+        return False
+    geom_name = getattr(base, "_goal_geom_name", "target")
+    try:
+        geom = model.geom(geom_name)
+    except Exception:
+        return False
+    try:
+        geom.rgba[:] = np.array(rgba, dtype=np.float32)
+    except Exception:
+        try:
+            geom.rgba = np.array(rgba, dtype=np.float32)
+        except Exception:
+            return False
+    return True

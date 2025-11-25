@@ -9,7 +9,7 @@ from .policy import (  # noqa: F401
     CriticEnsemble,
     CriticHead,
 )
-from .env_wrappers import build_ogbench_wrapper  # noqa: F401
+from .env_wrappers import build_ogbench_wrapper, maybe_set_goal_color  # noqa: F401
 from .cli import build_train_parser, build_eval_parser  # noqa: F401
 from .obs import infer_pixel_shape, prepare_observation, reshape_observation  # noqa: F401
 from .buffers import (  # noqa: F401

@@ -14,6 +14,9 @@ def build_train_parser() -> argparse.ArgumentParser:
     p.add_argument('--include_distance', action='store_true', default=False)
     p.add_argument('--include_direction', action='store_true', default=False)
     p.add_argument('--include_velocity', action='store_true', default=False)
+    p.add_argument('--goal_marker_color', type=str, default='auto',
+                   choices=['auto', 'red', 'green', 'blue'],
+                   help='Override maze goal marker color (auto keeps env default)')
     # Rewards
     p.add_argument('--reward_type', type=str, default='sparse', choices=['sparse','dense','combined'])
     p.add_argument('--dense_reward_scale', type=float, default=0.01)
@@ -220,6 +223,9 @@ def build_eval_parser() -> argparse.ArgumentParser:
                         help='Include direction to goal in observations')
     parser.add_argument('--include_velocity', action='store_true', default=False,
                         help='Include velocity features in observations')
+    parser.add_argument('--goal_marker_color', type=str, default='auto',
+                        choices=['auto', 'red', 'green', 'blue'],
+                        help='Override maze goal marker color (auto keeps env default)')
     parser.add_argument('--frame_stack', type=int, default=None,
                         help='Number of stacked frames expected by the policy (defaults to checkpoint metadata)')
     parser.add_argument('--use_local_actions', action='store_true', default=False,

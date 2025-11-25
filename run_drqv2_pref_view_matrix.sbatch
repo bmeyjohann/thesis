@@ -54,7 +54,8 @@ BASE_ARGS="--obs_mode pixels --pixel_width 84 --pixel_height 84 \
 --pref_capacity 200000 --pref_chunk_size 128 --pref_sample_ratio ${PREF_RATIO} \
 --pref_rank_margin ${PREF_MARGIN} --pref_rank_weight ${PREF_WEIGHT} \
 --pref_loss_type ${PREF_LOSS} --use_intervention --intervention_mode agent \
---teacher_type bfs --tolerance_type angle --tolerance_value ${TOLERANCE}"
+--teacher_type bfs --tolerance_type angle --tolerance_value ${TOLERANCE} \
+--goal_marker_color green"
 
 launch_run () {
   local GPU_ID=$1

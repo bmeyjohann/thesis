@@ -59,6 +59,7 @@ from ogbench_utils import (  # noqa: E402
     TeacherMetricsAccumulator,
     build_ogbench_wrapper,
     build_train_parser,
+    maybe_set_goal_color,
 )
 
 
@@ -268,6 +269,7 @@ class OGBenchPixelsEnv(dm_env.Environment):
         pixel_first_person_height: float,
         pixel_first_person_lookahead: float,
         pixel_first_person_pitch: float,
+        goal_marker_color: str,
         seed: int,
     ):
         env_kwargs = dict(
@@ -307,6 +309,7 @@ class OGBenchPixelsEnv(dm_env.Environment):
                 raise
         for wrap in wrappers:
             base_env = wrap(base_env)
+        maybe_set_goal_color(base_env, goal_marker_color)
         self._env = base_env
         self._seed = seed
         self._last_info: Dict[str, Any] = {}
@@ -779,6 +782,7 @@ def build_env(args, wrappers, seed: int) -> dm_env.Environment:
         pixel_first_person_height=float(args.pixel_first_person_height),
         pixel_first_person_lookahead=float(args.pixel_first_person_lookahead),
         pixel_first_person_pitch=float(args.pixel_first_person_pitch),
+        goal_marker_color=getattr(args, "goal_marker_color", "auto"),
         seed=seed,
     )
     return env

@@ -50,6 +50,7 @@ from ogbench_utils import (
     PixelNormalizer,
     build_ogbench_wrapper,
     build_eval_parser,
+    maybe_set_goal_color,
 )
 from ogbench_utils.obs import (
     prepare_observation,
@@ -109,6 +110,7 @@ _CLI_FLAG_ALIASES: dict[str, tuple[str, ...]] = {
     'pixel_first_person_height': ('--pixel_first_person_height',),
     'pixel_first_person_lookahead': ('--pixel_first_person_lookahead',),
     'pixel_first_person_pitch': ('--pixel_first_person_pitch',),
+    'goal_marker_color': ('--goal_marker_color',),
     'frame_stack': ('--frame_stack',),
     'use_local_actions': ('--use_local_actions', '--no_use_local_actions'),
     'se2_translation_scale': ('--se2_translation_scale',),
@@ -322,6 +324,7 @@ def update_args_from_checkpoint(args, checkpoint: dict[str, Any]) -> dict[str, A
         'pixel_first_person_height',
         'pixel_first_person_lookahead',
         'pixel_first_person_pitch',
+        'goal_marker_color',
     ]
     for key in keys_to_sync:
         if key not in ckpt_args or not hasattr(args, key):
@@ -1345,6 +1348,7 @@ def load_trained_policy(
             'agent_variant',
             'recurrent_type',
             'recurrent_use_se2_warp',
+            'goal_marker_color',
         ]:
             if key in args_obj:
                 training_info[key] = args_obj[key]
@@ -1370,6 +1374,7 @@ def load_trained_policy(
             'agent_variant',
             'recurrent_type',
             'recurrent_use_se2_warp',
+            'goal_marker_color',
         ]:
             if hasattr(args_obj, key):
                 training_info[key] = getattr(args_obj, key)
@@ -1471,6 +1476,7 @@ def create_env(env_name: str, args, *, render_override: str | None = None, mirro
             teleop_interface=teleop,
         )
         env = wrapper(env)
+        maybe_set_goal_color(env, getattr(args, 'goal_marker_color', 'auto'))
 
         if getattr(args, 'obs_mode', 'state') == 'state':
             print('Applied FlexibleObsWrapper')
