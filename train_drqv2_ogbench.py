@@ -1159,17 +1159,8 @@ def train():
             obs_tensor = ensure_tensor(obs, device)
             act_tensor = torch.as_tensor(action_for_logging, device=device).view(1, -1)
             if is_recurrent_agent:
-                hidden_snapshot = getattr(time_step, 'hidden_state', None)
-                warp_snapshot = getattr(time_step, 'warp_params', None)
-                hidden_tensor = torch.as_tensor(hidden_snapshot, device=device).float()
-                if hidden_tensor.dim() == len(hidden_state_shape):
-                    hidden_tensor = hidden_tensor.unsqueeze(0)
-                warp_tensor = None
-                if warp_dim > 0 and warp_snapshot is not None:
-                    warp_tensor = torch.as_tensor(warp_snapshot, device=device).float()
-                    if warp_tensor.dim() == 1:
-                        warp_tensor = warp_tensor.unsqueeze(0)
-                _, repr_feats = agent._compute_representation(obs_tensor, hidden_tensor, warp_tensor, augment=False)
+                init_h = agent.core.init_hidden(obs_tensor.shape[0], device)
+                _, repr_feats = agent.core(obs_tensor, init_h, warp_params=None, augment=False)
                 repr_obs = repr_feats.view(repr_feats.shape[0], -1)
             else:
                 repr_obs = agent.encoder(obs_tensor)
