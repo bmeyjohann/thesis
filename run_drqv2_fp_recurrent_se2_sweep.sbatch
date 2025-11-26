@@ -20,7 +20,7 @@ cd ..
 export MPLCONFIGDIR="${TMPDIR:-/tmp}/mplcache_${SLURM_JOB_ID}"
 mkdir -p "${MPLCONFIGDIR}"
 
-ENV_NAME=${ENV_NAME:-visual-pointmaze-arena-v0}
+TARGET_ENV=${TARGET_ENV:-visual-pointmaze-arena-v0}
 TOTAL_STEPS=${TOTAL_STEPS:-800000}
 LEARNING_RATE=${LEARNING_RATE:-1e-4}
 NUM_EXPL_STEPS=${NUM_EXPL_STEPS:-20000}
@@ -77,7 +77,7 @@ launch_run () {
 
   echo "Launching ${EXP_NAME} on GPU ${GPU_ID} (se2_scale=${SE2_SCALE})"
   WANDB_MODE=offline CUDA_VISIBLE_DEVICES=${GPU_ID} python -u train_drqv2_ogbench.py \
-    --env_name "${ENV_NAME}" \
+    --env_name "${TARGET_ENV}" \
     --exp_name "${EXP_NAME}" \
     ${RUN_ARGS} \
     2>&1 | tee "${LOG_PATH}" &
