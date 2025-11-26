@@ -6,9 +6,9 @@ Navigating challenging terrains without continuous human oversight is critical f
 
 ## Quick Start for gridworld experiments
 
-- Remote training: `source sc_venv_template/activate.sh` then `python train_rsl_rl_integrated.py --env_name [pointmaze-medium-v0, pointmaze-danger-{wall,lethal,sticky,floor}-v0]`
-- Local training: `conda activate fasttd3` then `python train_fast_sac_ogbench.py --env_name [pointmaze-medium-v0, pointmaze-danger-{wall,lethal,sticky,floor}-v0]`
-- Evaluate: `python eval_interactive.py --model_path models/<file>.pt --env_name [pointmaze-medium-v0, pointmaze-danger-{wall,lethal,sticky,floor}-v0]`
+- Remote training: `source sc_venv_template/activate.sh` then `python train_rsl_rl_integrated.py --env_name [pointmaze-medium-v0, pointmaze-arena-danger-{wall,lethal,sticky,floor}-v0]`
+- Local training: `conda activate fasttd3` then `python train_fast_sac_ogbench.py --env_name [pointmaze-medium-v0, pointmaze-arena-danger-{wall,lethal,sticky,floor}-v0]`
+- Evaluate: `python eval_interactive.py --model_path models/<file>.pt --env_name [pointmaze-medium-v0, pointmaze-arena-danger-{wall,lethal,sticky,floor}-v0]`
 - Submit on SLURM: `bash submit_job.sh [experiment_name].sbatch`
 
 ## Apptainer for Isaac Sim experiments
@@ -33,6 +33,35 @@ See Repository Guidelines for structure, style, and workflows:
 - Enter session: `srun --pty bash -l`
 
 ---
+
+## Cluster steps
+
+export UNITREE_ROS_DIR=/absolute/path/to/unitree_ros/unitree_ros
+export GIT_PYTHON_REFRESH=quiet
+unset CUDA_VISIBLE_DEVICES
+
+source sc_venv_template_isaaclab/activate.sh
+
+source .venv/bin/activate
+
+export XDG_CACHE_HOME=/p/project1/hai_1074/meyjohann1/apptainer/cache \
+export XDG_DATA_HOME=/p/project1/hai_1074/meyjohann1/apptainer/data \
+export KIT_USER_ROOT=/p/project1/hai_1074/meyjohann1/apptainer/kit \
+export KIT_USER_DATA=/p/project1/hai_1074/meyjohann1/apptainer/data \
+export KIT_CACHE_DIR=/p/project1/hai_1074/meyjohann1/apptainer/cache \
+export KIT_DERIVED_DATA_CACHE=/p/project1/hai_1074/meyjohann1/apptainer/DerivedDataCache \
+export KIT_PIP_INSTALL_PATH=/p/project1/hai_1074/meyjohann1/apptainer/pip3-envs \
+export OMNI_USER_CACHE_DIR=/p/project1/hai_1074/meyjohann1/apptainer/cache \
+export OMNI_KIT_USER_DIR=/p/project1/hai_1074/meyjohann1/apptainer/kit \
+export OMNI_KIT_DATA_DIR=/p/project1/hai_1074/meyjohann1/apptainer/data \
+export OMNI_KIT_CACHE_DIR=/p/project1/hai_1074/meyjohann1/apptainer/cache
+
+export OMNI_DISABLE_EXTENSIONS="omni.iray.libs,omni.mdl.neuraylib,omni.kit.usd.mdl,carb.scenerenderer-rtx.plugin,omni.rtx.*,omni.hydra.rtx"
+
+_isaac_sim/python.sh scripts/reinforcement_learning/rsl_rl/train.py --headless --task Isaac-Velocity-Flat-Unitree-Go2-v0
+
+---
+
 
 ## Interactive Apptainer session setup
 
@@ -88,6 +117,8 @@ apptainer shell --nv --cleanenv --writable-tmpfs \
     --/exts/omni.kit.pipapi/enable=0" \
   "$IMG"
 
+LOW_LEVEL_POLICY_PATH=wandb/wandb/offline-run-20251104_235648-1vmwzqxs/files/model_950.pt IsaacLab/isaaclab.sh -p safe-locomotion/scripts/rsl_rl/train.py --headless --task Isaac-Navigation-Flat-Go2-v0 "env.actions.pre_trained_policy_action.policy_path=${LOW_LEVEL_POLICY_PATH}"
+
   ./isaaclab.sh -p scripts/tutorials/00_sim/log_time.py --headless
 
   apptainer exec --nv \
@@ -128,31 +159,12 @@ apptainer shell --nv --cleanenv --writable-tmpfs \
   --bind ~/meyjohann1/apptainer/official/pkg:/isaac-sim/.local/share/ov/pkg:rw \
   ../apptainer/images/isaacsim-5.1.0.sif bash
 
-IsaacLab/isaaclab.sh -p - <<'PY'
-print("Starting Isaac Lab...")
-from isaaclab.app import AppLauncher
-al = AppLauncher(headless=True)
-from isaaclab.envs import ManagerBasedEnvCfg, ManagerBasedRLEnv
-from isaaclab_tasks.utils import parse_env_cfg
-from isaaclab_tasks.manager_based.classic.cartpole.cartpole_env_cfg import CartpoleEnvCfg
-cfg: ManagerBasedEnvCfg = CartpoleEnvCfg()
-env = ManagerBasedRLEnv(cfg)
-obs = env.reset()
-print("Reset ok; obs keys:", list(obs.keys()))
-for i in range(64):
-    actions = env.random_actions()
-    obs, rew, done, info = env.step(actions)
-    print("Step", i, "ok; obs keys:", list(obs.keys()))
-print("stepped 64 frames ok; obs keys:", list(obs.keys()))
-env.close(); al.close()
-PY
-
 ./isaaclab.sh -p scripts/tutorials/00_sim/log_time.py --headless --kit_args="--/persistent/isaac/asset_root/default=_assets_cache/Assets/Isaac/5.1/"
 /isaac-sim/python.sh scripts/tutorials/00_sim/log_time.py --headless
 /isaac-sim/runheadless.sh --/persistent/isaac/asset_root/default="_assets_cache/Assets/Isaac/5.1/"
 /isaac-sim/python.sh scripts/reinforcement_learning/rsl_rl/train.py --headless --task Isaac-Ant-v0
 
----
+------
 
 ## Get offline assets working
 
@@ -175,15 +187,11 @@ unzip -q isaac-sim-assets-complete-5.1.0.zip -d ../_assets_cache/
  ├─ Isaac/...
  └─ NVIDIA/...
 
-export UNITREE_ROS_DIR=/absolute/path/to/unitree_ros/unitree_ros
-export GIT_PYTHON_REFRESH=quiet
-unset CUDA_AVAILABLE_DEVICES
-
-source .venv/bin/activate
-
-/isaac-sim/python.sh unitree_rl_lab/scripts/rsl_rl/train.py --headless --kit_args="--/persistent/isaac/asset_root/default=_assets_cache/Assets/Isaac/5.1" --task Unitree-Go2-Velocity
+ /isaac-sim/python.sh unitree_rl_lab/scripts/rsl_rl/train.py --headless --kit_args="--/persistent/isaac/asset_root/default=_assets_cache/Assets/Isaac/5.1" --task Unitree-Go2-Velocity
 /isaac-sim/python.sh unitree_rl_lab/scripts/rsl_rl/train.py --headless --task Unitree-Go2-Velocity
 
 uv pip install -e IsaacLab/source/isaaclab -e IsaacLab/source/isaaclab_rl -e IsaacLab/source/isaaclab_tasks -e IsaacLab/source/isaaclab_mimic -e IsaacLab/source/isaaclab_assets -e unitree_rl_lab/source/unitree_rl_lab
 
 /p/project1/hai_1074/meyjohann1/isaacsim5.1/kit/data/Kit/Isaac-Sim/5.0/user.config.json
+
+~/meyjohann1/isaacsim5.1/python.sh IsaacLab/scripts/tutorials/00_sim/log_time.py --headless
