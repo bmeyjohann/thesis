@@ -79,6 +79,10 @@ def build_train_parser() -> argparse.ArgumentParser:
                    help='Forward offset (in meters) added to the lookat point for first_person mode')
     p.add_argument('--pixel_first_person_pitch', type=float, default=-15.0,
                    help='Camera pitch (degrees) applied in first_person mode (negative looks down)')
+    p.add_argument('--goal_relative_history', action='store_true', default=False,
+                   help='Append agent-centric goal deltas to the non-visual history trunk')
+    p.add_argument('--goal_relative_scale', type=float, default=10.0,
+                   help='Meters mapped to full-scale goal encoding (used with goal_relative_history)')
     p.add_argument('--pixel_conv_channels', type=str, default='32,64,64',
                    help='Comma-separated Conv2d channel sizes for the pixel backbone')
     p.add_argument('--pixel_kernel_sizes', type=str, default='8,4,3',

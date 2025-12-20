@@ -119,6 +119,12 @@ def build_arg_parser():
                         help="Scale factor applied to action x/y when computing SE(2) translation (in latent pixels)")
     parser.add_argument("--use_local_actions", action="store_true", default=False,
                         help="Interpret policy actions in the agent first-person frame when using first-person camera")
+    parser.add_argument("--context_mlp", action="store_true", default=False,
+                        help="Encode action/goal history with an MLP before concatenation")
+    parser.add_argument("--context_hidden_dim", type=int, default=128,
+                        help="Hidden dimension for the action/goal context MLP")
+    parser.add_argument("--context_dim", type=int, default=64,
+                        help="Output dimension for the action/goal context MLP")
 
     # Replay / optimisation knobs
     parser.add_argument("--discount", type=float, default=0.99)
@@ -163,6 +169,23 @@ def init_action_history(action_dim: int, stack: int) -> deque:
 
 
 def flatten_action_history(history: deque) -> np.ndarray:
+    if not history:
+        return np.zeros(0, dtype=np.float32)
+    return np.concatenate(list(history), axis=0).astype(np.float32, copy=False)
+
+
+def init_goal_history(goal_dim: int, stack: int, fill: Optional[np.ndarray] = None) -> deque:
+    history = deque(maxlen=stack)
+    if fill is None:
+        base = np.zeros(goal_dim, dtype=np.float32)
+    else:
+        base = np.asarray(fill, dtype=np.float32).reshape(goal_dim)
+    for _ in range(stack):
+        history.append(base.copy())
+    return history
+
+
+def flatten_goal_history(history: deque) -> np.ndarray:
     if not history:
         return np.zeros(0, dtype=np.float32)
     return np.concatenate(list(history), axis=0).astype(np.float32, copy=False)
@@ -376,6 +399,17 @@ class OGBenchPixelsEnv(dm_env.Environment):
                     frame = frame[key]
                     break
         return self._to_pixels(frame)
+
+    def goal_relative_global(self) -> Optional[np.ndarray]:
+        base = getattr(self._env, "unwrapped", self._env)
+        if hasattr(base, "get_xy") and hasattr(base, "cur_goal_xy"):
+            try:
+                agent_xy = np.asarray(base.get_xy(), dtype=np.float32)
+                goal_xy = np.asarray(base.cur_goal_xy, dtype=np.float32)
+                return goal_xy - agent_xy
+            except Exception:
+                return None
+        return None
 
     def reset(self) -> dm_env.TimeStep:
         if self._next_seed is not None:
@@ -802,14 +836,31 @@ def wrap_env_for_drq(env: dm_env.Environment, args) -> dm_env.Environment:
     return env
 
 
+def compute_goal_relative_local(
+    env: dm_env.Environment,
+    action_transformer: ActionFrameTransformer,
+    scale: float,
+    fallback_dim: int = 2,
+) -> np.ndarray:
+    rel_global = getattr(env, "goal_relative_global", lambda: None)()
+    if rel_global is None:
+        return np.zeros(fallback_dim, dtype=np.float32)
+    rel_local = action_transformer.to_local(np.asarray(rel_global, dtype=np.float32))
+    if scale and scale > 0:
+        rel_local = rel_local / float(scale)
+    return np.clip(rel_local, -1.0, 1.0).astype(np.float32, copy=False)
+
+
 def run_evaluation(env,
                    agent: DrQV2Agent,
                    num_episodes: int,
                    device: torch.device,
                    action_dim: int,
                    history_len: int,
+                   goal_history_len: int,
                    use_local_actions: bool,
                    translation_scale: float,
+                   goal_scale: float,
                    is_recurrent: bool) -> Tuple[float, float]:
     total_reward = 0.0
     total_length = 0
@@ -817,6 +868,16 @@ def run_evaluation(env,
     for _ in range(num_episodes):
         action_history = init_action_history(action_dim, history_len)
         prev_stack = flatten_action_history(action_history)
+        goal_history = None
+        if goal_history_len > 0:
+            initial_goal = compute_goal_relative_local(
+                env,
+                action_transformer,
+                scale=goal_scale,
+                fallback_dim=2,
+            )
+            goal_history = init_goal_history(2, goal_history_len, fill=initial_goal)
+        goal_stack = flatten_goal_history(goal_history) if goal_history is not None else None
         time_step = env.reset()
         action_transformer.reset()
         if is_recurrent and hasattr(agent, 'reset_memory'):
@@ -830,7 +891,8 @@ def run_evaluation(env,
                 action_local = agent.act(obs,
                                          step=0,
                                          eval_mode=True,
-                                         prev_actions=prev_stack)
+                                         prev_actions=prev_stack,
+                                         goal_history=goal_stack)
             warp_params = action_transformer.compute_warp_from_action(action_local)
             if is_recurrent and getattr(agent, 'use_se2_warp', False):
                 agent.register_pending_warp(warp_params)  # type: ignore[attr-defined]
@@ -839,6 +901,15 @@ def run_evaluation(env,
             action_history.append(np.asarray(action_local, dtype=np.float32).copy())
             prev_stack = flatten_action_history(action_history)
             action_transformer.update_heading(getattr(env, "last_info", lambda: {})() or {})
+            if goal_history is not None:
+                goal_rel_local = compute_goal_relative_local(
+                    env,
+                    action_transformer,
+                    scale=goal_scale,
+                    fallback_dim=2,
+                )
+                goal_history.append(goal_rel_local.copy())
+                goal_stack = flatten_goal_history(goal_history)
             episode_reward += float(time_step.reward)
             episode_len += 1
         total_reward += episode_reward
@@ -885,6 +956,9 @@ def train():
     action_history_len = max(1, int(args.frame_stack))
     action_dim = int(np.prod(action_shape))
     prev_action_dim = action_dim * action_history_len
+    goal_history_len = action_history_len if getattr(args, "goal_relative_history", False) else 0
+    goal_vector_dim = 2
+    goal_history_dim = goal_vector_dim * goal_history_len
     is_recurrent_agent = args.agent_variant == "recurrent"
     if is_recurrent_agent:
         agent = DrQV2RecurrentAgent(
@@ -901,6 +975,10 @@ def train():
             stddev_clip=args.stddev_clip,
             use_tb=False,
             action_history_len=action_history_len,
+            goal_history_dim=goal_history_dim,
+            use_context_mlp=args.context_mlp,
+            context_hidden_dim=args.context_hidden_dim,
+            context_dim=args.context_dim,
             recurrent_type=args.recurrent_type,
             recurrent_hidden_dim=args.recurrent_hidden_dim,
             conv_hidden_channels=args.recurrent_conv_channels,
@@ -925,6 +1003,10 @@ def train():
             stddev_clip=args.stddev_clip,
             use_tb=False,
             action_history_len=action_history_len,
+            goal_history_dim=goal_history_dim,
+            use_context_mlp=args.context_mlp,
+            context_hidden_dim=args.context_hidden_dim,
+            context_dim=args.context_dim,
         )
         hidden_state_shape = None
         warp_dim = 0
@@ -938,6 +1020,10 @@ def train():
     if prev_action_dim > 0:
         data_specs_list.append(
             specs.Array((prev_action_dim,), np.float32, "prev_actions")
+        )
+    if goal_history_dim > 0:
+        data_specs_list.append(
+            specs.Array((goal_history_dim,), np.float32, "goal_history")
         )
     data_specs_list.extend([
         train_env.action_spec(),
@@ -977,6 +1063,7 @@ def train():
             obs_shape=obs_shape,
             action_shape=action_shape,
             prev_action_shape=(prev_action_dim,),
+            goal_history_shape=(goal_history_dim,) if goal_history_dim > 0 else None,
             storage_dir=pref_dir,
             chunk_size=args.pref_chunk_size,
             hidden_state_shape=None,
@@ -987,6 +1074,7 @@ def train():
             max_size=args.pref_capacity,
             fetch_every=args.pref_fetch_every,
             prev_action_shape=(prev_action_dim,),
+            goal_history_shape=(goal_history_dim,) if goal_history_dim > 0 else None,
             hidden_state_shape=None,
             warp_param_dim=0,
         )
@@ -998,8 +1086,18 @@ def train():
     )
     action_transformer.reset()
     time_step = train_env.reset()
+    goal_history = None
+    if goal_history_len > 0:
+        initial_goal = compute_goal_relative_local(
+            train_env,
+            action_transformer,
+            scale=getattr(args, "goal_relative_scale", 10.0),
+            fallback_dim=goal_vector_dim,
+        )
+        goal_history = init_goal_history(goal_vector_dim, goal_history_len, fill=initial_goal)
     time_step = time_step._replace(
-        prev_actions=flatten_action_history(action_history)
+        prev_actions=flatten_action_history(action_history),
+        goal_history=flatten_goal_history(goal_history) if goal_history is not None else None,
     )
     replay_storage.add(time_step)
 
@@ -1033,8 +1131,17 @@ def train():
             action_history = init_action_history(action_dim, action_history_len)
             action_transformer.reset()
             time_step = train_env.reset()
+            if goal_history_len > 0:
+                initial_goal = compute_goal_relative_local(
+                    train_env,
+                    action_transformer,
+                    scale=getattr(args, "goal_relative_scale", 10.0),
+                    fallback_dim=goal_vector_dim,
+                )
+                goal_history = init_goal_history(goal_vector_dim, goal_history_len, fill=initial_goal)
             time_step = time_step._replace(
-                prev_actions=flatten_action_history(action_history)
+                prev_actions=flatten_action_history(action_history),
+                goal_history=flatten_goal_history(goal_history) if goal_history is not None else None,
             )
             if is_recurrent_agent:
                 agent.reset_memory()
@@ -1047,12 +1154,14 @@ def train():
 
         obs = time_step.observation
         prev_action_stack = time_step.prev_actions
+        goal_history_stack = time_step.goal_history if goal_history_len > 0 else None
         with torch.no_grad(), utils.eval_mode(agent):
             policy_action_local = agent.act(
                 obs,
                 step=total_env_steps,
                 eval_mode=False,
                 prev_actions=prev_action_stack,
+                goal_history=goal_history_stack,
             )
         policy_action_local = clip_action_l2(policy_action_local)
         warp_params_local = action_transformer.compute_warp_from_action(policy_action_local)
@@ -1083,14 +1192,25 @@ def train():
         action_for_logging = applied_action_local.copy()
         action_history.append(applied_action_local.copy())
         next_prev_stack = flatten_action_history(action_history)
-        next_time_step = next_time_step._replace(action=applied_action_local,
-                                                prev_actions=next_prev_stack)
+        action_transformer.update_heading(info)
+        if goal_history is not None:
+            goal_rel_local = compute_goal_relative_local(
+                train_env,
+                action_transformer,
+                scale=getattr(args, "goal_relative_scale", 10.0),
+                fallback_dim=goal_vector_dim,
+            )
+            goal_history.append(goal_rel_local.copy())
+        next_time_step = next_time_step._replace(
+            action=applied_action_local,
+            prev_actions=next_prev_stack,
+            goal_history=flatten_goal_history(goal_history) if goal_history is not None else None,
+        )
         if next_time_step.last():
             distance_val = info.get("distance_to_goal")
             if distance_val is not None:
                 goal_final_distance_sum += float(distance_val)
                 goal_final_distance_count += 1
-        action_transformer.update_heading(info)
         replay_storage.add(next_time_step)
 
         if teacher_intervened:
@@ -1105,6 +1225,7 @@ def train():
                 pref_storage.add(
                     np.asarray(obs).copy(),
                     np.asarray(prev_action_stack, dtype=np.float32).copy(),
+                    np.asarray(goal_history_stack, dtype=np.float32).copy() if goal_history_stack is not None else None,
                     teacher_action_local.copy(),
                     student_action_local.copy(),
                     hidden_state=None,
@@ -1164,12 +1285,15 @@ def train():
                 repr_obs = repr_feats.view(repr_feats.shape[0], -1)
             else:
                 repr_obs = agent.encoder(obs_tensor)
-            if agent.prev_action_dim > 0:
-                prev_tensor = torch.as_tensor(prev_action_stack,
-                                              device=device).view(1, -1)
+            if agent.context_input_dim > 0:
+                prev_tensor = torch.as_tensor(prev_action_stack, device=device).view(1, -1)
+                goal_tensor = None
+                if goal_history_stack is not None:
+                    goal_tensor = torch.as_tensor(goal_history_stack, device=device).view(1, -1)
+                context_tensor = agent._build_context(prev_tensor, goal_tensor, obs_tensor.shape[0])
             else:
-                prev_tensor = None
-            q1, q2 = agent.critic(repr_obs, prev_tensor, act_tensor)
+                context_tensor = None
+            q1, q2 = agent.critic(repr_obs, context_tensor, act_tensor)
             disagreement = torch.abs(q1 - q2).view(-1)
             qmin = torch.min(q1, q2).view(-1)
         teacher_flag = torch.tensor(
@@ -1220,8 +1344,10 @@ def train():
                 device,
                 action_dim,
                 action_history_len,
+                goal_history_len,
                 use_local_actions=args.use_local_actions,
                 translation_scale=args.se2_translation_scale,
+                goal_scale=getattr(args, "goal_relative_scale", 10.0),
                 is_recurrent=is_recurrent_agent,
             )
             logger.log_eval(total_env_steps=total_env_steps, reward=eval_reward, length=eval_length)
