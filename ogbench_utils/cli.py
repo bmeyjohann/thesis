@@ -79,6 +79,10 @@ def build_train_parser() -> argparse.ArgumentParser:
                    help='Forward offset (in meters) added to the lookat point for first_person mode')
     p.add_argument('--pixel_first_person_pitch', type=float, default=-15.0,
                    help='Camera pitch (degrees) applied in first_person mode (negative looks down)')
+    p.add_argument('--decouple_view', action='store_true', default=False,
+                   help='Decouple movement and view direction (adds a view-delta action)')
+    p.add_argument('--view_delta_scale', type=float, default=3.14159265,
+                   help='Max radians applied to view delta when decouple_view is enabled')
     p.add_argument('--goal_relative_history', action='store_true', default=False,
                    help='Append agent-centric goal deltas to the non-visual history trunk')
     p.add_argument('--goal_relative_scale', type=float, default=10.0,
@@ -200,8 +204,8 @@ def build_eval_parser() -> argparse.ArgumentParser:
                         choices=['auto', 'rsl-rl', 'fastsac', 'fastsac_v2', 'drqv2'],
                         help='Policy checkpoint format to load')
     parser.add_argument('--controller', type=str, default='policy',
-                        choices=['policy', 'random', 'human'],
-                        help='Source of actions: trained policy, random actions, or human-only (zero-action baseline)')
+                        choices=['policy', 'random', 'human', 'keyboard'],
+                        help='Source of actions: trained policy, random actions, human-only, or keyboard control')
     
     # Visualization
     parser.add_argument('--render_mode', type=str, default='human',
@@ -261,6 +265,10 @@ def build_eval_parser() -> argparse.ArgumentParser:
                         help='Forward offset (meters) for the lookat point in first_person mode')
     parser.add_argument('--pixel_first_person_pitch', type=float, default=-15.0,
                         help='Camera pitch (degrees, negative looks down) for first_person mode')
+    parser.add_argument('--decouple_view', action='store_true', default=False,
+                        help='Decouple movement and view direction (adds a view-delta action)')
+    parser.add_argument('--view_delta_scale', type=float, default=3.14159265,
+                        help='Max radians applied to view delta when decouple_view is enabled')
     parser.add_argument('--mirror_human_render', dest='mirror_human_render', action='store_true', default=False,
                         help='Mirror rgb_array rollouts to a separate human-rendered window')
     parser.add_argument('--no_mirror_human_render', dest='mirror_human_render', action='store_false',

@@ -160,6 +160,19 @@ def clip_action_l2(actions: np.ndarray, max_norm: float = 1.0) -> np.ndarray:
     return result
 
 
+def split_action_components(action: np.ndarray, decouple_view: bool) -> tuple[np.ndarray, float]:
+    vec = np.asarray(action, dtype=np.float32)
+    if not decouple_view:
+        return vec, 0.0
+    if vec.shape[0] < 3:
+        padded = np.pad(vec, (0, 3 - vec.shape[0]), mode='constant')
+    else:
+        padded = vec
+    move = padded[:2]
+    view_delta = float(np.clip(padded[2], -1.0, 1.0))
+    return move, view_delta
+
+
 def init_action_history(action_dim: int, stack: int) -> deque:
     history = deque(maxlen=stack)
     zero = np.zeros(action_dim, dtype=np.float32)
@@ -239,7 +252,9 @@ class ActionFrameTransformer:
                 self.heading[:] = delta[:2] / norm
 
     def compute_warp_from_action(self, action_local: np.ndarray) -> np.ndarray:
-        vec = np.asarray(action_local, dtype=np.float32)
+        vec = np.asarray(action_local, dtype=np.float32).reshape(-1)
+        if vec.shape[0] > 2:
+            vec = vec[:2]
         warp = np.zeros(3, dtype=np.float32)
         warp[:2] = vec[:2] * self.translation_scale
         prev = self.last_action
@@ -260,6 +275,8 @@ def parse_args():
         args.eval_every_frames = max(1, args.smoke_test_steps // 2)
         args.save_interval = max(1, args.smoke_test_steps)
         args.num_eval_episodes = 1
+    if getattr(args, "decouple_view", False):
+        args.use_local_actions = True
     if not getattr(args, "use_intervention", False):
         args.intervention_mode = "none"
     return args
@@ -296,6 +313,8 @@ class OGBenchPixelsEnv(dm_env.Environment):
         pixel_first_person_height: float,
         pixel_first_person_lookahead: float,
         pixel_first_person_pitch: float,
+        decouple_view: bool,
+        view_delta_scale: float,
         goal_marker_color: str,
         seed: int,
     ):
@@ -341,15 +360,25 @@ class OGBenchPixelsEnv(dm_env.Environment):
         self._seed = seed
         self._last_info: Dict[str, Any] = {}
         self._next_seed: Optional[int] = seed + 1
+        self._decouple_view = bool(decouple_view)
+        self._view_delta_scale = float(view_delta_scale)
 
         action_space = base_env.action_space
         if not isinstance(action_space, gym.spaces.Box):
             raise RuntimeError("OGBench DrQ wrapper expects a continuous Box action space.")
+        if self._decouple_view:
+            low = np.concatenate([action_space.low, np.array([-1.0], dtype=np.float32)], axis=0)
+            high = np.concatenate([action_space.high, np.array([1.0], dtype=np.float32)], axis=0)
+            shape = low.shape
+        else:
+            low = action_space.low
+            high = action_space.high
+            shape = action_space.shape
         self._action_spec = specs.BoundedArray(
-            shape=action_space.shape,
+            shape=shape,
             dtype=np.float32,
-            minimum=action_space.low,
-            maximum=action_space.high,
+            minimum=low,
+            maximum=high,
             name="action",
         )
 
@@ -422,7 +451,14 @@ class OGBenchPixelsEnv(dm_env.Environment):
         return dm_env.restart({self._obs_key: pixels})
 
     def step(self, action: np.ndarray) -> dm_env.TimeStep:
-        obs, reward, terminated, truncated, info = self._env.step(action)
+        move_action = action
+        if self._decouple_view:
+            move_action = np.asarray(action, dtype=np.float32)[:2]
+            view_delta = float(np.asarray(action, dtype=np.float32)[2])
+            view_dir = self._compute_view_dir(move_action, view_delta)
+            if hasattr(self._env, "unwrapped") and hasattr(self._env.unwrapped, "set_view_dir"):
+                self._env.unwrapped.set_view_dir(view_dir)
+        obs, reward, terminated, truncated, info = self._env.step(move_action)
         self._last_info = info or {}
         pixels = self._render_pixels(obs)
         done = bool(terminated or truncated)
@@ -433,6 +469,26 @@ class OGBenchPixelsEnv(dm_env.Environment):
 
     def last_info(self) -> Dict[str, Any]:
         return self._last_info
+
+    def _compute_view_dir(self, move_action: np.ndarray, view_delta: float) -> np.ndarray | None:
+        base = getattr(self._env, "unwrapped", self._env)
+        base_dir = None
+        move_vec = np.asarray(move_action, dtype=np.float32)
+        norm = np.linalg.norm(move_vec)
+        if norm > 1e-6:
+            base_dir = move_vec / norm
+        elif hasattr(base, "_last_move_dir"):
+            try:
+                base_dir = np.asarray(getattr(base, "_last_move_dir"), dtype=np.float32)[:2]
+            except Exception:
+                base_dir = None
+        if base_dir is None:
+            base_dir = np.array([1.0, 0.0], dtype=np.float32)
+        angle = float(np.clip(view_delta, -1.0, 1.0)) * self._view_delta_scale
+        cos_a = float(np.cos(angle))
+        sin_a = float(np.sin(angle))
+        rot = np.array([[cos_a, -sin_a], [sin_a, cos_a]], dtype=np.float32)
+        return (rot @ base_dir.reshape(-1, 1)).reshape(2)
 
     def observation_spec(self):
         return self._obs_spec
@@ -820,6 +876,8 @@ def build_env(args, wrappers, seed: int) -> dm_env.Environment:
         pixel_first_person_height=float(args.pixel_first_person_height),
         pixel_first_person_lookahead=float(args.pixel_first_person_lookahead),
         pixel_first_person_pitch=float(args.pixel_first_person_pitch),
+        decouple_view=bool(getattr(args, "decouple_view", False)),
+        view_delta_scale=float(getattr(args, "view_delta_scale", np.pi)),
         goal_marker_color=getattr(args, "goal_marker_color", "auto"),
         seed=seed,
     )
@@ -893,12 +951,26 @@ def run_evaluation(env,
                                          eval_mode=True,
                                          prev_actions=prev_stack,
                                          goal_history=goal_stack)
-            warp_params = action_transformer.compute_warp_from_action(action_local)
+            move_local, view_delta = split_action_components(
+                action_local, bool(getattr(env, "action_spec", lambda: None)() and env.action_spec().shape[0] == 3)
+            )
+            move_local = clip_action_l2(move_local)
+            action_local_full = (
+                np.concatenate([move_local, np.array([view_delta], dtype=np.float32)], axis=0)
+                if getattr(env, "action_spec", lambda: None)() and env.action_spec().shape[0] == 3
+                else move_local
+            )
+            warp_params = action_transformer.compute_warp_from_action(move_local)
             if is_recurrent and getattr(agent, 'use_se2_warp', False):
                 agent.register_pending_warp(warp_params)  # type: ignore[attr-defined]
-            action_global = action_transformer.to_global(action_local)
+            move_global = action_transformer.to_global(move_local)
+            move_global = clip_action_l2(move_global)
+            if action_local_full.shape[0] == 3:
+                action_global = np.concatenate([move_global, np.array([view_delta], dtype=np.float32)], axis=0)
+            else:
+                action_global = move_global
             time_step = env.step(action_global)
-            action_history.append(np.asarray(action_local, dtype=np.float32).copy())
+            action_history.append(np.asarray(action_local_full, dtype=np.float32).copy())
             prev_stack = flatten_action_history(action_history)
             action_transformer.update_heading(getattr(env, "last_info", lambda: {})() or {})
             if goal_history is not None:
@@ -1163,12 +1235,26 @@ def train():
                 prev_actions=prev_action_stack,
                 goal_history=goal_history_stack,
             )
-        policy_action_local = clip_action_l2(policy_action_local)
-        warp_params_local = action_transformer.compute_warp_from_action(policy_action_local)
+        move_local, view_delta = split_action_components(
+            policy_action_local, bool(getattr(args, "decouple_view", False))
+        )
+        move_local = clip_action_l2(move_local)
+        policy_action_local_full = (
+            np.concatenate([move_local, np.array([view_delta], dtype=np.float32)], axis=0)
+            if getattr(args, "decouple_view", False)
+            else move_local
+        )
+        warp_params_local = action_transformer.compute_warp_from_action(move_local)
         if is_recurrent_agent and getattr(agent, 'use_se2_warp', False):
             agent.register_pending_warp(warp_params_local)
-        policy_action_global = action_transformer.to_global(policy_action_local)
-        policy_action_global = clip_action_l2(policy_action_global)
+        move_global = action_transformer.to_global(move_local)
+        move_global = clip_action_l2(move_global)
+        if getattr(args, "decouple_view", False):
+            policy_action_global = np.concatenate(
+                [move_global, np.array([view_delta], dtype=np.float32)], axis=0
+            )
+        else:
+            policy_action_global = move_global
         next_time_step = train_env.step(policy_action_global)
         info = getattr(train_env, "last_info", lambda: {})() or {}
         logger.accumulate_env_metrics(info)
@@ -1182,13 +1268,23 @@ def train():
             teacher_action_local = action_transformer.to_local(
                 np.asarray(teacher_action_global, dtype=np.float32)
             ).astype(np.float32, copy=False)
-        student_action_global = info.get("student_action", policy_action_global)
-        student_action_local = policy_action_local.copy()
+        student_action_global = info.get("student_action", move_global)
+        student_action_local = policy_action_local_full.copy()
         if teacher_intervened and teacher_action_global is not None:
             applied_action_global = np.asarray(teacher_action_global, dtype=np.float32)
         else:
             applied_action_global = np.asarray(student_action_global, dtype=np.float32)
-        applied_action_local = action_transformer.to_local(applied_action_global).astype(np.float32, copy=False)
+        applied_move_local = action_transformer.to_local(applied_action_global).astype(np.float32, copy=False)
+        if getattr(args, "decouple_view", False):
+            applied_action_local = np.concatenate(
+                [applied_move_local, np.array([view_delta], dtype=np.float32)], axis=0
+            )
+            if teacher_action_local is not None:
+                teacher_action_local = np.concatenate(
+                    [teacher_action_local, np.array([view_delta], dtype=np.float32)], axis=0
+                )
+        else:
+            applied_action_local = applied_move_local
         action_for_logging = applied_action_local.copy()
         action_history.append(applied_action_local.copy())
         next_prev_stack = flatten_action_history(action_history)

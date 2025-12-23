@@ -110,6 +110,8 @@ _CLI_FLAG_ALIASES: dict[str, tuple[str, ...]] = {
     'pixel_first_person_height': ('--pixel_first_person_height',),
     'pixel_first_person_lookahead': ('--pixel_first_person_lookahead',),
     'pixel_first_person_pitch': ('--pixel_first_person_pitch',),
+    'decouple_view': ('--decouple_view',),
+    'view_delta_scale': ('--view_delta_scale',),
     'goal_marker_color': ('--goal_marker_color',),
     'frame_stack': ('--frame_stack',),
     'use_local_actions': ('--use_local_actions', '--no_use_local_actions'),
@@ -847,8 +849,10 @@ class DrQPolicy:
         self._step = 0
         self.use_se2_warp = bool(getattr(agent, 'use_se2_warp', False))
         self.prev_action_dim = int(getattr(agent, 'prev_action_dim', 0))
+        self.goal_history_dim = int(getattr(agent, 'goal_history_dim', 0))
         raw_hist = getattr(agent, 'action_history_len', 0) or 0
         self.action_history_len = max(0, int(raw_hist))
+        self.action_dim = int(getattr(agent, 'action_dim', 0)) or self.prev_action_dim // max(1, self.action_history_len)
         self.agent_variant = getattr(agent, 'recurrent_type', 'standard') if hasattr(agent, 'recurrent_type') else 'standard'
         self.agent.train(False)
 
@@ -935,19 +939,29 @@ class DrQPolicy:
             self._frame_buffer.append(cloned)
         return torch.cat(self._frame_buffer, dim=1)
 
-    def act(self, obs_dict, deterministic: bool = True, prev_actions: torch.Tensor | None = None):
+    def act(
+        self,
+        obs_dict,
+        deterministic: bool = True,
+        prev_actions: torch.Tensor | None = None,
+        goal_history: torch.Tensor | None = None,
+    ):
         obs = obs_dict["policy"].to(self.device)
         obs = self._reshape_obs(obs)
         obs_np = obs.detach().cpu().numpy()[0]
         prev_np = None
         if prev_actions is not None:
             prev_np = prev_actions.detach().cpu().numpy()[0]
+        goal_np = None
+        if goal_history is not None:
+            goal_np = goal_history.detach().cpu().numpy()[0]
         with torch.no_grad():
             action = self.agent.act(
                 obs_np,
                 step=self._step,
                 eval_mode=True,
                 prev_actions=prev_np,
+                goal_history=goal_np,
             )
         self._step += 1
         return torch.as_tensor(action, device=self.device, dtype=torch.float32).view(1, -1)
@@ -994,11 +1008,26 @@ class _ControllerPolicyBase:
     def reset(self):
         return None
 
+    def act(
+        self,
+        obs_dict,
+        deterministic: bool = True,
+        prev_actions: torch.Tensor | None = None,
+        goal_history: torch.Tensor | None = None,
+    ):
+        raise NotImplementedError
+
 
 class RandomControllerPolicy(_ControllerPolicyBase):
     """Uniform random actions in [-1, 1]."""
 
-    def act(self, obs_dict, deterministic: bool = True, prev_actions: torch.Tensor | None = None):
+    def act(
+        self,
+        obs_dict,
+        deterministic: bool = True,
+        prev_actions: torch.Tensor | None = None,
+        goal_history: torch.Tensor | None = None,
+    ):
         batch = obs_dict["policy"].shape[0]
         return torch.empty(batch, self.action_dim, device=self.device).uniform_(-1.0, 1.0)
 
@@ -1006,25 +1035,65 @@ class RandomControllerPolicy(_ControllerPolicyBase):
 class IdleControllerPolicy(_ControllerPolicyBase):
     """Always output zero actions (use with human teleop overrides)."""
 
-    def act(self, obs_dict, deterministic: bool = True, prev_actions: torch.Tensor | None = None):
+    def act(
+        self,
+        obs_dict,
+        deterministic: bool = True,
+        prev_actions: torch.Tensor | None = None,
+        goal_history: torch.Tensor | None = None,
+    ):
         batch = obs_dict["policy"].shape[0]
         return torch.zeros(batch, self.action_dim, device=self.device)
+
+
+class KeyboardControllerPolicy(_ControllerPolicyBase):
+    """Keyboard-controlled policy (WASD for move, Q/E for view delta)."""
+
+    def __init__(self, *, action_dim: int, device: torch.device, decouple_view: bool):
+        self.action_dim = int(action_dim)
+        self.device = device
+        self.decouple_view = bool(decouple_view)
+        self.teleop = InlineEvalTeleop(decouple_view=self.decouple_view)
+        self.teleop.print_controls()
+
+    def eval(self):
+        return None
+
+    def reset(self):
+        self.teleop.reset()
+
+    def act(
+        self,
+        obs_dict,
+        deterministic: bool = True,
+        prev_actions: torch.Tensor | None = None,
+        goal_history: torch.Tensor | None = None,
+    ):
+        action = self.teleop.get_action()
+        if action is None:
+            action = np.zeros(self.action_dim, dtype=np.float32)
+        else:
+            action = np.asarray(action, dtype=np.float32)
+            if action.shape[0] != self.action_dim:
+                action = np.pad(action, (0, max(0, self.action_dim - action.shape[0])), mode='constant')
+        return torch.as_tensor(action, device=self.device, dtype=torch.float32).view(1, -1)
 
 
 class InlineEvalTeleop:
     """Keyboard teleop that shares the main pygame window (no extra display)."""
 
-    def __init__(self, threshold: float = 0.05, hold_time: float = 0.25):
+    def __init__(self, threshold: float = 0.05, hold_time: float = 0.25, *, decouple_view: bool = False):
         pygame.init()
         self.threshold = float(threshold)
         self.hold_time = float(hold_time)
-        self._last_action = np.zeros(2, dtype=np.float32)
+        self.decouple_view = bool(decouple_view)
+        self._last_action = np.zeros(3 if self.decouple_view else 2, dtype=np.float32)
         self._last_active_ts = 0.0
 
     def get_action(self):
         pygame.event.pump()
         keys = pygame.key.get_pressed()
-        action = np.zeros(2, dtype=np.float32)
+        action = np.zeros(3 if self.decouple_view else 2, dtype=np.float32)
         if keys[pygame.K_UP] or keys[pygame.K_w]:
             action[1] = 1.0
         if keys[pygame.K_DOWN] or keys[pygame.K_s]:
@@ -1033,6 +1102,11 @@ class InlineEvalTeleop:
             action[0] = -1.0
         if keys[pygame.K_RIGHT] or keys[pygame.K_d]:
             action[0] = 1.0
+        if self.decouple_view:
+            if keys[pygame.K_q]:
+                action[2] = -1.0
+            if keys[pygame.K_e]:
+                action[2] = 1.0
 
         magnitude = float(np.linalg.norm(action))
         now = time.perf_counter()
@@ -1058,7 +1132,10 @@ class InlineEvalTeleop:
         return None
 
     def print_controls(self):
-        print("🎮 Inline teleop active – focus the render window and use WASD/arrow keys.")
+        if self.decouple_view:
+            print("🎮 Inline teleop active – WASD/arrow keys move, Q/E adjust view direction.")
+        else:
+            print("🎮 Inline teleop active – focus the render window and use WASD/arrow keys.")
 
 
 def _resolve_policy_type(args_policy_type: str, checkpoint: Dict[str, Any]) -> str:
@@ -1454,7 +1531,7 @@ def create_env(env_name: str, args, *, render_override: str | None = None, mirro
 
                 teleop = ControlWindowTeleop(width=520, height=420, show_debug_info=True)
             else:
-                teleop = InlineEvalTeleop()
+                teleop = InlineEvalTeleop(decouple_view=bool(getattr(args, 'decouple_view', False)))
                 teleop.print_controls()
 
         wrapper = build_ogbench_wrapper(
@@ -1584,7 +1661,9 @@ class ActionFrameTransformer:
                 self.heading[:] = delta[:2] / norm
 
     def compute_warp_from_action(self, action_local: np.ndarray) -> np.ndarray:
-        vec = np.asarray(action_local, dtype=np.float32)
+        vec = np.asarray(action_local, dtype=np.float32).reshape(-1)
+        if vec.shape[0] > 2:
+            vec = vec[:2]
         warp = np.zeros(3, dtype=np.float32)
         warp[:2] = vec[:2] * self.translation_scale
         prev = self.last_action
@@ -1606,6 +1685,17 @@ def clip_action_l2_np(action: np.ndarray, max_norm: float = 1.0) -> np.ndarray:
     return vec
 
 
+def split_action_components(action: np.ndarray, decouple_view: bool) -> tuple[np.ndarray, float]:
+    vec = np.asarray(action, dtype=np.float32).reshape(-1)
+    if not decouple_view:
+        return vec, 0.0
+    if vec.shape[0] < 3:
+        vec = np.pad(vec, (0, 3 - vec.shape[0]), mode='constant')
+    move = vec[:2]
+    view_delta = float(np.clip(vec[2], -1.0, 1.0))
+    return move, view_delta
+
+
 def _resolve_action_history_len(args, policy) -> int:
     if hasattr(policy, 'action_history_len'):
         try:
@@ -1621,6 +1711,63 @@ def _resolve_action_history_len(args, policy) -> int:
     return 1
 
 
+def _init_goal_history(goal_dim: int, stack: int, fill: Optional[np.ndarray] = None) -> deque:
+    history = deque(maxlen=stack)
+    if fill is None:
+        base = np.zeros(goal_dim, dtype=np.float32)
+    else:
+        base = np.asarray(fill, dtype=np.float32).reshape(goal_dim)
+    for _ in range(stack):
+        history.append(base.copy())
+    return history
+
+
+def _flatten_goal_history(history: deque) -> np.ndarray:
+    if not history:
+        return np.zeros(0, dtype=np.float32)
+    return np.concatenate(list(history), axis=0).astype(np.float32, copy=False)
+
+
+def _compute_goal_relative_local(env, transformer: ActionFrameTransformer, scale: float) -> np.ndarray:
+    base = getattr(env, "unwrapped", env)
+    if hasattr(base, "get_xy") and hasattr(base, "cur_goal_xy"):
+        try:
+            agent_xy = np.asarray(base.get_xy(), dtype=np.float32)
+            goal_xy = np.asarray(base.cur_goal_xy, dtype=np.float32)
+            rel_global = goal_xy - agent_xy
+        except Exception:
+            rel_global = np.zeros(2, dtype=np.float32)
+    else:
+        rel_global = np.zeros(2, dtype=np.float32)
+    rel_local = transformer.to_local(rel_global.astype(np.float32, copy=False))
+    if scale and scale > 0:
+        rel_local = rel_local / float(scale)
+    return np.clip(rel_local, -1.0, 1.0).astype(np.float32, copy=False)
+
+
+def _set_view_dir_from_delta(env, move_vec: np.ndarray, view_delta: float, view_delta_scale: float) -> None:
+    base = getattr(env, "unwrapped", env)
+    base_dir = None
+    move = np.asarray(move_vec, dtype=np.float32).reshape(-1)
+    norm = np.linalg.norm(move)
+    if norm > 1e-6:
+        base_dir = move[:2] / norm
+    elif hasattr(base, "_last_move_dir"):
+        try:
+            base_dir = np.asarray(getattr(base, "_last_move_dir"), dtype=np.float32)[:2]
+        except Exception:
+            base_dir = None
+    if base_dir is None:
+        base_dir = np.array([1.0, 0.0], dtype=np.float32)
+    angle = float(np.clip(view_delta, -1.0, 1.0)) * float(view_delta_scale)
+    cos_a = float(np.cos(angle))
+    sin_a = float(np.sin(angle))
+    rot = np.array([[cos_a, -sin_a], [sin_a, cos_a]], dtype=np.float32)
+    view_dir = (rot @ base_dir.reshape(-1, 1)).reshape(2)
+    if hasattr(base, "set_view_dir"):
+        base.set_view_dir(view_dir)
+
+
 def run_headless_evaluation(policy, env, args, device):
     """Minimal evaluation loop without pygame for automated tests."""
     print("\n🧪 Running headless evaluation")
@@ -1631,16 +1778,23 @@ def run_headless_evaluation(policy, env, args, device):
     max_steps = args.max_episode_steps
     episode_rewards: list[float] = []
     episode_lengths: list[int] = []
-    action_dim = int(np.prod(env.action_space.shape))
+    action_dim = int(getattr(policy, 'action_dim', 0) or np.prod(env.action_space.shape))
     history_len = _resolve_action_history_len(args, policy)
     prev_action_dim = int(getattr(policy, 'prev_action_dim', 0))
+    goal_history_dim = int(getattr(policy, 'goal_history_dim', 0))
+    goal_history_len = goal_history_dim // 2 if goal_history_dim > 0 else 0
     if prev_action_dim <= 0:
         history_len = 0
     use_local_actions = bool(getattr(args, 'use_local_actions', False))
     translation_scale = float(getattr(args, 'se2_translation_scale', 0.2))
+    decouple_view = bool(getattr(args, 'decouple_view', False))
+    view_delta_scale = float(getattr(args, 'view_delta_scale', np.pi))
     policy_has_warp = bool(getattr(policy, 'use_se2_warp', False))
     action_history = _init_action_history(action_dim, history_len)
     transformer = ActionFrameTransformer(use_local_actions, translation_scale)
+    goal_history = None
+    if goal_history_len > 0:
+        goal_history = _init_goal_history(2, goal_history_len)
 
     for episode_idx in range(target_episodes):
         obs, info = env.reset(seed=args.seed + episode_idx)
@@ -1648,6 +1802,9 @@ def run_headless_evaluation(policy, env, args, device):
         action_history = _init_action_history(action_dim, history_len)
         transformer.reset()
         transformer.update_heading(info if isinstance(info, dict) else None)
+        if goal_history_len > 0:
+            initial_goal = _compute_goal_relative_local(env, transformer, getattr(args, 'goal_relative_scale', 10.0))
+            goal_history = _init_goal_history(2, goal_history_len, fill=initial_goal)
         done = False
         ep_reward = 0.0
         steps = 0
@@ -1660,14 +1817,37 @@ def run_headless_evaluation(policy, env, args, device):
                     prev_tensor = torch.as_tensor(prev_stack, device=device).view(1, -1)
                 else:
                     prev_tensor = None
-                actions = policy.act(obs_dict, deterministic=True, prev_actions=prev_tensor)
-                actions = clip_action_l2_tensor(actions)
-            action_local = actions.cpu().numpy()[0]
+                if goal_history_len > 0 and goal_history:
+                    goal_stack = _flatten_goal_history(goal_history)
+                    goal_tensor = torch.as_tensor(goal_stack, device=device).view(1, -1)
+                else:
+                    goal_tensor = None
+                try:
+                    actions = policy.act(
+                        obs_dict,
+                        deterministic=True,
+                        prev_actions=prev_tensor,
+                        goal_history=goal_tensor,
+                    )
+                except TypeError:
+                    actions = policy.act(obs_dict, deterministic=True, prev_actions=prev_tensor)
+            action_local_raw = actions.cpu().numpy()[0]
+            move_local, view_delta = split_action_components(action_local_raw, decouple_view)
+            move_local = clip_action_l2_np(move_local)
+            if decouple_view:
+                action_local = np.concatenate([move_local, np.array([view_delta], dtype=np.float32)], axis=0)
+            else:
+                action_local = move_local
             if policy_has_warp and hasattr(policy, 'register_pending_warp'):
-                warp = transformer.compute_warp_from_action(action_local)
+                warp = transformer.compute_warp_from_action(move_local)
                 policy.register_pending_warp(warp)
-            action = transformer.to_global(action_local)
-            action = clip_action_l2_np(action)
+            move_global = transformer.to_global(move_local)
+            move_global = clip_action_l2_np(move_global)
+            if decouple_view:
+                _set_view_dir_from_delta(env, move_global, view_delta, view_delta_scale)
+                action = np.concatenate([move_global, np.array([view_delta], dtype=np.float32)], axis=0)
+            else:
+                action = move_global
             if args.action_scale != 1.0:
                 action *= args.action_scale
             if args.clip_actions:
@@ -1675,6 +1855,9 @@ def run_headless_evaluation(policy, env, args, device):
             obs, reward, terminated, truncated, info = env.step(action)
             if history_len > 0 and action_history is not None:
                 action_history.append(action_local.copy())
+            if goal_history_len > 0 and goal_history is not None:
+                goal_rel = _compute_goal_relative_local(env, transformer, getattr(args, 'goal_relative_scale', 10.0))
+                goal_history.append(goal_rel.copy())
             transformer.update_heading(info if isinstance(info, dict) else None)
             ep_reward += float(reward)
             steps += 1
@@ -1746,16 +1929,23 @@ def run_interactive_evaluation(policy, env, args, device, mirror: MirrorEnvProce
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     
-    action_dim = int(np.prod(env.action_space.shape))
+    action_dim = int(getattr(policy, 'action_dim', 0) or np.prod(env.action_space.shape))
     history_len = _resolve_action_history_len(args, policy)
     prev_action_dim = int(getattr(policy, 'prev_action_dim', 0))
+    goal_history_dim = int(getattr(policy, 'goal_history_dim', 0))
+    goal_history_len = goal_history_dim // 2 if goal_history_dim > 0 else 0
     if prev_action_dim <= 0:
         history_len = 0
     use_local_actions = bool(getattr(args, 'use_local_actions', False))
     translation_scale = float(getattr(args, 'se2_translation_scale', 0.2))
+    decouple_view = bool(getattr(args, 'decouple_view', False))
+    view_delta_scale = float(getattr(args, 'view_delta_scale', np.pi))
     policy_has_warp = bool(getattr(policy, 'use_se2_warp', False))
     action_history = _init_action_history(action_dim, history_len)
     transformer = ActionFrameTransformer(use_local_actions, translation_scale)
+    goal_history = None
+    if goal_history_len > 0:
+        goal_history = _init_goal_history(2, goal_history_len)
 
     # Reset environment
     obs, info = env.reset(seed=args.seed)
@@ -1763,6 +1953,9 @@ def run_interactive_evaluation(policy, env, args, device, mirror: MirrorEnvProce
     action_history = _init_action_history(action_dim, history_len)
     transformer.reset()
     transformer.update_heading(info if isinstance(info, dict) else None)
+    if goal_history_len > 0:
+        initial_goal = _compute_goal_relative_local(env, transformer, getattr(args, 'goal_relative_scale', 10.0))
+        goal_history = _init_goal_history(2, goal_history_len, fill=initial_goal)
     maze_env = unwrap_maze_env(env)
     birds_eye = None
     if maze_env is not None:
@@ -1794,7 +1987,7 @@ def run_interactive_evaluation(policy, env, args, device, mirror: MirrorEnvProce
     step_idx = 0
     
     def reset_environment(reason: Optional[str] = None):
-        nonlocal obs, info, episode_reward, episode_length, mirror, birds_eye, action_history, transformer
+        nonlocal obs, info, episode_reward, episode_length, mirror, birds_eye, action_history, transformer, goal_history
         if reason:
             print(reason)
         obs, info = env.reset()
@@ -1802,6 +1995,9 @@ def run_interactive_evaluation(policy, env, args, device, mirror: MirrorEnvProce
         action_history = _init_action_history(action_dim, history_len)
         transformer.reset()
         transformer.update_heading(info if isinstance(info, dict) else None)
+        if goal_history_len > 0:
+            initial_goal = _compute_goal_relative_local(env, transformer, getattr(args, 'goal_relative_scale', 10.0))
+            goal_history = _init_goal_history(2, goal_history_len, fill=initial_goal)
         if mirror is not None:
             try:
                 mirror.reset()
@@ -1824,7 +2020,7 @@ def run_interactive_evaluation(policy, env, args, device, mirror: MirrorEnvProce
             if event.type == pygame.QUIT:
                 running = False
             elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_ESCAPE or event.key == pygame.K_q:
+                if event.key == pygame.K_ESCAPE:
                     running = False
                 elif event.key == pygame.K_SPACE:
                     reset_environment("🔄 Manual reset triggered")
@@ -1853,15 +2049,38 @@ def run_interactive_evaluation(policy, env, args, device, mirror: MirrorEnvProce
                 prev_tensor = torch.as_tensor(prev_stack, device=device).view(1, -1)
             else:
                 prev_tensor = None
-            actions = policy.act(obs_dict, deterministic=True, prev_actions=prev_tensor)
-            actions = clip_action_l2_tensor(actions)
-        action_local = actions.cpu().numpy()[0]
+            if goal_history_len > 0 and goal_history:
+                goal_stack = _flatten_goal_history(goal_history)
+                goal_tensor = torch.as_tensor(goal_stack, device=device).view(1, -1)
+            else:
+                goal_tensor = None
+            try:
+                actions = policy.act(
+                    obs_dict,
+                    deterministic=True,
+                    prev_actions=prev_tensor,
+                    goal_history=goal_tensor,
+                )
+            except TypeError:
+                actions = policy.act(obs_dict, deterministic=True, prev_actions=prev_tensor)
+        action_local_raw = actions.cpu().numpy()[0]
+        move_local, view_delta = split_action_components(action_local_raw, decouple_view)
+        move_local = clip_action_l2_np(move_local)
+        if decouple_view:
+            action_local = np.concatenate([move_local, np.array([view_delta], dtype=np.float32)], axis=0)
+        else:
+            action_local = move_local
         warp_params = None
         if policy_has_warp and hasattr(policy, 'register_pending_warp'):
-            warp_params = transformer.compute_warp_from_action(action_local)
+            warp_params = transformer.compute_warp_from_action(move_local)
             policy.register_pending_warp(warp_params)
-        action_global = transformer.to_global(action_local)
-        action_global = clip_action_l2_np(action_global)
+        move_global = transformer.to_global(move_local)
+        move_global = clip_action_l2_np(move_global)
+        if decouple_view:
+            _set_view_dir_from_delta(env, move_global, view_delta, view_delta_scale)
+            action_global = move_global
+        else:
+            action_global = move_global
         
         # Apply action processing (matching training settings)
         if args.action_scale != 1.0:
@@ -1881,6 +2100,9 @@ def run_interactive_evaluation(policy, env, args, device, mirror: MirrorEnvProce
                 mirror = None
         if history_len > 0 and action_history is not None:
             action_history.append(action_local.copy())
+        if goal_history_len > 0 and goal_history is not None:
+            goal_rel = _compute_goal_relative_local(env, transformer, getattr(args, 'goal_relative_scale', 10.0))
+            goal_history.append(goal_rel.copy())
         transformer.update_heading(info if isinstance(info, dict) else None)
         
         # Update episode tracking
@@ -1984,6 +2206,8 @@ def run_interactive_evaluation(policy, env, args, device, mirror: MirrorEnvProce
 
 def main():
     args = get_args()
+    if getattr(args, 'decouple_view', False):
+        args.use_local_actions = True
     device = select_device(args.device)
 
     print("🚀 Interactive Policy Evaluation")
@@ -2042,6 +2266,13 @@ def main():
                     obs_mode=obs_mode,
                     pixel_shape=pixel_shape_hint,
                     device=device,
+                )
+            elif args.controller == 'keyboard':
+                action_dim = 3 if getattr(args, 'decouple_view', False) else int(np.prod(env.action_space.shape))
+                policy = KeyboardControllerPolicy(
+                    action_dim=action_dim,
+                    device=device,
+                    decouple_view=bool(getattr(args, 'decouple_view', False)),
                 )
             else:
                 raise ValueError(f"Unknown controller '{args.controller}'")
