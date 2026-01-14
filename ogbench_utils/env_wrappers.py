@@ -29,6 +29,9 @@ def build_ogbench_wrapper(
     tolerance_value: float = 30.0,
     hard_block_lethal: bool = True,
     intervention_enable_after_steps: int = 0,
+    intervention_agent_mode: str = "divergence",
+    intervention_safety_margin_frac: float = 0.0,
+    intervention_release_steps: int = 3,
     teleop_interface: Optional[object] = None,
 ) -> Callable:
     """Return a wrapper function that mirrors training/eval environment stacking."""
@@ -66,6 +69,23 @@ def build_ogbench_wrapper(
                 tolerance_value=tolerance_value,
                 hard_block_lethal=hard_block_lethal,
                 enable_after_steps=intervention_enable_after_steps,
+                agent_mode=intervention_agent_mode,
+                safety_margin_frac=intervention_safety_margin_frac,
+                release_steps=intervention_release_steps,
+            )
+        elif intervention_mode in ("agent_safety_align", "agent_safety_progress"):
+            agent_mode = "safety_align" if intervention_mode == "agent_safety_align" else "safety_progress"
+            env = InterventionWrapper(
+                env,
+                mode="agent",
+                teacher_type=teacher_type,
+                tolerance_type=tolerance_type,
+                tolerance_value=tolerance_value,
+                hard_block_lethal=hard_block_lethal,
+                enable_after_steps=intervention_enable_after_steps,
+                agent_mode=agent_mode,
+                safety_margin_frac=intervention_safety_margin_frac,
+                release_steps=intervention_release_steps,
             )
         return env
 

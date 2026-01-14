@@ -74,7 +74,14 @@ except Exception:  # pragma: no cover - optional dependency for viz
 
 
 def parse_args():
-    return build_train_parser().parse_args()
+    parser = build_train_parser()
+    parser.add_argument('--eval_interval', type=int, default=50_000,
+                        help='Environment step interval between evaluation runs (0 disables)')
+    parser.add_argument('--num_eval_episodes', type=int, default=5,
+                        help='Number of evaluation episodes to run each interval')
+    parser.add_argument('--eval_num_envs', type=int, default=8,
+                        help='Number of parallel envs to use for evaluation')
+    return parser.parse_args()
 
 
 def make_wrappers(args):
@@ -96,8 +103,55 @@ def make_wrappers(args):
         tolerance_value=args.tolerance_value,
         hard_block_lethal=args.hard_block_lethal,
         intervention_enable_after_steps=args.intervention_enable_after_steps,
+        intervention_safety_margin_frac=args.intervention_safety_margin_frac,
+        intervention_release_steps=args.intervention_release_steps,
     )
     return [wrapper]
+
+
+def make_eval_wrappers(args):
+    reward_switch = args.reward_switch_after_steps // max(1, args.num_envs)
+    wrapper = build_ogbench_wrapper(
+        obs_mode=args.obs_mode,
+        include_goal=args.include_goal,
+        include_distance=args.include_distance,
+        include_direction=args.include_direction,
+        include_velocity=args.include_velocity,
+        reward_type=args.reward_type,
+        dense_reward_scale=args.dense_reward_scale,
+        step_penalty=args.step_penalty,
+        reward_switch_after_steps=reward_switch,
+        intervention_mode="none",
+        teacher_type=args.teacher_type,
+        tolerance_type=args.tolerance_type,
+        tolerance_value=args.tolerance_value,
+        hard_block_lethal=args.hard_block_lethal,
+        intervention_enable_after_steps=args.intervention_enable_after_steps,
+        intervention_safety_margin_frac=args.intervention_safety_margin_frac,
+        intervention_release_steps=args.intervention_release_steps,
+    )
+    return [wrapper]
+
+
+def _build_env_kwargs(args) -> Dict[str, Any]:
+    env_kwargs: Dict[str, Any] = {}
+    if args.obs_mode == 'pixels':
+        env_kwargs['render_mode'] = 'rgb_array'
+        if args.pixel_width:
+            env_kwargs['width'] = int(args.pixel_width)
+        if args.pixel_height:
+            env_kwargs['height'] = int(args.pixel_height)
+        if args.pixel_camera:
+            env_kwargs['camera_name'] = args.pixel_camera
+        else:
+            env_kwargs['pixel_camera_mode'] = args.pixel_camera_mode
+            env_kwargs['pixel_local_view_size'] = args.pixel_local_view_size
+            env_kwargs['pixel_local_camera_height'] = args.pixel_local_camera_height
+            env_kwargs['pixel_first_person_distance'] = args.pixel_first_person_distance
+            env_kwargs['pixel_first_person_height'] = args.pixel_first_person_height
+            env_kwargs['pixel_first_person_lookahead'] = args.pixel_first_person_lookahead
+            env_kwargs['pixel_first_person_pitch'] = args.pixel_first_person_pitch
+    return env_kwargs
 
 
 @dataclass
@@ -242,23 +296,7 @@ def build_environment(
     torch.Tensor | None,
 ]:
     wrappers = make_wrappers(args)
-    env_kwargs: Dict[str, Any] = {}
-    if args.obs_mode == 'pixels':
-        env_kwargs['render_mode'] = 'rgb_array'
-        if args.pixel_width:
-            env_kwargs['width'] = int(args.pixel_width)
-        if args.pixel_height:
-            env_kwargs['height'] = int(args.pixel_height)
-        if args.pixel_camera:
-            env_kwargs['camera_name'] = args.pixel_camera
-        else:
-            env_kwargs['pixel_camera_mode'] = args.pixel_camera_mode
-            env_kwargs['pixel_local_view_size'] = args.pixel_local_view_size
-            env_kwargs['pixel_local_camera_height'] = args.pixel_local_camera_height
-            env_kwargs['pixel_first_person_distance'] = args.pixel_first_person_distance
-            env_kwargs['pixel_first_person_height'] = args.pixel_first_person_height
-            env_kwargs['pixel_first_person_lookahead'] = args.pixel_first_person_lookahead
-            env_kwargs['pixel_first_person_pitch'] = args.pixel_first_person_pitch
+    env_kwargs = _build_env_kwargs(args)
     record_progress("[Init] constructing vector env adapter")
     envs = OGBenchVecEnvAdapter(
         env_name=args.env_name,
@@ -304,6 +342,127 @@ def build_environment(
         envs.num_actions,
         initial_obs_raw,
     )
+
+
+def build_eval_environment(args, device: torch.device) -> OGBenchVecEnvAdapter:
+    wrappers = make_eval_wrappers(args)
+    env_kwargs = _build_env_kwargs(args)
+    eval_envs = OGBenchVecEnvAdapter(
+        env_name=args.env_name,
+        num_envs=max(1, int(args.eval_num_envs)),
+        device=device,
+        wrappers=wrappers,
+        clip_actions=1.0,
+        **env_kwargs,
+    )
+    return eval_envs
+
+
+def run_eval_metrics(
+    *,
+    args,
+    device: torch.device,
+    eval_envs: OGBenchVecEnvAdapter,
+    actor_backbone: nn.Module,
+    actor_head: nn.Module,
+    obs_normalizer,
+    pixel_shape,
+    amp: AMPComponents,
+) -> Dict[str, float]:
+    num_eval_episodes = max(1, int(args.num_eval_episodes))
+    obs_normalizer_was_training = obs_normalizer.training
+    actor_backbone_was_training = actor_backbone.training
+    actor_head_was_training = actor_head.training
+    obs_normalizer.eval()
+    actor_backbone.eval()
+    actor_head.eval()
+
+    obs_raw = eval_envs.reset()
+    obs = prepare_observation(
+        obs_raw,
+        device=device,
+        obs_mode=args.obs_mode,
+        pixel_shape=pixel_shape,
+        flatten=True,
+    )
+
+    episode_returns = torch.zeros(eval_envs.num_envs, device=device)
+    episode_lengths = torch.zeros(eval_envs.num_envs, device=device)
+    total_reward = 0.0
+    total_length = 0.0
+    success_count = 0
+    lethal_count = 0
+    distance_sum = 0.0
+    distance_count = 0
+    success_length_sum = 0.0
+    episodes_completed = 0
+
+    while episodes_completed < num_eval_episodes:
+        norm_obs = obs_normalizer(obs)
+        obs_actor_input = reshape_observation(norm_obs, obs_mode=args.obs_mode, pixel_shape=pixel_shape)
+        with torch.no_grad(), autocast(device_type=amp.device_type, dtype=amp.dtype, enabled=amp.enabled):
+            _, _, mean_actions = actor_head(actor_backbone(obs_actor_input))
+        next_obs_raw, rewards, dones, infos = eval_envs.step(mean_actions.float())
+        next_obs = prepare_observation(
+            next_obs_raw,
+            device=device,
+            obs_mode=args.obs_mode,
+            pixel_shape=pixel_shape,
+            flatten=True,
+        )
+
+        episode_returns += rewards
+        episode_lengths += 1
+
+        done_indices = torch.nonzero(dones).flatten().tolist()
+        if done_indices:
+            completed_returns = [float(episode_returns[i].item()) for i in done_indices]
+            completed_lengths = [float(episode_lengths[i].item()) for i in done_indices]
+            for i in done_indices:
+                episode_returns[i] = 0.0
+                episode_lengths[i] = 0.0
+
+            total_reward += float(np.sum(completed_returns))
+            total_length += float(np.sum(completed_lengths))
+            episodes_completed += len(done_indices)
+
+            goals = infos.get("goals_reached") or []
+            lethals = infos.get("lethal_terminations") or []
+            distances = infos.get("distances_to_goal") or []
+
+            count = min(len(goals), len(completed_lengths))
+            for idx in range(count):
+                if float(goals[idx]) > 0.0:
+                    success_count += 1
+                    success_length_sum += completed_lengths[idx]
+            for val in lethals[: len(completed_lengths)]:
+                if float(val) > 0.0:
+                    lethal_count += 1
+            for val in distances[: len(completed_lengths)]:
+                distance_sum += float(val)
+                distance_count += 1
+
+        obs = next_obs
+
+    if obs_normalizer_was_training:
+        obs_normalizer.train()
+    if actor_backbone_was_training:
+        actor_backbone.train()
+    if actor_head_was_training:
+        actor_head.train()
+
+    denom = max(1, episodes_completed)
+    metrics = {
+        "avg_return": total_reward / denom,
+        "avg_length": total_length / denom,
+        "success_rate": success_count / denom,
+        "lethal_rate": lethal_count / denom,
+    }
+    if distance_count > 0:
+        metrics["avg_final_distance"] = distance_sum / max(1, distance_count)
+    if success_count > 0:
+        metrics["avg_success_length"] = success_length_sum / max(1, success_count)
+    return metrics
 
 
 def initialize_models(
@@ -586,6 +745,7 @@ def run_training_loop(
     args,
     device: torch.device,
     envs: OGBenchVecEnvAdapter,
+    eval_envs: OGBenchVecEnvAdapter,
     wrappers,
     pixel_shape,
     obs_normalizer,
@@ -1003,6 +1163,19 @@ def run_training_loop(
                 )
                 last_update_metrics = None
 
+            if args.eval_interval and total_env_steps % args.eval_interval == 0:
+                eval_metrics = run_eval_metrics(
+                    args=args,
+                    device=device,
+                    eval_envs=eval_envs,
+                    actor_backbone=actor_backbone,
+                    actor_head=actor_head,
+                    obs_normalizer=obs_normalizer,
+                    pixel_shape=pixel_shape,
+                    amp=amp,
+                )
+                training_logger.log_eval(total_env_steps=total_env_steps, metrics=eval_metrics)
+
         final_ckpt = checkpoint_manager.save(
             tag='final',
             step_value=total_env_steps,
@@ -1069,6 +1242,7 @@ def main():
         device,
         record_progress,
     )
+    eval_envs = build_eval_environment(args, device)
 
     model = initialize_models(args, device, n_obs, n_act, pixel_shape, record_progress)
     amp = initialize_amp(args, device)
@@ -1113,6 +1287,7 @@ def main():
             args=args,
             device=device,
             envs=envs,
+            eval_envs=eval_envs,
             wrappers=wrappers,
             pixel_shape=pixel_shape,
             obs_normalizer=obs_normalizer,
@@ -1136,6 +1311,10 @@ def main():
             pass
         try:
             envs.close()
+        except Exception:
+            pass
+        try:
+            eval_envs.close()
         except Exception:
             pass
 

@@ -118,6 +118,8 @@ _CLI_FLAG_ALIASES: dict[str, tuple[str, ...]] = {
     'se2_translation_scale': ('--se2_translation_scale',),
     'teacher_type': ('--teacher_type',),
     'intervention_mode': ('--intervention_mode',),
+    'intervention_safety_margin_frac': ('--intervention_safety_margin_frac',),
+    'intervention_release_steps': ('--intervention_release_steps',),
 }
 
 
@@ -1550,6 +1552,8 @@ def create_env(env_name: str, args, *, render_override: str | None = None, mirro
             tolerance_value=args.tolerance_value,
             hard_block_lethal=args.hard_block_lethal,
             intervention_enable_after_steps=args.intervention_enable_after_steps,
+            intervention_safety_margin_frac=args.intervention_safety_margin_frac,
+            intervention_release_steps=args.intervention_release_steps,
             teleop_interface=teleop,
         )
         env = wrapper(env)

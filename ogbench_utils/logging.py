@@ -321,6 +321,26 @@ class TrainingLogger:
         self.teacher_metrics.reset_after_log()
         return logs
 
+    def log_eval(self, *, total_env_steps: int, metrics: Dict[str, float]) -> None:
+        payload = {f"Eval/{key}": float(value) for key, value in metrics.items()}
+        msg = ", ".join(f"{k}={v:.3f}" for k, v in payload.items())
+        console_line = f"[Eval] steps={total_env_steps} {msg}"
+        print(console_line, flush=True)
+        self.record_progress(console_line)
+        if self.args.use_wandb:
+            import wandb
+
+            if self.wandb_run is None:
+                self.wandb_run = wandb.init(
+                    project=self.args.project,
+                    name=self.args.exp_name,
+                    id=self.args.exp_name,
+                    config=vars(self.args),
+                    reinit=True,
+                    resume="allow",
+                )
+            self.wandb_run.log(payload, step=total_env_steps)
+
     def finish(self):
         if self.wandb_run is not None:
             try:

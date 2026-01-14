@@ -18,7 +18,7 @@ def build_train_parser() -> argparse.ArgumentParser:
                    choices=['auto', 'red', 'green', 'blue'],
                    help='Override maze goal marker color (auto keeps env default)')
     # Rewards
-    p.add_argument('--reward_type', type=str, default='sparse', choices=['sparse','dense','combined'])
+    p.add_argument('--reward_type', type=str, default='sparse', choices=['sparse', 'dense', 'combined', 'none'])
     p.add_argument('--dense_reward_scale', type=float, default=0.01)
     p.add_argument('--step_penalty', type=float, default=0.0)
     p.add_argument('--reward_switch_after_steps', type=int, default=0)
@@ -28,13 +28,18 @@ def build_train_parser() -> argparse.ArgumentParser:
                    help='Global env steps after which to switch to switch_env_name (0 disables)')
     # Intervention / Teacher
     p.add_argument('--use_intervention', action='store_true', default=False)
-    p.add_argument('--intervention_mode', type=str, default='agent', choices=['human','agent'])
+    p.add_argument('--intervention_mode', type=str, default='agent',
+                   choices=['human', 'agent', 'agent_safety_align', 'agent_safety_progress'])
     p.add_argument('--teacher_type', type=str, default='bfs', choices=['bfs'])
     p.add_argument('--tolerance_type', type=str, default='angle', choices=['angle','l2'])
     p.add_argument('--tolerance_value', type=float, default=30.0)
     p.add_argument('--hard_block_lethal', action='store_true', default=True)
     p.add_argument('--no_hard_block_lethal', dest='hard_block_lethal', action='store_false')
     p.add_argument('--intervention_enable_after_steps', type=int, default=0)
+    p.add_argument('--intervention_safety_margin_frac', type=float, default=0.25,
+                   help='Safety margin as a fraction of maze cell size for safety-based intervention modes')
+    p.add_argument('--intervention_release_steps', type=int, default=3,
+                   help='Consecutive aligned/progressing steps required to release safety intervention')
     # SAC core (trimmed reasonable defaults)
     p.add_argument('--actor_learning_rate', type=float, default=3e-4)
     p.add_argument('--critic_learning_rate', type=float, default=3e-4)
@@ -279,7 +284,7 @@ def build_eval_parser() -> argparse.ArgumentParser:
 
     # Reward shaping (should mirror training wrapper settings)
     parser.add_argument('--reward_type', type=str, default='sparse',
-                        choices=['sparse', 'dense', 'combined'],
+                        choices=['sparse', 'dense', 'combined', 'none'],
                         help='Reward type for DetailedRewardWrapper')
     parser.add_argument('--dense_reward_scale', type=float, default=0.01,
                         help='Scale for dense reward shaping (if applicable)')
@@ -302,7 +307,7 @@ def build_eval_parser() -> argparse.ArgumentParser:
 
     # Intervention / Teleop
     parser.add_argument('--intervention_mode', type=str, default='none',
-                        choices=['none', 'human', 'agent'],
+                        choices=['none', 'human', 'agent', 'agent_safety_align', 'agent_safety_progress'],
                         help='Intervention mode: none, human teleop, or agent teacher')
     parser.add_argument('--teacher_type', type=str, default='bfs', choices=['bfs'],
                         help='Teacher type when intervention_mode=agent')
@@ -315,6 +320,10 @@ def build_eval_parser() -> argparse.ArgumentParser:
     parser.add_argument('--no_hard_block_lethal', dest='hard_block_lethal', action='store_false')
     parser.add_argument('--intervention_enable_after_steps', type=int, default=0,
                         help='Warm-up steps before agent teacher interventions engage')
+    parser.add_argument('--intervention_safety_margin_frac', type=float, default=0.25,
+                        help='Safety margin as a fraction of maze cell size for safety-based intervention modes')
+    parser.add_argument('--intervention_release_steps', type=int, default=3,
+                        help='Consecutive aligned/progressing steps required to release safety intervention')
     
     # Action processing (should match training settings)
     parser.add_argument('--action_scale', type=float, default=1.0,
