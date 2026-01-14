@@ -247,6 +247,8 @@ def build_eval_parser() -> argparse.ArgumentParser:
                         help='Force global actions even if checkpoint requested local frame')
     parser.add_argument('--se2_translation_scale', type=float, default=0.2,
                         help='Scale factor for SE(2) latent warps when local actions are enabled')
+    parser.add_argument('--goal_relative_scale', type=float, default=10.0,
+                        help='Scale factor for agent-centric goal deltas (used when goal history is enabled)')
 
     # Pixel observation overrides (auto-filled from checkpoint if available)
     parser.add_argument('--pixel_width', type=int, default=None,

@@ -125,6 +125,8 @@ def build_arg_parser():
                         help="Override total timesteps for very short smoke tests (0 disables override)")
     parser.add_argument("--pvp_use_reward_in_replay", action="store_true", default=False,
                         help="Store environment rewards in the replay buffer (PVP reward ablation)")
+    parser.add_argument("--pref_loss_type", type=str, default="pvp", choices=["pvp"],
+                        help="Proxy value loss type (fixed for PVP runs)")
     parser.add_argument("--pref_chunk_size", type=int, default=64,
                         help="Number of preference events per on-disk shard")
     parser.add_argument("--pref_fetch_every", type=int, default=512,
