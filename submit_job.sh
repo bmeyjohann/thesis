@@ -3,14 +3,11 @@ set -euo pipefail
 
 usage() {
     cat <<EOF
-Usage: $0 [--sync-wandb] [--wandb-dir DIR] [--wandb-interval SEC] [sbatch_file]
+Usage: $0 [sbatch_file]
 Defaults to sbatch_file=run_experiment.sbatch when omitted.
 EOF
 }
 
-SYNC_WANDB=0
-WAND_DIR="wandb"
-WAND_INTERVAL=600
 SCRIPT_NAME=""
 SC_ACTIVATE_SCRIPT="${SC_ACTIVATE_SCRIPT:-sc_venv_template/activate.sh}"
 _SC_ENV_SOURCED=0
@@ -32,19 +29,6 @@ source_sc_env() {
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --sync-wandb)
-            SYNC_WANDB=1
-            ;;
-        --wandb-dir)
-            shift
-            [[ $# -gt 0 ]] || { echo "Missing value for --wandb-dir" >&2; exit 1; }
-            WAND_DIR="$1"
-            ;;
-        --wandb-interval)
-            shift
-            [[ $# -gt 0 ]] || { echo "Missing value for --wandb-interval" >&2; exit 1; }
-            WAND_INTERVAL="$1"
-            ;;
         -h|--help)
             usage
             exit 0
@@ -92,22 +76,66 @@ detect_account() {
     echo "$manual"
 }
 
+collect_run_dirs() {
+    local base_dir="$1"
+    local -a wandb_dirs=()
+    local -a run_dirs=()
+    while IFS= read -r -d '' wandb_dir; do
+        wandb_dirs+=("$wandb_dir")
+    done < <(find "$base_dir" -type d -name "wandb" -print0)
+    if [[ "${#wandb_dirs[@]}" -eq 0 ]]; then
+        wandb_dirs=("$base_dir")
+    fi
+    for root in "${wandb_dirs[@]}"; do
+        while IFS= read -r -d '' run_dir; do
+            run_dirs+=("$run_dir")
+        done < <(find "$root" -type d \( -name "run-*" -o -name "offline-run-*" \) -print0)
+    done
+    printf '%s\n' "${run_dirs[@]}"
+}
+
 monitor_wandb() {
     local job_id="$1"
     local wandb_dir="$2"
     local interval="$3"
+    local baseline_file="$4"
     source_sc_env || true
     if ! command -v wandb >/dev/null 2>&1; then
         echo "⚠️  wandb CLI not found; skipping auto-sync."
         return
     fi
     mkdir -p "$wandb_dir"
-    echo "🔁 Auto-syncing wandb runs from ${wandb_dir} every ${interval}s while job ${job_id} is active."
-    while squeue -h -j "$job_id" >/dev/null 2>&1; do
-        wandb sync --sync-all "$wandb_dir" >/dev/null 2>&1 || true
+    echo "🔁 Auto-syncing new wandb runs from ${wandb_dir} every ${interval}s while job ${job_id} is active."
+
+    declare -A baseline_dirs
+    if [[ -f "$baseline_file" ]]; then
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && baseline_dirs["$line"]=1
+        done < "$baseline_file"
+    fi
+
+    declare -A new_run_dirs
+    while true; do
+        local queue_output
+        queue_output=$(squeue -h -j "$job_id" -o "%i" 2>/dev/null || true)
+        [[ -n "$queue_output" ]] || break
+
+        while IFS= read -r run_dir; do
+            [[ -n "$run_dir" ]] || continue
+            if [[ -z "${baseline_dirs[$run_dir]:-}" ]]; then
+                new_run_dirs["$run_dir"]=1
+            fi
+        done < <(collect_run_dirs "$wandb_dir")
+
+        for run_dir in "${!new_run_dirs[@]}"; do
+            WANDB_MODE=online wandb sync --sync-all "$run_dir" >/dev/null 2>&1 || true
+        done
         sleep "$interval"
     done
-    wandb sync --sync-all "$wandb_dir" >/dev/null 2>&1 || true
+
+    for run_dir in "${!new_run_dirs[@]}"; do
+        WANDB_MODE=online wandb sync --sync-all "$run_dir" >/dev/null 2>&1 || true
+    done
     echo "✅ wandb sync finished for job ${job_id}."
 }
 
@@ -115,6 +143,40 @@ if [[ ! -f "$SCRIPT_NAME" ]]; then
     echo "❌ Script not found: $SCRIPT_NAME"
     ls -1 *.sbatch 2>/dev/null || true
     exit 1
+fi
+
+SYNC_WANDB=1
+WAND_DIR="wandb"
+WAND_INTERVAL=600
+BASELINE_FILE=""
+
+read -rp "Enable wandb logging sync? [Y/n] " enable_sync
+case "${enable_sync:-Y}" in
+    Y|y|"")
+        ;;
+    N|n)
+        SYNC_WANDB=0
+        ;;
+    *)
+        echo "Invalid response; defaulting to yes."
+        ;;
+esac
+
+if [[ "$SYNC_WANDB" -eq 1 ]]; then
+    read -rp "Base wandb directory [${WAND_DIR}]: " input_wand_dir
+    WAND_DIR="${input_wand_dir:-$WAND_DIR}"
+
+    read -rp "Sync interval seconds [${WAND_INTERVAL}]: " input_interval
+    WAND_INTERVAL="${input_interval:-$WAND_INTERVAL}"
+
+    if ! [[ "$WAND_INTERVAL" =~ ^[0-9]+$ ]]; then
+        echo "❌ Sync interval must be a non-negative integer." >&2
+        exit 1
+    fi
+
+    mkdir -p logs
+    BASELINE_FILE=$(mktemp)
+    collect_run_dirs "$WAND_DIR" > "$BASELINE_FILE" || true
 fi
 
 ACCOUNT=$(detect_account)
@@ -149,10 +211,16 @@ printf 'export SLURM_ACCOUNT="%s"\n' "$ACCOUNT" > .slurm_account
 if [[ "$SYNC_WANDB" -eq 1 ]]; then
     mkdir -p logs
     LOG_PATH="logs/wandb_sync_${JOB_ID}.log"
+    BASELINE_PATH="logs/wandb_sync_${JOB_ID}_baseline.txt"
+    if [[ -n "${BASELINE_FILE:-}" && -f "$BASELINE_FILE" ]]; then
+        mv "$BASELINE_FILE" "$BASELINE_PATH"
+    else
+        : > "$BASELINE_PATH"
+    fi
     echo "📡 Launching background wandb sync (log: ${LOG_PATH})"
     (
         source_sc_env || true
-        monitor_wandb "$JOB_ID" "$WAND_DIR" "$WAND_INTERVAL"
+        monitor_wandb "$JOB_ID" "$WAND_DIR" "$WAND_INTERVAL" "$BASELINE_PATH"
     ) >"${LOG_PATH}" 2>&1 < /dev/null &
     disown
 fi
