@@ -44,6 +44,7 @@ from typing import Any, Dict, Optional
 from contextlib import contextmanager
 
 from ogbench_utils import (
+    CriticEnsemble,
     GaussianPolicyHead,
     MLPBackbone,
     PixelBackbone,
@@ -805,13 +806,17 @@ class FastSACPolicy:
                  pixel_shape=None,
                  actor_backbone: nn.Module | None = None,
                  actor_head: nn.Module | None = None,
-                 legacy_actor: nn.Module | None = None):
+                 legacy_actor: nn.Module | None = None,
+                 critic_backbone: nn.Module | None = None,
+                 critic_heads: nn.Module | None = None):
         self.obs_normalizer = obs_normalizer
         self.obs_mode = obs_mode
         self.pixel_shape = tuple(pixel_shape) if pixel_shape is not None else None
         self.actor_backbone = actor_backbone
         self.actor_head = actor_head
         self.legacy_actor = legacy_actor
+        self.critic_backbone = critic_backbone
+        self.critic_heads = critic_heads
         module = legacy_actor if legacy_actor is not None else actor_head
         self.device = next(module.parameters()).device
 
@@ -822,6 +827,10 @@ class FastSACPolicy:
         else:
             self.actor_backbone.eval()
             self.actor_head.eval()
+        if self.critic_backbone is not None:
+            self.critic_backbone.eval()
+        if self.critic_heads is not None:
+            self.critic_heads.eval()
 
     def _normalize(self, obs):
         try:
@@ -842,6 +851,18 @@ class FastSACPolicy:
             features = self.actor_backbone(obs_input)
             actions, _, means = self.actor_head(features)
         return means if deterministic else actions
+
+    def q_value(self, obs: torch.Tensor, action: np.ndarray | torch.Tensor) -> Optional[float]:
+        if self.critic_backbone is None or self.critic_heads is None:
+            return None
+        obs_norm = self._normalize(obs)
+        obs_input = reshape_observation(obs_norm, obs_mode=self.obs_mode, pixel_shape=self.pixel_shape)
+        action_tensor = torch.as_tensor(action, device=self.device, dtype=torch.float32).view(1, -1)
+        with torch.no_grad():
+            features = self.critic_backbone(obs_input)
+            q_vals = self.critic_heads(features, action_tensor)
+            q_min = torch.min(q_vals, dim=-1).values
+        return float(q_min.mean().item())
 
 
 class DrQPolicy:
@@ -977,6 +998,17 @@ class DrQPolicy:
             )
         self._step += 1
         return torch.as_tensor(action, device=self.device, dtype=torch.float32).view(1, -1)
+
+    def q_value(self, obs: torch.Tensor, action: np.ndarray | torch.Tensor, prev_actions: torch.Tensor | None = None) -> Optional[float]:
+        if not hasattr(self.agent, 'critic'):
+            return None
+        obs = self._reshape_obs(obs.to(self.device))
+        action_tensor = torch.as_tensor(action, device=self.device, dtype=torch.float32).view(1, -1)
+        prev = prev_actions.to(self.device) if prev_actions is not None else None
+        with torch.no_grad():
+            q1, q2 = self.agent.critic(obs, prev, action_tensor)
+            q_min = torch.min(q1, q2)
+        return float(q_min.mean().item())
 
     def register_pending_warp(self, warp_params: np.ndarray):
         fn = getattr(self.agent, 'register_pending_warp', None)
@@ -1395,12 +1427,42 @@ def load_trained_policy(
         actor_head = GaussianPolicyHead(backbone.output_dim, act_dim, actor_hidden, init_scale).to(device)
         actor_head.load_state_dict(checkpoint['actor_head'])
         actor_head.eval()
+        critic_backbone = None
+        critic_heads = None
+        if checkpoint.get('critic_heads') is not None:
+            critic_hidden = int(train_args.get('critic_hidden_dim', actor_hidden))
+            num_critics = int(train_args.get('num_critics', 2))
+            if arch_shared:
+                critic_backbone = backbone
+            else:
+                if obs_mode == 'pixels':
+                    critic_backbone = PixelBackbone(
+                        pixel_shape,
+                        critic_hidden,
+                        conv_channels=conv_channels,
+                        kernel_sizes=kernel_sizes,
+                        strides=strides,
+                        final_pool=final_pool,
+                    ).to(device)
+                else:
+                    critic_backbone = MLPBackbone(obs_dim, critic_hidden).to(device)
+                critic_backbone.load_state_dict(checkpoint['critic_backbone'])
+            critic_heads = CriticEnsemble(
+                critic_backbone.output_dim,
+                act_dim,
+                critic_hidden,
+                num_critics,
+            ).to(device)
+            critic_heads.load_state_dict(checkpoint['critic_heads'])
+            critic_heads.eval()
         policy = FastSACPolicy(
             obs_normalizer=obs_normalizer,
             obs_mode=obs_mode,
             pixel_shape=pixel_shape,
             actor_backbone=backbone,
             actor_head=actor_head,
+            critic_backbone=critic_backbone,
+            critic_heads=critic_heads,
         )
         policy.eval()
         training_info['obs_mode'] = obs_mode
@@ -1867,6 +1929,20 @@ def run_headless_evaluation(policy, env, args, device):
             if args.clip_actions:
                 action = np.clip(action, -1.0, 1.0)
             obs, reward, terminated, truncated, info = env.step(action)
+            if args.log_q_values and steps % max(1, int(args.log_q_every)) == 0:
+                q_action = action
+                if isinstance(info, dict) and info.get('teacher_intervened', False):
+                    q_action = info.get('teacher_action', q_action)
+                if hasattr(policy, 'q_value'):
+                    try:
+                        if isinstance(policy, DrQPolicy):
+                            q_val = policy.q_value(obs_tensor, q_action, prev_actions=prev_tensor)
+                        else:
+                            q_val = policy.q_value(obs_tensor, q_action)
+                    except Exception:
+                        q_val = None
+                    if q_val is not None:
+                        print(f"Q(action)={q_val:.3f}")
             if history_len > 0 and action_history is not None:
                 action_history.append(action_local.copy())
             if goal_history_len > 0 and goal_history is not None:
@@ -2118,6 +2194,21 @@ def run_interactive_evaluation(policy, env, args, device, mirror: MirrorEnvProce
             goal_rel = _compute_goal_relative_local(env, transformer, getattr(args, 'goal_relative_scale', 10.0))
             goal_history.append(goal_rel.copy())
         transformer.update_heading(info if isinstance(info, dict) else None)
+
+        if args.log_q_values and step_idx % max(1, int(args.log_q_every)) == 0:
+            q_action = action_global
+            if isinstance(info, dict) and info.get('teacher_intervened', False):
+                q_action = info.get('teacher_action', q_action)
+            if hasattr(policy, 'q_value'):
+                try:
+                    if isinstance(policy, DrQPolicy):
+                        q_val = policy.q_value(obs_tensor, q_action, prev_actions=prev_tensor)
+                    else:
+                        q_val = policy.q_value(obs_tensor, q_action)
+                except Exception:
+                    q_val = None
+                if q_val is not None:
+                    print(f"Q(action)={q_val:.3f}")
         
         # Update episode tracking
         obs = next_obs

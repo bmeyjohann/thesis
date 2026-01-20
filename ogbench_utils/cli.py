@@ -253,6 +253,10 @@ def build_eval_parser() -> argparse.ArgumentParser:
                         help='Render height')
     parser.add_argument('--fps', type=int, default=30,
                         help='Target FPS for rendering')
+    parser.add_argument('--log_q_values', action='store_true', default=False,
+                        help='Log critic Q values for performed actions during evaluation')
+    parser.add_argument('--log_q_every', type=int, default=50,
+                        help='Step interval for logging Q values during evaluation')
     
     # Observation configuration (match training)
     parser.add_argument('--obs_mode', type=str, default=None, choices=['state', 'pixels'],
