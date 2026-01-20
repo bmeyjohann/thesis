@@ -133,7 +133,7 @@ def build_arg_parser():
     parser.add_argument("--replay_buffer_num_workers", type=int, default=4)
 
     # Evaluation / logging
-    parser.add_argument("--num_eval_episodes", type=int, default=5)
+    parser.add_argument("--num_eval_episodes", type=int, default=10)
     parser.add_argument("--eval_every_frames", type=int, default=50_000)
     parser.add_argument("--smoke_test_steps", type=int, default=0,
                         help="Override total timesteps for very short smoke tests (0 disables override)")

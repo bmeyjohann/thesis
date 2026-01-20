@@ -77,7 +77,7 @@ def parse_args():
     parser = build_train_parser()
     parser.add_argument('--eval_interval', type=int, default=50_000,
                         help='Environment step interval between evaluation runs (0 disables)')
-    parser.add_argument('--num_eval_episodes', type=int, default=5,
+    parser.add_argument('--num_eval_episodes', type=int, default=10,
                         help='Number of evaluation episodes to run each interval')
     parser.add_argument('--eval_num_envs', type=int, default=8,
                         help='Number of parallel envs to use for evaluation')
