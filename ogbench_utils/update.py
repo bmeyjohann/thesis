@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch.amp import autocast
 from torch.cuda.amp import GradScaler
+from tensordict import TensorDict
 
 from .buffers import CounterfactualBuffer, PreferencePairBuffer, PreferenceTDBuffer
 
@@ -157,11 +158,13 @@ class FastSACUpdater:
         self,
         *,
         replay_buffer,
+        demo_buffer=None,
         total_env_steps: int,
         main_batch: int,
         base_batch: int,
         b_pref: int,
         b_pref_td: int,
+        b_demo: int,
     ) -> Tuple[Dict[str, float], int]:
         args = self.args
         metrics_accumulator = {
@@ -180,6 +183,14 @@ class FastSACUpdater:
 
         for _ in range(args.num_updates):
             batch = replay_buffer.sample(main_batch)
+            if demo_buffer is not None and b_demo > 0:
+                try:
+                    demo_size = getattr(demo_buffer, "size", 0)
+                except Exception:
+                    demo_size = 0
+                if demo_size >= b_demo:
+                    demo_batch = demo_buffer.sample(b_demo)
+                    batch = TensorDict.cat([batch, demo_batch], dim=0)
             obs_batch = batch["observations"]
             next_obs_batch = batch["next"]["observations"]
             actions_batch = batch["actions"]

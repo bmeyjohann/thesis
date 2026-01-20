@@ -105,6 +105,11 @@ def make_wrappers(args):
         intervention_enable_after_steps=args.intervention_enable_after_steps,
         intervention_safety_margin_frac=args.intervention_safety_margin_frac,
         intervention_release_steps=args.intervention_release_steps,
+        intervention_episode_prob=args.intervention_episode_prob,
+        intervention_episode_prob_min=args.intervention_episode_prob_min,
+        intervention_episode_prob_decay_steps=args.intervention_episode_prob_decay_steps,
+        intervention_episode_prob_decay_start=args.intervention_episode_prob_decay_start,
+        intervention_episode_prob_seed=args.intervention_episode_prob_seed,
     )
     return [wrapper]
 
@@ -129,6 +134,11 @@ def make_eval_wrappers(args):
         intervention_enable_after_steps=args.intervention_enable_after_steps,
         intervention_safety_margin_frac=args.intervention_safety_margin_frac,
         intervention_release_steps=args.intervention_release_steps,
+        intervention_episode_prob=args.intervention_episode_prob,
+        intervention_episode_prob_min=args.intervention_episode_prob_min,
+        intervention_episode_prob_decay_steps=args.intervention_episode_prob_decay_steps,
+        intervention_episode_prob_decay_start=args.intervention_episode_prob_decay_start,
+        intervention_episode_prob_seed=args.intervention_episode_prob_seed,
     )
     return [wrapper]
 
@@ -342,6 +352,108 @@ def build_environment(
         envs.num_actions,
         initial_obs_raw,
     )
+
+
+def prefill_replay_buffer_with_demos(
+    *,
+    args,
+    device: torch.device,
+    replay_buffer: SimpleReplayBuffer,
+    demo_buffer: Optional[SimpleReplayBuffer],
+    obs_normalizer,
+    pixel_shape,
+    model: ModelComponents,
+    record_progress,
+) -> None:
+    if args.demo_prefill_steps <= 0:
+        return
+
+    if args.demo_prefill_target == "demo":
+        if demo_buffer is None:
+            raise ValueError("demo_prefill_target=demo requires --demo_buffer_enable")
+        target_buffer = demo_buffer
+        target_label = "demo"
+    else:
+        target_buffer = replay_buffer
+        target_label = "replay"
+
+    demo_args = copy.deepcopy(args)
+    demo_args.use_intervention = True
+    demo_args.intervention_mode = args.demo_prefill_intervention_mode
+    demo_args.intervention_enable_after_steps = args.demo_prefill_enable_after_steps
+    demo_args.intervention_episode_prob = args.demo_prefill_episode_prob
+    demo_args.intervention_episode_prob_min = args.demo_prefill_episode_prob
+    demo_args.intervention_episode_prob_decay_steps = 0
+    demo_args.intervention_episode_prob_decay_start = 0
+    demo_args.hard_block_lethal = args.demo_prefill_hard_block_lethal
+
+    wrappers = make_wrappers(demo_args)
+    env_kwargs = _build_env_kwargs(demo_args)
+    demo_envs = OGBenchVecEnvAdapter(
+        env_name=demo_args.env_name,
+        num_envs=demo_args.num_envs,
+        device=device,
+        wrappers=wrappers,
+        clip_actions=1.0,
+        **env_kwargs,
+    )
+
+    record_progress(f"[Demo] Prefilling {target_label} buffer for {args.demo_prefill_steps} env steps")
+    obs_raw = demo_envs.reset()
+    obs = prepare_observation(
+        obs_raw,
+        device=device,
+        obs_mode=demo_args.obs_mode,
+        pixel_shape=pixel_shape,
+        flatten=True,
+    )
+
+    total_steps = 0
+    actor_backbone = model.actor_backbone
+    actor_head = model.actor_head
+    actor_backbone.eval()
+    actor_head.eval()
+    try:
+        while total_steps < args.demo_prefill_steps:
+            with torch.no_grad():
+                norm_obs = obs_normalizer(obs)
+                obs_actor_input = reshape_observation(norm_obs, obs_mode=demo_args.obs_mode, pixel_shape=pixel_shape)
+                pi_action, _, _ = actor_head(actor_backbone(obs_actor_input))
+            next_obs_raw, rewards, dones, infos = demo_envs.step(pi_action.float())
+            next_obs = prepare_observation(
+                next_obs_raw,
+                device=device,
+                obs_mode=demo_args.obs_mode,
+                pixel_shape=pixel_shape,
+                flatten=True,
+            )
+
+            truncations = infos.get('time_outs', torch.zeros_like(dones, device=device))
+            applied_actions = infos.get('applied_actions', pi_action)
+
+            transition = TensorDict(
+                {
+                    'observations': obs.detach(),
+                    'actions': applied_actions.detach(),
+                    'next': {
+                        'observations': next_obs.detach(),
+                        'rewards': rewards.detach(),
+                        'truncations': truncations.long(),
+                        'dones': dones.long(),
+                    },
+                },
+                batch_size=(demo_envs.num_envs,),
+                device=device,
+            )
+            target_buffer.extend(transition)
+
+            obs = next_obs
+            total_steps += demo_envs.num_envs
+    finally:
+        demo_envs.close()
+        actor_backbone.train()
+        actor_head.train()
+        record_progress(f"[Demo] Prefill complete: {total_steps} env steps added to {target_label} buffer")
 
 
 def build_eval_environment(args, device: torch.device) -> OGBenchVecEnvAdapter:
@@ -684,10 +796,11 @@ def create_replay_buffer(
     n_obs: int,
     n_act: int,
     pixel_shape: Optional[Tuple[int, int, int]],
+    buffer_size: Optional[int] = None,
 ) -> SimpleReplayBuffer:
     return SimpleReplayBuffer(
         n_env=args.num_envs,
-        buffer_size=args.buffer_size,
+        buffer_size=int(buffer_size if buffer_size is not None else args.buffer_size),
         n_obs=n_obs,
         n_act=n_act,
         n_critic_obs=n_obs,
@@ -758,6 +871,7 @@ def run_training_loop(
     checkpoint_manager: CheckpointManager,
     record_progress,
     replay_buffer: SimpleReplayBuffer,
+    demo_buffer: Optional[SimpleReplayBuffer],
     updater: FastSACUpdater,
     current_env_name: str,
     initial_obs_raw: torch.Tensor | None,
@@ -1127,15 +1241,18 @@ def run_training_loop(
                 base_batch = args.batch_size // max(1, args.num_envs)
                 b_pref = int(base_batch * args.pref_sample_ratio) if pref_buffer is not None else 0
                 b_pref_td = int(base_batch * args.pref_td_sample_ratio) if pref_td_buffer is not None else 0
-                main_batch = max(1, base_batch - b_pref - b_pref_td)
+                b_demo = int(base_batch * args.demo_sample_ratio) if demo_buffer is not None else 0
+                main_batch = max(1, base_batch - b_pref - b_pref_td - b_demo)
 
                 metrics_accumulator, updates_count = updater.update(
                     replay_buffer=rb,
+                    demo_buffer=demo_buffer,
                     total_env_steps=total_env_steps,
                     main_batch=main_batch,
                     base_batch=base_batch,
                     b_pref=b_pref,
                     b_pref_td=b_pref_td,
+                    b_demo=b_demo,
                 )
                 if updates_count > 0:
                     last_update_metrics = (metrics_accumulator, updates_count)
@@ -1146,6 +1263,8 @@ def run_training_loop(
                 pref_size = pref_buffer.size if pref_buffer is not None else -1
                 pref_td_teacher_size = pref_td_buffer.teacher_size if pref_td_buffer is not None else -1
                 pref_td_student_size = pref_td_buffer.student_size if pref_td_buffer is not None else -1
+                demo_size = demo_buffer.size if demo_buffer is not None else -1
+                demo_capacity = demo_buffer.capacity if demo_buffer is not None else -1
                 training_logger.log(
                     total_env_steps=total_env_steps,
                     total_timesteps=args.total_timesteps,
@@ -1160,6 +1279,10 @@ def run_training_loop(
                     pref_size=pref_size,
                     pref_td_teacher_size=pref_td_teacher_size,
                     pref_td_student_size=pref_td_student_size,
+                    replay_size=rb.size,
+                    replay_capacity=rb.capacity,
+                    demo_size=demo_size,
+                    demo_capacity=demo_capacity,
                 )
                 last_update_metrics = None
 
@@ -1262,6 +1385,11 @@ def main():
 
     buffers = initialize_buffers(args, device, n_obs, n_act, obs_normalizer)
     replay_buffer = create_replay_buffer(args, device, n_obs, n_act, pixel_shape)
+    demo_buffer = (
+        create_replay_buffer(args, device, n_obs, n_act, pixel_shape, buffer_size=args.demo_buffer_capacity)
+        if args.demo_buffer_enable
+        else None
+    )
     updater = build_updater_from_components(
         args=args,
         device=device,
@@ -1282,6 +1410,17 @@ def main():
         teacher_metrics=teacher_metrics,
     )
 
+    prefill_replay_buffer_with_demos(
+        args=args,
+        device=device,
+        replay_buffer=replay_buffer,
+        demo_buffer=demo_buffer,
+        obs_normalizer=obs_normalizer,
+        pixel_shape=pixel_shape,
+        model=model,
+        record_progress=record_progress,
+    )
+
     try:
         run_training_loop(
             args=args,
@@ -1300,6 +1439,7 @@ def main():
             checkpoint_manager=logging_components.checkpoint_manager,
             record_progress=record_progress,
             replay_buffer=replay_buffer,
+            demo_buffer=demo_buffer,
             updater=updater,
             current_env_name=args.env_name,
             initial_obs_raw=initial_obs_raw,

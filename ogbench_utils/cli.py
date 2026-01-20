@@ -40,6 +40,16 @@ def build_train_parser() -> argparse.ArgumentParser:
                    help='Safety margin as a fraction of maze cell size for safety-based intervention modes')
     p.add_argument('--intervention_release_steps', type=int, default=3,
                    help='Consecutive aligned/progressing steps required to release safety intervention')
+    p.add_argument('--intervention_episode_prob', type=float, default=1.0,
+                   help='Probability of enabling interventions each episode (1.0 = always)')
+    p.add_argument('--intervention_episode_prob_min', type=float, default=0.0,
+                   help='Minimum per-episode intervention probability after decay')
+    p.add_argument('--intervention_episode_prob_decay_steps', type=int, default=0,
+                   help='Per-env steps over which to linearly decay intervention probability (0 disables)')
+    p.add_argument('--intervention_episode_prob_decay_start', type=int, default=0,
+                   help='Per-env step to start decaying intervention probability')
+    p.add_argument('--intervention_episode_prob_seed', type=int, default=None,
+                   help='Optional seed for per-episode intervention gating')
     # SAC core (trimmed reasonable defaults)
     p.add_argument('--actor_learning_rate', type=float, default=3e-4)
     p.add_argument('--critic_learning_rate', type=float, default=3e-4)
@@ -122,6 +132,27 @@ def build_train_parser() -> argparse.ArgumentParser:
                    help='Magnitude for intervention reward shaping (e.g., 0.1)')
     p.add_argument('--bonus_teacher_value', type=float, default=0.0,
                    help='Additional reward added when teacher action is applied (can combine with penalty modes)')
+    # Demo prefill (teacher-generated data)
+    p.add_argument('--demo_prefill_steps', type=int, default=0,
+                   help='Number of env steps to prefill replay buffer with teacher demos (0 disables)')
+    p.add_argument('--demo_prefill_intervention_mode', type=str, default='agent_safety_progress',
+                   choices=['human', 'agent', 'agent_safety_align', 'agent_safety_progress'],
+                   help='Intervention mode to use during demo prefill')
+    p.add_argument('--demo_prefill_enable_after_steps', type=int, default=0,
+                   help='Warm-up steps per env before demo interventions engage')
+    p.add_argument('--demo_prefill_episode_prob', type=float, default=1.0,
+                   help='Per-episode intervention gate probability during demo prefill')
+    p.add_argument('--demo_prefill_hard_block_lethal', action='store_true', default=False,
+                   help='Enable hard blocking of lethal moves during demo prefill')
+    p.add_argument('--demo_prefill_target', type=str, default='replay',
+                   choices=['replay', 'demo'],
+                   help='Which buffer to prefill with teacher demos')
+    p.add_argument('--demo_buffer_enable', action='store_true', default=False,
+                   help='Enable a separate demo replay buffer for mixed sampling')
+    p.add_argument('--demo_buffer_capacity', type=int, default=200000,
+                   help='Capacity of the demo replay buffer')
+    p.add_argument('--demo_sample_ratio', type=float, default=0.0,
+                   help='Fraction of each update batch sampled from demo buffer (0..1)')
     # Logging
     p.add_argument('--use_wandb', action='store_true', default=False)
     p.add_argument('--project', type=str, default='ogbench-rsl-rl')

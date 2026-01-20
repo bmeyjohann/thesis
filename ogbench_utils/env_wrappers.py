@@ -32,6 +32,11 @@ def build_ogbench_wrapper(
     intervention_agent_mode: str = "divergence",
     intervention_safety_margin_frac: float = 0.0,
     intervention_release_steps: int = 3,
+    intervention_episode_prob: float = 1.0,
+    intervention_episode_prob_min: float = 0.0,
+    intervention_episode_prob_decay_steps: int = 0,
+    intervention_episode_prob_decay_start: int = 0,
+    intervention_episode_prob_seed: Optional[int] = None,
     teleop_interface: Optional[object] = None,
 ) -> Callable:
     """Return a wrapper function that mirrors training/eval environment stacking."""
@@ -72,6 +77,11 @@ def build_ogbench_wrapper(
                 agent_mode=intervention_agent_mode,
                 safety_margin_frac=intervention_safety_margin_frac,
                 release_steps=intervention_release_steps,
+                episode_intervention_prob=intervention_episode_prob,
+                episode_intervention_prob_min=intervention_episode_prob_min,
+                episode_intervention_prob_decay_steps=intervention_episode_prob_decay_steps,
+                episode_intervention_prob_decay_start=intervention_episode_prob_decay_start,
+                episode_intervention_seed=intervention_episode_prob_seed,
             )
         elif intervention_mode in ("agent_safety_align", "agent_safety_progress"):
             agent_mode = "safety_align" if intervention_mode == "agent_safety_align" else "safety_progress"
@@ -86,6 +96,11 @@ def build_ogbench_wrapper(
                 agent_mode=agent_mode,
                 safety_margin_frac=intervention_safety_margin_frac,
                 release_steps=intervention_release_steps,
+                episode_intervention_prob=intervention_episode_prob,
+                episode_intervention_prob_min=intervention_episode_prob_min,
+                episode_intervention_prob_decay_steps=intervention_episode_prob_decay_steps,
+                episode_intervention_prob_decay_start=intervention_episode_prob_decay_start,
+                episode_intervention_seed=intervention_episode_prob_seed,
             )
         return env
 

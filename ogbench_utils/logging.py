@@ -216,6 +216,10 @@ class TrainingLogger:
         pref_size: int,
         pref_td_teacher_size: int,
         pref_td_student_size: int,
+        replay_size: int,
+        replay_capacity: int,
+        demo_size: int,
+        demo_capacity: int,
     ) -> Dict[str, float]:
         fps = int(total_env_steps / max(1e-6, collection_time))
         logs = {
@@ -286,6 +290,14 @@ class TrainingLogger:
             logs["/Buffers/pref_td_teacher"] = float(pref_td_teacher_size)
         if pref_td_student_size >= 0:
             logs["/Buffers/pref_td_student"] = float(pref_td_student_size)
+        if replay_size >= 0:
+            logs["/Buffers/replay_size"] = float(replay_size)
+        if replay_capacity >= 0:
+            logs["/Buffers/replay_capacity"] = float(replay_capacity)
+        if demo_size >= 0:
+            logs["/Buffers/demo_size"] = float(demo_size)
+        if demo_capacity >= 0:
+            logs["/Buffers/demo_capacity"] = float(demo_capacity)
 
         log_line_parts = [
             f"env_steps {total_env_steps}/{total_timesteps}",
