@@ -23,3 +23,6 @@
 [submodule "drqv2"]
 	path = drqv2
 	url = git@github.com:bmeyjohann/drqv2.git
+[submodule "HighwayEnv"]
+	path = HighwayEnv
+	url = git@github.com:bmeyjohann/HighwayEnv.git

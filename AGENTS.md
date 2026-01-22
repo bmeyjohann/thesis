@@ -10,10 +10,11 @@
 - `logs/`, `models/`, `wandb/`: Outputs, artifacts, offline tracking.
 
 ## Build, Test, and Development Commands
-- To run/test anything locally, activate the local virtual env first: `conda activate fasttd3`
+- To run/test anything locally, ALWAYS activate the local virtual env first: `conda activate fasttd3`
 - See `README.md`
-- Start jobs on cluster with automatic account detection: `bash submit_job.sh [experiment_name].sbatch`
+- Starting jobs on the cluster with automatic account detection works like this but is reserved for the human just use it to create appropriate sbatch files: `bash submit_job.sh [experiment_name].sbatch`
 - Logs: tail `logs/<name>_<JOBID>.log` and `logs/rsl_rl/<experiment>/` for artifacts.
+- If possible, ALWAYS run local smoke tests before telling me something is working and done.
 
 ## Coding Style & Naming Conventions
 - Python: PEP 8, 4 spaces, max line length 120.
