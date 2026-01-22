@@ -4,7 +4,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
-#SBATCH --time=48:00:00
+#SBATCH --time=06:00:00
 #SBATCH --partition=booster
 #SBATCH --output=logs/fastsac_highway_expert_%j.out
 #SBATCH --error=logs/fastsac_highway_expert_%j.err
