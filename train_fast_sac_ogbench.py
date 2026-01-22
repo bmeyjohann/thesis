@@ -504,6 +504,7 @@ def run_eval_metrics(
     total_length = 0.0
     success_count = 0
     lethal_count = 0
+    timeout_count = 0
     distance_sum = 0.0
     distance_count = 0
     success_length_sum = 0.0
@@ -540,6 +541,7 @@ def run_eval_metrics(
 
             goals = infos.get("goals_reached") or []
             lethals = infos.get("lethal_terminations") or []
+            timeouts = infos.get("timeouts") or []
             distances = infos.get("distances_to_goal") or []
 
             count = min(len(goals), len(completed_lengths))
@@ -550,6 +552,9 @@ def run_eval_metrics(
             for val in lethals[: len(completed_lengths)]:
                 if float(val) > 0.0:
                     lethal_count += 1
+            for val in timeouts[: len(completed_lengths)]:
+                if float(val) > 0.0:
+                    timeout_count += 1
             for val in distances[: len(completed_lengths)]:
                 distance_sum += float(val)
                 distance_count += 1
@@ -569,6 +574,7 @@ def run_eval_metrics(
         "avg_length": total_length / denom,
         "success_rate": success_count / denom,
         "lethal_rate": lethal_count / denom,
+        "timeout_rate": timeout_count / denom,
     }
     if distance_count > 0:
         metrics["avg_final_distance"] = distance_sum / max(1, distance_count)

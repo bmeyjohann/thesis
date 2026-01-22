@@ -447,7 +447,10 @@ class OGBenchPixelsEnv(dm_env.Environment):
             if hasattr(self._env, "unwrapped") and hasattr(self._env.unwrapped, "set_view_dir"):
                 self._env.unwrapped.set_view_dir(view_dir)
         obs, reward, terminated, truncated, info = self._env.step(move_action)
-        self._last_info = info or {}
+        info = dict(info or {})
+        info["terminated"] = bool(terminated)
+        info["truncated"] = bool(truncated)
+        self._last_info = info
         pixels = self._render_pixels(obs)
         done = bool(terminated or truncated)
         step_type = dm_env.StepType.LAST if done else dm_env.StepType.MID
@@ -921,6 +924,7 @@ def run_eval_metrics(env,
     total_length = 0
     success_count = 0
     lethal_count = 0
+    timeout_count = 0
     distance_sum = 0.0
     distance_count = 0
     success_length_sum = 0
@@ -992,6 +996,8 @@ def run_eval_metrics(env,
                 success_length_sum += episode_len
             if bool(final_info.get("killed", 0.0)):
                 lethal_count += 1
+            if bool(final_info.get("time_out", False)) or bool(final_info.get("truncated", False)):
+                timeout_count += 1
             if "distance_to_goal" in final_info:
                 distance_sum += float(final_info["distance_to_goal"])
                 distance_count += 1
@@ -1002,6 +1008,7 @@ def run_eval_metrics(env,
         "avg_length": total_length / denom,
         "success_rate": success_count / denom,
         "lethal_rate": lethal_count / denom,
+        "timeout_rate": timeout_count / denom,
     }
     if distance_count > 0:
         metrics["avg_final_distance"] = distance_sum / max(1, distance_count)
