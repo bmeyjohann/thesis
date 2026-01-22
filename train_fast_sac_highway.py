@@ -89,6 +89,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--project", type=str, default="fastsac_highway")
     parser.add_argument("--checkpoint_path", type=str, default="")
     parser.add_argument("--cuda", action="store_true", default=True)
+    parser.add_argument("--no_cuda", dest="cuda", action="store_false")
     parser.add_argument("--device_rank", type=int, default=0)
     parser.add_argument("--amp", action="store_true", default=True)
     parser.add_argument("--amp_dtype", type=str, default="bf16", choices=("bf16", "fp16"))
@@ -173,6 +174,7 @@ def build_env_config(args: argparse.Namespace) -> Dict:
 def make_env(env_name: str, config: Dict, seed: int | None = None) -> gym.Env:
     env = gym.make(env_name)
     env.unwrapped.configure(config)
+    env.reset(seed=seed)
     env = gym.wrappers.FlattenObservation(env)
     env.reset(seed=seed)
     return env
@@ -309,7 +311,7 @@ def main() -> None:
     eval_envs = [make_env(args.env_name, env_config, seed=args.seed + 100 + i) for i in range(args.num_eval_envs)]
 
     obs, _ = reset_envs(envs, args.seed)
-    obs_dim = int(np.prod(envs[0].observation_space.shape))
+    obs_dim = int(obs.shape[1])
     act_dim = int(np.prod(envs[0].action_space.shape))
 
     obs_normalizer: EmpiricalNormalization | torch.nn.Identity

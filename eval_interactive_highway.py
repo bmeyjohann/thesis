@@ -194,7 +194,9 @@ def make_env(env_name: str, config: Dict[str, Any], render_mode: str | None, max
         env_kwargs["max_episode_steps"] = max_steps
     env = gym.make(env_name, **env_kwargs)
     env.unwrapped.configure(config)
+    env.reset()
     env = gym.wrappers.FlattenObservation(env)
+    env.reset()
     return env
 
 
