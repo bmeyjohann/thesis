@@ -277,6 +277,7 @@ def run_eval(
         "eval/return_std": float(np.std(returns)),
         "eval/ep_len_mean": float(np.mean(lengths)),
         "eval/crash_rate": float(np.mean(crashes)) if crashes else 0.0,
+        "eval/success_rate": 1.0 - float(np.mean(crashes)) if crashes else 0.0,
         "eval/speed_mean": float(np.mean(speeds)) if speeds else 0.0,
     }
 
@@ -572,12 +573,12 @@ def main() -> None:
                 "train/return_mean": avg_return,
                 "train/ep_len_mean": avg_len,
                 "train/crash_rate": crash_rate,
+                "train/success_rate": 1.0 - crash_rate,
                 "train/speed_mean": mean_speed,
+                "train/episodes_logged": float(len(episode_returns)),
             }
             if lane_total > 0:
                 lane_fracs = lane_counts / max(1, lane_total)
-                for lane_id, frac in enumerate(lane_fracs):
-                    log_items[f"train/lane_frac_{lane_id}"] = float(frac)
                 entropy = float(-np.sum(lane_fracs * np.log(lane_fracs + 1e-8)))
                 log_items["train/lane_entropy"] = entropy
             if metrics is not None:
