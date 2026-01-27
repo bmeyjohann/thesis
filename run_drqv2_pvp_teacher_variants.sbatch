@@ -44,7 +44,8 @@ BASE_ARGS="--obs_mode pixels --pixel_width 84 --pixel_height 84 \
 --drq_feature_dim ${FEATURE_DIM} --drq_hidden_dim ${HIDDEN_DIM} \
 --use_wandb --viz_on_checkpoint \
 --use_intervention --teacher_type ${TEACHER_TYPE} \
---reward_type ${PVP_REWARD_TYPE}"
+--reward_type ${PVP_REWARD_TYPE} \
+--replay_buffer_num_workers 0"
 
 launch_pvp_run () {
   local GPU_ID=$1
