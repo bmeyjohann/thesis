@@ -127,6 +127,8 @@ def build_arg_parser():
                         help="Store environment rewards in the replay buffer (PVP reward ablation)")
     parser.add_argument("--pref_loss_type", type=str, default="pvp", choices=["pvp"],
                         help="Proxy value loss type (fixed for PVP runs)")
+    parser.add_argument("--buffer_root", type=str, default=None,
+                        help="Optional root directory for replay/pref buffers (e.g., tmpfs/ramdisk).")
     parser.add_argument("--pref_chunk_size", type=int, default=64,
                         help="Number of preference events per on-disk shard")
     parser.add_argument("--pref_fetch_every", type=int, default=512,
@@ -625,6 +627,7 @@ class DrQLogger:
         lenbuffer: list,
         update_metrics: Dict[str, float],
         update_count: int,
+        perf_metrics: Optional[Dict[str, float]] = None,
         log_alpha: float = 0.0,
         last_denied_samples: int = 0,
         pref_buffer_size: int = -1,
@@ -663,6 +666,9 @@ class DrQLogger:
             logs["/Env/goal_successes"] = float(goal_successes)
         if goal_distance_count > 0:
             logs["/Env/final_goal_distance"] = float(goal_distance_sum / max(1, goal_distance_count))
+
+        if perf_metrics:
+            logs.update({k: float(v) for k, v in perf_metrics.items()})
 
         teacher_snapshot = self.teacher_metrics.snapshot()
         if teacher_snapshot.mean_disagreement_teacher is not None:
@@ -1120,8 +1126,10 @@ def train():
         specs.Array((1,), np.float32, "discount"),
     ])
     data_specs = tuple(data_specs_list)
-    replay_dir_novice = run_paths.log_dir / "buffer_novice"
-    replay_dir_human = run_paths.log_dir / "buffer_human"
+    buffer_root = Path(args.buffer_root).expanduser() if args.buffer_root else run_paths.log_dir
+    buffer_root.mkdir(parents=True, exist_ok=True)
+    replay_dir_novice = buffer_root / "buffer_novice"
+    replay_dir_human = buffer_root / "buffer_human"
     replay_storage_novice = ReplayBufferStorage(data_specs, replay_dir_novice)
     replay_storage_human = ReplayBufferStorage(data_specs, replay_dir_human)
 
@@ -1161,7 +1169,7 @@ def train():
     pref_storage = None
     pref_dataset = None
     if args.pref_buffer_enable:
-        pref_dir = run_paths.log_dir / "pref_pairs"
+        pref_dir = buffer_root / "pref_pairs"
         pref_storage = PreferencePairStorage(
             obs_shape=obs_shape,
             action_shape=action_shape,
@@ -1220,6 +1228,13 @@ def train():
     lenbuffer: list = []
     metrics_accum: Dict[str, float] = {}
     metrics_updates = 0
+    perf_accum: Dict[str, float] = {
+        "loop_time": 0.0,
+        "env_step": 0.0,
+        "update": 0.0,
+        "sample": 0.0,
+    }
+    perf_steps = 0
     goal_success_counter = 0
     goal_final_distance_sum = 0.0
     goal_final_distance_count = 0
@@ -1227,6 +1242,7 @@ def train():
     log_alpha = 0.0
 
     while total_env_steps < args.total_timesteps:
+        loop_start = time.perf_counter()
         last_denied_samples = 0
         if time_step.last():
             rewbuffer.append(episode_reward)
@@ -1278,7 +1294,9 @@ def train():
             )
         else:
             policy_action_global = move_global
+        env_step_start = time.perf_counter()
         next_time_step = train_env.step(policy_action_global)
+        env_step_end = time.perf_counter()
         info = getattr(train_env, "last_info", lambda: {})() or {}
         logger.accumulate_env_metrics(info)
         if float(info.get("success", 0.0)) > 0.0:
@@ -1374,13 +1392,16 @@ def train():
                 and args.pref_rank_weight > 0.0
                 and args.pref_sample_ratio > 0.0
             ):
+                pref_sample_start = time.perf_counter()
                 pref_batch_size = max(1, int(args.batch_size * args.pref_sample_ratio))
                 pref_batch_np = pref_dataset.sample(pref_batch_size)
+                perf_accum["sample"] += time.perf_counter() - pref_sample_start
             if use_balanced:
                 if novice_iter_half is None:
                     novice_iter_half = iter(novice_loader_half)
                 if human_iter_half is None:
                     human_iter_half = iter(human_loader_half)
+                sample_start = time.perf_counter()
                 try:
                     batch_n = next(novice_iter_half)
                 except StopIteration:
@@ -1393,16 +1414,20 @@ def train():
                     batch_h = next(human_iter_half)
                 combined_batch = concat_replay_batches(batch_n, batch_h)
                 replay_iter = iter([combined_batch])
+                perf_accum["sample"] += time.perf_counter() - sample_start
             else:
                 if novice_iter_full is None:
                     novice_iter_full = iter(novice_loader_full)
+                sample_start = time.perf_counter()
                 try:
                     batch_n = next(novice_iter_full)
                 except StopIteration:
                     novice_iter_full = iter(novice_loader_full)
                     batch_n = next(novice_iter_full)
                 replay_iter = iter([batch_n])
+                perf_accum["sample"] += time.perf_counter() - sample_start
 
+            update_start = time.perf_counter()
             metrics = agent.update(
                 replay_iter,
                 total_env_steps,
@@ -1411,6 +1436,7 @@ def train():
                 pref_margin=args.pref_rank_margin,
                 pref_loss_type=args.pref_loss_type,
             )
+            perf_accum["update"] += time.perf_counter() - update_start
             if metrics:
                 for key, value in metrics.items():
                     metrics_accum[key] = metrics_accum.get(key, 0.0) + float(value)
@@ -1438,6 +1464,11 @@ def train():
         )
         teacher_metrics.update(disagreement, teacher_flag, 1.0 - teacher_flag, qmin)
 
+        loop_end = time.perf_counter()
+        perf_accum["loop_time"] += loop_end - loop_start
+        perf_accum["env_step"] += env_step_end - env_step_start
+        perf_steps += 1
+
         if args.save_interval and total_env_steps % args.save_interval == 0:
             ckpt = checkpoint_mgr.save(
                 tag=f"step{total_env_steps}",
@@ -1449,6 +1480,21 @@ def train():
             checkpoint_mgr.maybe_render_policy_map(checkpoint_path=ckpt, step_value=total_env_steps)
 
         pref_buffer_size = pref_storage.num_pairs() if pref_storage is not None else -1
+        perf_metrics = None
+        if perf_steps > 0 and perf_accum["loop_time"] > 0:
+            loop_avg = perf_accum["loop_time"] / perf_steps
+            env_avg = perf_accum["env_step"] / perf_steps
+            update_avg = perf_accum["update"] / max(1, perf_steps)
+            sample_avg = perf_accum["sample"] / max(1, perf_steps)
+            perf_metrics = {
+                "Perf/step_ms": loop_avg * 1000.0,
+                "Perf/env_step_ms": env_avg * 1000.0,
+                "Perf/update_ms": update_avg * 1000.0,
+                "Perf/sample_ms": sample_avg * 1000.0,
+                "Perf/env_step_pct": (perf_accum["env_step"] / perf_accum["loop_time"]) * 100.0,
+                "Perf/update_pct": (perf_accum["update"] / perf_accum["loop_time"]) * 100.0,
+                "Perf/sample_pct": (perf_accum["sample"] / perf_accum["loop_time"]) * 100.0,
+            }
         logged = logger.maybe_log(
             total_env_steps=total_env_steps,
             total_timesteps=args.total_timesteps,
@@ -1456,6 +1502,7 @@ def train():
             lenbuffer=lenbuffer,
             update_metrics=metrics_accum,
             update_count=metrics_updates,
+            perf_metrics=perf_metrics,
             log_alpha=log_alpha,
             last_denied_samples=last_denied_samples,
             pref_buffer_size=pref_buffer_size,
@@ -1467,6 +1514,8 @@ def train():
             if metrics_updates > 0:
                 metrics_accum = {}
                 metrics_updates = 0
+            perf_accum = {"loop_time": 0.0, "env_step": 0.0, "update": 0.0, "sample": 0.0}
+            perf_steps = 0
             goal_success_counter = 0
             goal_final_distance_sum = 0.0
             goal_final_distance_count = 0
