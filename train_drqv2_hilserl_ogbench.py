@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-DrQ-v2 training entrypoint backed by OGBench environments.
+DrQ-v2 + HIL-SERL-style human-in-the-loop baseline for OGBench.
 
-This script mirrors the original DrQ-v2 training loop but swaps out the
-DeepMind Control tasks for OGBench's PointMaze variants. It reuses the
-existing OGBench wrappers (reward shaping, teacher interventions, etc.)
-and preserves the visualization/logging conventions used by the FastSAC
-pipeline so we can compare runs easily.
+This script mirrors the DrQ-v2 training loop but adds:
+- A demo buffer (prefilled with teacher demos).
+- Equal sampling from demo and RL buffers (50/50) when enabled.
+- Intervention transitions stored in both buffers (demo + RL).
 """
 
 from __future__ import annotations
@@ -51,11 +50,8 @@ except Exception:  # pragma: no cover - optional dependency
     generate_policy_map = None
 
 from drqv2.drqv2 import DrQV2Agent  # noqa: E402
-from drqv2.recurrent_agent import DrQV2RecurrentAgent  # noqa: E402
 from drqv2 import utils  # noqa: E402
-from drqv2.replay_buffer import ReplayBufferStorage, make_replay_loader, make_sequence_replay_loader  # noqa: E402
-from drqv2.pref_buffer import PreferencePairStorage, PreferencePairDataset  # noqa: E402
-
+from drqv2.replay_buffer import ReplayBufferStorage, make_replay_loader  # noqa: E402
 from ogbench_utils import (  # noqa: E402
     TeacherMetricsAccumulator,
     build_ogbench_wrapper,
@@ -84,6 +80,8 @@ def build_arg_parser():
         viz_first_step=0,
         viz_grid_resolution=32,
         viz_quiver_stride=2,
+        demo_buffer_enable=False,
+        demo_sample_ratio=0.5,
     )
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--action_repeat", type=int, default=2)
@@ -102,20 +100,6 @@ def build_arg_parser():
     parser.add_argument("--stddev_clip", type=float, default=0.3)
     parser.add_argument("--num_expl_steps", type=int, default=2000)
     parser.add_argument("--update_every_steps", type=int, default=1)
-    parser.add_argument("--agent_variant", type=str, default="standard", choices=["standard", "recurrent"],
-                        help="Select base DrQ agent architecture")
-    parser.add_argument("--recurrent_type", type=str, default="convgru", choices=["gru", "convgru"],
-                        help="Recurrent core type when agent_variant=recurrent")
-    parser.add_argument("--recurrent_hidden_dim", type=int, default=512,
-                        help="Hidden dimension for GRU variant")
-    parser.add_argument("--recurrent_conv_channels", type=int, default=32,
-                        help="Number of hidden channels for ConvGRU variant")
-    parser.add_argument("--recurrent_use_se2_warp", action="store_true", default=False,
-                        help="Enable SE(2) warp of the recurrent latent map between steps")
-    parser.add_argument("--recurrent_unroll_length", type=int, default=8,
-                        help="Number of time steps to unroll the recurrent core during updates")
-    parser.add_argument("--recurrent_burn_in", type=int, default=4,
-                        help="Burn-in steps to warm up hidden state before computing losses")
     parser.add_argument("--se2_translation_scale", type=float, default=0.2,
                         help="Scale factor applied to action x/y when computing SE(2) translation (in latent pixels)")
     parser.add_argument("--use_local_actions", action="store_true", default=False,
@@ -138,12 +122,29 @@ def build_arg_parser():
     parser.add_argument("--eval_every_frames", type=int, default=50_000)
     parser.add_argument("--smoke_test_steps", type=int, default=0,
                         help="Override total timesteps for very short smoke tests (0 disables override)")
-    parser.add_argument("--pref_loss_type", type=str, default="margin", choices=["margin", "bradley_terry"],
-                        help="Preference loss formulation applied to the critic")
-    parser.add_argument("--pref_chunk_size", type=int, default=64,
-                        help="Number of preference events per on-disk shard")
-    parser.add_argument("--pref_fetch_every", type=int, default=512,
-                        help="How often (in samples) to attempt loading new preference shards")
+    parser.add_argument("--demo_prefill_steps", type=int, default=0,
+                        help="Number of env steps to prefill with teacher demos (0 disables)")
+    parser.add_argument("--demo_prefill_episodes", type=int, default=0,
+                        help="Number of demo episodes to prefill (0 disables, overrides steps)")
+    parser.add_argument("--demo_prefill_intervention_mode", type=str, default="agent_safety_progress",
+                        help="Intervention mode to use during demo prefill")
+    parser.add_argument("--demo_prefill_enable_after_steps", type=int, default=0,
+                        help="Warm-up steps before demo interventions engage")
+    parser.add_argument("--demo_prefill_episode_prob", type=float, default=1.0,
+                        help="Per-episode intervention gate probability during demo prefill")
+    parser.add_argument("--demo_prefill_hard_block_lethal", action="store_true", default=False,
+                        help="Enable hard blocking of lethal moves during demo prefill")
+    parser.add_argument("--demo_prefill_target", type=str, default="demo",
+                        choices=["demo", "replay"],
+                        help="Which buffer to prefill with teacher demos")
+    parser.add_argument("--demo_buffer_enable", action="store_true", default=False,
+                        help="Enable a separate demo replay buffer for mixed sampling")
+    parser.add_argument("--demo_buffer_capacity", type=int, default=200000,
+                        help="Capacity of the demo replay buffer")
+    parser.add_argument("--demo_sample_ratio", type=float, default=0.5,
+                        help="Fraction of each update batch sampled from demo buffer (0..1)")
+    parser.add_argument("--buffer_root", type=str, default=None,
+                        help="Optional root directory for replay/pref buffers (e.g., tmpfs/ramdisk).")
     return parser
 
 def clip_action_l2(actions: np.ndarray, max_norm: float = 1.0) -> np.ndarray:
@@ -1108,8 +1109,7 @@ def run_eval_metrics(env,
                      goal_history_len: int,
                      use_local_actions: bool,
                      translation_scale: float,
-                     goal_scale: float,
-                     is_recurrent: bool) -> Dict[str, float]:
+                     goal_scale: float) -> Dict[str, float]:
     total_reward = 0.0
     total_length = 0
     success_count = 0
@@ -1134,8 +1134,6 @@ def run_eval_metrics(env,
         goal_stack = flatten_goal_history(goal_history) if goal_history is not None else None
         time_step = env.reset()
         action_transformer.reset()
-        if is_recurrent and hasattr(agent, 'reset_memory'):
-            agent.reset_memory()  # type: ignore[attr-defined]
         done = False
         episode_reward = 0.0
         episode_len = 0
@@ -1157,9 +1155,6 @@ def run_eval_metrics(env,
                 if getattr(env, "action_spec", lambda: None)() and env.action_spec().shape[0] == 3
                 else move_local
             )
-            warp_params = action_transformer.compute_warp_from_action(move_local)
-            if is_recurrent and getattr(agent, 'use_se2_warp', False):
-                agent.register_pending_warp(warp_params)  # type: ignore[attr-defined]
             move_global = action_transformer.to_global(move_local)
             move_global = clip_action_l2(move_global)
             if action_local_full.shape[0] == 3:
@@ -1275,57 +1270,25 @@ def train():
     goal_history_len = action_history_len if getattr(args, "goal_relative_history", False) else 0
     goal_vector_dim = 2
     goal_history_dim = goal_vector_dim * goal_history_len
-    is_recurrent_agent = args.agent_variant == "recurrent"
-    if is_recurrent_agent:
-        agent = DrQV2RecurrentAgent(
-            obs_shape=obs_shape,
-            action_shape=action_shape,
-            device=device,
-            lr=args.learning_rate,
-            feature_dim=args.drq_feature_dim,
-            hidden_dim=args.drq_hidden_dim,
-            critic_target_tau=args.critic_target_tau,
-            num_expl_steps=args.num_expl_steps,
-            update_every_steps=args.update_every_steps,
-            stddev_schedule=args.stddev_schedule,
-            stddev_clip=args.stddev_clip,
-            use_tb=False,
-            action_history_len=action_history_len,
-            goal_history_dim=goal_history_dim,
-            use_context_mlp=args.context_mlp,
-            context_hidden_dim=args.context_hidden_dim,
-            context_dim=args.context_dim,
-            recurrent_type=args.recurrent_type,
-            recurrent_hidden_dim=args.recurrent_hidden_dim,
-            conv_hidden_channels=args.recurrent_conv_channels,
-            use_se2_warp=args.recurrent_use_se2_warp,
-            unroll_length=args.recurrent_unroll_length,
-            burn_in=args.recurrent_burn_in,
-        )
-        hidden_state_shape = tuple(int(x) for x in agent.hidden_state_shape)
-        warp_dim = 0
-    else:
-        agent = DrQV2Agent(
-            obs_shape=obs_shape,
-            action_shape=action_shape,
-            device=device,
-            lr=args.learning_rate,
-            feature_dim=args.drq_feature_dim,
-            hidden_dim=args.drq_hidden_dim,
-            critic_target_tau=args.critic_target_tau,
-            num_expl_steps=args.num_expl_steps,
-            update_every_steps=args.update_every_steps,
-            stddev_schedule=args.stddev_schedule,
-            stddev_clip=args.stddev_clip,
-            use_tb=False,
-            action_history_len=action_history_len,
-            goal_history_dim=goal_history_dim,
-            use_context_mlp=args.context_mlp,
-            context_hidden_dim=args.context_hidden_dim,
-            context_dim=args.context_dim,
-        )
-        hidden_state_shape = None
-        warp_dim = 0
+    agent = DrQV2Agent(
+        obs_shape=obs_shape,
+        action_shape=action_shape,
+        device=device,
+        lr=args.learning_rate,
+        feature_dim=args.drq_feature_dim,
+        hidden_dim=args.drq_hidden_dim,
+        critic_target_tau=args.critic_target_tau,
+        num_expl_steps=args.num_expl_steps,
+        update_every_steps=args.update_every_steps,
+        stddev_schedule=args.stddev_schedule,
+        stddev_clip=args.stddev_clip,
+        use_tb=False,
+        action_history_len=action_history_len,
+        goal_history_dim=goal_history_dim,
+        use_context_mlp=args.context_mlp,
+        context_hidden_dim=args.context_hidden_dim,
+        context_dim=args.context_dim,
+    )
 
     run_paths = prepare_run_dirs(args)
     teacher_metrics = build_teacher_metrics(args, device)
@@ -1347,75 +1310,66 @@ def train():
         specs.Array((1,), np.float32, "discount"),
     ])
     data_specs = tuple(data_specs_list)
-    replay_dir = run_paths.log_dir / "buffer"
-    replay_storage = ReplayBufferStorage(data_specs, replay_dir)
+    buffer_root = Path(args.buffer_root).expanduser() if args.buffer_root else run_paths.log_dir
+    buffer_root.mkdir(parents=True, exist_ok=True)
+    replay_dir_rl = buffer_root / "buffer_rl"
+    replay_storage_rl = ReplayBufferStorage(data_specs, replay_dir_rl)
+
     demo_storage = None
     demo_dir = None
     if args.demo_buffer_enable:
-        if is_recurrent_agent:
-            raise ValueError("demo_buffer_enable is not supported with recurrent agent variant.")
-        demo_dir = run_paths.log_dir / "buffer_demo"
+        demo_dir = buffer_root / "buffer_demo"
         demo_storage = ReplayBufferStorage(data_specs, demo_dir)
-    if is_recurrent_agent:
-        replay_loader = make_sequence_replay_loader(
-            replay_dir,
-            max_size=args.replay_buffer_size,
-            batch_size=args.batch_size,
-            num_workers=args.replay_buffer_num_workers,
-            save_snapshot=args.save_snapshot,
-            sequence_length=args.recurrent_unroll_length,
-            burn_in=args.recurrent_burn_in,
-        )
-        demo_loader_part = None
-        replay_loader_part = None
-    else:
-        replay_loader = make_replay_loader(
-            replay_dir,
-            max_size=args.replay_buffer_size,
-            batch_size=args.batch_size,
+
+    demo_ratio = float(args.demo_sample_ratio)
+    demo_ratio = min(1.0, max(0.0, demo_ratio))
+    demo_batch = int(round(args.batch_size * demo_ratio))
+    rl_batch = max(1, args.batch_size - demo_batch)
+    if demo_batch <= 0:
+        demo_batch = 0
+        rl_batch = args.batch_size
+
+    rl_loader_full = make_replay_loader(
+        replay_dir_rl,
+        max_size=args.replay_buffer_size,
+        batch_size=args.batch_size,
+        num_workers=args.replay_buffer_num_workers,
+        save_snapshot=args.save_snapshot,
+        nstep=args.nstep,
+        discount=args.discount,
+    )
+    rl_loader_part = make_replay_loader(
+        replay_dir_rl,
+        max_size=args.replay_buffer_size,
+        batch_size=rl_batch,
+        num_workers=args.replay_buffer_num_workers,
+        save_snapshot=args.save_snapshot,
+        nstep=args.nstep,
+        discount=args.discount,
+    )
+    demo_loader_part = None
+    if demo_storage is not None and demo_batch > 0:
+        demo_loader_part = make_replay_loader(
+            demo_dir,
+            max_size=args.demo_buffer_capacity,
+            batch_size=demo_batch,
             num_workers=args.replay_buffer_num_workers,
             save_snapshot=args.save_snapshot,
             nstep=args.nstep,
             discount=args.discount,
         )
-        demo_ratio = min(1.0, max(0.0, float(args.demo_sample_ratio)))
-        demo_batch = int(round(args.batch_size * demo_ratio))
-        replay_batch = max(1, args.batch_size - demo_batch)
-        if demo_batch <= 0:
-            demo_batch = 0
-            replay_batch = args.batch_size
-        replay_loader_part = make_replay_loader(
-            replay_dir,
-            max_size=args.replay_buffer_size,
-            batch_size=replay_batch,
-            num_workers=args.replay_buffer_num_workers,
-            save_snapshot=args.save_snapshot,
-            nstep=args.nstep,
-            discount=args.discount,
-        )
-        demo_loader_part = None
-        if demo_storage is not None and demo_batch > 0:
-            demo_loader_part = make_replay_loader(
-                demo_dir,
-                max_size=args.demo_buffer_capacity,
-                batch_size=demo_batch,
-                num_workers=args.replay_buffer_num_workers,
-                save_snapshot=args.save_snapshot,
-                nstep=args.nstep,
-                discount=args.discount,
-            )
-    replay_iter = None
-    replay_iter_part = None
+    rl_iter_full = None
+    rl_iter_part = None
     demo_iter_part = None
 
-    if args.demo_prefill_steps > 0 or args.demo_prefill_episodes > 0:
+    if args.demo_prefill_steps > 0:
         if args.demo_prefill_target == "demo":
             if demo_storage is None:
                 raise ValueError("demo_prefill_target=demo requires --demo_buffer_enable")
             target_storage = demo_storage
             target_label = "demo"
         else:
-            target_storage = replay_storage
+            target_storage = replay_storage_rl
             target_label = "replay"
         prefill_replay_with_demos(
             args=args,
@@ -1428,30 +1382,6 @@ def train():
             action_history_len=action_history_len,
             goal_history_len=goal_history_len,
             goal_vector_dim=goal_vector_dim,
-        )
-
-    pref_storage = None
-    pref_dataset = None
-    if args.pref_buffer_enable:
-        pref_dir = run_paths.log_dir / "pref_pairs"
-        pref_storage = PreferencePairStorage(
-            obs_shape=obs_shape,
-            action_shape=action_shape,
-            prev_action_shape=(prev_action_dim,),
-            goal_history_shape=(goal_history_dim,) if goal_history_dim > 0 else None,
-            storage_dir=pref_dir,
-            chunk_size=args.pref_chunk_size,
-            hidden_state_shape=None,
-            warp_param_dim=0,
-        )
-        pref_dataset = PreferencePairDataset(
-            storage_dir=pref_dir,
-            max_size=args.pref_capacity,
-            fetch_every=args.pref_fetch_every,
-            prev_action_shape=(prev_action_dim,),
-            goal_history_shape=(goal_history_dim,) if goal_history_dim > 0 else None,
-            hidden_state_shape=None,
-            warp_param_dim=0,
         )
 
     action_history = init_action_history(action_dim, action_history_len)
@@ -1474,7 +1404,7 @@ def train():
         prev_actions=flatten_action_history(action_history),
         goal_history=flatten_goal_history(goal_history) if goal_history is not None else None,
     )
-    replay_storage.add(time_step)
+    replay_storage_rl.add(time_step)
 
     initial_ckpt = checkpoint_mgr.save(
         tag="step0",
@@ -1526,12 +1456,7 @@ def train():
                 prev_actions=flatten_action_history(action_history),
                 goal_history=flatten_goal_history(goal_history) if goal_history is not None else None,
             )
-            if is_recurrent_agent:
-                agent.reset_memory()
-                init_hidden = agent.export_state()
-                init_warp = np.zeros((warp_dim,), dtype=np.float32) if warp_dim > 0 else None
-                time_step = time_step._replace(hidden_state=init_hidden, warp_params=init_warp)
-            replay_storage.add(time_step)
+            replay_storage_rl.add(time_step)
             episode_reward = 0.0
             episode_length = 0
 
@@ -1555,9 +1480,6 @@ def train():
             if getattr(args, "decouple_view", False)
             else move_local
         )
-        warp_params_local = action_transformer.compute_warp_from_action(move_local)
-        if is_recurrent_agent and getattr(agent, 'use_se2_warp', False):
-            agent.register_pending_warp(warp_params_local)
         move_global = action_transformer.to_global(move_local)
         move_global = clip_action_l2(move_global)
         if getattr(args, "decouple_view", False):
@@ -1615,93 +1537,62 @@ def train():
             prev_actions=next_prev_stack,
             goal_history=flatten_goal_history(goal_history) if goal_history is not None else None,
         )
+        reward_arr = np.asarray(next_time_step.reward, dtype=np.float32)
+        if reward_arr.shape == ():
+            reward_arr = reward_arr.reshape(1)
+        stored_reward = reward_arr if args.pvp_use_reward_in_replay else np.zeros_like(reward_arr)
+        next_time_step = next_time_step._replace(reward=stored_reward)
         if next_time_step.last():
             distance_val = info.get("distance_to_goal")
             if distance_val is not None:
                 goal_final_distance_sum += float(distance_val)
                 goal_final_distance_count += 1
-        replay_storage.add(next_time_step)
+        replay_storage_rl.add(next_time_step)
+        if teacher_intervened and demo_storage is not None:
+            demo_storage.add(next_time_step)
 
         if teacher_intervened:
             last_denied_samples = 1
-        if (
-            pref_storage is not None
-            and teacher_intervened
-            and teacher_action_local is not None
-            and student_action_local is not None
-        ):
-            try:
-                pref_storage.add(
-                    np.asarray(obs).copy(),
-                    np.asarray(prev_action_stack, dtype=np.float32).copy(),
-                    np.asarray(goal_history_stack, dtype=np.float32).copy() if goal_history_stack is not None else None,
-                    teacher_action_local.copy(),
-                    student_action_local.copy(),
-                    hidden_state=None,
-                    warp_params=None,
-                )
-            except Exception as exc:
-                run_paths.record_progress(f"[PrefBuffer] append failed: {exc}")
-
-        episode_reward += float(next_time_step.reward)
+        episode_reward += float(reward_arr)
         episode_length += 1
         total_env_steps += 1
         time_step = next_time_step
 
         if total_env_steps >= args.num_expl_steps:
-            if replay_storage.num_episodes() == 0:
+            if replay_storage_rl.num_episodes() == 0:
                 continue
-            pref_batch_np = None
-            if (
-                pref_dataset is not None
-                and args.pref_rank_weight > 0.0
-                and args.pref_sample_ratio > 0.0
-            ):
-                pref_sample_start = time.perf_counter()
-                pref_batch_size = max(1, int(args.batch_size * args.pref_sample_ratio))
-                pref_batch_np = pref_dataset.sample(pref_batch_size)
-                perf_accum["sample"] += time.perf_counter() - pref_sample_start
-            if not is_recurrent_agent and demo_storage is not None and demo_loader_part is not None:
-                use_demo = demo_storage.num_episodes() > 0 and args.demo_sample_ratio > 0.0
-            else:
-                use_demo = False
+            use_demo = demo_storage is not None and demo_batch > 0 and demo_storage.num_episodes() > 0
             if use_demo:
-                if replay_iter_part is None:
-                    replay_iter_part = iter(replay_loader_part)
-                if demo_iter_part is None:
+                if rl_iter_part is None:
+                    rl_iter_part = iter(rl_loader_part)
+                if demo_iter_part is None and demo_loader_part is not None:
                     demo_iter_part = iter(demo_loader_part)
                 try:
-                    batch_replay = next(replay_iter_part)
+                    batch_rl = next(rl_iter_part)
                 except StopIteration:
-                    replay_iter_part = iter(replay_loader_part)
-                    batch_replay = next(replay_iter_part)
+                    rl_iter_part = iter(rl_loader_part)
+                    batch_rl = next(rl_iter_part)
                 try:
                     batch_demo = next(demo_iter_part)
                 except StopIteration:
                     demo_iter_part = iter(demo_loader_part)
                     batch_demo = next(demo_iter_part)
-                combined_batch = concat_replay_batches(batch_replay, batch_demo)
+                combined_batch = concat_replay_batches(batch_rl, batch_demo)
                 replay_iter = iter([combined_batch])
             else:
-                if replay_iter is None:
-                    replay_iter = iter(replay_loader)
+                if rl_iter_full is None:
+                    rl_iter_full = iter(rl_loader_full)
                 try:
-                    batch_replay = next(replay_iter)
+                    batch_rl = next(rl_iter_full)
                 except StopIteration:
-                    replay_iter = iter(replay_loader)
-                    batch_replay = next(replay_iter)
-                replay_iter = iter([batch_replay])
+                    rl_iter_full = iter(rl_loader_full)
+                    batch_rl = next(rl_iter_full)
+                replay_iter = iter([batch_rl])
 
-            update_start = time.perf_counter()
             metrics = agent.update(
                 replay_iter,
                 total_env_steps,
-                pref_batch=pref_batch_np,
-                pref_weight=args.pref_rank_weight,
-                pref_margin=args.pref_rank_margin,
-                pref_loss_type=args.pref_loss_type,
             )
-            perf_accum["update"] += time.perf_counter() - update_start
             if metrics:
                 for key, value in metrics.items():
                     metrics_accum[key] = metrics_accum.get(key, 0.0) + float(value)
@@ -1710,12 +1601,7 @@ def train():
         with torch.no_grad(), utils.eval_mode(agent):
             obs_tensor = ensure_tensor(obs, device)
             act_tensor = torch.as_tensor(action_for_logging, device=device).view(1, -1)
-            if is_recurrent_agent:
-                init_h = agent.core.init_hidden(obs_tensor.shape[0], device)
-                _, repr_feats = agent.core(obs_tensor, init_h, warp_params=None, augment=False)
-                repr_obs = repr_feats.view(repr_feats.shape[0], -1)
-            else:
-                repr_obs = agent.encoder(obs_tensor)
+            repr_obs = agent.encoder(obs_tensor)
             if agent.context_input_dim > 0:
                 prev_tensor = torch.as_tensor(prev_action_stack, device=device).view(1, -1)
                 goal_tensor = None
@@ -1749,7 +1635,7 @@ def train():
             )
             checkpoint_mgr.maybe_render_policy_map(checkpoint_path=ckpt, step_value=total_env_steps)
 
-        pref_buffer_size = pref_storage.num_pairs() if pref_storage is not None else -1
+        pref_buffer_size = -1
         perf_metrics = None
         if perf_steps > 0 and perf_accum["loop_time"] > 0:
             loop_avg = perf_accum["loop_time"] / perf_steps
@@ -1802,7 +1688,6 @@ def train():
                 use_local_actions=args.use_local_actions,
                 translation_scale=args.se2_translation_scale,
                 goal_scale=getattr(args, "goal_relative_scale", 10.0),
-                is_recurrent=is_recurrent_agent,
             )
             logger.log_eval(total_env_steps=total_env_steps, metrics=eval_metrics)
 
@@ -1814,8 +1699,6 @@ def train():
         action_shape=action_shape,
     )
     checkpoint_mgr.maybe_render_policy_map(checkpoint_path=final_ckpt, step_value=total_env_steps)
-    if pref_storage is not None:
-        pref_storage.close()
     logger.finish()
 
 
