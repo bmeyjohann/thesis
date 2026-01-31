@@ -138,8 +138,25 @@ def build_arg_parser():
     parser.add_argument("--eval_every_frames", type=int, default=50_000)
     parser.add_argument("--smoke_test_steps", type=int, default=0,
                         help="Override total timesteps for very short smoke tests (0 disables override)")
-    parser.add_argument("--pref_loss_type", type=str, default="margin", choices=["margin", "bradley_terry"],
+    parser.add_argument("--pref_loss_type", type=str, default="margin",
+                        choices=["margin", "bradley_terry", "lagrangian"],
                         help="Preference loss formulation applied to the critic")
+    parser.add_argument("--pref_lambda_init", type=float, default=0.0,
+                        help="Initial Lagrange multiplier value for pref_loss_type=lagrangian")
+    parser.add_argument("--pref_lambda_lr", type=float, default=1e-3,
+                        help="Dual ascent step size for Lagrange multiplier updates")
+    parser.add_argument("--pref_lambda_max", type=float, default=10.0,
+                        help="Upper clip for Lagrange multiplier (<=0 disables max clip)")
+    parser.add_argument("--pref_lambda_ema", type=float, default=0.9,
+                        help="EMA factor for constraint violation (0 disables EMA)")
+    parser.add_argument("--pref_violation_clip", type=float, default=10.0,
+                        help="Clip constraint violation magnitude used for dual update (<=0 disables)")
+    parser.add_argument("--adaptive_utd", action="store_true", default=False,
+                        help="Perform multiple critic/actor updates per env step until preference constraint is met")
+    parser.add_argument("--adaptive_utd_max_updates", type=int, default=10,
+                        help="Maximum number of updates per env step when adaptive_utd is enabled")
+    parser.add_argument("--adaptive_utd_violation_tol", type=float, default=0.0,
+                        help="Stop adaptive updates once pref_violation <= tolerance")
     parser.add_argument("--pref_chunk_size", type=int, default=64,
                         help="Number of preference events per on-disk shard")
     parser.add_argument("--pref_fetch_every", type=int, default=512,
@@ -1323,6 +1340,11 @@ def train():
             use_context_mlp=args.context_mlp,
             context_hidden_dim=args.context_hidden_dim,
             context_dim=args.context_dim,
+            pref_lambda_init=args.pref_lambda_init,
+            pref_lambda_lr=args.pref_lambda_lr,
+            pref_lambda_max=args.pref_lambda_max,
+            pref_lambda_ema=args.pref_lambda_ema,
+            pref_violation_clip=args.pref_violation_clip,
         )
         hidden_state_shape = None
         warp_dim = 0
@@ -1497,6 +1519,7 @@ def train():
         "env_step": 0.0,
         "update": 0.0,
         "sample": 0.0,
+        "update_iters": 0.0,
     }
     perf_steps = 0
     goal_success_counter = 0
@@ -1651,61 +1674,76 @@ def train():
         if total_env_steps >= args.num_expl_steps:
             if replay_storage.num_episodes() == 0:
                 continue
-            pref_batch_np = None
-            if (
-                pref_dataset is not None
-                and args.pref_rank_weight > 0.0
-                and args.pref_sample_ratio > 0.0
-            ):
-                pref_sample_start = time.perf_counter()
-                pref_batch_size = max(1, int(args.batch_size * args.pref_sample_ratio))
-                pref_batch_np = pref_dataset.sample(pref_batch_size)
-                perf_accum["sample"] += time.perf_counter() - pref_sample_start
-            if not is_recurrent_agent and demo_storage is not None and demo_loader_part is not None:
-                use_demo = demo_storage.num_episodes() > 0 and args.demo_sample_ratio > 0.0
-            else:
-                use_demo = False
-            if use_demo:
-                if replay_iter_part is None:
-                    replay_iter_part = iter(replay_loader_part)
-                if demo_iter_part is None:
-                    demo_iter_part = iter(demo_loader_part)
-                try:
-                    batch_replay = next(replay_iter_part)
-                except StopIteration:
-                    replay_iter_part = iter(replay_loader_part)
-                    batch_replay = next(replay_iter_part)
-                try:
-                    batch_demo = next(demo_iter_part)
-                except StopIteration:
-                    demo_iter_part = iter(demo_loader_part)
-                    batch_demo = next(demo_iter_part)
-                combined_batch = concat_replay_batches(batch_replay, batch_demo)
-                replay_iter = iter([combined_batch])
-            else:
-                if replay_iter is None:
-                    replay_iter = iter(replay_loader)
-                try:
-                    batch_replay = next(replay_iter)
-                except StopIteration:
-                    replay_iter = iter(replay_loader)
-                    batch_replay = next(replay_iter)
-                replay_iter = iter([batch_replay])
+            max_updates = args.adaptive_utd_max_updates if args.adaptive_utd else 1
+            updates_this_step = 0
+            for update_idx in range(max_updates):
+                pref_batch_np = None
+                if (
+                    pref_dataset is not None
+                    and args.pref_rank_weight > 0.0
+                    and args.pref_sample_ratio > 0.0
+                ):
+                    pref_sample_start = time.perf_counter()
+                    pref_batch_size = max(1, int(args.batch_size * args.pref_sample_ratio))
+                    pref_batch_np = pref_dataset.sample(pref_batch_size)
+                    perf_accum["sample"] += time.perf_counter() - pref_sample_start
+                if not is_recurrent_agent and demo_storage is not None and demo_loader_part is not None:
+                    use_demo = demo_storage.num_episodes() > 0 and args.demo_sample_ratio > 0.0
+                else:
+                    use_demo = False
+                if use_demo:
+                    if replay_iter_part is None:
+                        replay_iter_part = iter(replay_loader_part)
+                    if demo_iter_part is None:
+                        demo_iter_part = iter(demo_loader_part)
+                    try:
+                        batch_replay = next(replay_iter_part)
+                    except StopIteration:
+                        replay_iter_part = iter(replay_loader_part)
+                        batch_replay = next(replay_iter_part)
+                    try:
+                        batch_demo = next(demo_iter_part)
+                    except StopIteration:
+                        demo_iter_part = iter(demo_loader_part)
+                        batch_demo = next(demo_iter_part)
+                    combined_batch = concat_replay_batches(batch_replay, batch_demo)
+                    replay_iter = iter([combined_batch])
+                else:
+                    if replay_iter is None:
+                        replay_iter = iter(replay_loader)
+                    try:
+                        batch_replay = next(replay_iter)
+                    except StopIteration:
+                        replay_iter = iter(replay_loader)
+                        batch_replay = next(replay_iter)
+                    replay_iter = iter([batch_replay])
 
-            update_start = time.perf_counter()
-            metrics = agent.update(
-                replay_iter,
-                total_env_steps,
-                pref_batch=pref_batch_np,
-                pref_weight=args.pref_rank_weight,
-                pref_margin=args.pref_rank_margin,
-                pref_loss_type=args.pref_loss_type,
-            )
-            perf_accum["update"] += time.perf_counter() - update_start
-            if metrics:
-                for key, value in metrics.items():
-                    metrics_accum[key] = metrics_accum.get(key, 0.0) + float(value)
-                metrics_updates += 1
+                update_start = time.perf_counter()
+                metrics = agent.update(
+                    replay_iter,
+                    total_env_steps,
+                    pref_batch=pref_batch_np,
+                    pref_weight=args.pref_rank_weight,
+                    pref_margin=args.pref_rank_margin,
+                    pref_loss_type=args.pref_loss_type,
+                )
+                perf_accum["update"] += time.perf_counter() - update_start
+                if metrics:
+                    for key, value in metrics.items():
+                        metrics_accum[key] = metrics_accum.get(key, 0.0) + float(value)
+                    metrics_updates += 1
+                    updates_this_step += 1
+                else:
+                    break
+
+                if not args.adaptive_utd:
+                    break
+                if pref_batch_np is None:
+                    break
+                pref_violation = metrics.get("pref_violation")
+                if pref_violation is None or float(pref_violation) <= args.adaptive_utd_violation_tol:
+                    break
+            perf_accum["update_iters"] += float(updates_this_step)
 
         with torch.no_grad(), utils.eval_mode(agent):
             obs_tensor = ensure_tensor(obs, device)
@@ -1756,11 +1794,13 @@ def train():
             env_avg = perf_accum["env_step"] / perf_steps
             update_avg = perf_accum["update"] / max(1, perf_steps)
             sample_avg = perf_accum["sample"] / max(1, perf_steps)
+            update_iters_avg = perf_accum["update_iters"] / max(1, perf_steps)
             perf_metrics = {
                 "Perf/step_ms": loop_avg * 1000.0,
                 "Perf/env_step_ms": env_avg * 1000.0,
                 "Perf/update_ms": update_avg * 1000.0,
                 "Perf/sample_ms": sample_avg * 1000.0,
+                "Perf/updates_per_step": update_iters_avg,
                 "Perf/env_step_pct": (perf_accum["env_step"] / perf_accum["loop_time"]) * 100.0,
                 "Perf/update_pct": (perf_accum["update"] / perf_accum["loop_time"]) * 100.0,
                 "Perf/sample_pct": (perf_accum["sample"] / perf_accum["loop_time"]) * 100.0,
@@ -1784,7 +1824,7 @@ def train():
             if metrics_updates > 0:
                 metrics_accum = {}
                 metrics_updates = 0
-            perf_accum = {"loop_time": 0.0, "env_step": 0.0, "update": 0.0, "sample": 0.0}
+            perf_accum = {"loop_time": 0.0, "env_step": 0.0, "update": 0.0, "sample": 0.0, "update_iters": 0.0}
             perf_steps = 0
             goal_success_counter = 0
             goal_final_distance_sum = 0.0
