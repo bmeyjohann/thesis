@@ -15,7 +15,7 @@ import sys
 import json
 import time
 import warnings
-from collections import deque
+from collections import deque, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -878,6 +878,30 @@ def concat_replay_batches(batch_a: tuple, batch_b: tuple) -> tuple:
     return tuple(combined)
 
 
+def collect_replay_stats(loaders) -> Dict[str, float]:
+    totals = defaultdict(float)
+    counts = defaultdict(int)
+    for loader in loaders:
+        if loader is None or not hasattr(loader, "dataset"):
+            continue
+        dataset = loader.dataset
+        if hasattr(dataset, "get_stats"):
+            stats, stat_counts = dataset.get_stats(reset=True)
+            for key, value in stats.items():
+                totals[key] += float(value)
+            for key, value in stat_counts.items():
+                counts[key] += int(value)
+    metrics = {}
+    if totals:
+        metrics["Perf/replay_scan_ms"] = totals.get("replay_scan_s", 0.0) * 1000.0
+        metrics["Perf/replay_load_ms"] = totals.get("replay_load_s", 0.0) * 1000.0
+        metrics["Perf/replay_sample_ms"] = totals.get("replay_sample_s", 0.0) * 1000.0
+        metrics["Perf/replay_scan_calls"] = counts.get("replay_scan_s", 0)
+        metrics["Perf/replay_load_calls"] = counts.get("replay_load_s", 0)
+        metrics["Perf/replay_sample_calls"] = counts.get("replay_sample_s", 0)
+    return metrics
+
+
 def build_env(args, wrappers, seed: int) -> dm_env.Environment:
     env = OGBenchPixelsEnv(
         env_name=args.env_name,
@@ -1513,21 +1537,24 @@ def train():
             checkpoint_mgr.maybe_render_policy_map(checkpoint_path=ckpt, step_value=total_env_steps)
 
         pref_buffer_size = pref_storage.num_pairs() if pref_storage is not None else -1
-        perf_metrics = None
-        if perf_steps > 0 and perf_accum["loop_time"] > 0:
-            loop_avg = perf_accum["loop_time"] / perf_steps
-            env_avg = perf_accum["env_step"] / perf_steps
-            update_avg = perf_accum["update"] / max(1, perf_steps)
-            sample_avg = perf_accum["sample"] / max(1, perf_steps)
-            perf_metrics = {
-                "Perf/step_ms": loop_avg * 1000.0,
-                "Perf/env_step_ms": env_avg * 1000.0,
-                "Perf/update_ms": update_avg * 1000.0,
-                "Perf/sample_ms": sample_avg * 1000.0,
-                "Perf/env_step_pct": (perf_accum["env_step"] / perf_accum["loop_time"]) * 100.0,
-                "Perf/update_pct": (perf_accum["update"] / perf_accum["loop_time"]) * 100.0,
-                "Perf/sample_pct": (perf_accum["sample"] / perf_accum["loop_time"]) * 100.0,
-            }
+    perf_metrics = None
+    if perf_steps > 0 and perf_accum["loop_time"] > 0:
+        loop_avg = perf_accum["loop_time"] / perf_steps
+        env_avg = perf_accum["env_step"] / perf_steps
+        update_avg = perf_accum["update"] / max(1, perf_steps)
+        sample_avg = perf_accum["sample"] / max(1, perf_steps)
+        perf_metrics = {
+            "Perf/step_ms": loop_avg * 1000.0,
+            "Perf/env_step_ms": env_avg * 1000.0,
+            "Perf/update_ms": update_avg * 1000.0,
+            "Perf/sample_ms": sample_avg * 1000.0,
+            "Perf/env_step_pct": (perf_accum["env_step"] / perf_accum["loop_time"]) * 100.0,
+            "Perf/update_pct": (perf_accum["update"] / perf_accum["loop_time"]) * 100.0,
+            "Perf/sample_pct": (perf_accum["sample"] / perf_accum["loop_time"]) * 100.0,
+        }
+        replay_stats = collect_replay_stats([novice_loader_full, novice_loader_half, human_loader_half])
+        if replay_stats:
+            perf_metrics.update(replay_stats)
         logged = logger.maybe_log(
             total_env_steps=total_env_steps,
             total_timesteps=args.total_timesteps,

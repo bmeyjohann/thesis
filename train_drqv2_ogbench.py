@@ -17,7 +17,7 @@ import json
 import time
 import warnings
 import copy
-from collections import deque
+from collections import deque, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -885,6 +885,30 @@ def ensure_tensor(obs: np.ndarray, device: torch.device) -> torch.Tensor:
     if tensor.ndim == 3:
         tensor = tensor.unsqueeze(0)
     return tensor.float()
+
+
+def collect_replay_stats(loaders) -> Dict[str, float]:
+    totals = defaultdict(float)
+    counts = defaultdict(int)
+    for loader in loaders:
+        if loader is None or not hasattr(loader, "dataset"):
+            continue
+        dataset = loader.dataset
+        if hasattr(dataset, "get_stats"):
+            stats, stat_counts = dataset.get_stats(reset=True)
+            for key, value in stats.items():
+                totals[key] += float(value)
+            for key, value in stat_counts.items():
+                counts[key] += int(value)
+    metrics = {}
+    if totals:
+        metrics["Perf/replay_scan_ms"] = totals.get("replay_scan_s", 0.0) * 1000.0
+        metrics["Perf/replay_load_ms"] = totals.get("replay_load_s", 0.0) * 1000.0
+        metrics["Perf/replay_sample_ms"] = totals.get("replay_sample_s", 0.0) * 1000.0
+        metrics["Perf/replay_scan_calls"] = counts.get("replay_scan_s", 0)
+        metrics["Perf/replay_load_calls"] = counts.get("replay_load_s", 0)
+        metrics["Perf/replay_sample_calls"] = counts.get("replay_sample_s", 0)
+    return metrics
 
 
 def concat_replay_batches(batch_a: tuple, batch_b: tuple) -> tuple:
@@ -1811,6 +1835,9 @@ def train():
                 "Perf/update_pct": (perf_accum["update"] / perf_accum["loop_time"]) * 100.0,
                 "Perf/sample_pct": (perf_accum["sample"] / perf_accum["loop_time"]) * 100.0,
             }
+            replay_stats = collect_replay_stats([replay_loader, replay_loader_part, demo_loader_part])
+            if replay_stats:
+                perf_metrics.update(replay_stats)
         logged = logger.maybe_log(
             total_env_steps=total_env_steps,
             total_timesteps=args.total_timesteps,
