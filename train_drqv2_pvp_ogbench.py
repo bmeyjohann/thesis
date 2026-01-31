@@ -50,7 +50,12 @@ except Exception:  # pragma: no cover - optional dependency
 
 from drqv2.drqv2 import DrQV2Agent  # noqa: E402
 from drqv2 import utils  # noqa: E402
-from drqv2.replay_buffer import ReplayBufferStorage, make_replay_loader  # noqa: E402
+from drqv2.replay_buffer import (  # noqa: E402
+    ReplayBufferStorage,
+    InMemoryReplayStorage,
+    make_replay_loader,
+    make_replay_loader_in_memory,
+)
 from drqv2.pref_buffer import PreferencePairStorage, PreferencePairDataset  # noqa: E402
 
 from ogbench_utils import (  # noqa: E402
@@ -117,6 +122,8 @@ def build_arg_parser():
     parser.add_argument("--nstep", type=int, default=3)
     parser.add_argument("--replay_buffer_size", type=int, default=1_000_000)
     parser.add_argument("--replay_buffer_num_workers", type=int, default=4)
+    parser.add_argument("--replay_fetch_every", type=int, default=1000,
+                        help="How often to scan disk replay buffers for new episodes")
 
     # Evaluation / logging
     parser.add_argument("--num_eval_episodes", type=int, default=10)
@@ -129,6 +136,8 @@ def build_arg_parser():
                         help="Proxy value loss type (fixed for PVP runs)")
     parser.add_argument("--buffer_root", type=str, default=None,
                         help="Optional root directory for replay/pref buffers (e.g., tmpfs/ramdisk).")
+    parser.add_argument("--replay_mode", type=str, default="disk", choices=["disk", "ram"],
+                        help="Replay buffer backend: disk (default) or in-memory")
     parser.add_argument("--pref_chunk_size", type=int, default=64,
                         help="Number of preference events per on-disk shard")
     parser.add_argument("--pref_fetch_every", type=int, default=512,
@@ -1128,40 +1137,64 @@ def train():
     data_specs = tuple(data_specs_list)
     buffer_root = Path(args.buffer_root).expanduser() if args.buffer_root else run_paths.log_dir
     buffer_root.mkdir(parents=True, exist_ok=True)
-    replay_dir_novice = buffer_root / "buffer_novice"
-    replay_dir_human = buffer_root / "buffer_human"
-    replay_storage_novice = ReplayBufferStorage(data_specs, replay_dir_novice)
-    replay_storage_human = ReplayBufferStorage(data_specs, replay_dir_human)
-
     batch_h = max(1, args.batch_size // 2)
     batch_n = max(1, args.batch_size - batch_h)
-    novice_loader_full = make_replay_loader(
-        replay_dir_novice,
-        max_size=args.replay_buffer_size,
-        batch_size=args.batch_size,
-        num_workers=args.replay_buffer_num_workers,
-        save_snapshot=args.save_snapshot,
-        nstep=args.nstep,
-        discount=args.discount,
-    )
-    novice_loader_half = make_replay_loader(
-        replay_dir_novice,
-        max_size=args.replay_buffer_size,
-        batch_size=batch_n,
-        num_workers=args.replay_buffer_num_workers,
-        save_snapshot=args.save_snapshot,
-        nstep=args.nstep,
-        discount=args.discount,
-    )
-    human_loader_half = make_replay_loader(
-        replay_dir_human,
-        max_size=args.replay_buffer_size,
-        batch_size=batch_h,
-        num_workers=args.replay_buffer_num_workers,
-        save_snapshot=args.save_snapshot,
-        nstep=args.nstep,
-        discount=args.discount,
-    )
+    if args.replay_mode == "ram":
+        replay_storage_novice = InMemoryReplayStorage(data_specs, max_size=args.replay_buffer_size)
+        replay_storage_human = InMemoryReplayStorage(data_specs, max_size=args.replay_buffer_size)
+        novice_loader_full = make_replay_loader_in_memory(
+            replay_storage_novice,
+            batch_size=args.batch_size,
+            nstep=args.nstep,
+            discount=args.discount,
+        )
+        novice_loader_half = make_replay_loader_in_memory(
+            replay_storage_novice,
+            batch_size=batch_n,
+            nstep=args.nstep,
+            discount=args.discount,
+        )
+        human_loader_half = make_replay_loader_in_memory(
+            replay_storage_human,
+            batch_size=batch_h,
+            nstep=args.nstep,
+            discount=args.discount,
+        )
+    else:
+        replay_dir_novice = buffer_root / "buffer_novice"
+        replay_dir_human = buffer_root / "buffer_human"
+        replay_storage_novice = ReplayBufferStorage(data_specs, replay_dir_novice)
+        replay_storage_human = ReplayBufferStorage(data_specs, replay_dir_human)
+        novice_loader_full = make_replay_loader(
+            replay_dir_novice,
+            max_size=args.replay_buffer_size,
+            batch_size=args.batch_size,
+            num_workers=args.replay_buffer_num_workers,
+            save_snapshot=args.save_snapshot,
+            nstep=args.nstep,
+            discount=args.discount,
+            fetch_every=args.replay_fetch_every,
+        )
+        novice_loader_half = make_replay_loader(
+            replay_dir_novice,
+            max_size=args.replay_buffer_size,
+            batch_size=batch_n,
+            num_workers=args.replay_buffer_num_workers,
+            save_snapshot=args.save_snapshot,
+            nstep=args.nstep,
+            discount=args.discount,
+            fetch_every=args.replay_fetch_every,
+        )
+        human_loader_half = make_replay_loader(
+            replay_dir_human,
+            max_size=args.replay_buffer_size,
+            batch_size=batch_h,
+            num_workers=args.replay_buffer_num_workers,
+            save_snapshot=args.save_snapshot,
+            nstep=args.nstep,
+            discount=args.discount,
+            fetch_every=args.replay_fetch_every,
+        )
     novice_iter_full = None
     novice_iter_half = None
     human_iter_half = None

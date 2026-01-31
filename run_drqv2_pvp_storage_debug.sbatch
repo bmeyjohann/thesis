@@ -71,12 +71,12 @@ echo "Launching PVP storage debug variants"
 PIDS=()
 launch_pvp_run 0 "baseline" \
   "--pref_chunk_size ${PREF_CHUNK_SIZE} --pref_fetch_every ${PREF_FETCH_EVERY}"
-launch_pvp_run 1 "chunkfetch" \
-  "--pref_chunk_size 512 --pref_fetch_every 5000"
-launch_pvp_run 2 "tmpdir" \
-  "--buffer_root ${TMPDIR:-/tmp}/pvp_buffers_${SLURM_JOB_ID}_tmp"
-launch_pvp_run 3 "ramdisk" \
-  "--buffer_root /dev/shm/pvp_buffers_${SLURM_JOB_ID}_ram --replay_buffer_size ${RAM_REPLAY_SIZE}"
+launch_pvp_run 1 "fetch_every_50000" \
+  "--replay_fetch_every 50000"
+launch_pvp_run 2 "ram" \
+  "--replay_mode ram --replay_buffer_size ${RAM_REPLAY_SIZE}"
+launch_pvp_run 3 "explore_2000" \
+  "--num_expl_steps 2000"
 
 FAIL=0
 for PID in "${PIDS[@]}"; do

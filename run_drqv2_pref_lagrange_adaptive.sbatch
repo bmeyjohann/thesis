@@ -16,6 +16,9 @@ cd sc_venv_template
 source activate.sh
 cd ..
 
+export MPLCONFIGDIR=${MPLCONFIGDIR:-/tmp/matplotlib-${SLURM_JOB_ID}}
+mkdir -p "${MPLCONFIGDIR}"
+
 ENV_ID=${ENV_ID:-pointmaze-arena-danger-wall-v0}
 TOTAL_STEPS=${TOTAL_STEPS:-1500000}
 SAVE_INTERVAL=${SAVE_INTERVAL:-200000}

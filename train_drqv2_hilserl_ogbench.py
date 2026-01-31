@@ -122,27 +122,6 @@ def build_arg_parser():
     parser.add_argument("--eval_every_frames", type=int, default=50_000)
     parser.add_argument("--smoke_test_steps", type=int, default=0,
                         help="Override total timesteps for very short smoke tests (0 disables override)")
-    parser.add_argument("--demo_prefill_steps", type=int, default=0,
-                        help="Number of env steps to prefill with teacher demos (0 disables)")
-    parser.add_argument("--demo_prefill_episodes", type=int, default=0,
-                        help="Number of demo episodes to prefill (0 disables, overrides steps)")
-    parser.add_argument("--demo_prefill_intervention_mode", type=str, default="agent_safety_progress",
-                        help="Intervention mode to use during demo prefill")
-    parser.add_argument("--demo_prefill_enable_after_steps", type=int, default=0,
-                        help="Warm-up steps before demo interventions engage")
-    parser.add_argument("--demo_prefill_episode_prob", type=float, default=1.0,
-                        help="Per-episode intervention gate probability during demo prefill")
-    parser.add_argument("--demo_prefill_hard_block_lethal", action="store_true", default=False,
-                        help="Enable hard blocking of lethal moves during demo prefill")
-    parser.add_argument("--demo_prefill_target", type=str, default="demo",
-                        choices=["demo", "replay"],
-                        help="Which buffer to prefill with teacher demos")
-    parser.add_argument("--demo_buffer_enable", action="store_true", default=False,
-                        help="Enable a separate demo replay buffer for mixed sampling")
-    parser.add_argument("--demo_buffer_capacity", type=int, default=200000,
-                        help="Capacity of the demo replay buffer")
-    parser.add_argument("--demo_sample_ratio", type=float, default=0.5,
-                        help="Fraction of each update batch sampled from demo buffer (0..1)")
     parser.add_argument("--buffer_root", type=str, default=None,
                         help="Optional root directory for replay/pref buffers (e.g., tmpfs/ramdisk).")
     return parser
@@ -1362,7 +1341,7 @@ def train():
     rl_iter_part = None
     demo_iter_part = None
 
-    if args.demo_prefill_steps > 0:
+    if args.demo_prefill_steps > 0 or args.demo_prefill_episodes > 0:
         if args.demo_prefill_target == "demo":
             if demo_storage is None:
                 raise ValueError("demo_prefill_target=demo requires --demo_buffer_enable")

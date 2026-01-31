@@ -135,6 +135,8 @@ def build_train_parser() -> argparse.ArgumentParser:
     # Demo prefill (teacher-generated data)
     p.add_argument('--demo_prefill_steps', type=int, default=0,
                    help='Number of env steps to prefill replay buffer with teacher demos (0 disables)')
+    p.add_argument('--demo_prefill_episodes', type=int, default=0,
+                   help='Number of demo episodes to prefill (0 disables, overrides steps)')
     p.add_argument('--demo_prefill_intervention_mode', type=str, default='agent_safety_progress',
                    choices=['human', 'agent', 'agent_safety_align', 'agent_safety_progress'],
                    help='Intervention mode to use during demo prefill')
@@ -253,10 +255,16 @@ def build_eval_parser() -> argparse.ArgumentParser:
                         help='Render height')
     parser.add_argument('--fps', type=int, default=30,
                         help='Target FPS for rendering')
+    parser.add_argument('--verbose', action='store_true', default=False,
+                        help='Enable verbose evaluation logging')
     parser.add_argument('--log_q_values', action='store_true', default=False,
                         help='Log critic Q values for performed actions during evaluation')
     parser.add_argument('--log_q_every', type=int, default=50,
                         help='Step interval for logging Q values during evaluation')
+    parser.add_argument('--show_q_overlay', dest='show_q_overlay', action='store_true', default=True,
+                        help='Overlay critic Q values in the interactive renderer')
+    parser.add_argument('--no_show_q_overlay', dest='show_q_overlay', action='store_false',
+                        help='Disable Q-value overlay')
     
     # Observation configuration (match training)
     parser.add_argument('--obs_mode', type=str, default=None, choices=['state', 'pixels'],

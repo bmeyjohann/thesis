@@ -132,6 +132,8 @@ def build_arg_parser():
     parser.add_argument("--nstep", type=int, default=3)
     parser.add_argument("--replay_buffer_size", type=int, default=1_000_000)
     parser.add_argument("--replay_buffer_num_workers", type=int, default=4)
+    parser.add_argument("--replay_fetch_every", type=int, default=1000,
+                        help="How often to scan disk replay buffers for new episodes")
 
     # Evaluation / logging
     parser.add_argument("--num_eval_episodes", type=int, default=10)
@@ -1387,6 +1389,7 @@ def train():
             save_snapshot=args.save_snapshot,
             sequence_length=args.recurrent_unroll_length,
             burn_in=args.recurrent_burn_in,
+            fetch_every=args.replay_fetch_every,
         )
         demo_loader_part = None
         replay_loader_part = None
@@ -1399,6 +1402,7 @@ def train():
             save_snapshot=args.save_snapshot,
             nstep=args.nstep,
             discount=args.discount,
+            fetch_every=args.replay_fetch_every,
         )
         demo_ratio = min(1.0, max(0.0, float(args.demo_sample_ratio)))
         demo_batch = int(round(args.batch_size * demo_ratio))
@@ -1414,6 +1418,7 @@ def train():
             save_snapshot=args.save_snapshot,
             nstep=args.nstep,
             discount=args.discount,
+            fetch_every=args.replay_fetch_every,
         )
         demo_loader_part = None
         if demo_storage is not None and demo_batch > 0:
@@ -1425,6 +1430,7 @@ def train():
                 save_snapshot=args.save_snapshot,
                 nstep=args.nstep,
                 discount=args.discount,
+                fetch_every=args.replay_fetch_every,
             )
     replay_iter = None
     replay_iter_part = None
