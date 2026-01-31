@@ -243,6 +243,8 @@ def apply_model_config_defaults(args) -> Optional[dict[str, Any]]:
 
 
 def log_eval_configuration(args, *, config_info=None, checkpoint_args=None) -> None:
+    if not getattr(args, 'verbose', False):
+        return
     print("\n⚙️ Evaluation configuration summary")
     if config_info and config_info.get('path'):
         applied = config_info.get('applied_keys') or []
@@ -532,7 +534,7 @@ class BirdsEyeRenderer:
         base = min(960 // max(cols, 1), 720 // max(rows, 1))
         return int(max(16, min(72, base)))
 
-    def draw(self, pixel_obs: np.ndarray | None = None):
+    def draw(self, pixel_obs: np.ndarray | None = None, overlay_lines: Optional[list[str]] = None):
         if self.surface is None:
             return
         self.surface.fill((28, 28, 28))
@@ -587,6 +589,15 @@ class BirdsEyeRenderer:
                 surf = pygame.transform.smoothscale(surf, self.obs_surface_size)
                 panel.blit(surf, (0, 24))
             self.surface.blit(panel, (self.grid_width + 16, 0))
+
+        if overlay_lines:
+            overlay_height = 10 + 18 * len(overlay_lines)
+            overlay_surface = pygame.Surface((self.grid_width, overlay_height), pygame.SRCALPHA)
+            overlay_surface.fill((0, 0, 0, 140))
+            for idx, line in enumerate(overlay_lines):
+                label = self.font.render(line, True, (255, 255, 255))
+                overlay_surface.blit(label, (8, 4 + idx * 18))
+            self.surface.blit(overlay_surface, (0, 0))
 
         pygame.display.flip()
 
@@ -864,6 +875,27 @@ class FastSACPolicy:
             q_min = torch.min(q_vals, dim=-1).values
         return float(q_min.mean().item())
 
+    def q_values(self, obs: torch.Tensor, action: np.ndarray | torch.Tensor) -> Optional[tuple[float, float]]:
+        if self.critic_backbone is None or self.critic_heads is None:
+            return None
+        obs_norm = self._normalize(obs)
+        obs_input = reshape_observation(obs_norm, obs_mode=self.obs_mode, pixel_shape=self.pixel_shape)
+        action_tensor = torch.as_tensor(action, device=self.device, dtype=torch.float32).view(1, -1)
+        with torch.no_grad():
+            features = self.critic_backbone(obs_input)
+            q_vals = self.critic_heads(features, action_tensor)
+            if isinstance(q_vals, (list, tuple)):
+                q_vals = torch.stack(q_vals, dim=0)
+            if q_vals.ndim == 1:
+                q_vals = q_vals.unsqueeze(0)
+            if q_vals.ndim == 2:
+                q_min = q_vals.min(dim=0).values
+                q_mean = q_vals.mean(dim=0)
+            else:
+                q_min = q_vals.min(dim=-1).values
+                q_mean = q_vals.mean(dim=-1)
+        return float(q_min.mean().item()), float(q_mean.mean().item())
+
 
 class DrQPolicy:
     """Wrapper around DrQV2Agent/DrQV2RecurrentAgent for pixel observations."""
@@ -1009,6 +1041,23 @@ class DrQPolicy:
             q1, q2 = self.agent.critic(obs, prev, action_tensor)
             q_min = torch.min(q1, q2)
         return float(q_min.mean().item())
+
+    def q_values(
+        self,
+        obs: torch.Tensor,
+        action: np.ndarray | torch.Tensor,
+        prev_actions: torch.Tensor | None = None,
+    ) -> Optional[tuple[float, float]]:
+        if not hasattr(self.agent, 'critic'):
+            return None
+        obs = self._reshape_obs(obs.to(self.device))
+        action_tensor = torch.as_tensor(action, device=self.device, dtype=torch.float32).view(1, -1)
+        prev = prev_actions.to(self.device) if prev_actions is not None else None
+        with torch.no_grad():
+            q1, q2 = self.agent.critic(obs, prev, action_tensor)
+            q_min = torch.min(q1, q2)
+            q_mean = (q1 + q2) / 2.0
+        return float(q_min.mean().item()), float(q_mean.mean().item())
 
     def register_pending_warp(self, warp_params: np.ndarray):
         fn = getattr(self.agent, 'register_pending_warp', None)
@@ -1336,6 +1385,10 @@ def load_trained_policy(
         if 'drq_critic_target' in checkpoint:
             agent.critic_target.load_state_dict(checkpoint['drq_critic_target'])
         agent.train(False)
+        if hasattr(agent, 'critic') and 'drq_critic' in checkpoint:
+            print("✓ Loaded DrQ-v2 critic weights")
+        else:
+            print("ℹ️ DrQ-v2 critic weights not found; Q overlays disabled")
         policy = DrQPolicy(agent=agent, pixel_shape=pixel_shape, device=device)
         policy.eval()
     else:  # fastsac_v2
@@ -1455,6 +1508,9 @@ def load_trained_policy(
             ).to(device)
             critic_heads.load_state_dict(checkpoint['critic_heads'])
             critic_heads.eval()
+            print("✓ Loaded FastSAC critic weights")
+        else:
+            print("ℹ️ FastSAC critic weights not found; Q overlays disabled")
         policy = FastSACPolicy(
             obs_normalizer=obs_normalizer,
             obs_mode=obs_mode,
@@ -1547,7 +1603,8 @@ def load_trained_policy(
 
 def create_env(env_name: str, args, *, render_override: str | None = None, mirror_mode: bool = False):
     """Create the evaluation environment with appropriate wrappers."""
-    print(f"🏗️  Creating environment: {env_name}")
+    if getattr(args, 'verbose', False):
+        print(f"🏗️  Creating environment: {env_name}")
     
     # Base environment creation parameters
     env_kwargs = {
@@ -1592,8 +1649,9 @@ def create_env(env_name: str, args, *, render_override: str | None = None, mirro
         env_kwargs['width'] = args.width
         env_kwargs['height'] = args.height
     debug_suffix = " (mirror)" if mirror_mode else ""
-    print(f"   render_mode={render_mode}{debug_suffix}")
-    print(f"   env_kwargs={env_kwargs}{debug_suffix}")
+    if getattr(args, 'verbose', False):
+        print(f"   render_mode={render_mode}{debug_suffix}")
+        print(f"   env_kwargs={env_kwargs}{debug_suffix}")
     
     try:
         env = gym.make(env_name, **env_kwargs)
@@ -1631,24 +1689,26 @@ def create_env(env_name: str, args, *, render_override: str | None = None, mirro
         env = wrapper(env)
         maybe_set_goal_color(env, getattr(args, 'goal_marker_color', 'auto'))
 
-        if getattr(args, 'obs_mode', 'state') == 'state':
-            print('Applied FlexibleObsWrapper')
-        print('Applied DetailedRewardWrapper (type={})'.format(args.reward_type))
-        if args.intervention_mode == 'human':
-            print('Applied InterventionWrapper (human teleop)')
-        elif args.intervention_mode == 'agent':
-            print('Applied InterventionWrapper (agent teacher: {})'.format(args.teacher_type))
         if getattr(args, 'obs_mode', 'state') == 'pixels' and not mirror_mode:
             env = RenderedPixelsWrapper(
                 env,
                 width=env_kwargs.get('width'),
                 height=env_kwargs.get('height'),
             )
-            print('Applied RenderedPixelsWrapper for pixel observations')
+            if getattr(args, 'verbose', False):
+                print('Applied RenderedPixelsWrapper for pixel observations')
 
-        print('Environment created successfully')
-        print('   Observation space:', env.observation_space)
-        print('   Action space:', env.action_space)
+        if getattr(args, 'verbose', False):
+            if getattr(args, 'obs_mode', 'state') == 'state':
+                print('Applied FlexibleObsWrapper')
+            print('Applied DetailedRewardWrapper (type={})'.format(args.reward_type))
+            if args.intervention_mode == 'human':
+                print('Applied InterventionWrapper (human teleop)')
+            elif args.intervention_mode == 'agent':
+                print('Applied InterventionWrapper (agent teacher: {})'.format(args.teacher_type))
+            print('Environment created successfully')
+            print('   Observation space:', env.observation_space)
+            print('   Action space:', env.action_space)
         return env, render_mode
     except Exception as e:
         print(f"❌ Environment creation failed: {e}")
@@ -1924,25 +1984,26 @@ def run_headless_evaluation(policy, env, args, device):
                 action = np.concatenate([move_global, np.array([view_delta], dtype=np.float32)], axis=0)
             else:
                 action = move_global
-            if args.action_scale != 1.0:
-                action *= args.action_scale
-            if args.clip_actions:
-                action = np.clip(action, -1.0, 1.0)
+        if args.action_scale != 1.0:
+            action *= args.action_scale
+        if args.clip_actions:
+            action = clip_action_l2_np(action, max_norm=1.0)
             obs, reward, terminated, truncated, info = env.step(action)
-            if args.log_q_values and steps % max(1, int(args.log_q_every)) == 0:
-                q_action = action
-                if isinstance(info, dict) and info.get('teacher_intervened', False):
-                    q_action = info.get('teacher_action', q_action)
-                if hasattr(policy, 'q_value'):
-                    try:
-                        if isinstance(policy, DrQPolicy):
-                            q_val = policy.q_value(obs_tensor, q_action, prev_actions=prev_tensor)
-                        else:
-                            q_val = policy.q_value(obs_tensor, q_action)
-                    except Exception:
-                        q_val = None
-                    if q_val is not None:
-                        print(f"Q(action)={q_val:.3f}")
+        if args.log_q_values and steps % max(1, int(args.log_q_every)) == 0:
+            q_action = action
+            if isinstance(info, dict) and info.get('teacher_intervened', False):
+                q_action = info.get('teacher_action', q_action)
+            if hasattr(policy, 'q_values'):
+                try:
+                    if isinstance(policy, DrQPolicy):
+                        q_vals = policy.q_values(obs_tensor, q_action, prev_actions=prev_tensor)
+                    else:
+                        q_vals = policy.q_values(obs_tensor, q_action)
+                except Exception:
+                    q_vals = None
+                if q_vals is not None:
+                    q_min, q_mean = q_vals
+                    print(f"Qmin={q_min:.3f} Qmean={q_mean:.3f}")
             if history_len > 0 and action_history is not None:
                 action_history.append(action_local.copy())
             if goal_history_len > 0 and goal_history is not None:
@@ -1999,13 +2060,14 @@ def run_interactive_evaluation(policy, env, args, device, mirror: MirrorEnvProce
     print(f"Model: {model_label}")
     print(f"Controller: {getattr(args, 'controller', 'policy')}")
     print(f"Device: {device}")
-    print(f"\n🎮 Controls:")
-    print(f"   ESC/Q: Exit")
-    print(f"   SPACE: Reset environment")
-    print(f"   N: Skip to next goal")
-    print(f"   S: Slow down  |  F: Speed up")
-    print(f"   R: Toggle auto-reset")
-    print(f"   Click the window and use keys!")
+    if getattr(args, 'verbose', False):
+        print(f"\n🎮 Controls:")
+        print(f"   ESC/Q: Exit")
+        print(f"   SPACE: Reset environment")
+        print(f"   N: Skip to next goal")
+        print(f"   S: Slow down  |  F: Speed up")
+        print(f"   R: Toggle auto-reset")
+        print(f"   Click the window and use keys!")
 
     # Initialize pygame for event handling
     pygame.init()
@@ -2104,6 +2166,7 @@ def run_interactive_evaluation(policy, env, args, device, mirror: MirrorEnvProce
         episode_reward = 0.0
         episode_length = 0
 
+    q_overlay_error_printed = False
     while running and (args.num_episodes == 0 or episode_count < args.num_episodes):
         # Handle pygame events
         for event in pygame.event.get():
@@ -2176,7 +2239,7 @@ def run_interactive_evaluation(policy, env, args, device, mirror: MirrorEnvProce
         if args.action_scale != 1.0:
             action_global *= args.action_scale
         if args.clip_actions:
-            action_global = np.clip(action_global, -1.0, 1.0)
+            action_global = clip_action_l2_np(action_global, max_norm=1.0)
         
         # Step environment
         next_obs, reward, terminated, truncated, info = env.step(action_global)
@@ -2195,28 +2258,44 @@ def run_interactive_evaluation(policy, env, args, device, mirror: MirrorEnvProce
             goal_history.append(goal_rel.copy())
         transformer.update_heading(info if isinstance(info, dict) else None)
 
-        if args.log_q_values and step_idx % max(1, int(args.log_q_every)) == 0:
+        q_overlay_lines = None
+        if args.show_q_overlay or args.log_q_values:
             q_action = action_global
             if isinstance(info, dict) and info.get('teacher_intervened', False):
                 q_action = info.get('teacher_action', q_action)
-            if hasattr(policy, 'q_value'):
+            q_vals = None
+            q_err = None
+            if hasattr(policy, 'q_values'):
                 try:
                     if isinstance(policy, DrQPolicy):
-                        q_val = policy.q_value(obs_tensor, q_action, prev_actions=prev_tensor)
+                        q_vals = policy.q_values(obs_tensor, q_action, prev_actions=prev_tensor)
                     else:
-                        q_val = policy.q_value(obs_tensor, q_action)
-                except Exception:
-                    q_val = None
-                if q_val is not None:
-                    print(f"Q(action)={q_val:.3f}")
-        
+                        q_vals = policy.q_values(obs_tensor, q_action)
+                except Exception as exc:
+                    q_vals = None
+                    if not q_overlay_error_printed and getattr(args, 'verbose', False):
+                        q_err = f"Q-value computation failed: {exc!r}"
+            if q_vals is None and q_err is None and not q_overlay_error_printed and getattr(args, 'verbose', False):
+                q_err = "Q-value computation returned None (missing critic weights or input mismatch)."
+            if q_err and not q_overlay_error_printed:
+                print(f"⚠️ {q_err}")
+                q_overlay_error_printed = True
+            if q_vals is not None:
+                q_min, q_mean = q_vals
+                if args.log_q_values and step_idx % max(1, int(args.log_q_every)) == 0:
+                    print(f"Qmin={q_min:.3f} Qmean={q_mean:.3f}")
+                if args.show_q_overlay:
+                    q_overlay_lines = [f"Qmin: {q_min:.3f}", f"Qmean: {q_mean:.3f}"]
+            elif args.show_q_overlay:
+                q_overlay_lines = ["Qmin: n/a", "Qmean: n/a"]
+
         # Update episode tracking
         obs = next_obs
         episode_reward += reward
         episode_length += 1
         if birds_eye is not None:
             try:
-                birds_eye.draw(obs)
+                birds_eye.draw(obs, overlay_lines=q_overlay_lines)
             except Exception as exc:
                 print(f"⚠️ Bird's eye draw failed: {exc}")
                 birds_eye = None
@@ -2384,7 +2463,7 @@ def main():
             training_info = {'controller': args.controller}
         if hasattr(policy, 'eval'):
             policy.eval()
-        if training_info:
+        if training_info and getattr(args, 'verbose', False):
             print("Training info:")
             for key, value in training_info.items():
                 print(f"   {key}: {value}")
