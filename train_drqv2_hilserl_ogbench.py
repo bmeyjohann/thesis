@@ -1273,6 +1273,12 @@ def train():
     teacher_metrics = build_teacher_metrics(args, device)
     logger = DrQLogger(args=args, record_progress=run_paths.record_progress, teacher_metrics=teacher_metrics)
     checkpoint_mgr = DrQCheckpointManager(args=args, run_paths=run_paths, logger=logger)
+    if args.use_wandb:
+        try:
+            logger._ensure_wandb_run()
+            logger._log_to_wandb({"Run/startup": 1.0}, step=0)
+        except Exception as exc:  # pragma: no cover - wandb is best-effort
+            run_paths.record_progress(f"[WandB] init failed: {exc}")
 
     data_specs_list = [train_env.observation_spec()]
     if prev_action_dim > 0:
@@ -1299,6 +1305,28 @@ def train():
     if args.demo_buffer_enable:
         demo_dir = buffer_root / "buffer_demo"
         demo_storage = ReplayBufferStorage(data_specs, demo_dir)
+
+    if args.demo_prefill_steps > 0 or args.demo_prefill_episodes > 0:
+        if args.demo_prefill_target == "demo":
+            if demo_storage is None:
+                raise ValueError("demo_prefill_target=demo requires --demo_buffer_enable")
+            target_storage = demo_storage
+            target_label = "demo"
+        else:
+            target_storage = replay_storage_rl
+            target_label = "replay"
+        prefill_replay_with_demos(
+            args=args,
+            agent=agent,
+            device=device,
+            target_storage=target_storage,
+            target_label=target_label,
+            record_progress=run_paths.record_progress,
+            action_dim=action_dim,
+            action_history_len=action_history_len,
+            goal_history_len=goal_history_len,
+            goal_vector_dim=goal_vector_dim,
+        )
 
     demo_ratio = float(args.demo_sample_ratio)
     demo_ratio = min(1.0, max(0.0, demo_ratio))
@@ -1340,28 +1368,6 @@ def train():
     rl_iter_full = None
     rl_iter_part = None
     demo_iter_part = None
-
-    if args.demo_prefill_steps > 0 or args.demo_prefill_episodes > 0:
-        if args.demo_prefill_target == "demo":
-            if demo_storage is None:
-                raise ValueError("demo_prefill_target=demo requires --demo_buffer_enable")
-            target_storage = demo_storage
-            target_label = "demo"
-        else:
-            target_storage = replay_storage_rl
-            target_label = "replay"
-        prefill_replay_with_demos(
-            args=args,
-            agent=agent,
-            device=device,
-            target_storage=target_storage,
-            target_label=target_label,
-            record_progress=run_paths.record_progress,
-            action_dim=action_dim,
-            action_history_len=action_history_len,
-            goal_history_len=goal_history_len,
-            goal_vector_dim=goal_vector_dim,
-        )
 
     action_history = init_action_history(action_dim, action_history_len)
     action_transformer = ActionFrameTransformer(
@@ -1519,7 +1525,7 @@ def train():
         reward_arr = np.asarray(next_time_step.reward, dtype=np.float32)
         if reward_arr.shape == ():
             reward_arr = reward_arr.reshape(1)
-        stored_reward = reward_arr if args.pvp_use_reward_in_replay else np.zeros_like(reward_arr)
+        stored_reward = reward_arr
         next_time_step = next_time_step._replace(reward=stored_reward)
         if next_time_step.last():
             distance_val = info.get("distance_to_goal")

@@ -19,6 +19,10 @@ cd ..
 
 export MPLCONFIGDIR="${TMPDIR:-/tmp}/mplcache_${SLURM_JOB_ID}"
 mkdir -p "${MPLCONFIGDIR}"
+export WANDB_DIR=${WANDB_DIR:-$PWD/wandb}
+mkdir -p "${WANDB_DIR}"
+BUFFER_ROOT=${BUFFER_ROOT:-${CSCRATCH:-${SCRATCH:-/tmp}}/drqv2_buffers_${SLURM_JOB_ID}}
+mkdir -p "${BUFFER_ROOT}"
 
 OGBENCH_ENV=${OGBENCH_ENV:-visual-pointmaze-arena-danger-lethal-v0}
 TOTAL_STEPS=${TOTAL_STEPS:-50000}
@@ -47,6 +51,7 @@ BASE_ARGS="--obs_mode pixels --pixel_width 84 --pixel_height 84 \
 --use_wandb --viz_on_checkpoint \
 --use_intervention --teacher_type ${TEACHER_TYPE} \
 --reward_type ${PVP_REWARD_TYPE} \
+--buffer_root ${BUFFER_ROOT} \
 --replay_buffer_num_workers 0 \
 --intervention_mode agent --tolerance_type angle --tolerance_value ${TOLERANCE}"
 

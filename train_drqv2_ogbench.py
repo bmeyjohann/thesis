@@ -1379,6 +1379,12 @@ def train():
     teacher_metrics = build_teacher_metrics(args, device)
     logger = DrQLogger(args=args, record_progress=run_paths.record_progress, teacher_metrics=teacher_metrics)
     checkpoint_mgr = DrQCheckpointManager(args=args, run_paths=run_paths, logger=logger)
+    if args.use_wandb:
+        try:
+            logger._ensure_wandb_run()
+            logger._log_to_wandb({"Run/startup": 1.0}, step=0)
+        except Exception as exc:  # pragma: no cover - wandb is best-effort
+            run_paths.record_progress(f"[WandB] init failed: {exc}")
 
     data_specs_list = [train_env.observation_spec()]
     if prev_action_dim > 0:
@@ -1404,6 +1410,28 @@ def train():
             raise ValueError("demo_buffer_enable is not supported with recurrent agent variant.")
         demo_dir = run_paths.log_dir / "buffer_demo"
         demo_storage = ReplayBufferStorage(data_specs, demo_dir)
+
+    if args.demo_prefill_steps > 0 or args.demo_prefill_episodes > 0:
+        if args.demo_prefill_target == "demo":
+            if demo_storage is None:
+                raise ValueError("demo_prefill_target=demo requires --demo_buffer_enable")
+            target_storage = demo_storage
+            target_label = "demo"
+        else:
+            target_storage = replay_storage
+            target_label = "replay"
+        prefill_replay_with_demos(
+            args=args,
+            agent=agent,
+            device=device,
+            target_storage=target_storage,
+            target_label=target_label,
+            record_progress=run_paths.record_progress,
+            action_dim=action_dim,
+            action_history_len=action_history_len,
+            goal_history_len=goal_history_len,
+            goal_vector_dim=goal_vector_dim,
+        )
     if is_recurrent_agent:
         replay_loader = make_sequence_replay_loader(
             replay_dir,
@@ -1459,28 +1487,6 @@ def train():
     replay_iter = None
     replay_iter_part = None
     demo_iter_part = None
-
-    if args.demo_prefill_steps > 0 or args.demo_prefill_episodes > 0:
-        if args.demo_prefill_target == "demo":
-            if demo_storage is None:
-                raise ValueError("demo_prefill_target=demo requires --demo_buffer_enable")
-            target_storage = demo_storage
-            target_label = "demo"
-        else:
-            target_storage = replay_storage
-            target_label = "replay"
-        prefill_replay_with_demos(
-            args=args,
-            agent=agent,
-            device=device,
-            target_storage=target_storage,
-            target_label=target_label,
-            record_progress=run_paths.record_progress,
-            action_dim=action_dim,
-            action_history_len=action_history_len,
-            goal_history_len=goal_history_len,
-            goal_vector_dim=goal_vector_dim,
-        )
 
     pref_storage = None
     pref_dataset = None

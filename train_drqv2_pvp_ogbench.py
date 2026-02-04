@@ -1143,6 +1143,12 @@ def train():
     teacher_metrics = build_teacher_metrics(args, device)
     logger = DrQLogger(args=args, record_progress=run_paths.record_progress, teacher_metrics=teacher_metrics)
     checkpoint_mgr = DrQCheckpointManager(args=args, run_paths=run_paths, logger=logger)
+    if args.use_wandb:
+        try:
+            logger._ensure_wandb_run()
+            logger._log_to_wandb({"Run/startup": 1.0}, step=0)
+        except Exception as exc:  # pragma: no cover - wandb is best-effort
+            run_paths.record_progress(f"[WandB] init failed: {exc}")
 
     data_specs_list = [train_env.observation_spec()]
     if prev_action_dim > 0:
@@ -1537,63 +1543,63 @@ def train():
             checkpoint_mgr.maybe_render_policy_map(checkpoint_path=ckpt, step_value=total_env_steps)
 
         pref_buffer_size = pref_storage.num_pairs() if pref_storage is not None else -1
-    perf_metrics = None
-    if perf_steps > 0 and perf_accum["loop_time"] > 0:
-        loop_avg = perf_accum["loop_time"] / perf_steps
-        env_avg = perf_accum["env_step"] / perf_steps
-        update_avg = perf_accum["update"] / max(1, perf_steps)
-        sample_avg = perf_accum["sample"] / max(1, perf_steps)
-        perf_metrics = {
-            "Perf/step_ms": loop_avg * 1000.0,
-            "Perf/env_step_ms": env_avg * 1000.0,
-            "Perf/update_ms": update_avg * 1000.0,
-            "Perf/sample_ms": sample_avg * 1000.0,
-            "Perf/env_step_pct": (perf_accum["env_step"] / perf_accum["loop_time"]) * 100.0,
-            "Perf/update_pct": (perf_accum["update"] / perf_accum["loop_time"]) * 100.0,
-            "Perf/sample_pct": (perf_accum["sample"] / perf_accum["loop_time"]) * 100.0,
-        }
-        replay_stats = collect_replay_stats([novice_loader_full, novice_loader_half, human_loader_half])
-        if replay_stats:
-            perf_metrics.update(replay_stats)
-        logged = logger.maybe_log(
-            total_env_steps=total_env_steps,
-            total_timesteps=args.total_timesteps,
-            rewbuffer=rewbuffer,
-            lenbuffer=lenbuffer,
-            update_metrics=metrics_accum,
-            update_count=metrics_updates,
-            perf_metrics=perf_metrics,
-            log_alpha=log_alpha,
-            last_denied_samples=last_denied_samples,
-            pref_buffer_size=pref_buffer_size,
-            goal_successes=goal_success_counter,
-            goal_distance_sum=goal_final_distance_sum,
-            goal_distance_count=goal_final_distance_count,
-        )
-        if logged:
-            if metrics_updates > 0:
-                metrics_accum = {}
-                metrics_updates = 0
-            perf_accum = {"loop_time": 0.0, "env_step": 0.0, "update": 0.0, "sample": 0.0}
-            perf_steps = 0
-            goal_success_counter = 0
-            goal_final_distance_sum = 0.0
-            goal_final_distance_count = 0
-
-        if args.eval_every_frames and total_env_steps % args.eval_every_frames == 0:
-            eval_metrics = run_eval_metrics(
-                eval_env,
-                agent,
-                args.num_eval_episodes,
-                device,
-                action_dim,
-                action_history_len,
-                goal_history_len,
-                use_local_actions=args.use_local_actions,
-                translation_scale=args.se2_translation_scale,
-                goal_scale=getattr(args, "goal_relative_scale", 10.0),
+        perf_metrics = None
+        if perf_steps > 0 and perf_accum["loop_time"] > 0:
+            loop_avg = perf_accum["loop_time"] / perf_steps
+            env_avg = perf_accum["env_step"] / perf_steps
+            update_avg = perf_accum["update"] / max(1, perf_steps)
+            sample_avg = perf_accum["sample"] / max(1, perf_steps)
+            perf_metrics = {
+                "Perf/step_ms": loop_avg * 1000.0,
+                "Perf/env_step_ms": env_avg * 1000.0,
+                "Perf/update_ms": update_avg * 1000.0,
+                "Perf/sample_ms": sample_avg * 1000.0,
+                "Perf/env_step_pct": (perf_accum["env_step"] / perf_accum["loop_time"]) * 100.0,
+                "Perf/update_pct": (perf_accum["update"] / perf_accum["loop_time"]) * 100.0,
+                "Perf/sample_pct": (perf_accum["sample"] / perf_accum["loop_time"]) * 100.0,
+            }
+            replay_stats = collect_replay_stats([novice_loader_full, novice_loader_half, human_loader_half])
+            if replay_stats:
+                perf_metrics.update(replay_stats)
+            logged = logger.maybe_log(
+                total_env_steps=total_env_steps,
+                total_timesteps=args.total_timesteps,
+                rewbuffer=rewbuffer,
+                lenbuffer=lenbuffer,
+                update_metrics=metrics_accum,
+                update_count=metrics_updates,
+                perf_metrics=perf_metrics,
+                log_alpha=log_alpha,
+                last_denied_samples=last_denied_samples,
+                pref_buffer_size=pref_buffer_size,
+                goal_successes=goal_success_counter,
+                goal_distance_sum=goal_final_distance_sum,
+                goal_distance_count=goal_final_distance_count,
             )
-            logger.log_eval(total_env_steps=total_env_steps, metrics=eval_metrics)
+            if logged:
+                if metrics_updates > 0:
+                    metrics_accum = {}
+                    metrics_updates = 0
+                perf_accum = {"loop_time": 0.0, "env_step": 0.0, "update": 0.0, "sample": 0.0}
+                perf_steps = 0
+                goal_success_counter = 0
+                goal_final_distance_sum = 0.0
+                goal_final_distance_count = 0
+
+            if args.eval_every_frames and total_env_steps % args.eval_every_frames == 0:
+                eval_metrics = run_eval_metrics(
+                    eval_env,
+                    agent,
+                    args.num_eval_episodes,
+                    device,
+                    action_dim,
+                    action_history_len,
+                    goal_history_len,
+                    use_local_actions=args.use_local_actions,
+                    translation_scale=args.se2_translation_scale,
+                    goal_scale=getattr(args, "goal_relative_scale", 10.0),
+                )
+                logger.log_eval(total_env_steps=total_env_steps, metrics=eval_metrics)
 
     final_ckpt = checkpoint_mgr.save(
         tag="final",

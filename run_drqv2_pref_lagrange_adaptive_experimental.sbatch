@@ -1,13 +1,13 @@
 #!/bin/bash
-#SBATCH --job-name=drqv2_pref_lagrange_adapt
+#SBATCH --job-name=drqv2_pref_lagrange_adapt_exp
 #SBATCH --account=<your_account>
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:4
 #SBATCH --time=06:00:00
 #SBATCH --partition=booster
-#SBATCH --output=logs/drqv2_pref_lagrange_adapt_%j.out
-#SBATCH --error=logs/drqv2_pref_lagrange_adapt_%j.err
+#SBATCH --output=logs/drqv2_pref_lagrange_adapt_exp_%j.out
+#SBATCH --error=logs/drqv2_pref_lagrange_adapt_exp_%j.err
 
 set -euo pipefail
 mkdir -p logs models
@@ -20,13 +20,16 @@ export MPLCONFIGDIR=${MPLCONFIGDIR:-/tmp/matplotlib-${SLURM_JOB_ID}}
 mkdir -p "${MPLCONFIGDIR}"
 export WANDB_DIR=${WANDB_DIR:-$PWD/wandb}
 mkdir -p "${WANDB_DIR}"
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
+export MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
 
 ENV_ID=${ENV_ID:-pointmaze-arena-danger-wall-v0}
 TOTAL_STEPS=${TOTAL_STEPS:-1500000}
 SAVE_INTERVAL=${SAVE_INTERVAL:-200000}
-LOG_INTERVAL=${LOG_INTERVAL:-20000}
+LOG_INTERVAL=${LOG_INTERVAL:-1000}
 PREF_MARGIN=${PREF_MARGIN:-0.1}
 PREF_WEIGHT=${PREF_WEIGHT:-1.0}
+REPLAY_WORKERS=${REPLAY_WORKERS:-0}
 
 LAMBDA_INIT=${LAMBDA_INIT:-0.0}
 LAMBDA_LR=${LAMBDA_LR:-1e-3}
@@ -41,6 +44,7 @@ BASE_ARGS="--env_name ${ENV_ID} --total_timesteps ${TOTAL_STEPS} --include_goal 
 --pref_sample_ratio 0.3 --pref_rank_margin ${PREF_MARGIN} --pref_rank_weight ${PREF_WEIGHT} \
 --use_intervention --intervention_mode agent --teacher_type bfs \
 --pixel_width 84 --pixel_height 84 --frame_stack 3 --action_repeat 2 \
+--replay_buffer_num_workers ${REPLAY_WORKERS} \
 --disagreement_hist_edges 0.02,0.05,0.1,0.2,0.3,0.5,0.75,1.0,1.5,2.0 \
 --eval_every_frames 200000 --num_eval_episodes 3 --viz_on_checkpoint --viz_grid_resolution 64 \
 --viz_quiver_stride 2 --viz_device cpu --viz_seed 0"
