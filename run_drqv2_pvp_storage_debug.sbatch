@@ -19,7 +19,9 @@ cd ..
 
 export MPLCONFIGDIR="${TMPDIR:-/tmp}/mplcache_${SLURM_JOB_ID}"
 mkdir -p "${MPLCONFIGDIR}"
-export WANDB_DIR=${WANDB_DIR:-$PWD/wandb}
+export XDG_CACHE_HOME=${XDG_CACHE_HOME:-${SLURM_TMPDIR:-/tmp}/xdg_cache_${SLURM_JOB_ID}}
+mkdir -p "${XDG_CACHE_HOME}"
+export WANDB_DIR=${WANDB_DIR:-${SLURM_TMPDIR:-/tmp}/wandb_${SLURM_JOB_ID}}
 mkdir -p "${WANDB_DIR}"
 BUFFER_ROOT=${BUFFER_ROOT:-${CSCRATCH:-${SCRATCH:-/tmp}}/drqv2_buffers_${SLURM_JOB_ID}}
 mkdir -p "${BUFFER_ROOT}"

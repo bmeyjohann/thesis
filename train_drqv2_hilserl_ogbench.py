@@ -251,6 +251,12 @@ class ActionFrameTransformer:
 def parse_args():
     parser = build_arg_parser()
     args = parser.parse_args()
+    if args.nstep != 1:
+        print(
+            "[Warn] nstep>1 is not supported in current buffer setups. "
+            "Forcing --nstep 1 to avoid invalid multi-step samples."
+        )
+        args.nstep = 1
     if args.smoke_test_steps and args.smoke_test_steps > 0:
         args.total_timesteps = args.smoke_test_steps
         args.eval_every_frames = max(1, args.smoke_test_steps // 2)
@@ -311,6 +317,7 @@ class OGBenchPixelsEnv(dm_env.Environment):
             pixel_first_person_height=pixel_first_person_height,
             pixel_first_person_lookahead=pixel_first_person_lookahead,
             pixel_first_person_pitch=pixel_first_person_pitch,
+            disable_env_checker=True,
         )
         try:
             base_env = gym.make(env_name, **env_kwargs)
@@ -324,6 +331,7 @@ class OGBenchPixelsEnv(dm_env.Environment):
                 'pixel_first_person_height',
                 'pixel_first_person_lookahead',
                 'pixel_first_person_pitch',
+                'disable_env_checker',
             ]
             if any(key in str(exc) for key in drop_keys):
                 for key in drop_keys:
@@ -1538,7 +1546,7 @@ def train():
 
         if teacher_intervened:
             last_denied_samples = 1
-        episode_reward += float(reward_arr)
+        episode_reward += float(np.asarray(reward_arr).reshape(-1)[0])
         episode_length += 1
         total_env_steps += 1
         time_step = next_time_step

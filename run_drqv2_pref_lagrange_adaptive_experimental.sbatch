@@ -18,7 +18,9 @@ cd ..
 
 export MPLCONFIGDIR=${MPLCONFIGDIR:-/tmp/matplotlib-${SLURM_JOB_ID}}
 mkdir -p "${MPLCONFIGDIR}"
-export WANDB_DIR=${WANDB_DIR:-$PWD/wandb}
+export XDG_CACHE_HOME=${XDG_CACHE_HOME:-${SLURM_TMPDIR:-/tmp}/xdg_cache_${SLURM_JOB_ID}}
+mkdir -p "${XDG_CACHE_HOME}"
+export WANDB_DIR=${WANDB_DIR:-${SLURM_TMPDIR:-/tmp}/wandb_${SLURM_JOB_ID}}
 mkdir -p "${WANDB_DIR}"
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
 export MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
