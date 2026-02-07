@@ -1,13 +1,13 @@
 #!/bin/bash
-#SBATCH --job-name=drqv2_hilserl_vs_own
+#SBATCH --job-name=drqv2_cube_double_hilserl_vs_own
 #SBATCH --account=<your_account>
 #SBATCH --nodes=1
 #SBATCH --ntasks=4
 #SBATCH --gres=gpu:4
 #SBATCH --time=06:00:00
 #SBATCH --partition=booster
-#SBATCH --output=logs/drqv2_hilserl_vs_own_%j.out
-#SBATCH --error=logs/drqv2_hilserl_vs_own_%j.err
+#SBATCH --output=logs/drqv2_cube_double_hilserl_vs_own_%j.out
+#SBATCH --error=logs/drqv2_cube_double_hilserl_vs_own_%j.err
 
 set -euo pipefail
 
@@ -21,27 +21,25 @@ export MPLCONFIGDIR="${TMPDIR:-/tmp}/mplcache_${SLURM_JOB_ID}"
 mkdir -p "${MPLCONFIGDIR}"
 export XDG_CACHE_HOME=${XDG_CACHE_HOME:-${SLURM_TMPDIR:-/tmp}/xdg_cache_${SLURM_JOB_ID}}
 mkdir -p "${XDG_CACHE_HOME}"
-export WANDB_DIR=${WANDB_DIR:-${SLURM_TMPDIR:-/tmp}/wandb_${SLURM_JOB_ID}}
+export WANDB_DIR=${WANDB_DIR:-$PWD/wandb}
 mkdir -p "${WANDB_DIR}"
 
-OGBENCH_ENV=${OGBENCH_ENV:-visual-pointmaze-arena-danger-lethal-v0}
+OGBENCH_ENV=${OGBENCH_ENV:-visual-cube-double-v0}
 TOTAL_STEPS=${TOTAL_STEPS:-1200000}
 LEARNING_RATE=${LEARNING_RATE:-1e-4}
 NUM_EXPL_STEPS=${NUM_EXPL_STEPS:-20000}
 SAVE_INTERVAL=${SAVE_INTERVAL:-200000}
 EVAL_EVERY=${EVAL_EVERY:-50000}
-PROJECT=${PROJECT:-ogbench_hilserl_vs_own}
+PROJECT=${PROJECT:-ogbench_cube_double_hilserl_vs_own}
 FRAME_STACK=${FRAME_STACK:-3}
-ACTION_REPEAT=${ACTION_REPEAT:-2}
+ACTION_REPEAT=${ACTION_REPEAT:-1}
 FEATURE_DIM=${FEATURE_DIM:-50}
 HIDDEN_DIM=${HIDDEN_DIM:-1024}
-TOLERANCE=${TOLERANCE:-30}
-TEACHER_TYPE=${TEACHER_TYPE:-bfs}
-INTERVENTION_MODE=${INTERVENTION_MODE:-agent_safety_align}
-INTERVENTION_MARGIN=${INTERVENTION_MARGIN:-0.25}
-INTERVENTION_RELEASE=${INTERVENTION_RELEASE:-3}
+TOLERANCE_TYPE=${TOLERANCE_TYPE:-l2}
+TOLERANCE=${TOLERANCE:-0.3}
+TEACHER_TYPE=${TEACHER_TYPE:-cube_plan}
+INTERVENTION_MODE=${INTERVENTION_MODE:-agent}
 DEMO_PREFILL_EPISODES=${DEMO_PREFILL_EPISODES:-20}
-REWARD_MODE=${REWARD_MODE:-sparse}
 
 BASE_ARGS="--obs_mode pixels --pixel_width 84 --pixel_height 84 \
 --total_timesteps ${TOTAL_STEPS} --learning_rate ${LEARNING_RATE} \
@@ -52,10 +50,7 @@ BASE_ARGS="--obs_mode pixels --pixel_width 84 --pixel_height 84 \
 --nstep 1 \
 --use_wandb --viz_on_checkpoint \
 --use_intervention --intervention_mode ${INTERVENTION_MODE} --teacher_type ${TEACHER_TYPE} \
---tolerance_type angle --tolerance_value ${TOLERANCE} \
---intervention_safety_margin_frac ${INTERVENTION_MARGIN} \
---intervention_release_steps ${INTERVENTION_RELEASE} \
---reward_type ${REWARD_MODE}"
+--tolerance_type ${TOLERANCE_TYPE} --tolerance_value ${TOLERANCE}"
 
 OWN_PREF_ARGS="--pref_buffer_enable --pref_capacity 200000 --pref_chunk_size 128 \
 --pref_sample_ratio 0.3 --pref_rank_margin 0.1 --pref_rank_weight 1.0 \
@@ -90,7 +85,7 @@ launch_own () {
   PIDS+=($!)
 }
 
-echo "Launching HIL-SERL vs own variants (sparse reward)"
+echo "Launching cube-double HIL-SERL vs own variants"
 
 PIDS=()
 launch_hilserl 0 "demo50_prefill20" \
@@ -111,8 +106,8 @@ for PID in "${PIDS[@]}"; do
 done
 
 if [ "${FAIL}" -ne 0 ]; then
-  echo "One or more HIL-SERL vs own runs failed."
+  echo "One or more cube-double HIL-SERL vs own runs failed."
   exit 1
 fi
 
-echo "HIL-SERL vs own comparison completed successfully."
+echo "Cube-double HIL-SERL vs own comparison completed successfully."

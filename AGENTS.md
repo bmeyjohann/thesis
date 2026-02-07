@@ -1,5 +1,13 @@
 # Repository Guidelines
 
+## General Guidelines
+
+- Whenever I need to tell you to do something in a different way, append concise info on what you made wrong and how to do it correctly to AGENT.md
+- Save other relevant info that should be preserved in codex/[appropriate_nameing_for_info].md
+- Always ask me if I want that info saved in a file.
+- Correction noted: for cube state-observation variants, use FastSAC (`train_fast_sac_ogbench.py`) rather than DrQ-v2 scripts.
+- Correction noted: for intervention behavior, do not use intervention-probability decay scheduling; keep interventions deterministic by teacher-student deviation/tolerance rules.
+
 ## Project Structure & Module Organization
 - `train_*.py`: Entry points for training (RSL‑RL, PointMaze variants).
 - `eval_interactive.py`: Load a trained model and render episodes.
@@ -12,21 +20,18 @@
 ## Build, Test, and Development Commands
 - To run/test anything locally, ALWAYS activate the local virtual env first: `conda activate fasttd3`
 - See `README.md`
-- Starting jobs on the cluster with automatic account detection works like this but is reserved for the human just use it to create appropriate sbatch files: `bash submit_job.sh [experiment_name].sbatch`
-- Logs: tail `logs/<name>_<JOBID>.log` and `logs/rsl_rl/<experiment>/` for artifacts.
+- Starting jobs on the cluster with automatic account detection works like this but is reserved for the human Use this info to create appropriate sbatch files and submit them: `bash submit_job.sh [experiment_name].sbatch`
+- Logs: tail `logs/<name>_<JOBID>.log` for artifacts.
 - If possible, ALWAYS run local smoke tests before telling me something is working and done.
 
 ## Coding Style & Naming Conventions
 - Python: PEP 8, 4 spaces, max line length 120.
-- Format/lint: use pre-commit in submodules
-  - `cd rsl_rl && pre-commit run -a` (Black, isort, Flake8); same idea for `fasttd3`.
 - Names: modules/functions `snake_case`, classes `CamelCase`, constants `UPPER_SNAKE_CASE`.
 - Scripts: executable with shebang; keep flags explicit and self-documenting.
 
 ## Testing Guidelines
 - Framework: no unit test suite at root; add minimal smoke tests when changing training/eval.
-- Quick check: run a short job `--total_timesteps 20000 --num_envs 8` and verify logs and model save.
-- Consistency: ensure `eval_interactive.py` loads the produced checkpoint without edits.
+- Quick check: run a short job and verify logs and model saved.
 
 ## Commit & Pull Request Guidelines
 - Commits: imperative, concise, scoped (e.g., “Adjust SLURM script for booster queue”).
@@ -35,6 +40,6 @@
 - Link related issues; note breaking changes and migration steps.
 
 ## Security & Configuration Tips
-- WANDB runs offline by default; set `WANDB_MODE=run` to sync online.
+- WANDB runs offline by default as compute node on cluster does not have internet access; set `WANDB_MODE=run` to sync online.
 - SLURM account replacement uses `.slurm_account`; review before submitting.
 - Keep large artifacts out of Git; rely on `logs/`, `models/`, and external storage.

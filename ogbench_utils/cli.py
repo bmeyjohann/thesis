@@ -30,7 +30,7 @@ def build_train_parser() -> argparse.ArgumentParser:
     p.add_argument('--use_intervention', action='store_true', default=False)
     p.add_argument('--intervention_mode', type=str, default='agent',
                    choices=['human', 'agent', 'agent_safety_align', 'agent_safety_progress'])
-    p.add_argument('--teacher_type', type=str, default='bfs', choices=['bfs'])
+    p.add_argument('--teacher_type', type=str, default='bfs', choices=['bfs', 'cube_plan', 'cube_markov'])
     p.add_argument('--tolerance_type', type=str, default='angle', choices=['angle','l2'])
     p.add_argument('--tolerance_value', type=float, default=30.0)
     p.add_argument('--hard_block_lethal', action='store_true', default=True)
@@ -354,7 +354,7 @@ def build_eval_parser() -> argparse.ArgumentParser:
     parser.add_argument('--intervention_mode', type=str, default='none',
                         choices=['none', 'human', 'agent', 'agent_safety_align', 'agent_safety_progress'],
                         help='Intervention mode: none, human teleop, or agent teacher')
-    parser.add_argument('--teacher_type', type=str, default='bfs', choices=['bfs'],
+    parser.add_argument('--teacher_type', type=str, default='bfs', choices=['bfs', 'cube_plan', 'cube_markov'],
                         help='Teacher type when intervention_mode=agent')
     parser.add_argument('--tolerance_type', type=str, default='angle', choices=['angle', 'l2'],
                         help='Intervention tolerance metric (agent mode)')

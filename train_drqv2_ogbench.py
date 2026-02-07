@@ -180,6 +180,11 @@ def clip_action_l2(actions: np.ndarray, max_norm: float = 1.0) -> np.ndarray:
     return result
 
 
+def is_manip_env(env_name: str) -> bool:
+    lowered = env_name.lower()
+    return any(tag in lowered for tag in ("cube", "scene", "puzzle"))
+
+
 def split_action_components(action: np.ndarray, decouple_view: bool) -> tuple[np.ndarray, float]:
     vec = np.asarray(action, dtype=np.float32)
     if not decouple_view:
@@ -655,6 +660,7 @@ class DrQLogger:
         self.last_log_time = self.start_time
         self.wandb_run = None
         self._env_metric_accum: Dict[str, Dict[str, float]] = {}
+        self._env_metric_bounds: Dict[str, Dict[str, float]] = {}
 
     def maybe_log(
         self,
@@ -723,12 +729,6 @@ class DrQLogger:
             logs["/Critic/mean_q_min_intervened"] = teacher_snapshot.qmin_teacher
         if teacher_snapshot.qmin_non is not None:
             logs["/Critic/mean_q_min_no_intervention"] = teacher_snapshot.qmin_non
-        for label, value in teacher_snapshot.hist_teacher.items():
-            logs[f"/Teacher/disagreement_hist_teacher_{label}"] = value
-        for label, value in teacher_snapshot.hist_non_teacher.items():
-            logs[f"/Teacher/disagreement_hist_non_teacher_{label}"] = value
-        for thr, pct in teacher_snapshot.threshold_percentages.items():
-            logs[f"/Teacher/frac_interventions_dis_ge_{thr}"] = pct
 
         self._flush_env_metrics(logs)
 
@@ -740,6 +740,8 @@ class DrQLogger:
             msg_parts.append(f"rew {logs['Train/episode_reward_mean']:.2f}")
         if "Train/episode_length_mean" in logs:
             msg_parts.append(f"len {logs['Train/episode_length_mean']:.1f}")
+        if "/Wrapper/teacher_fraction_steps" in logs:
+            msg_parts.append(f"teacher_frac {logs['/Wrapper/teacher_fraction_steps']:.2f}")
         self.record_progress("[DrQ] " + " | ".join(msg_parts))
 
         self._log_to_wandb(logs, step=total_env_steps)
@@ -772,35 +774,51 @@ class DrQLogger:
         )
 
     def accumulate_env_metrics(self, infos) -> None:
-        log_dict = None
-        if isinstance(infos, dict):
-            candidate = infos.get("log")
-            if isinstance(candidate, dict):
-                log_dict = candidate
-            else:
-                teacher_keys = (
-                    "teacher_fraction_steps",
-                    "teacher_avg_burst_len",
-                    "teacher_num_interventions",
-                    "teacher_intervention_steps",
-                    "teacher_num_safety_interventions",
-                    "teacher_num_divergence_interventions",
-                )
-                if any(key in infos for key in teacher_keys):
-                    log_dict = {key: infos[key] for key in teacher_keys if key in infos}
-        if not isinstance(log_dict, dict) or not log_dict:
-            return
-        for key, value in log_dict.items():
+        def _accumulate_metric(metric_key: str, value: Any) -> None:
             try:
                 tensor = value
                 if hasattr(tensor, "float"):
                     tensor = tensor.float()
                 metric_value = float(torch.as_tensor(tensor).mean().item())
             except Exception:
-                continue
-            slot = self._env_metric_accum.setdefault(key, {"sum": 0.0, "count": 0})
+                return
+            slot = self._env_metric_accum.setdefault(metric_key, {"sum": 0.0, "count": 0})
             slot["sum"] += metric_value
             slot["count"] += 1
+            bounds = self._env_metric_bounds.setdefault(metric_key, {"min": metric_value, "max": metric_value})
+            bounds["min"] = min(bounds["min"], metric_value)
+            bounds["max"] = max(bounds["max"], metric_value)
+
+        log_dict = None
+        if isinstance(infos, dict):
+            candidate = infos.get("log")
+            if isinstance(candidate, dict):
+                log_dict = candidate
+            else:
+                log_dict = None
+        if isinstance(log_dict, dict) and log_dict:
+            for key, value in log_dict.items():
+                _accumulate_metric(key, value)
+
+        if isinstance(infos, dict):
+            for key, value in infos.items():
+                if not isinstance(key, str):
+                    continue
+                if key.startswith("teacher_") or key in {"terminated", "truncated"}:
+                    _accumulate_metric(f"/Wrapper/{key}", value)
+            if "proprio/gripper_opening" in infos:
+                opening = infos["proprio/gripper_opening"]
+                _accumulate_metric("/Wrapper/gripper_opening", opening)
+            if "proprio/gripper_contact" in infos:
+                contact = infos["proprio/gripper_contact"]
+                _accumulate_metric("/Wrapper/gripper_contact", contact)
+                try:
+                    closed = (np.asarray(contact, dtype=np.float32) > 0.5).astype(np.float32)
+                    _accumulate_metric("/Wrapper/gripper_closed", closed)
+                except Exception:
+                    pass
+            if "proprio/effector_yaw" in infos:
+                _accumulate_metric("/Wrapper/gripper_yaw_rad", infos["proprio/effector_yaw"])
 
     def _flush_env_metrics(self, logs: Dict[str, float]) -> None:
         if not self._env_metric_accum:
@@ -808,7 +826,12 @@ class DrQLogger:
         for key, data in self._env_metric_accum.items():
             if data["count"] > 0:
                 logs[key] = data["sum"] / data["count"]
+                bounds = self._env_metric_bounds.get(key)
+                if bounds is not None:
+                    logs[f"{key}_min"] = bounds["min"]
+                    logs[f"{key}_max"] = bounds["max"]
         self._env_metric_accum.clear()
+        self._env_metric_bounds.clear()
 
     def _ensure_wandb_run(self):
         if not self.args.use_wandb:
@@ -1038,6 +1061,7 @@ def prefill_replay_with_demos(
 
     total_steps = 0
     total_episodes = 0
+    manip_env = is_manip_env(args.env_name)
     action_history = init_action_history(action_dim, action_history_len)
     action_transformer = ActionFrameTransformer(
         use_local=args.use_local_actions,
@@ -1096,17 +1120,21 @@ def prefill_replay_with_demos(
                     prev_actions=prev_action_stack,
                     goal_history=goal_history_stack,
                 )
-            move_local, view_delta = split_action_components(
-                policy_action_local, bool(getattr(args, "decouple_view", False))
-            )
-            move_local = clip_action_l2(move_local)
-            if getattr(args, "decouple_view", False):
-                policy_action_global = np.concatenate(
-                    [action_transformer.to_global(move_local), np.array([view_delta], dtype=np.float32)], axis=0
-                )
+            if manip_env:
+                policy_action_global = np.clip(np.asarray(policy_action_local, dtype=np.float32), -1.0, 1.0)
+                view_delta = 0.0
             else:
-                policy_action_global = action_transformer.to_global(move_local)
-            policy_action_global = clip_action_l2(policy_action_global)
+                move_local, view_delta = split_action_components(
+                    policy_action_local, bool(getattr(args, "decouple_view", False))
+                )
+                move_local = clip_action_l2(move_local)
+                if getattr(args, "decouple_view", False):
+                    policy_action_global = np.concatenate(
+                        [action_transformer.to_global(move_local), np.array([view_delta], dtype=np.float32)], axis=0
+                    )
+                else:
+                    policy_action_global = action_transformer.to_global(move_local)
+                policy_action_global = clip_action_l2(policy_action_global)
 
             next_time_step = demo_env.step(policy_action_global)
             info = getattr(demo_env, "last_info", lambda: {})() or {}
@@ -1116,13 +1144,16 @@ def prefill_replay_with_demos(
                 applied_action_global = np.asarray(teacher_action_global, dtype=np.float32)
             else:
                 applied_action_global = np.asarray(info.get("student_action", policy_action_global), dtype=np.float32)
-            applied_move_local = action_transformer.to_local(applied_action_global).astype(np.float32, copy=False)
-            if getattr(args, "decouple_view", False):
-                applied_action_local = np.concatenate(
-                    [applied_move_local, np.array([view_delta], dtype=np.float32)], axis=0
-                )
+            if manip_env:
+                applied_action_local = applied_action_global.astype(np.float32, copy=False)
             else:
-                applied_action_local = applied_move_local
+                applied_move_local = action_transformer.to_local(applied_action_global).astype(np.float32, copy=False)
+                if getattr(args, "decouple_view", False):
+                    applied_action_local = np.concatenate(
+                        [applied_move_local, np.array([view_delta], dtype=np.float32)], axis=0
+                    )
+                else:
+                    applied_action_local = applied_move_local
 
             action_history.append(applied_action_local.copy())
             next_prev_stack = flatten_action_history(action_history)
@@ -1160,7 +1191,8 @@ def run_eval_metrics(env,
                      use_local_actions: bool,
                      translation_scale: float,
                      goal_scale: float,
-                     is_recurrent: bool) -> Dict[str, float]:
+                     is_recurrent: bool,
+                     manip_env: bool) -> Dict[str, float]:
     total_reward = 0.0
     total_length = 0
     success_count = 0
@@ -1199,24 +1231,28 @@ def run_eval_metrics(env,
                                          eval_mode=True,
                                          prev_actions=prev_stack,
                                          goal_history=goal_stack)
-            move_local, view_delta = split_action_components(
-                action_local, bool(getattr(env, "action_spec", lambda: None)() and env.action_spec().shape[0] == 3)
-            )
-            move_local = clip_action_l2(move_local)
-            action_local_full = (
-                np.concatenate([move_local, np.array([view_delta], dtype=np.float32)], axis=0)
-                if getattr(env, "action_spec", lambda: None)() and env.action_spec().shape[0] == 3
-                else move_local
-            )
-            warp_params = action_transformer.compute_warp_from_action(move_local)
-            if is_recurrent and getattr(agent, 'use_se2_warp', False):
-                agent.register_pending_warp(warp_params)  # type: ignore[attr-defined]
-            move_global = action_transformer.to_global(move_local)
-            move_global = clip_action_l2(move_global)
-            if action_local_full.shape[0] == 3:
-                action_global = np.concatenate([move_global, np.array([view_delta], dtype=np.float32)], axis=0)
+            if manip_env:
+                action_global = np.clip(np.asarray(action_local, dtype=np.float32), -1.0, 1.0)
+                action_local_full = action_global
             else:
-                action_global = move_global
+                move_local, view_delta = split_action_components(
+                    action_local, bool(getattr(env, "action_spec", lambda: None)() and env.action_spec().shape[0] == 3)
+                )
+                move_local = clip_action_l2(move_local)
+                action_local_full = (
+                    np.concatenate([move_local, np.array([view_delta], dtype=np.float32)], axis=0)
+                    if getattr(env, "action_spec", lambda: None)() and env.action_spec().shape[0] == 3
+                    else move_local
+                )
+                warp_params = action_transformer.compute_warp_from_action(move_local)
+                if is_recurrent and getattr(agent, 'use_se2_warp', False):
+                    agent.register_pending_warp(warp_params)  # type: ignore[attr-defined]
+                move_global = action_transformer.to_global(move_local)
+                move_global = clip_action_l2(move_global)
+                if action_local_full.shape[0] == 3:
+                    action_global = np.concatenate([move_global, np.array([view_delta], dtype=np.float32)], axis=0)
+                else:
+                    action_global = move_global
             time_step = env.step(action_global)
             action_history.append(np.asarray(action_local_full, dtype=np.float32).copy())
             prev_stack = flatten_action_history(action_history)
@@ -1326,6 +1362,7 @@ def train():
     goal_history_len = action_history_len if getattr(args, "goal_relative_history", False) else 0
     goal_vector_dim = 2
     goal_history_dim = goal_vector_dim * goal_history_len
+    manip_env = is_manip_env(args.env_name)
     is_recurrent_agent = args.agent_variant == "recurrent"
     if is_recurrent_agent:
         agent = DrQV2RecurrentAgent(
@@ -1613,26 +1650,32 @@ def train():
                 prev_actions=prev_action_stack,
                 goal_history=goal_history_stack,
             )
-        move_local, view_delta = split_action_components(
-            policy_action_local, bool(getattr(args, "decouple_view", False))
-        )
-        move_local = clip_action_l2(move_local)
-        policy_action_local_full = (
-            np.concatenate([move_local, np.array([view_delta], dtype=np.float32)], axis=0)
-            if getattr(args, "decouple_view", False)
-            else move_local
-        )
-        warp_params_local = action_transformer.compute_warp_from_action(move_local)
-        if is_recurrent_agent and getattr(agent, 'use_se2_warp', False):
-            agent.register_pending_warp(warp_params_local)
-        move_global = action_transformer.to_global(move_local)
-        move_global = clip_action_l2(move_global)
-        if getattr(args, "decouple_view", False):
-            policy_action_global = np.concatenate(
-                [move_global, np.array([view_delta], dtype=np.float32)], axis=0
-            )
+        if manip_env:
+            policy_action_global = np.clip(np.asarray(policy_action_local, dtype=np.float32), -1.0, 1.0)
+            policy_action_local_full = policy_action_global.copy()
+            move_global = policy_action_global
+            view_delta = 0.0
         else:
-            policy_action_global = move_global
+            move_local, view_delta = split_action_components(
+                policy_action_local, bool(getattr(args, "decouple_view", False))
+            )
+            move_local = clip_action_l2(move_local)
+            policy_action_local_full = (
+                np.concatenate([move_local, np.array([view_delta], dtype=np.float32)], axis=0)
+                if getattr(args, "decouple_view", False)
+                else move_local
+            )
+            warp_params_local = action_transformer.compute_warp_from_action(move_local)
+            if is_recurrent_agent and getattr(agent, 'use_se2_warp', False):
+                agent.register_pending_warp(warp_params_local)
+            move_global = action_transformer.to_global(move_local)
+            move_global = clip_action_l2(move_global)
+            if getattr(args, "decouple_view", False):
+                policy_action_global = np.concatenate(
+                    [move_global, np.array([view_delta], dtype=np.float32)], axis=0
+                )
+            else:
+                policy_action_global = move_global
         env_step_start = time.perf_counter()
         next_time_step = train_env.step(policy_action_global)
         env_step_end = time.perf_counter()
@@ -1645,26 +1688,32 @@ def train():
         teacher_action_global = info.get("teacher_action")
         teacher_action_local = None
         if teacher_action_global is not None:
-            teacher_action_local = action_transformer.to_local(
-                np.asarray(teacher_action_global, dtype=np.float32)
-            ).astype(np.float32, copy=False)
+            if manip_env:
+                teacher_action_local = np.asarray(teacher_action_global, dtype=np.float32)
+            else:
+                teacher_action_local = action_transformer.to_local(
+                    np.asarray(teacher_action_global, dtype=np.float32)
+                ).astype(np.float32, copy=False)
         student_action_global = info.get("student_action", move_global)
         student_action_local = policy_action_local_full.copy()
         if teacher_intervened and teacher_action_global is not None:
             applied_action_global = np.asarray(teacher_action_global, dtype=np.float32)
         else:
             applied_action_global = np.asarray(student_action_global, dtype=np.float32)
-        applied_move_local = action_transformer.to_local(applied_action_global).astype(np.float32, copy=False)
-        if getattr(args, "decouple_view", False):
-            applied_action_local = np.concatenate(
-                [applied_move_local, np.array([view_delta], dtype=np.float32)], axis=0
-            )
-            if teacher_action_local is not None:
-                teacher_action_local = np.concatenate(
-                    [teacher_action_local, np.array([view_delta], dtype=np.float32)], axis=0
-                )
+        if manip_env:
+            applied_action_local = applied_action_global.astype(np.float32, copy=False)
         else:
-            applied_action_local = applied_move_local
+            applied_move_local = action_transformer.to_local(applied_action_global).astype(np.float32, copy=False)
+            if getattr(args, "decouple_view", False):
+                applied_action_local = np.concatenate(
+                    [applied_move_local, np.array([view_delta], dtype=np.float32)], axis=0
+                )
+                if teacher_action_local is not None:
+                    teacher_action_local = np.concatenate(
+                        [teacher_action_local, np.array([view_delta], dtype=np.float32)], axis=0
+                    )
+            else:
+                applied_action_local = applied_move_local
         action_for_logging = applied_action_local.copy()
         action_history.append(applied_action_local.copy())
         next_prev_stack = flatten_action_history(action_history)
@@ -1890,6 +1939,7 @@ def train():
                 translation_scale=args.se2_translation_scale,
                 goal_scale=getattr(args, "goal_relative_scale", 10.0),
                 is_recurrent=is_recurrent_agent,
+                manip_env=manip_env,
             )
             logger.log_eval(total_env_steps=total_env_steps, metrics=eval_metrics)
 
