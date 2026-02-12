@@ -1,15 +1,107 @@
 from __future__ import annotations
 
+import gymnasium as gym
+import numpy as np
 from typing import Callable, Optional
 
 from ogbench.wrappers import FlexibleObsWrapper, DetailedRewardWrapper, InterventionWrapper
-import numpy as np
 
 _GOAL_COLOR_MAP = {
     "red": (0.85, 0.2, 0.2, 1.0),
     "green": (0.1, 0.8, 0.2, 1.0),
     "blue": (0.2, 0.5, 1.0, 1.0),
 }
+
+
+def _yaw_from_quat_wxyz(quat_wxyz: np.ndarray) -> float:
+    w, x, y, z = [float(v) for v in quat_wxyz]
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    return float(np.arctan2(siny_cosp, cosy_cosp))
+
+
+class CubeTeacherInfoAdapter(gym.Wrapper):
+    """
+    Ensure cube teacher oracles get target-block info in task-mode environments.
+
+    In cube task mode, info often omits privileged target-block fields that cube oracles expect.
+    This adapter reconstructs them and can select a dynamic target block sequentially.
+    """
+
+    def __init__(self, env: gym.Env, *, target_mode: str = "sequential", success_tolerance: float = 0.04):
+        super().__init__(env)
+        if target_mode not in {"fixed", "sequential"}:
+            raise ValueError(f"Unknown target_mode={target_mode}")
+        self.target_mode = target_mode
+        self.success_tolerance = float(success_tolerance)
+
+    def _cube_target_errors(self, out: dict, unwrapped) -> np.ndarray:
+        num_cubes = int(getattr(unwrapped, "_num_cubes", 0))
+        if num_cubes <= 0:
+            return np.zeros(0, dtype=np.float32)
+        errs: list[float] = []
+        for i in range(num_cubes):
+            try:
+                obj = np.asarray(out[f"privileged/block_{i}_pos"], dtype=np.float32)
+            except Exception:
+                try:
+                    obj = np.asarray(unwrapped._data.joint(f"object_joint_{i}").qpos[:3], dtype=np.float32)
+                except Exception:
+                    obj = np.zeros(3, dtype=np.float32)
+            try:
+                mocap_id = int(unwrapped._cube_target_mocap_ids[i])
+                tar = np.asarray(unwrapped._data.mocap_pos[mocap_id], dtype=np.float32)
+            except Exception:
+                tar = obj
+            errs.append(float(np.linalg.norm(obj - tar)))
+        return np.asarray(errs, dtype=np.float32)
+
+    def _select_target_block(self, unwrapped, errs: np.ndarray) -> int:
+        base_target = int(getattr(unwrapped, "_target_block", 0))
+        if self.target_mode != "sequential" or errs.size == 0:
+            return base_target
+        unresolved = np.where(errs > self.success_tolerance)[0]
+        if unresolved.size == 0:
+            return base_target
+        return int(unresolved[0])
+
+    def _augment_info(self, info):
+        if not isinstance(info, dict):
+            return info
+        out = dict(info)
+        unwrapped = self.unwrapped
+        errs = self._cube_target_errors(out, unwrapped)
+        out["diag/cube_target_errors"] = errs
+        out["diag/cubes_solved"] = int(np.sum(errs <= self.success_tolerance)) if errs.size else 0
+        out["diag/cube_max_target_error"] = float(np.max(errs)) if errs.size else 0.0
+
+        target_idx = self._select_target_block(unwrapped, errs)
+        out["privileged/target_block"] = int(target_idx)
+        out["diag/target_block_dynamic"] = int(target_idx)
+
+        try:
+            mocap_pos = np.asarray(unwrapped._data.mocap_pos, dtype=np.float32)
+            if target_idx < mocap_pos.shape[0]:
+                out["privileged/target_block_pos"] = mocap_pos[target_idx].copy()
+        except Exception:
+            pass
+
+        try:
+            mocap_quat = np.asarray(unwrapped._data.mocap_quat, dtype=np.float32)
+            if target_idx < mocap_quat.shape[0]:
+                yaw = _yaw_from_quat_wxyz(mocap_quat[target_idx])
+                out["privileged/target_block_yaw"] = np.asarray([yaw], dtype=np.float32)
+        except Exception:
+            pass
+        return out
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        return obs, self._augment_info(info)
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        return obs, reward, terminated, truncated, self._augment_info(info)
 
 
 def build_ogbench_wrapper(
@@ -37,6 +129,8 @@ def build_ogbench_wrapper(
     intervention_episode_prob_decay_steps: int = 0,
     intervention_episode_prob_decay_start: int = 0,
     intervention_episode_prob_seed: Optional[int] = None,
+    teacher_target_mode: str = "sequential",
+    cube_success_tolerance: float = 0.04,
     teleop_interface: Optional[object] = None,
 ) -> Callable:
     """Return a wrapper function that mirrors training/eval environment stacking."""
@@ -57,6 +151,15 @@ def build_ogbench_wrapper(
             step_penalty=step_penalty,
             switch_reward_to_sparse_after_steps_per_env=reward_switch_after_steps,
         )
+        if intervention_mode in {"agent", "agent_safety_align", "agent_safety_progress"} and teacher_type in {
+            "cube_plan",
+            "cube_markov",
+        }:
+            env = CubeTeacherInfoAdapter(
+                env,
+                target_mode=teacher_target_mode,
+                success_tolerance=cube_success_tolerance,
+            )
         if intervention_mode == "human":
             env = InterventionWrapper(
                 env,

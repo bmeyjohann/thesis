@@ -47,11 +47,12 @@ BASE_ARGS="--obs_mode pixels --pixel_width 84 --pixel_height 84 \
 --frame_stack ${FRAME_STACK} --action_repeat ${ACTION_REPEAT} \
 --drq_feature_dim ${FEATURE_DIM} --drq_hidden_dim ${HIDDEN_DIM} \
 --nstep 1 \
---use_wandb --viz_on_checkpoint \
+--use_wandb \
 --pref_buffer_enable --pref_capacity 200000 --pref_chunk_size 128 \
 --pref_sample_ratio 0.3 --pref_rank_margin 0.1 --pref_rank_weight 1.0 \
 --pref_loss_type margin \
 --use_intervention --intervention_mode agent --teacher_type ${TEACHER_TYPE} \
+--teacher_target_mode sequential --cube_success_tolerance 0.04 \
 --intervention_episode_prob 1.0 --intervention_episode_prob_min 1.0 \
 --intervention_episode_prob_decay_steps 0 --intervention_episode_prob_decay_start 0 \
 --reward_type ${REWARD_TYPE}"

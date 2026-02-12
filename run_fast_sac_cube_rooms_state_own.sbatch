@@ -41,10 +41,13 @@ BASE_ARGS="--obs_mode state \
 --reward_type ${REWARD_TYPE} --step_penalty ${STEP_PENALTY} \
 --use_wandb --project ${PROJECT} \
 --use_intervention --intervention_mode agent --teacher_type cube_plan \
+--teacher_target_mode sequential --cube_success_tolerance 0.04 \
 --tolerance_type ${TOLERANCE_TYPE} --tolerance_value ${TOLERANCE_VALUE} \
+--intervention_episode_prob 1.0 --intervention_episode_prob_min 1.0 \
+--intervention_episode_prob_decay_steps 0 --intervention_episode_prob_decay_start 0 \
 --pref_buffer_enable --pref_capacity 200000 --pref_sample_ratio 0.3 \
 --pref_rank_margin 0.1 --pref_rank_weight 1.0 \
---viz_on_checkpoint --viz_grid_resolution 32 --viz_quiver_stride 2"
+"
 
 echo "Launching FastSAC cube state OWN runs for: ${ENV_IDS}"
 

@@ -50,6 +50,10 @@ def build_train_parser() -> argparse.ArgumentParser:
                    help='Per-env step to start decaying intervention probability')
     p.add_argument('--intervention_episode_prob_seed', type=int, default=None,
                    help='Optional seed for per-episode intervention gating')
+    p.add_argument('--teacher_target_mode', type=str, default='sequential', choices=['fixed', 'sequential'],
+                   help='Cube-teacher target-block selection mode (sequential is recommended for multi-cube tasks)')
+    p.add_argument('--cube_success_tolerance', type=float, default=0.04,
+                   help='Success-distance tolerance used to mark per-cube completion for cube teacher target selection')
     # SAC core (trimmed reasonable defaults)
     p.add_argument('--actor_learning_rate', type=float, default=3e-4)
     p.add_argument('--critic_learning_rate', type=float, default=3e-4)

@@ -111,6 +111,8 @@ def make_wrappers(args):
         intervention_episode_prob_decay_steps=args.intervention_episode_prob_decay_steps,
         intervention_episode_prob_decay_start=args.intervention_episode_prob_decay_start,
         intervention_episode_prob_seed=args.intervention_episode_prob_seed,
+        teacher_target_mode=args.teacher_target_mode,
+        cube_success_tolerance=args.cube_success_tolerance,
     )
     return [wrapper]
 
@@ -140,6 +142,8 @@ def make_eval_wrappers(args):
         intervention_episode_prob_decay_steps=args.intervention_episode_prob_decay_steps,
         intervention_episode_prob_decay_start=args.intervention_episode_prob_decay_start,
         intervention_episode_prob_seed=args.intervention_episode_prob_seed,
+        teacher_target_mode=args.teacher_target_mode,
+        cube_success_tolerance=args.cube_success_tolerance,
     )
     return [wrapper]
 

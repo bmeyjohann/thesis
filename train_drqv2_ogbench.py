@@ -1052,6 +1052,8 @@ def prefill_replay_with_demos(
         intervention_episode_prob_decay_steps=demo_args.intervention_episode_prob_decay_steps,
         intervention_episode_prob_decay_start=demo_args.intervention_episode_prob_decay_start,
         intervention_episode_prob_seed=demo_args.intervention_episode_prob_seed,
+        teacher_target_mode=demo_args.teacher_target_mode,
+        cube_success_tolerance=demo_args.cube_success_tolerance,
     )]
     demo_base_env = build_env(demo_args, demo_wrappers, seed=demo_args.seed + 123)
     demo_env = wrap_env_for_drq(demo_base_env, demo_args)
@@ -1322,6 +1324,8 @@ def train():
         intervention_enable_after_steps=args.intervention_enable_after_steps,
         intervention_safety_margin_frac=args.intervention_safety_margin_frac,
         intervention_release_steps=args.intervention_release_steps,
+        teacher_target_mode=args.teacher_target_mode,
+        cube_success_tolerance=args.cube_success_tolerance,
     )]
     eval_wrappers = [build_ogbench_wrapper(
         obs_mode=args.obs_mode,
@@ -1341,6 +1345,8 @@ def train():
         intervention_enable_after_steps=args.intervention_enable_after_steps,
         intervention_safety_margin_frac=args.intervention_safety_margin_frac,
         intervention_release_steps=args.intervention_release_steps,
+        teacher_target_mode=args.teacher_target_mode,
+        cube_success_tolerance=args.cube_success_tolerance,
     )]
 
     base_env = build_env(args, train_wrappers, seed=args.seed)

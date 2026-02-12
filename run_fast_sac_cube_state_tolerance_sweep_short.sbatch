@@ -24,16 +24,16 @@ mkdir -p "${XDG_CACHE_HOME}"
 export WANDB_DIR=${WANDB_DIR:-$PWD}
 mkdir -p "${WANDB_DIR}/wandb"
 
-ENV_ID=${ENV_ID:-cube-double-v0}
+ENV_ID=${ENV_ID:-cube-triple-singletask-task5-v0}
 TOTAL_STEPS=${TOTAL_STEPS:-250000}
 NUM_ENVS=${NUM_ENVS:-64}
 SAVE_INTERVAL=${SAVE_INTERVAL:-50000}
-LOG_INTERVAL=${LOG_INTERVAL:-5000}
-PROJECT=${PROJECT:-ogbench_fastsac_cube_tol_sweep_short}
-REWARD_TYPE=${REWARD_TYPE:-dense}
+LOG_INTERVAL=${LOG_INTERVAL:-2000}
+PROJECT=${PROJECT:-ogbench_fastsac_cube_stack_tol_sweep_short}
+REWARD_TYPE=${REWARD_TYPE:-sparse}
 STEP_PENALTY=${STEP_PENALTY:-0.0}
 TOLERANCE_TYPE=${TOLERANCE_TYPE:-l2}
-TOLERANCES=${TOLERANCES:-"0.10 0.20 0.30 0.50"}
+TOLERANCES=${TOLERANCES:-"0.00 0.01 0.05 0.20"}
 
 BASE_ARGS="--obs_mode state \
 --total_timesteps ${TOTAL_STEPS} --num_envs ${NUM_ENVS} \
@@ -41,11 +41,12 @@ BASE_ARGS="--obs_mode state \
 --reward_type ${REWARD_TYPE} --step_penalty ${STEP_PENALTY} \
 --use_wandb --project ${PROJECT} \
 --use_intervention --intervention_mode agent --teacher_type cube_plan \
+--teacher_target_mode sequential --cube_success_tolerance 0.04 \
 --intervention_episode_prob 1.0 --intervention_episode_prob_min 1.0 \
 --intervention_episode_prob_decay_steps 0 --intervention_episode_prob_decay_start 0 \
 --pref_buffer_enable --pref_capacity 200000 --pref_sample_ratio 0.3 \
 --pref_rank_margin 0.1 --pref_rank_weight 1.0 \
---viz_on_checkpoint --viz_grid_resolution 32 --viz_quiver_stride 2"
+"
 
 launch_tol_run () {
   local GPU_ID=$1
