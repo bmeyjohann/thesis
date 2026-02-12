@@ -332,7 +332,6 @@ class OGBenchPixelsEnv(dm_env.Environment):
             render_mode="rgb_array",
             width=width,
             height=height,
-            camera_name=camera_name,
             pixel_camera_mode=pixel_camera_mode,
             pixel_local_view_size=pixel_local_view_size,
             pixel_local_camera_height=pixel_local_camera_height,
@@ -342,6 +341,9 @@ class OGBenchPixelsEnv(dm_env.Environment):
             pixel_first_person_pitch=pixel_first_person_pitch,
             disable_env_checker=True,
         )
+        if camera_name is not None:
+            env_kwargs["camera_name"] = camera_name
+
         try:
             base_env = gym.make(env_name, **env_kwargs)
         except TypeError as exc:
@@ -355,6 +357,7 @@ class OGBenchPixelsEnv(dm_env.Environment):
                 'pixel_first_person_lookahead',
                 'pixel_first_person_pitch',
                 'disable_env_checker',
+                'camera_name',
             ]
             if any(key in str(exc) for key in drop_keys):
                 for key in drop_keys:
@@ -694,14 +697,6 @@ class DrQLogger:
             logs.update({k: float(v) for k, v in perf_metrics.items()})
 
         teacher_snapshot = self.teacher_metrics.snapshot()
-        if teacher_snapshot.mean_disagreement_teacher is not None:
-            logs["/Teacher/mean_disagreement_intervened"] = teacher_snapshot.mean_disagreement_teacher
-        if teacher_snapshot.mean_disagreement_non is not None:
-            logs["/Teacher/mean_disagreement_no_intervention"] = teacher_snapshot.mean_disagreement_non
-        if teacher_snapshot.mean_disagreement_all is not None:
-            logs["/Critic/mean_disagreement_all"] = teacher_snapshot.mean_disagreement_all
-        if teacher_snapshot.corr_value is not None:
-            logs["/Teacher/corr(disagreement, intervention)"] = teacher_snapshot.corr_value
         if teacher_snapshot.qmin_all is not None:
             logs["/Critic/mean_q_min_all"] = teacher_snapshot.qmin_all
         if teacher_snapshot.qmin_teacher is not None:
@@ -710,6 +705,10 @@ class DrQLogger:
             logs["/Critic/mean_q_min_no_intervention"] = teacher_snapshot.qmin_non
 
         self._flush_env_metrics(logs)
+        for key in list(logs.keys()):
+            lower_key = key.lower()
+            if "disagreement" in lower_key or "frac_interventions_dis_ge_" in lower_key:
+                logs.pop(key, None)
 
         msg_parts = [
             f"env_steps {total_env_steps}/{total_timesteps}",

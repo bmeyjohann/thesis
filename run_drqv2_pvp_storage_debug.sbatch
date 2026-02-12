@@ -21,8 +21,8 @@ export MPLCONFIGDIR="${TMPDIR:-/tmp}/mplcache_${SLURM_JOB_ID}"
 mkdir -p "${MPLCONFIGDIR}"
 export XDG_CACHE_HOME=${XDG_CACHE_HOME:-${SLURM_TMPDIR:-/tmp}/xdg_cache_${SLURM_JOB_ID}}
 mkdir -p "${XDG_CACHE_HOME}"
-export WANDB_DIR=${WANDB_DIR:-$PWD/wandb}
-mkdir -p "${WANDB_DIR}"
+export WANDB_DIR=${WANDB_DIR:-$PWD}
+mkdir -p "${WANDB_DIR}/wandb"
 TMP_BUFFER_ROOT=${TMP_BUFFER_ROOT:-/tmp/drqv2_buffers_${SLURM_JOB_ID}}
 SCRATCH_BUFFER_ROOT=${SCRATCH_BUFFER_ROOT:-${CSCRATCH:-${SCRATCH:-/tmp}}/drqv2_buffers_${SLURM_JOB_ID}}
 mkdir -p "${TMP_BUFFER_ROOT}" "${SCRATCH_BUFFER_ROOT}"

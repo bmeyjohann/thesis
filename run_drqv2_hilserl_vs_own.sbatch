@@ -21,8 +21,8 @@ export MPLCONFIGDIR="${TMPDIR:-/tmp}/mplcache_${SLURM_JOB_ID}"
 mkdir -p "${MPLCONFIGDIR}"
 export XDG_CACHE_HOME=${XDG_CACHE_HOME:-${SLURM_TMPDIR:-/tmp}/xdg_cache_${SLURM_JOB_ID}}
 mkdir -p "${XDG_CACHE_HOME}"
-export WANDB_DIR=${WANDB_DIR:-${SLURM_TMPDIR:-/tmp}/wandb_${SLURM_JOB_ID}}
-mkdir -p "${WANDB_DIR}"
+export WANDB_DIR=${WANDB_DIR:-${SLURM_TMPDIR:-/tmp}/wandb_parent_${SLURM_JOB_ID}}
+mkdir -p "${WANDB_DIR}/wandb"
 
 OGBENCH_ENV=${OGBENCH_ENV:-visual-pointmaze-arena-danger-lethal-v0}
 TOTAL_STEPS=${TOTAL_STEPS:-1200000}

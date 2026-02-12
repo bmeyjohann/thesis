@@ -21,8 +21,8 @@ export MPLCONFIGDIR="${TMPDIR:-/tmp}/mplcache_${SLURM_JOB_ID}"
 mkdir -p "${MPLCONFIGDIR}"
 export XDG_CACHE_HOME=${XDG_CACHE_HOME:-${SLURM_TMPDIR:-/tmp}/xdg_cache_${SLURM_JOB_ID}}
 mkdir -p "${XDG_CACHE_HOME}"
-export WANDB_DIR=${WANDB_DIR:-$PWD/wandb}
-mkdir -p "${WANDB_DIR}"
+export WANDB_DIR=${WANDB_DIR:-$PWD}
+mkdir -p "${WANDB_DIR}/wandb"
 
 ENV_ID=${ENV_ID:-cube-double-v0}
 TOTAL_STEPS=${TOTAL_STEPS:-250000}

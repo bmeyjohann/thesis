@@ -5,6 +5,7 @@
 - Whenever I need to tell you to do something in a different way or am dissatisfied with your work, append concise info on what you made wrong and how to do it correctly to AGENT.md. Also save a short note in codex/[appropriate_naming_for_info].md.
 - Save other relevant info that should be preserved in codex/[appropriate_naming_for_info].md
 - Always inform me if you save info in a file.
+- Subagent permission policy: subagents must not execute commands that require escalated permissions. If escalation is needed (e.g., SSH/cluster operations), subagents should return the required command/context and the main agent executes it with explicit user approval.
 - STT clarification: whenever the user says or writes `1B`, interpret it as `WANDB` every time. This mixup is caused by the user's speech-to-text tool.
 - Correction noted: for cube state-observation variants, use FastSAC (`train_fast_sac_ogbench.py`) rather than DrQ-v2 scripts.
 - Correction noted: for intervention behavior, do not use intervention-probability decay scheduling; keep interventions deterministic by teacher-student deviation/tolerance rules.
@@ -54,6 +55,7 @@
 ## Cluster Access Notes
 - The cluster project workspace path is `/p/project1/hai_1074/meyjohann1/thesis` and mirrors the local repo structure (`logs/`, `models/`, `wandb/`, `run_*.sbatch`, `train_*.py`).
 - For repeated non-interactive cluster access after one MFA login, use SSH connection multiplexing (`ControlMaster`/`ControlPersist`) with a control socket under `~/.ssh/cm/`.
+- Prefer `scripts/cluster_readonly.sh` for cluster read operations (logs/wandb inspection). It enforces a read-only command allowlist and should be the default path for non-mutating cluster triage.
 - Typical flow:
   - Start master once: `ssh -MNf juwels-booster.fz-juelich.de` (requires key passphrase + TOTP once).
   - Verify reuse: `ssh -O check juwels-booster.fz-juelich.de`.

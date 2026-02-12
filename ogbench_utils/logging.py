@@ -262,21 +262,6 @@ class TrainingLogger:
             logs["/Teacher/denied_transition_samples"] = float(last_denied_samples)
 
         teacher_snapshot = self.teacher_metrics.snapshot()
-        if teacher_snapshot.mean_disagreement_teacher is not None:
-            logs["/Teacher/mean_disagreement_intervened"] = teacher_snapshot.mean_disagreement_teacher
-        if teacher_snapshot.mean_disagreement_non is not None:
-            logs["/Teacher/mean_disagreement_no_intervention"] = teacher_snapshot.mean_disagreement_non
-        if teacher_snapshot.mean_disagreement_all is not None:
-            logs["/Critic/mean_disagreement_all"] = teacher_snapshot.mean_disagreement_all
-        if teacher_snapshot.corr_value is not None:
-            logs["/Teacher/corr(disagreement, intervention)"] = teacher_snapshot.corr_value
-
-        for label, value in teacher_snapshot.hist_teacher.items():
-            logs[f"/Teacher/disagreement_hist_teacher_{label}"] = value
-        for label, value in teacher_snapshot.hist_non_teacher.items():
-            logs[f"/Teacher/disagreement_hist_non_teacher_{label}"] = value
-        for thr, pct in teacher_snapshot.threshold_percentages.items():
-            logs[f"/Teacher/frac_interventions_dis_ge_{thr}"] = pct
         if teacher_snapshot.qmin_all is not None:
             logs["/Critic/mean_q_min_all"] = teacher_snapshot.qmin_all
         if teacher_snapshot.qmin_teacher is not None:
@@ -298,6 +283,11 @@ class TrainingLogger:
             logs["/Buffers/demo_size"] = float(demo_size)
         if demo_capacity >= 0:
             logs["/Buffers/demo_capacity"] = float(demo_capacity)
+
+        for key in list(logs.keys()):
+            lower_key = key.lower()
+            if "disagreement" in lower_key or "frac_interventions_dis_ge_" in lower_key:
+                logs.pop(key, None)
 
         log_line_parts = [
             f"env_steps {total_env_steps}/{total_timesteps}",

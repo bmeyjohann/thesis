@@ -11,6 +11,7 @@ import sys
 import json
 import copy
 import time
+import warnings
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -164,6 +165,70 @@ def _build_env_kwargs(args) -> Dict[str, Any]:
     return env_kwargs
 
 
+def _build_vec_env_with_fallback(
+    *,
+    env_name: str,
+    num_envs: int,
+    device: torch.device,
+    wrappers,
+    clip_actions: float,
+    env_kwargs: Dict[str, Any],
+) -> OGBenchVecEnvAdapter:
+    try:
+        return OGBenchVecEnvAdapter(
+            env_name=env_name,
+            num_envs=num_envs,
+            device=device,
+            wrappers=wrappers,
+            clip_actions=clip_actions,
+            **env_kwargs,
+        )
+    except TypeError as exc:
+        drop_keys = [
+            'pixel_camera_mode',
+            'pixel_local_view_size',
+            'pixel_local_camera_height',
+            'pixel_first_person_distance',
+            'pixel_first_person_height',
+            'pixel_first_person_lookahead',
+            'pixel_first_person_pitch',
+            'camera_name',
+        ]
+        if not any(key in str(exc) for key in drop_keys):
+            raise
+        fallback_kwargs = dict(env_kwargs)
+        for key in drop_keys:
+            fallback_kwargs.pop(key, None)
+        warnings.warn(
+            f"{env_name} vector env does not accept pixel camera kwargs; falling back to default camera behaviour."
+        )
+        return OGBenchVecEnvAdapter(
+            env_name=env_name,
+            num_envs=num_envs,
+            device=device,
+            wrappers=wrappers,
+            clip_actions=clip_actions,
+            **fallback_kwargs,
+        )
+
+
+def _as_tensor_batch(
+    value: Any,
+    *,
+    device: torch.device,
+    dtype: Optional[torch.dtype] = None,
+    num_envs: Optional[int] = None,
+) -> torch.Tensor:
+    tensor = value if torch.is_tensor(value) else torch.as_tensor(value)
+    if dtype is not None:
+        tensor = tensor.to(device=device, dtype=dtype)
+    else:
+        tensor = tensor.to(device=device)
+    if tensor.ndim == 0 and num_envs is not None:
+        tensor = tensor.repeat(int(num_envs))
+    return tensor
+
+
 @dataclass
 class ModelComponents:
     actor_backbone: nn.Module
@@ -308,13 +373,13 @@ def build_environment(
     wrappers = make_wrappers(args)
     env_kwargs = _build_env_kwargs(args)
     record_progress("[Init] constructing vector env adapter")
-    envs = OGBenchVecEnvAdapter(
+    envs = _build_vec_env_with_fallback(
         env_name=args.env_name,
         num_envs=args.num_envs,
         device=device,
         wrappers=wrappers,
         clip_actions=1.0,
-        **env_kwargs,
+        env_kwargs=env_kwargs,
     )
     record_progress("[Init] env adapter constructed")
     print("[Init] Env adapter constructed", flush=True)
@@ -389,13 +454,13 @@ def prefill_replay_buffer_with_demos(
 
     wrappers = make_wrappers(demo_args)
     env_kwargs = _build_env_kwargs(demo_args)
-    demo_envs = OGBenchVecEnvAdapter(
+    demo_envs = _build_vec_env_with_fallback(
         env_name=demo_args.env_name,
         num_envs=demo_args.num_envs,
         device=device,
         wrappers=wrappers,
         clip_actions=1.0,
-        **env_kwargs,
+        env_kwargs=env_kwargs,
     )
 
     record_progress(f"[Demo] Prefilling {target_label} buffer for {args.demo_prefill_steps} env steps")
@@ -420,6 +485,8 @@ def prefill_replay_buffer_with_demos(
                 obs_actor_input = reshape_observation(norm_obs, obs_mode=demo_args.obs_mode, pixel_shape=pixel_shape)
                 pi_action, _, _ = actor_head(actor_backbone(obs_actor_input))
             next_obs_raw, rewards, dones, infos = demo_envs.step(pi_action.float())
+            rewards = _as_tensor_batch(rewards, device=device, dtype=torch.float32, num_envs=demo_envs.num_envs)
+            dones = _as_tensor_batch(dones, device=device, dtype=torch.bool, num_envs=demo_envs.num_envs)
             next_obs = prepare_observation(
                 next_obs_raw,
                 device=device,
@@ -428,8 +495,14 @@ def prefill_replay_buffer_with_demos(
                 flatten=True,
             )
 
-            truncations = infos.get('time_outs', torch.zeros_like(dones, device=device))
-            applied_actions = infos.get('applied_actions', pi_action)
+            trunc_raw = infos.get('time_outs') if isinstance(infos, dict) else None
+            truncations = (
+                _as_tensor_batch(trunc_raw, device=device, dtype=torch.bool, num_envs=demo_envs.num_envs)
+                if trunc_raw is not None
+                else torch.zeros_like(dones, device=device, dtype=torch.bool)
+            )
+            applied_raw = infos.get('applied_actions', pi_action) if isinstance(infos, dict) else pi_action
+            applied_actions = _as_tensor_batch(applied_raw, device=device, dtype=torch.float32)
 
             transition = TensorDict(
                 {
@@ -438,8 +511,12 @@ def prefill_replay_buffer_with_demos(
                     'next': {
                         'observations': next_obs.detach(),
                         'rewards': rewards.detach(),
-                        'truncations': truncations.long(),
-                        'dones': dones.long(),
+                        'truncations': _as_tensor_batch(
+                            truncations, device=device, dtype=torch.bool, num_envs=demo_envs.num_envs
+                        ).long(),
+                        'dones': _as_tensor_batch(
+                            dones, device=device, dtype=torch.bool, num_envs=demo_envs.num_envs
+                        ).long(),
                     },
                 },
                 batch_size=(demo_envs.num_envs,),
@@ -459,13 +536,13 @@ def prefill_replay_buffer_with_demos(
 def build_eval_environment(args, device: torch.device) -> OGBenchVecEnvAdapter:
     wrappers = make_eval_wrappers(args)
     env_kwargs = _build_env_kwargs(args)
-    eval_envs = OGBenchVecEnvAdapter(
+    eval_envs = _build_vec_env_with_fallback(
         env_name=args.env_name,
         num_envs=max(1, int(args.eval_num_envs)),
         device=device,
         wrappers=wrappers,
         clip_actions=1.0,
-        **env_kwargs,
+        env_kwargs=env_kwargs,
     )
     return eval_envs
 
@@ -516,6 +593,8 @@ def run_eval_metrics(
         with torch.no_grad(), autocast(device_type=amp.device_type, dtype=amp.dtype, enabled=amp.enabled):
             _, _, mean_actions = actor_head(actor_backbone(obs_actor_input))
         next_obs_raw, rewards, dones, infos = eval_envs.step(mean_actions.float())
+        rewards = _as_tensor_batch(rewards, device=device, dtype=torch.float32, num_envs=eval_envs.num_envs)
+        dones = _as_tensor_batch(dones, device=device, dtype=torch.bool, num_envs=eval_envs.num_envs)
         next_obs = prepare_observation(
             next_obs_raw,
             device=device,
@@ -1001,6 +1080,8 @@ def run_training_loop(
             with torch.no_grad(), autocast(device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled):
                 pi_action, _, _ = actor_head(actor_backbone(obs_actor_input))
             next_obs_raw, rewards, dones, infos = envs.step(pi_action.float())
+            rewards = _as_tensor_batch(rewards, device=device, dtype=torch.float32, num_envs=envs.num_envs)
+            dones = _as_tensor_batch(dones, device=device, dtype=torch.bool, num_envs=envs.num_envs)
             actions = pi_action
             next_obs = prepare_observation(
                 next_obs_raw,
@@ -1011,10 +1092,24 @@ def run_training_loop(
             )
             obs_detached_flat = obs.detach()
             next_obs_detached_flat = next_obs.detach()
-            truncations = infos.get('time_outs', torch.zeros_like(dones, device=device))
-            applied_actions = infos.get('applied_actions', actions)
-            student_actions = infos.get('student_actions')
-            teacher_mask = infos.get('teacher_intervened_mask')
+            trunc_raw = infos.get('time_outs') if isinstance(infos, dict) else None
+            truncations = (
+                _as_tensor_batch(trunc_raw, device=device, dtype=torch.bool, num_envs=envs.num_envs)
+                if trunc_raw is not None
+                else torch.zeros_like(dones, device=device, dtype=torch.bool)
+            )
+            applied_raw = infos.get('applied_actions', actions) if isinstance(infos, dict) else actions
+            applied_actions = _as_tensor_batch(applied_raw, device=device, dtype=torch.float32)
+            student_raw = infos.get('student_actions') if isinstance(infos, dict) else None
+            student_actions = (
+                _as_tensor_batch(student_raw, device=device, dtype=torch.float32) if student_raw is not None else None
+            )
+            teacher_mask_raw = infos.get('teacher_intervened_mask') if isinstance(infos, dict) else None
+            teacher_mask = (
+                _as_tensor_batch(teacher_mask_raw, device=device, dtype=torch.bool, num_envs=envs.num_envs)
+                if teacher_mask_raw is not None
+                else None
+            )
             if teacher_mask is None and student_actions is not None and applied_actions is not None:
                 try:
                     teacher_mask = (torch.abs(applied_actions - student_actions).sum(dim=-1) > 1e-6)
@@ -1051,7 +1146,9 @@ def run_training_loop(
 
                     if pref_buffer is not None and student_actions is not None and 'teacher_actions' in infos:
                         try:
-                            a_teacher_all = infos['teacher_actions']
+                            a_teacher_all = _as_tensor_batch(
+                                infos['teacher_actions'], device=device, dtype=torch.float32
+                            )
                             pref_buffer.append(
                                 obs_detached_flat[denied_ids],
                                 a_teacher_all[denied_ids],
@@ -1062,7 +1159,9 @@ def run_training_loop(
 
                     if pref_td_buffer is not None and student_actions is not None and 'teacher_actions' in infos:
                         try:
-                            a_teacher_all = infos['teacher_actions']
+                            a_teacher_all = _as_tensor_batch(
+                                infos['teacher_actions'], device=device, dtype=torch.float32
+                            )
                             s_now = obs_detached_flat[denied_ids]
                             s_next = next_obs_detached_flat[denied_ids]
                             r_teacher = rewards[denied_ids].clone().view(-1, 1)
@@ -1092,8 +1191,12 @@ def run_training_loop(
                     'next': {
                         'observations': next_obs_detached_flat,
                         'rewards': rewards_eff.detach(),
-                        'truncations': truncations.long(),
-                        'dones': dones_eff.long(),
+                        'truncations': _as_tensor_batch(
+                            truncations, device=device, dtype=torch.bool, num_envs=envs.num_envs
+                        ).long(),
+                        'dones': _as_tensor_batch(
+                            dones_eff, device=device, dtype=torch.bool, num_envs=envs.num_envs
+                        ).long(),
                     },
                 },
                 batch_size=(envs.num_envs,),
