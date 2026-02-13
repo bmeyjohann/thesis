@@ -5,12 +5,15 @@ usage() {
     cat <<EOF
 Usage: $0 [sbatch_file]
 Defaults to sbatch_file=run_experiment.sbatch when omitted.
+Options:
+  -y, --yes    Non-interactive mode. Accept prompt defaults.
 EOF
 }
 
 SCRIPT_NAME=""
 SC_ACTIVATE_SCRIPT="${SC_ACTIVATE_SCRIPT:-sc_venv_template/activate.sh}"
 _SC_ENV_SOURCED=0
+AUTO_YES=0
 
 source_sc_env() {
     if [[ "$_SC_ENV_SOURCED" -eq 1 ]]; then
@@ -32,6 +35,9 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             usage
             exit 0
+            ;;
+        -y|--yes)
+            AUTO_YES=1
             ;;
         -*)
             echo "Unknown option: $1" >&2
@@ -70,6 +76,10 @@ detect_account() {
             echo "Set SLURM_ACCOUNT and re-run." >&2
             exit 1
         fi
+    fi
+    if [[ "$AUTO_YES" -eq 1 ]]; then
+        echo "❌ Could not auto-detect SLURM account in --yes mode. Set SLURM_ACCOUNT or .slurm_account." >&2
+        exit 1
     fi
     read -rp "Enter SLURM account: " manual
     [[ -n "$manual" ]] || { echo "No account provided." >&2; exit 1; }
@@ -150,7 +160,11 @@ WAND_DIR="wandb"
 WAND_INTERVAL=600
 BASELINE_FILE=""
 
-read -rp "Enable wandb logging sync? [Y/n] " enable_sync
+if [[ "$AUTO_YES" -eq 1 ]]; then
+    enable_sync="Y"
+else
+    read -rp "Enable wandb logging sync? [Y/n] " enable_sync
+fi
 case "${enable_sync:-Y}" in
     Y|y|"")
         ;;
@@ -163,10 +177,18 @@ case "${enable_sync:-Y}" in
 esac
 
 if [[ "$SYNC_WANDB" -eq 1 ]]; then
-    read -rp "Base wandb directory [${WAND_DIR}]: " input_wand_dir
+    if [[ "$AUTO_YES" -eq 1 ]]; then
+        input_wand_dir=""
+    else
+        read -rp "Base wandb directory [${WAND_DIR}]: " input_wand_dir
+    fi
     WAND_DIR="${input_wand_dir:-$WAND_DIR}"
 
-    read -rp "Sync interval seconds [${WAND_INTERVAL}]: " input_interval
+    if [[ "$AUTO_YES" -eq 1 ]]; then
+        input_interval=""
+    else
+        read -rp "Sync interval seconds [${WAND_INTERVAL}]: " input_interval
+    fi
     WAND_INTERVAL="${input_interval:-$WAND_INTERVAL}"
 
     if ! [[ "$WAND_INTERVAL" =~ ^[0-9]+$ ]]; then
