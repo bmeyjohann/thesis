@@ -14,7 +14,7 @@ Usage:
   scripts/cluster_readonly.sh <allowed_cmd> [args...]
 
 Allowed commands:
-  ls cat tail head grep find wc stat du df pwd basename dirname sed
+  ls cat tail head grep find wc stat du df pwd basename dirname sed sacct squeue
 
 Environment overrides:
   CLUSTER_HOST, CLUSTER_ROOT
@@ -49,6 +49,8 @@ allowed=(
   basename
   dirname
   sed
+  sacct
+  squeue
 )
 
 is_allowed=0

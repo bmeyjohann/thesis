@@ -2,7 +2,7 @@
 
 ## General Guidelines
 
-- Whenever I need to tell you to do something in a different way or am dissatisfied with your work, append concise info on what you made wrong and how to do it correctly to AGENT.md. Also save a short note in codex/[appropriate_naming_for_info].md.
+- Whenever I need to tell you to do something in a different way or am dissatisfied with your work, append concise info on what you made wrong and how to do it correctly to AGENTS.md. Also save a short note in codex/[appropriate_naming_for_info].md.
 - Save other relevant info that should be preserved in codex/[appropriate_naming_for_info].md
 - Always inform me if you save info in a file.
 - Subagent permission policy: subagents must not execute commands that require escalated permissions. If escalation is needed (e.g., SSH/cluster operations), subagents should return the required command/context and the main agent executes it with explicit user approval.
