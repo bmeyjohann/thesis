@@ -5,7 +5,7 @@ Purpose: reliably submit cluster jobs without prompt blocking, then verify queue
 ## Preconditions
 - SSH control master is active (`ssh -O check juwels-booster.fz-juelich.de`).
 - Local repo changes are committed and pushed.
-- Cluster repo is updated via `git pull all` in `/p/project1/hai_1074/meyjohann1/thesis`.
+- Cluster repo is updated via `git pullall` in `/p/project1/hai_1074/meyjohann1/thesis`.
 
 ## Submit command
 - Use:
@@ -22,7 +22,7 @@ Purpose: reliably submit cluster jobs without prompt blocking, then verify queue
   - `squeue -j <JOBID1>,<JOBID2>,...`
 
 ## Recommended order for batch starts
-1. Pull latest code on cluster (`git pull all`).
+1. Pull latest code on cluster (`git pullall`).
 2. Submit all target scripts with `submit_job.sh -y`.
 3. Immediately verify with `squeue`.
 4. Then monitor logs in `logs/` and wandb sync logs (`logs/wandb_sync_<JOBID>.log`).

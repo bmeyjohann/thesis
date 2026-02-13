@@ -62,7 +62,7 @@
   - Reuse for commands/log triage without re-prompt while master is alive: `ssh juwels-booster.fz-juelich.de 'cd /p/project1/hai_1074/meyjohann1/thesis && ...'`.
   - Close when done: `ssh -O exit juwels-booster.fz-juelich.de`.
 - Cluster submission workflow (non-interactive):
-  - Keep local + cluster repos in sync first (use local commit/push, then `git pull all` on cluster repo).
+  - Keep local + cluster repos in sync first (use local commit/push, then `git pullall` on cluster repo).
   - Use `bash submit_job.sh -y <script>.sbatch` to accept defaults without interactive prompts.
   - `-y` requires SLURM account auto-detection to work (or `SLURM_ACCOUNT`/`.slurm_account` to be set), otherwise it exits with a clear error.
   - After submit, verify queued/running jobs with `squeue -u "$USER"` or `squeue -j <JOBID>`.
