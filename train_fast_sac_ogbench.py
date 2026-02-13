@@ -228,8 +228,14 @@ def _as_tensor_batch(
         tensor = tensor.to(device=device, dtype=dtype)
     else:
         tensor = tensor.to(device=device)
-    if tensor.ndim == 0 and num_envs is not None:
-        tensor = tensor.repeat(int(num_envs))
+    if num_envs is not None:
+        target = int(num_envs)
+        if tensor.ndim == 0:
+            tensor = tensor.repeat(target)
+        elif tensor.shape[0] == 1 and target > 1:
+            reps = [1] * tensor.ndim
+            reps[0] = target
+            tensor = tensor.repeat(*reps)
     return tensor
 
 
@@ -507,6 +513,32 @@ def prefill_replay_buffer_with_demos(
             )
             applied_raw = infos.get('applied_actions', pi_action) if isinstance(infos, dict) else pi_action
             applied_actions = _as_tensor_batch(applied_raw, device=device, dtype=torch.float32)
+
+            # Guard against malformed vector-env outputs (e.g. shape [1] instead of [num_envs]).
+            if obs_detached_flat.shape[0] != envs.num_envs:
+                raise RuntimeError(
+                    f"obs batch mismatch: expected {envs.num_envs}, got {tuple(obs_detached_flat.shape)}"
+                )
+            if used_actions.shape[0] != envs.num_envs:
+                raise RuntimeError(
+                    f"action batch mismatch: expected {envs.num_envs}, got {tuple(used_actions.shape)}"
+                )
+            if next_obs_detached_flat.shape[0] != envs.num_envs:
+                raise RuntimeError(
+                    f"next_obs batch mismatch: expected {envs.num_envs}, got {tuple(next_obs_detached_flat.shape)}"
+                )
+            if rewards_eff.shape[0] != envs.num_envs:
+                raise RuntimeError(
+                    f"reward batch mismatch: expected {envs.num_envs}, got {tuple(rewards_eff.shape)}"
+                )
+            if dones_eff.shape[0] != envs.num_envs:
+                raise RuntimeError(
+                    f"done batch mismatch: expected {envs.num_envs}, got {tuple(dones_eff.shape)}"
+                )
+            if truncations.shape[0] != envs.num_envs:
+                raise RuntimeError(
+                    f"truncation batch mismatch: expected {envs.num_envs}, got {tuple(truncations.shape)}"
+                )
 
             transition = TensorDict(
                 {
@@ -1102,11 +1134,31 @@ def run_training_loop(
                 if trunc_raw is not None
                 else torch.zeros_like(dones, device=device, dtype=torch.bool)
             )
+            if truncations.shape[0] != envs.num_envs:
+                # Some env adapters return timeout flags only for done envs.
+                # Convert that compact form into a full per-env mask.
+                done_ids = torch.nonzero(dones, as_tuple=False).flatten()
+                if truncations.ndim == 1 and truncations.numel() == done_ids.numel():
+                    trunc_full = torch.zeros_like(dones, device=device, dtype=torch.bool)
+                    trunc_full[done_ids] = truncations.to(dtype=torch.bool)
+                    truncations = trunc_full
+                else:
+                    record_progress(
+                        "[Warn] Unexpected time_outs shape=%s for num_envs=%d; defaulting truncations to zeros"
+                        % (tuple(truncations.shape), envs.num_envs)
+                    )
+                    truncations = torch.zeros_like(dones, device=device, dtype=torch.bool)
             applied_raw = infos.get('applied_actions', actions) if isinstance(infos, dict) else actions
-            applied_actions = _as_tensor_batch(applied_raw, device=device, dtype=torch.float32)
+            applied_actions = _as_tensor_batch(
+                applied_raw, device=device, dtype=torch.float32, num_envs=envs.num_envs
+            )
             student_raw = infos.get('student_actions') if isinstance(infos, dict) else None
             student_actions = (
-                _as_tensor_batch(student_raw, device=device, dtype=torch.float32) if student_raw is not None else None
+                _as_tensor_batch(
+                    student_raw, device=device, dtype=torch.float32, num_envs=envs.num_envs
+                )
+                if student_raw is not None
+                else None
             )
             teacher_mask_raw = infos.get('teacher_intervened_mask') if isinstance(infos, dict) else None
             teacher_mask = (
@@ -1151,7 +1203,7 @@ def run_training_loop(
                     if pref_buffer is not None and student_actions is not None and 'teacher_actions' in infos:
                         try:
                             a_teacher_all = _as_tensor_batch(
-                                infos['teacher_actions'], device=device, dtype=torch.float32
+                                infos['teacher_actions'], device=device, dtype=torch.float32, num_envs=envs.num_envs
                             )
                             pref_buffer.append(
                                 obs_detached_flat[denied_ids],
@@ -1164,7 +1216,7 @@ def run_training_loop(
                     if pref_td_buffer is not None and student_actions is not None and 'teacher_actions' in infos:
                         try:
                             a_teacher_all = _as_tensor_batch(
-                                infos['teacher_actions'], device=device, dtype=torch.float32
+                                infos['teacher_actions'], device=device, dtype=torch.float32, num_envs=envs.num_envs
                             )
                             s_now = obs_detached_flat[denied_ids]
                             s_next = next_obs_detached_flat[denied_ids]
@@ -1188,24 +1240,38 @@ def run_training_loop(
                         except Exception:
                             pass
 
-            transition = TensorDict(
-                {
-                    'observations': obs_detached_flat,
-                    'actions': used_actions.detach(),
-                    'next': {
-                        'observations': next_obs_detached_flat,
-                        'rewards': rewards_eff.detach(),
-                        'truncations': _as_tensor_batch(
-                            truncations, device=device, dtype=torch.bool, num_envs=envs.num_envs
-                        ).long(),
-                        'dones': _as_tensor_batch(
-                            dones_eff, device=device, dtype=torch.bool, num_envs=envs.num_envs
-                        ).long(),
-                    },
+            transition_dict = {
+                'observations': obs_detached_flat,
+                'actions': used_actions.detach(),
+                'next': {
+                    'observations': next_obs_detached_flat,
+                    'rewards': rewards_eff.detach(),
+                    'truncations': _as_tensor_batch(
+                        truncations, device=device, dtype=torch.bool, num_envs=envs.num_envs
+                    ).long(),
+                    'dones': _as_tensor_batch(
+                        dones_eff, device=device, dtype=torch.bool, num_envs=envs.num_envs
+                    ).long(),
                 },
-                batch_size=(envs.num_envs,),
-                device=device,
-            )
+            }
+            try:
+                transition = TensorDict(
+                    transition_dict,
+                    batch_size=(envs.num_envs,),
+                    device=device,
+                )
+            except Exception as exc:
+                shape_dbg = {
+                    'observations': tuple(transition_dict['observations'].shape),
+                    'actions': tuple(transition_dict['actions'].shape),
+                    'next.observations': tuple(transition_dict['next']['observations'].shape),
+                    'next.rewards': tuple(transition_dict['next']['rewards'].shape),
+                    'next.truncations': tuple(transition_dict['next']['truncations'].shape),
+                    'next.dones': tuple(transition_dict['next']['dones'].shape),
+                }
+                raise RuntimeError(
+                    f"Failed to build transition TensorDict for num_envs={envs.num_envs}; shapes={shape_dbg}"
+                ) from exc
             rb.extend(transition)
 
             with torch.no_grad(), autocast(device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled):
