@@ -1,0 +1,235 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional
+from pathlib import Path
+import sys
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+# Ensure local FastSAC package is importable without installation.
+_FAST_SAC_PATH = Path(__file__).resolve().parent.parent / "fasttd3" / "fast_sac"
+if _FAST_SAC_PATH.exists():
+    _fast_sac_path_str = str(_FAST_SAC_PATH)
+    if _fast_sac_path_str not in sys.path:
+        sys.path.insert(0, _fast_sac_path_str)
+
+from fast_sac import Actor, Critic
+
+
+@dataclass
+class SACTensors:
+    actor: Actor
+    critic: Critic
+    critic_target: Critic
+    actor_optimizer: torch.optim.Optimizer
+    critic_optimizer: torch.optim.Optimizer
+    alpha_optimizer: torch.optim.Optimizer
+    log_alpha: torch.Tensor
+    target_entropy: float
+
+
+@dataclass
+class SACUpdateMetrics:
+    critic_loss: float
+    actor_loss: float
+    alpha_loss: float
+    alpha: float
+    target_q_mean: float
+
+
+@dataclass
+class QDisagreementMetrics:
+    abs_diff_mean: float
+    abs_diff_max: float
+    q1_mean: float
+    q2_mean: float
+    q_min_mean: float
+    q_max_mean: float
+
+
+def build_sac(
+    *,
+    obs_dim: int,
+    act_dim: int,
+    hidden_actor: int,
+    hidden_critic: int,
+    init_scale: float,
+    lr_actor: float,
+    lr_critic: float,
+    weight_decay: float,
+    num_envs: int,
+    device: torch.device,
+) -> SACTensors:
+    actor = Actor(
+        n_obs=obs_dim,
+        n_act=act_dim,
+        num_envs=num_envs,
+        init_scale=init_scale,
+        hidden_dim=hidden_actor,
+        device=device,
+    )
+    critic = Critic(
+        n_obs=obs_dim,
+        n_act=act_dim,
+        hidden_dim=hidden_critic,
+        device=device,
+    )
+    critic_target = Critic(
+        n_obs=obs_dim,
+        n_act=act_dim,
+        hidden_dim=hidden_critic,
+        device=device,
+    )
+    critic_target.load_state_dict(critic.state_dict())
+
+    actor_optimizer = torch.optim.AdamW(actor.parameters(), lr=lr_actor, weight_decay=weight_decay)
+    critic_optimizer = torch.optim.AdamW(critic.parameters(), lr=lr_critic, weight_decay=weight_decay)
+
+    log_alpha = torch.ones(1, requires_grad=True, device=device)
+    log_alpha.data.copy_(torch.tensor([np.log(1e-3)], device=device))
+    alpha_optimizer = torch.optim.Adam([log_alpha], lr=lr_critic)
+    target_entropy = -float(act_dim)
+
+    return SACTensors(
+        actor=actor,
+        critic=critic,
+        critic_target=critic_target,
+        actor_optimizer=actor_optimizer,
+        critic_optimizer=critic_optimizer,
+        alpha_optimizer=alpha_optimizer,
+        log_alpha=log_alpha,
+        target_entropy=target_entropy,
+    )
+
+
+def reset_critic(
+    *,
+    sac: SACTensors,
+    obs_dim: int,
+    act_dim: int,
+    hidden_critic: int,
+    lr_critic: float,
+    weight_decay: float,
+    device: torch.device,
+) -> None:
+    """Reinitialize critic, target critic, and critic optimizer state."""
+    critic = Critic(
+        n_obs=obs_dim,
+        n_act=act_dim,
+        hidden_dim=hidden_critic,
+        device=device,
+    )
+    critic_target = Critic(
+        n_obs=obs_dim,
+        n_act=act_dim,
+        hidden_dim=hidden_critic,
+        device=device,
+    )
+    critic_target.load_state_dict(critic.state_dict())
+    critic_optimizer = torch.optim.AdamW(critic.parameters(), lr=lr_critic, weight_decay=weight_decay)
+    sac.critic = critic
+    sac.critic_target = critic_target
+    sac.critic_optimizer = critic_optimizer
+
+
+def compute_q_disagreement(
+    *,
+    sac: SACTensors,
+    obs: torch.Tensor,
+    actions: torch.Tensor,
+) -> QDisagreementMetrics:
+    """Return scalar critic disagreement statistics for the given batch."""
+    with torch.no_grad():
+        q1, q2 = sac.critic(obs, actions)
+        abs_diff = torch.abs(q1 - q2)
+        q_min = torch.min(q1, q2)
+        q_max = torch.max(q1, q2)
+    return QDisagreementMetrics(
+        abs_diff_mean=float(abs_diff.mean().detach().cpu().item()),
+        abs_diff_max=float(abs_diff.max().detach().cpu().item()),
+        q1_mean=float(q1.mean().detach().cpu().item()),
+        q2_mean=float(q2.mean().detach().cpu().item()),
+        q_min_mean=float(q_min.mean().detach().cpu().item()),
+        q_max_mean=float(q_max.mean().detach().cpu().item()),
+    )
+
+
+def soft_update(source: torch.nn.Module, target: torch.nn.Module, tau: float) -> None:
+    for p, tp in zip(source.parameters(), target.parameters()):
+        tp.data.lerp_(p.data, tau)
+
+
+def sac_update_step(
+    *,
+    sac: SACTensors,
+    batch,
+    gamma: float,
+    tau: float,
+    max_grad_norm: float,
+    pref_batch=None,
+    pref_rank_weight: float = 0.0,
+    pref_rank_margin: float = 0.1,
+) -> SACUpdateMetrics:
+    obs = batch["observations"]
+    actions = batch["actions"]
+    next_obs = batch["next"]["observations"]
+    rewards = batch["next"]["rewards"].unsqueeze(-1)
+    dones = batch["next"]["dones"].bool().unsqueeze(-1)
+    trunc = batch["next"]["truncations"].bool().unsqueeze(-1)
+    discount = torch.as_tensor(gamma, device=obs.device, dtype=torch.float32)
+    bootstrap = (trunc | ~dones).float()
+
+    with torch.no_grad():
+        next_actions, next_log_pi, _ = sac.actor(next_obs)
+        q1_next, q2_next = sac.critic_target(next_obs, next_actions)
+        min_q_next = torch.min(q1_next, q2_next) - sac.log_alpha.exp() * next_log_pi
+        target_q = rewards + bootstrap * discount * min_q_next
+
+    q1, q2 = sac.critic(obs, actions)
+    critic_loss = F.mse_loss(q1, target_q) + F.mse_loss(q2, target_q)
+
+    if pref_batch is not None and float(pref_rank_weight) > 0.0:
+        pref_obs = pref_batch["obs"]
+        pref_teacher = pref_batch["teacher_actions"]
+        pref_student = pref_batch["student_actions"]
+        tq1, tq2 = sac.critic(pref_obs, pref_teacher)
+        sq1, sq2 = sac.critic(pref_obs, pref_student)
+        q_teacher = torch.min(tq1, tq2)
+        q_student = torch.min(sq1, sq2)
+        rank_loss = F.softplus(float(pref_rank_margin) - (q_teacher - q_student)).mean()
+        critic_loss = critic_loss + float(pref_rank_weight) * rank_loss
+
+    sac.critic_optimizer.zero_grad(set_to_none=True)
+    critic_loss.backward()
+    if max_grad_norm > 0:
+        torch.nn.utils.clip_grad_norm_(sac.critic.parameters(), max_grad_norm)
+    sac.critic_optimizer.step()
+
+    pi_actions, log_pi, _ = sac.actor(obs)
+    q1_pi, q2_pi = sac.critic(obs, pi_actions)
+    q_pi = torch.min(q1_pi, q2_pi)
+    actor_loss = ((sac.log_alpha.exp().detach() * log_pi) - q_pi).mean()
+
+    sac.actor_optimizer.zero_grad(set_to_none=True)
+    actor_loss.backward()
+    if max_grad_norm > 0:
+        torch.nn.utils.clip_grad_norm_(sac.actor.parameters(), max_grad_norm)
+    sac.actor_optimizer.step()
+
+    alpha_loss = -sac.log_alpha.exp() * (log_pi.detach() + sac.target_entropy).mean()
+    sac.alpha_optimizer.zero_grad(set_to_none=True)
+    alpha_loss.backward()
+    sac.alpha_optimizer.step()
+
+    soft_update(sac.critic, sac.critic_target, tau)
+
+    return SACUpdateMetrics(
+        critic_loss=float(critic_loss.detach().cpu().item()),
+        actor_loss=float(actor_loss.detach().cpu().item()),
+        alpha_loss=float(alpha_loss.detach().cpu().item()),
+        alpha=float(sac.log_alpha.exp().detach().cpu().item()),
+        target_q_mean=float(target_q.detach().mean().cpu().item()),
+    )
