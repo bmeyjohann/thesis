@@ -59,14 +59,14 @@ echo "Launching FastSAC safety_progress runs on ${ENV_A} and ${ENV_B}"
 
 echo "Intervention schedule: p0=${INTERVENTION_EP_PROB} -> pmin=${INTERVENTION_EP_PROB_MIN} over ${INTERVENTION_DECAY_STEPS} steps per env (start ${INTERVENTION_DECAY_START})"
 
-WANDB_MODE=offline CUDA_VISIBLE_DEVICES=0 python -u train_fast_sac_ogbench.py \
+WANDB_MODE=offline CUDA_VISIBLE_DEVICES=0 python -u train_fast_sac_ogbench_maze.py \
   --env_name ${ENV_A} \
   --exp_name "fastsac_${ENV_A}_safety_progress_${SLURM_JOB_ID}" \
   ${BASE_ARGS} \
   2>&1 | tee logs/${ENV_A}_fastsac_safety_progress_${SLURM_JOB_ID}.log &
 PID_A=$!
 
-WANDB_MODE=offline CUDA_VISIBLE_DEVICES=1 python -u train_fast_sac_ogbench.py \
+WANDB_MODE=offline CUDA_VISIBLE_DEVICES=1 python -u train_fast_sac_ogbench_maze.py \
   --env_name ${ENV_B} \
   --exp_name "fastsac_${ENV_B}_safety_progress_${SLURM_JOB_ID}" \
   ${BASE_ARGS} \

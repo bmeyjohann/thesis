@@ -62,7 +62,7 @@ echo "Launching SLOW comparison (ours vs demo-buffer baseline) for: ${ENV_IDS}"
 for ENV_ID in ${ENV_IDS}; do
   echo "Starting env=${ENV_ID}"
 
-  WANDB_MODE=offline CUDA_VISIBLE_DEVICES=0 python -u train_fast_sac_ogbench.py \
+  WANDB_MODE=offline CUDA_VISIBLE_DEVICES=0 python -u train_fast_sac_ogbench_manip.py \
     --env_name "${ENV_ID}" \
     --exp_name "fastsac_own_${ENV_ID}_state_${SLURM_JOB_ID}" \
     ${BASE_ARGS} \
@@ -70,7 +70,7 @@ for ENV_ID in ${ENV_IDS}; do
     2>&1 | tee "logs/fastsac_own_${ENV_ID}_state_${SLURM_JOB_ID}.log" &
   PID_OURS=$!
 
-  WANDB_MODE=offline CUDA_VISIBLE_DEVICES=1 python -u train_fast_sac_ogbench.py \
+  WANDB_MODE=offline CUDA_VISIBLE_DEVICES=1 python -u train_fast_sac_ogbench_manip.py \
     --env_name "${ENV_ID}" \
     --exp_name "fastsac_baseline_${ENV_ID}_state_${SLURM_JOB_ID}" \
     ${BASE_ARGS} \

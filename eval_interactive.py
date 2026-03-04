@@ -49,10 +49,12 @@ from ogbench_utils import (
     MLPBackbone,
     PixelBackbone,
     PixelNormalizer,
-    build_ogbench_wrapper,
     build_eval_parser,
     maybe_set_goal_color,
 )
+from ogbench_utils.env_wrappers_common import infer_ogbench_env_family
+from ogbench_utils.env_wrappers_manip import build_ogbench_manip_wrapper
+from ogbench_utils.env_wrappers_maze import build_ogbench_maze_wrapper
 from ogbench_utils.obs import (
     prepare_observation,
     reshape_observation,
@@ -1666,7 +1668,13 @@ def create_env(env_name: str, args, *, render_override: str | None = None, mirro
                 teleop = InlineEvalTeleop(decouple_view=bool(getattr(args, 'decouple_view', False)))
                 teleop.print_controls()
 
-        wrapper = build_ogbench_wrapper(
+        env_family = infer_ogbench_env_family(env_name)
+        if env_family == "manip":
+            build_wrapper = build_ogbench_manip_wrapper
+        else:
+            build_wrapper = build_ogbench_maze_wrapper
+        wrapper = build_wrapper(
+            env_name=env_name,
             obs_mode=getattr(args, 'obs_mode', 'state'),
             include_goal=args.include_goal,
             include_distance=args.include_distance,

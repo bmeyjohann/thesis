@@ -54,7 +54,7 @@ launch_tol_run () {
   local TOL_TAG
   TOL_TAG=$(echo "${TOL}" | tr '.' 'p')
 
-  WANDB_MODE=offline CUDA_VISIBLE_DEVICES=${GPU_ID} python -u train_fast_sac_ogbench.py \
+  WANDB_MODE=offline CUDA_VISIBLE_DEVICES=${GPU_ID} python -u train_fast_sac_ogbench_manip.py \
     --env_name "${ENV_ID}" \
     ${BASE_ARGS} \
     --tolerance_type "${TOLERANCE_TYPE}" --tolerance_value "${TOL}" \

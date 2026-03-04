@@ -77,7 +77,7 @@ BASE_ARGS="--env_name ${ENV_ID} --obs_mode pixels --num_envs ${NUM_ENVS} \
 echo "Launching pixel sweep (reference-stabilized) on ${ENV_ID}"
 
 # A: tiny CNN
-WANDB_MODE=offline CUDA_VISIBLE_DEVICES=0 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
+WANDB_MODE=offline CUDA_VISIBLE_DEVICES=0 python -u train_fast_sac_ogbench_maze.py ${BASE_ARGS} \
   --dense_reward_scale ${SCALE_A} \
   --pixel_conv_channels ${CNN_A} --pixel_kernel_sizes ${KER_A} --pixel_strides ${STR_A} \
   --exp_name "pix_ref_A_tiny_${SLURM_JOB_ID}" \
@@ -85,7 +85,7 @@ WANDB_MODE=offline CUDA_VISIBLE_DEVICES=0 python -u train_fast_sac_ogbench.py ${
 PID_A=$!
 
 # B: single‑conv baseline
-WANDB_MODE=offline CUDA_VISIBLE_DEVICES=1 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
+WANDB_MODE=offline CUDA_VISIBLE_DEVICES=1 python -u train_fast_sac_ogbench_maze.py ${BASE_ARGS} \
   --dense_reward_scale ${SCALE_B} \
   --pixel_conv_channels ${CNN_B} --pixel_kernel_sizes ${KER_B} --pixel_strides ${STR_B} \
   --pixel_final_pool 0 \
@@ -94,7 +94,7 @@ WANDB_MODE=offline CUDA_VISIBLE_DEVICES=1 python -u train_fast_sac_ogbench.py ${
 PID_B=$!
 
 # C: medium CNN
-WANDB_MODE=offline CUDA_VISIBLE_DEVICES=2 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
+WANDB_MODE=offline CUDA_VISIBLE_DEVICES=2 python -u train_fast_sac_ogbench_maze.py ${BASE_ARGS} \
   --dense_reward_scale ${SCALE_C} \
   --pixel_conv_channels ${CNN_C} --pixel_kernel_sizes ${KER_C} --pixel_strides ${STR_C} \
   --exp_name "pix_ref_C_medium_${SLURM_JOB_ID}" \
@@ -102,7 +102,7 @@ WANDB_MODE=offline CUDA_VISIBLE_DEVICES=2 python -u train_fast_sac_ogbench.py ${
 PID_C=$!
 
 # D: large CNN
-WANDB_MODE=offline CUDA_VISIBLE_DEVICES=3 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
+WANDB_MODE=offline CUDA_VISIBLE_DEVICES=3 python -u train_fast_sac_ogbench_maze.py ${BASE_ARGS} \
   --dense_reward_scale ${SCALE_D} \
   --pixel_conv_channels ${CNN_D} --pixel_kernel_sizes ${KER_D} --pixel_strides ${STR_D} \
   --exp_name "pix_ref_D_large_${SLURM_JOB_ID}" \

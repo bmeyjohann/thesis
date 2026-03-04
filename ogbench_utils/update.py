@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Tuple, Optional
+import time
 
 import numpy as np
 import torch
@@ -9,7 +9,7 @@ from torch.amp import autocast
 from torch.cuda.amp import GradScaler
 from tensordict import TensorDict
 
-from .buffers import CounterfactualBuffer, PreferencePairBuffer, PreferenceTDBuffer
+from .buffers import PreferencePairBuffer
 
 
 class FastSACUpdater:
@@ -41,11 +41,7 @@ class FastSACUpdater:
         amp_device_type: str,
         scaler: GradScaler,
         target_entropy: float,
-        cf_buffer: CounterfactualBuffer | None = None,
         pref_buffer: PreferencePairBuffer | None = None,
-        pref_td_buffer: PreferenceTDBuffer | None = None,
-        pixel_shape: Optional[Tuple[int, int, int]] = None,
-        pixel_random_shift_pad: int = 0,
     ):
         self.args = args
         self.actor_backbone = actor_backbone
@@ -70,23 +66,13 @@ class FastSACUpdater:
         self.amp_device_type = amp_device_type
         self.scaler = scaler
         self.target_entropy = target_entropy
-        self.cf_buffer = cf_buffer
         self.pref_buffer = pref_buffer
-        self.pref_td_buffer = pref_td_buffer
-        self.pixel_shape = pixel_shape
-        self.pixel_random_shift_pad = int(max(0, pixel_random_shift_pad))
-        self._random_shift_base_grid: Dict[Tuple[torch.device, torch.dtype], torch.Tensor] = {}
-        if (
-            getattr(args, "obs_mode", "state") == "pixels"
-            and self.pixel_shape is not None
-            and self.pixel_random_shift_pad > 0
-        ):
-            self.random_shift_enabled = True
-            c, h, w = self.pixel_shape
-            self._pixel_flat_dim = c * h * w
-        else:
-            self.random_shift_enabled = False
-            self._pixel_flat_dim = None
+        self.pref_lambda = float(getattr(args, "pref_lambda_init", 0.0))
+        self.pref_lambda_lr = float(getattr(args, "pref_lambda_lr", 1e-3))
+        self.pref_lambda_max = float(getattr(args, "pref_lambda_max", 10.0))
+        self.pref_lambda_ema = float(getattr(args, "pref_lambda_ema", 0.9))
+        self.pref_violation_clip = float(getattr(args, "pref_violation_clip", 10.0))
+        self._pref_violation_ema = 0.0
 
     def actor_forward(self, obs_flat: torch.Tensor):
         obs_in = self.reshape_obs(obs_flat)
@@ -100,60 +86,6 @@ class FastSACUpdater:
         q_values = heads_module(features, actions)
         return features, q_values
 
-    def _apply_random_shift_flat(self, obs_flat: torch.Tensor) -> torch.Tensor:
-        if not self.random_shift_enabled:
-            return obs_flat
-        if obs_flat is None or obs_flat.ndim != 2:
-            return obs_flat
-        if self._pixel_flat_dim is None or obs_flat.shape[1] != self._pixel_flat_dim:
-            return obs_flat
-        obs_view = self.reshape_obs(obs_flat)
-        shifted = self._random_shift(obs_view)
-        return shifted.view(obs_flat.shape[0], -1)
-
-    def _random_shift(self, obs: torch.Tensor) -> torch.Tensor:
-        pad = self.pixel_random_shift_pad
-        if pad <= 0 or self.pixel_shape is None:
-            return obs
-        obs_padded = F.pad(obs, (pad, pad, pad, pad), mode="replicate")
-        n = obs_padded.shape[0]
-        base_grid = self._get_random_shift_base_grid(obs_padded.device, obs_padded.dtype)
-        base_grid = base_grid.expand(n, -1, -1, -1)
-        offsets = torch.randint(-pad, pad + 1, size=(n, 2), device=obs_padded.device).to(base_grid.dtype)
-        height = self.pixel_shape[1] + 2 * pad
-        width = self.pixel_shape[2] + 2 * pad
-        shift_y = offsets[:, 0] * (2.0 / max(1, height))
-        shift_x = offsets[:, 1] * (2.0 / max(1, width))
-        shift = torch.stack((shift_x, shift_y), dim=-1).view(n, 1, 1, 2)
-        grid = base_grid + shift
-        return F.grid_sample(obs_padded, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
-
-    def _get_random_shift_base_grid(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        key = (device, dtype)
-        cached = self._random_shift_base_grid.get(key)
-        if cached is not None:
-            return cached
-        if self.pixel_shape is None:
-            raise RuntimeError("Pixel shape must be provided for random shift augmentation")
-        pad = self.pixel_random_shift_pad
-        _, h, w = self.pixel_shape
-        total_h = h + 2 * pad
-        total_w = w + 2 * pad
-        eps_y = 1.0 / max(1, total_h)
-        eps_x = 1.0 / max(1, total_w)
-        y_coords = torch.linspace(-1.0 + eps_y, 1.0 - eps_y, total_h, device=device, dtype=dtype)
-        x_coords = torch.linspace(-1.0 + eps_x, 1.0 - eps_x, total_w, device=device, dtype=dtype)
-        try:
-            grid_y, grid_x = torch.meshgrid(y_coords, x_coords, indexing="ij")
-        except TypeError:  # PyTorch < 1.10 fallback
-            grid_y, grid_x = torch.meshgrid(y_coords, x_coords)
-        base_grid = torch.stack((grid_x, grid_y), dim=-1)
-        if pad > 0:
-            base_grid = base_grid[pad:-pad, pad:-pad, :]
-        base_grid = base_grid.unsqueeze(0)
-        self._random_shift_base_grid[key] = base_grid
-        return base_grid
-
     def update(
         self,
         *,
@@ -163,26 +95,49 @@ class FastSACUpdater:
         main_batch: int,
         base_batch: int,
         b_pref: int,
-        b_pref_td: int,
         b_demo: int,
     ) -> Tuple[Dict[str, float], int]:
         args = self.args
         metrics_accumulator = {
             "critic_loss": 0.0,
+            "critic_loss_replay": 0.0,
+            "critic_loss_pref": 0.0,
+            "critic_loss_pref_weighted": 0.0,
+            "critic_loss_total": 0.0,
+            "pref_linked_rows": 0.0,
+            "pref_lambda": 0.0,
+            "pref_lambda_delta": 0.0,
+            "pref_dual_violation": 0.0,
+            "pref_violation": 0.0,
+            "pref_violation_ema": 0.0,
+            "pref_lagrangian_loss": 0.0,
             "actor_loss": 0.0,
+            "actor_loss_sac": 0.0,
+            "actor_bc_loss_demo": 0.0,
+            "actor_bc_loss_pref": 0.0,
             "alpha_loss": 0.0,
             "entropy": 0.0,
             "action_norm": 0.0,
             "target_q": 0.0,
             "q_min_pi": 0.0,
+            "q_disagreement_data": 0.0,
+            "q_disagreement_pi": 0.0,
             "reward": 0.0,
             "reward_abs": 0.0,
             "alpha_value": 0.0,
+            "timing_sample_s": 0.0,
+            "timing_opt_s": 0.0,
         }
         updates_count = 0
 
         for _ in range(args.num_updates):
+            sample_t0 = time.perf_counter()
             batch = replay_buffer.sample(main_batch)
+            demo_batch = None
+            demo_bc_obs = None
+            demo_bc_actions = None
+            pref_states_for_actor = None
+            pref_teacher_actions_for_actor = None
             if demo_buffer is not None and b_demo > 0:
                 try:
                     demo_size = getattr(demo_buffer, "size", 0)
@@ -191,6 +146,12 @@ class FastSACUpdater:
                 if demo_size >= b_demo:
                     demo_batch = demo_buffer.sample(b_demo)
                     batch = TensorDict.cat([batch, demo_batch], dim=0)
+                    demo_bc_obs = demo_batch["observations"]
+                    demo_bc_actions = demo_batch["actions"]
+            sample_elapsed = time.perf_counter() - sample_t0
+            metrics_accumulator["timing_sample_s"] += float(sample_elapsed)
+
+            opt_t0 = time.perf_counter()
             obs_batch = batch["observations"]
             next_obs_batch = batch["next"]["observations"]
             actions_batch = batch["actions"]
@@ -199,9 +160,6 @@ class FastSACUpdater:
 
             obs_batch = self.normalize_obs(obs_batch)
             next_obs_batch = self.normalize_obs(next_obs_batch)
-
-            obs_batch = self._apply_random_shift_flat(obs_batch)
-            next_obs_batch = self._apply_random_shift_flat(next_obs_batch)
 
             if args.arch_shared_trunk and self.trunk_optimizer is not None:
                 self.trunk_optimizer.zero_grad(set_to_none=True)
@@ -219,88 +177,126 @@ class FastSACUpdater:
                 current_backbone = self.actor_backbone if args.arch_shared_trunk else self.critic_backbone
                 current_features = current_backbone(self.reshape_obs(obs_batch))
                 current_q_list = self.critic_heads(current_features, actions_batch)
-                qf_loss = torch.tensor(0.0, device=self.device)
+                q_stack_data = torch.stack(current_q_list, dim=0).squeeze(-1)
+                qf_loss_replay_sum = torch.tensor(0.0, device=self.device)
                 for q_pred in current_q_list:
-                    qf_loss = qf_loss + F.mse_loss(q_pred, target_q)
+                    qf_loss_replay_sum = qf_loss_replay_sum + F.mse_loss(q_pred, target_q)
+                num_critics = max(1, len(current_q_list))
+                critic_loss_replay_tensor = qf_loss_replay_sum / num_critics
+                qf_loss = qf_loss_replay_sum
+                rank_loss = torch.tensor(0.0, device=self.device)
+                rank_loss_weighted = torch.tensor(0.0, device=self.device)
+                pref_violation_value = 0.0
+                pref_dual_violation_value = 0.0
+                pref_violation_ema_value = float(self._pref_violation_ema)
+                pref_lambda_value = float(self.pref_lambda)
+                pref_lambda_delta_value = 0.0
 
-                critic_loss_value = float((qf_loss / max(1, len(current_q_list))).detach().cpu().item())
-
-                # Counterfactual critic penalty
-                if (
-                    self.cf_buffer is not None
-                    and args.cf_q_weight > 0.0
-                    and args.cf_sample_ratio > 0.0
-                    and self.cf_buffer.size > 0
-                ):
-                    cf_b = max(1, int(base_batch * args.cf_sample_ratio))
-                    cf_sample = self.cf_buffer.sample(cf_b)
-                    if cf_sample is not None:
-                        cf_states = self._apply_random_shift_flat(cf_sample.states)
-                        cf_features = current_backbone(self.reshape_obs(cf_states))
-                        cf_q_list = self.critic_heads(cf_features, cf_sample.actions)
-                        for q_cf in cf_q_list:
-                            qf_loss = qf_loss + args.cf_q_weight * F.mse_loss(
-                                q_cf, torch.full_like(q_cf, args.cf_penalty_target)
-                            )
+                critic_loss_replay_value = float(critic_loss_replay_tensor.detach().cpu().item())
+                q_disagreement_data = torch.max(q_stack_data, dim=0).values - torch.min(q_stack_data, dim=0).values
+                q_disagreement_data_value = float(q_disagreement_data.detach().mean().cpu().item())
 
                 # Preference ranking loss
-                if (
-                    self.pref_buffer is not None
-                    and args.pref_rank_weight > 0.0
-                    and b_pref > 0
-                    and self.pref_buffer.size > 0
-                ):
-                    pref_sample = self.pref_buffer.sample(b_pref)
-                    if pref_sample is not None:
-                        pref_states = self._apply_random_shift_flat(pref_sample.states)
+                pref_sampling_mode = str(getattr(args, "pref_sampling_mode", "independent")).strip().lower()
+                if float(args.pref_rank_weight) > 0.0:
+                    pref_states = None
+                    pref_teacher_actions = None
+                    pref_student_actions = None
+
+                    if pref_sampling_mode == "linked":
+                        has_student_actions = False
+                        try:
+                            has_student_actions = "student_actions" in batch.keys(include_nested=False)
+                        except TypeError:
+                            has_student_actions = "student_actions" in batch.keys()
+                        except Exception:
+                            has_student_actions = "student_actions" in batch
+                        if has_student_actions:
+                            linked_student_actions = batch["student_actions"]
+                            has_teacher_intervened = False
+                            try:
+                                has_teacher_intervened = "teacher_intervened" in batch.keys(include_nested=False)
+                            except TypeError:
+                                has_teacher_intervened = "teacher_intervened" in batch.keys()
+                            except Exception:
+                                has_teacher_intervened = "teacher_intervened" in batch
+                            if has_teacher_intervened:
+                                linked_mask = batch["teacher_intervened"].to(torch.bool)
+                                linked_rows = int(linked_mask.sum().item())
+                                metrics_accumulator["pref_linked_rows"] += float(linked_rows)
+                                if linked_rows > 0:
+                                    pref_states = obs_batch[linked_mask]
+                                    pref_teacher_actions = actions_batch[linked_mask]
+                                    pref_student_actions = linked_student_actions[linked_mask]
+                    elif (
+                        self.pref_buffer is not None
+                        and b_pref > 0
+                        and self.pref_buffer.size > 0
+                    ):
+                        pref_t0 = time.perf_counter()
+                        pref_sample = self.pref_buffer.sample(b_pref)
+                        metrics_accumulator["timing_sample_s"] += float(time.perf_counter() - pref_t0)
+                        if pref_sample is not None:
+                            pref_states = pref_sample.states
+                            pref_teacher_actions = pref_sample.teacher_actions
+                            pref_student_actions = pref_sample.student_actions
+
+                    if (
+                        pref_states is not None
+                        and pref_teacher_actions is not None
+                        and pref_student_actions is not None
+                        and pref_states.shape[0] > 0
+                    ):
                         pref_features = current_backbone(self.reshape_obs(pref_states))
-                        q_pos = self.critic_heads(pref_features, pref_sample.teacher_actions)
-                        q_neg = self.critic_heads(pref_features, pref_sample.student_actions)
-                        qpos_min = torch.min(torch.stack(q_pos, dim=0), dim=0).values
-                        qneg_min = torch.min(torch.stack(q_neg, dim=0), dim=0).values
+                        q_pos = self.critic_heads(pref_features, pref_teacher_actions)
+                        q_neg = self.critic_heads(pref_features, pref_student_actions)
+                        # Per-head preference ranking: every critic is trained to rank teacher > student.
+                        q_pos_stack = torch.stack(q_pos, dim=0)
+                        q_neg_stack = torch.stack(q_neg, dim=0)
+                        if bool(getattr(args, "pref_stopgrad_positive", False)):
+                            q_pos_term = q_pos_stack.detach()
+                        else:
+                            q_pos_term = q_pos_stack
                         margin = float(args.pref_rank_margin)
-                        rank_loss = F.softplus(margin - (qpos_min - qneg_min)).mean()
-                        qf_loss = qf_loss + float(args.pref_rank_weight) * rank_loss
-
-                # Preference TD loss
-                if (
-                    self.pref_td_buffer is not None
-                    and args.pref_td_q_weight > 0.0
-                    and b_pref_td > 0
-                    and self.pref_td_buffer.teacher_size > 0
-                    and self.pref_td_buffer.student_size > 0
-                ):
-                    td_batch = self.pref_td_buffer.sample(b_pref_td)
-                    if td_batch is not None:
-                        t_s = td_batch["t_states"]
-                        t_a = td_batch["t_actions"]
-                        t_r = td_batch["t_rewards"]
-                        t_next_s = td_batch["t_next_states"]
-                        t_done = td_batch["t_dones"]
-                        s_s = td_batch["s_states"]
-                        s_a = td_batch["s_actions"]
-                        s_r = td_batch["s_rewards"]
-
-                        t_s = self._apply_random_shift_flat(t_s)
-                        t_next_s = self._apply_random_shift_flat(t_next_s)
-                        s_s = self._apply_random_shift_flat(s_s)
-
-                        with torch.no_grad():
-                            next_actions_td, next_log_pi_td, _, _ = self.actor_forward(t_next_s)
-                            next_features_td = self.critic_target_backbone(self.reshape_obs(t_next_s))
-                            q_td_list = self.critic_target_heads(next_features_td, next_actions_td)
-                            min_q_td = torch.min(torch.stack(q_td_list, dim=0), dim=0).values
-                            min_q_td = min_q_td - self.log_alpha.exp() * next_log_pi_td
-                            target_teacher = t_r + (1.0 - t_done) * (args.gamma * min_q_td)
-
-                        teacher_features = current_backbone(self.reshape_obs(t_s))
-                        teacher_q_list = self.critic_heads(teacher_features, t_a)
-                        loss_teacher = sum(F.mse_loss(q_t, target_teacher) for q_t in teacher_q_list)
-
-                        student_features = current_backbone(self.reshape_obs(s_s))
-                        student_q_list = self.critic_heads(student_features, s_a)
-                        loss_student = sum(F.mse_loss(q_s, s_r) for q_s in student_q_list)
-                        qf_loss = qf_loss + float(args.pref_td_q_weight) * (loss_teacher + loss_student)
+                        delta = q_pos_term - q_neg_stack
+                        pref_loss_type = str(getattr(args, "pref_loss_type", "margin")).strip().lower()
+                        if pref_loss_type == "bradley_terry":
+                            rank_loss = F.softplus(-delta).mean()
+                            rank_loss_weighted = float(args.pref_rank_weight) * rank_loss
+                        elif pref_loss_type == "lagrangian":
+                            prev_pref_lambda = float(self.pref_lambda)
+                            violation = torch.clamp(margin - delta, min=0.0)
+                            pref_violation_value = float(violation.detach().mean().cpu().item())
+                            if self.pref_violation_clip > 0.0:
+                                violation = torch.clamp(violation, max=self.pref_violation_clip)
+                            if self.pref_lambda_ema > 0.0:
+                                self._pref_violation_ema = (
+                                    self.pref_lambda_ema * self._pref_violation_ema
+                                    + (1.0 - self.pref_lambda_ema) * float(pref_violation_value)
+                                )
+                                dual_violation = float(self._pref_violation_ema)
+                            else:
+                                dual_violation = float(pref_violation_value)
+                            pref_dual_violation_value = float(dual_violation)
+                            if self.pref_lambda_lr > 0.0:
+                                self.pref_lambda = max(0.0, self.pref_lambda + self.pref_lambda_lr * dual_violation)
+                                if self.pref_lambda_max > 0.0:
+                                    self.pref_lambda = min(self.pref_lambda, self.pref_lambda_max)
+                            pref_lambda_value = float(self.pref_lambda)
+                            pref_lambda_delta_value = pref_lambda_value - prev_pref_lambda
+                            pref_violation_ema_value = float(self._pref_violation_ema)
+                            rank_loss = (pref_lambda_value * violation).mean()
+                            # Lagrangian already scales by lambda; keep extra rank weight neutral.
+                            rank_loss_weighted = rank_loss
+                        else:
+                            rank_loss = F.softplus(margin - delta).mean()
+                            rank_loss_weighted = float(args.pref_rank_weight) * rank_loss
+                        qf_loss = qf_loss + rank_loss_weighted
+                        pref_states_for_actor = pref_states
+                        pref_teacher_actions_for_actor = pref_teacher_actions
+                critic_loss_pref_value = float(rank_loss.detach().cpu().item())
+                critic_loss_pref_weighted_value = float(rank_loss_weighted.detach().cpu().item())
+                critic_loss_total_value = critic_loss_replay_value + critic_loss_pref_weighted_value
 
             self.scaler.scale(qf_loss).backward()
             self.scaler.unscale_(self.critic_optimizer)
@@ -315,13 +311,42 @@ class FastSACUpdater:
                 pi_actions, log_pi, _, _ = self.actor_forward(obs_batch)
                 actor_backbone_eval = current_backbone
                 q_pi_list = self.critic_heads(actor_backbone_eval(self.reshape_obs(obs_batch)), pi_actions)
-                min_q_pi = torch.min(torch.stack(q_pi_list, dim=0), dim=0).values
-                actor_loss = (self.log_alpha.exp().detach() * log_pi - min_q_pi).mean()
+                q_stack_pi = torch.stack(q_pi_list, dim=0)
+                min_q_pi = torch.min(q_stack_pi, dim=0).values
+                actor_loss_sac = (self.log_alpha.exp().detach() * log_pi - min_q_pi).mean()
+                actor_loss = actor_loss_sac
+                bc_loss_demo = torch.tensor(0.0, device=self.device)
+                bc_loss_pref = torch.tensor(0.0, device=self.device)
+
+                if (
+                    float(getattr(args, "actor_bc_weight_demo", 0.0)) > 0.0
+                    and demo_bc_obs is not None
+                    and demo_bc_actions is not None
+                ):
+                    demo_obs_norm = self.normalize_obs(demo_bc_obs)
+                    demo_pi, _, _, _ = self.actor_forward(demo_obs_norm)
+                    bc_loss_demo = F.mse_loss(demo_pi, demo_bc_actions)
+                    actor_loss = actor_loss + float(args.actor_bc_weight_demo) * bc_loss_demo
+
+                if (
+                    float(getattr(args, "actor_bc_weight_pref", 0.0)) > 0.0
+                    and pref_states_for_actor is not None
+                    and pref_teacher_actions_for_actor is not None
+                ):
+                    pref_pi, _, _, _ = self.actor_forward(pref_states_for_actor)
+                    bc_loss_pref = F.mse_loss(pref_pi, pref_teacher_actions_for_actor)
+                    actor_loss = actor_loss + float(args.actor_bc_weight_pref) * bc_loss_pref
+
             actor_loss_value = float(actor_loss.detach().cpu().item())
+            actor_loss_sac_value = float(actor_loss_sac.detach().cpu().item())
+            bc_demo_loss_value = float(bc_loss_demo.detach().cpu().item())
+            bc_pref_loss_value = float(bc_loss_pref.detach().cpu().item())
             entropy_value = float((-log_pi).detach().mean().cpu().item())
             action_norm_value = float(pi_actions.detach().norm(dim=-1).mean().cpu().item())
             target_q_mean = float(target_q.detach().mean().cpu().item())
             min_q_pi_mean = float(min_q_pi.detach().mean().cpu().item())
+            q_disagreement_pi = torch.max(q_stack_pi, dim=0).values - torch.min(q_stack_pi, dim=0).values
+            q_disagreement_pi_value = float(q_disagreement_pi.detach().mean().cpu().item())
             reward_mean = float(rewards_batch.detach().mean().cpu().item())
 
             self.scaler.scale(actor_loss).backward()
@@ -375,16 +400,34 @@ class FastSACUpdater:
             for src_param, tgt_param in zip(self.critic_heads.parameters(), self.critic_target_heads.parameters()):
                 tgt_param.data.copy_(args.tau * src_param.data + (1 - args.tau) * tgt_param.data)
 
-            metrics_accumulator["critic_loss"] += critic_loss_value
+            metrics_accumulator["critic_loss"] += critic_loss_total_value
+            metrics_accumulator["critic_loss_replay"] += critic_loss_replay_value
+            metrics_accumulator["critic_loss_pref"] += critic_loss_pref_value
+            metrics_accumulator["critic_loss_pref_weighted"] += critic_loss_pref_weighted_value
+            metrics_accumulator["critic_loss_total"] += critic_loss_total_value
+            metrics_accumulator["pref_lambda"] += pref_lambda_value
+            metrics_accumulator["pref_lambda_delta"] += pref_lambda_delta_value
+            metrics_accumulator["pref_dual_violation"] += pref_dual_violation_value
+            metrics_accumulator["pref_violation"] += pref_violation_value
+            metrics_accumulator["pref_violation_ema"] += pref_violation_ema_value
+            metrics_accumulator["pref_lagrangian_loss"] += (
+                critic_loss_pref_weighted_value if str(getattr(args, "pref_loss_type", "margin")).strip().lower() == "lagrangian" else 0.0
+            )
             metrics_accumulator["actor_loss"] += actor_loss_value
+            metrics_accumulator["actor_loss_sac"] += actor_loss_sac_value
+            metrics_accumulator["actor_bc_loss_demo"] += bc_demo_loss_value
+            metrics_accumulator["actor_bc_loss_pref"] += bc_pref_loss_value
             metrics_accumulator["alpha_loss"] += alpha_loss_value
             metrics_accumulator["entropy"] += entropy_value
             metrics_accumulator["action_norm"] += action_norm_value
             metrics_accumulator["target_q"] += target_q_mean
             metrics_accumulator["q_min_pi"] += min_q_pi_mean
+            metrics_accumulator["q_disagreement_data"] += q_disagreement_data_value
+            metrics_accumulator["q_disagreement_pi"] += q_disagreement_pi_value
             metrics_accumulator["reward"] += reward_mean
             metrics_accumulator["reward_abs"] += float(rewards_batch.detach().abs().mean().cpu().item())
             metrics_accumulator["alpha_value"] += alpha_value
+            metrics_accumulator["timing_opt_s"] += float(time.perf_counter() - opt_t0)
             updates_count += 1
 
         return metrics_accumulator, updates_count

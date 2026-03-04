@@ -54,28 +54,28 @@ BASE_ARGS="--env_name ${ENV_ID} --obs_mode pixels --num_envs ${NUM_ENVS} --total
 echo "Launching Batch P (pixel CNN sweep) on ${ENV_ID}"
 
 # 1) Pixels, non-shared, 2 critics
-CUDA_VISIBLE_DEVICES=0 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
+CUDA_VISIBLE_DEVICES=0 python -u train_fast_sac_ogbench_maze.py ${BASE_ARGS} \
   --num_critics 2 \
   --exp_name "P_pixels_mlp2_${SLURM_JOB_ID}" \
   2>&1 | tee logs/${ENV_ID}_sac_P_pixels_mlp2_${SLURM_JOB_ID}.log &
 PID1=$!
 
 # 2) Pixels, non-shared, 3 critics
-CUDA_VISIBLE_DEVICES=1 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
+CUDA_VISIBLE_DEVICES=1 python -u train_fast_sac_ogbench_maze.py ${BASE_ARGS} \
   --num_critics 3 \
   --exp_name "P_pixels_mlp3_${SLURM_JOB_ID}" \
   2>&1 | tee logs/${ENV_ID}_sac_P_pixels_mlp3_${SLURM_JOB_ID}.log &
 PID2=$!
 
 # 3) Pixels, shared trunk, 2 critics
-CUDA_VISIBLE_DEVICES=2 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
+CUDA_VISIBLE_DEVICES=2 python -u train_fast_sac_ogbench_maze.py ${BASE_ARGS} \
   --arch_shared_trunk --shared_hidden_dim ${SHARED_DIM} --num_critics 2 \
   --exp_name "P_pixels_shared2_${SLURM_JOB_ID}" \
   2>&1 | tee logs/${ENV_ID}_sac_P_pixels_shared2_${SLURM_JOB_ID}.log &
 PID3=$!
 
 # 4) Pixels, shared trunk, 3 critics
-CUDA_VISIBLE_DEVICES=3 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
+CUDA_VISIBLE_DEVICES=3 python -u train_fast_sac_ogbench_maze.py ${BASE_ARGS} \
   --arch_shared_trunk --shared_hidden_dim ${SHARED_DIM} --num_critics 3 \
   --exp_name "P_pixels_shared3_${SLURM_JOB_ID}" \
   2>&1 | tee logs/${ENV_ID}_sac_P_pixels_shared3_${SLURM_JOB_ID}.log &

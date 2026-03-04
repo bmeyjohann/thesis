@@ -22,6 +22,78 @@ class TeacherSnapshot:
     qmin_non: float | None
 
 
+@dataclass
+class TimingWindow:
+    steps: int = 0
+    action_s: float = 0.0
+    env_s: float = 0.0
+    info_s: float = 0.0
+    replay_s: float = 0.0
+    sample_s: float = 0.0
+    update_s: float = 0.0
+    misc_s: float = 0.0
+    total_s: float = 0.0
+
+    def add(
+        self,
+        *,
+        action_s: float,
+        env_s: float,
+        info_s: float,
+        replay_s: float,
+        sample_s: float,
+        update_s: float,
+        misc_s: float,
+        total_s: float,
+    ) -> None:
+        self.steps += 1
+        self.action_s += float(action_s)
+        self.env_s += float(env_s)
+        self.info_s += float(info_s)
+        self.replay_s += float(replay_s)
+        self.sample_s += float(sample_s)
+        self.update_s += float(update_s)
+        self.misc_s += float(misc_s)
+        self.total_s += float(total_s)
+
+    def summary(self, prefix: str = "Perf/timing") -> Dict[str, float]:
+        if self.steps <= 0:
+            return {}
+        out: Dict[str, float] = {
+            f"{prefix}/steps": float(self.steps),
+            f"{prefix}/step_ms_mean": float((self.total_s / self.steps) * 1e3),
+            f"{prefix}/action_ms_mean": float((self.action_s / self.steps) * 1e3),
+            f"{prefix}/env_step_ms_mean": float((self.env_s / self.steps) * 1e3),
+            f"{prefix}/info_ms_mean": float((self.info_s / self.steps) * 1e3),
+            f"{prefix}/replay_add_ms_mean": float((self.replay_s / self.steps) * 1e3),
+            f"{prefix}/sample_ms_mean": float((self.sample_s / self.steps) * 1e3),
+            f"{prefix}/update_ms_mean": float((self.update_s / self.steps) * 1e3),
+            f"{prefix}/misc_ms_mean": float((self.misc_s / self.steps) * 1e3),
+            f"{prefix}/update_total_ms_mean": float(((self.sample_s + self.update_s) / self.steps) * 1e3),
+        }
+        denom = max(1e-9, self.total_s)
+        out[f"{prefix}/pct_action"] = float(100.0 * self.action_s / denom)
+        out[f"{prefix}/pct_env_step"] = float(100.0 * self.env_s / denom)
+        out[f"{prefix}/pct_info"] = float(100.0 * self.info_s / denom)
+        out[f"{prefix}/pct_replay_add"] = float(100.0 * self.replay_s / denom)
+        out[f"{prefix}/pct_sample"] = float(100.0 * self.sample_s / denom)
+        out[f"{prefix}/pct_update"] = float(100.0 * self.update_s / denom)
+        out[f"{prefix}/pct_misc"] = float(100.0 * self.misc_s / denom)
+        out[f"{prefix}/pct_update_total"] = float(100.0 * (self.sample_s + self.update_s) / denom)
+        return out
+
+    def reset(self) -> None:
+        self.steps = 0
+        self.action_s = 0.0
+        self.env_s = 0.0
+        self.info_s = 0.0
+        self.replay_s = 0.0
+        self.sample_s = 0.0
+        self.update_s = 0.0
+        self.misc_s = 0.0
+        self.total_s = 0.0
+
+
 class TeacherMetricsAccumulator:
     def __init__(
         self,
@@ -214,12 +286,12 @@ class TrainingLogger:
         log_alpha: torch.Tensor,
         last_denied_samples: int,
         pref_size: int,
-        pref_td_teacher_size: int,
-        pref_td_student_size: int,
+        pref_capacity: int,
         replay_size: int,
         replay_capacity: int,
         demo_size: int,
         demo_capacity: int,
+        timing_summary: Optional[Dict[str, float]] = None,
     ) -> Dict[str, float]:
         fps = int(total_env_steps / max(1e-6, collection_time))
         logs = {
@@ -237,13 +309,35 @@ class TrainingLogger:
         if last_update_metrics is not None:
             metrics_accumulator, updates_count = last_update_metrics
             denom = float(max(1, updates_count))
+            pref_loss_type = str(getattr(self.args, "pref_loss_type", "margin")).strip().lower()
+            lagrangian_enabled = 1.0 if pref_loss_type == "lagrangian" else 0.0
             logs["Train/critic_loss"] = metrics_accumulator["critic_loss"] / denom
+            logs["Train/critic_loss_replay"] = metrics_accumulator["critic_loss_replay"] / denom
+            logs["Train/critic_loss_pref"] = metrics_accumulator["critic_loss_pref"] / denom
+            logs["Train/critic_loss_pref_weighted"] = metrics_accumulator["critic_loss_pref_weighted"] / denom
+            logs["Train/critic_loss_total"] = metrics_accumulator["critic_loss_total"] / denom
+            logs["Train/pref_lambda"] = metrics_accumulator["pref_lambda"] / denom
+            logs["Train/pref_lambda_delta"] = metrics_accumulator["pref_lambda_delta"] / denom
+            logs["Train/pref_dual_violation"] = metrics_accumulator["pref_dual_violation"] / denom
+            logs["Train/pref_violation"] = metrics_accumulator["pref_violation"] / denom
+            logs["Train/pref_violation_ema"] = metrics_accumulator["pref_violation_ema"] / denom
+            logs["Train/pref_lagrangian_loss"] = metrics_accumulator["pref_lagrangian_loss"] / denom
+            logs["Train/pref_lagrangian_enabled"] = lagrangian_enabled
+            logs["Train/pref_lambda_lr"] = float(getattr(self.args, "pref_lambda_lr", 0.0))
+            logs["Train/pref_lambda_max"] = float(getattr(self.args, "pref_lambda_max", 0.0))
+            logs["Train/pref_lambda_ema_cfg"] = float(getattr(self.args, "pref_lambda_ema", 0.0))
+            logs["Train/pref_violation_clip"] = float(getattr(self.args, "pref_violation_clip", 0.0))
             logs["Train/actor_loss"] = metrics_accumulator["actor_loss"] / denom
+            logs["Train/actor_loss_sac"] = metrics_accumulator["actor_loss_sac"] / denom
+            logs["Train/actor_bc_loss_demo"] = metrics_accumulator["actor_bc_loss_demo"] / denom
+            logs["Train/actor_bc_loss_pref"] = metrics_accumulator["actor_bc_loss_pref"] / denom
             logs["Train/alpha_loss"] = metrics_accumulator["alpha_loss"] / denom
             logs["Train/policy_entropy"] = metrics_accumulator["entropy"] / denom
             logs["Train/action_l2"] = metrics_accumulator["action_norm"] / denom
             logs["Train/target_q_mean"] = metrics_accumulator["target_q"] / denom
             logs["Train/q_min_pi_mean"] = metrics_accumulator["q_min_pi"] / denom
+            logs["Train/q_disagreement_data_mean"] = metrics_accumulator["q_disagreement_data"] / denom
+            logs["Train/q_disagreement_pi_mean"] = metrics_accumulator["q_disagreement_pi"] / denom
             logs["Train/replay_reward_mean"] = metrics_accumulator["reward"] / denom
             logs["Train/replay_reward_abs_mean"] = metrics_accumulator["reward_abs"] / denom
             logs["Train/alpha"] = metrics_accumulator["alpha_value"] / denom
@@ -269,24 +363,34 @@ class TrainingLogger:
         if teacher_snapshot.qmin_non is not None:
             logs["/Critic/mean_q_min_no_intervention"] = teacher_snapshot.qmin_non
 
-        if pref_size >= 0:
-            logs["/Buffers/pref_pairs"] = float(pref_size)
-        if pref_td_teacher_size >= 0:
-            logs["/Buffers/pref_td_teacher"] = float(pref_td_teacher_size)
-        if pref_td_student_size >= 0:
-            logs["/Buffers/pref_td_student"] = float(pref_td_student_size)
-        if replay_size >= 0:
-            logs["/Buffers/replay_size"] = float(replay_size)
-        if replay_capacity >= 0:
-            logs["/Buffers/replay_capacity"] = float(replay_capacity)
-        if demo_size >= 0:
-            logs["/Buffers/demo_size"] = float(demo_size)
-        if demo_capacity >= 0:
-            logs["/Buffers/demo_capacity"] = float(demo_capacity)
+        pref_size_f = float(max(0, int(pref_size)))
+        pref_capacity_f = float(max(0, int(pref_capacity)))
+        replay_size_f = float(max(0, int(replay_size)))
+        replay_capacity_f = float(max(0, int(replay_capacity)))
+        demo_size_f = float(max(0, int(demo_size)))
+        demo_capacity_f = float(max(0, int(demo_capacity)))
+
+        # Always log buffer state, even when individual buffers are disabled.
+        logs["/Buffers/pref_pairs"] = pref_size_f
+        logs["/Buffers/pref_capacity"] = pref_capacity_f
+        logs["/Buffers/replay_size"] = replay_size_f
+        logs["/Buffers/replay_capacity"] = replay_capacity_f
+        logs["/Buffers/demo_size"] = demo_size_f
+        logs["/Buffers/demo_capacity"] = demo_capacity_f
+
+        # Duplicated under Train/* so panels can be grouped with loss curves.
+        logs["Train/buffer_pref_size"] = pref_size_f
+        logs["Train/buffer_pref_capacity"] = pref_capacity_f
+        logs["Train/buffer_replay_size"] = replay_size_f
+        logs["Train/buffer_replay_capacity"] = replay_capacity_f
+        logs["Train/buffer_demo_size"] = demo_size_f
+        logs["Train/buffer_demo_capacity"] = demo_capacity_f
+        if timing_summary:
+            logs.update(timing_summary)
 
         for key in list(logs.keys()):
             lower_key = key.lower()
-            if "disagreement" in lower_key or "frac_interventions_dis_ge_" in lower_key:
+            if "frac_interventions_dis_ge_" in lower_key:
                 logs.pop(key, None)
 
         log_line_parts = [
@@ -302,6 +406,14 @@ class TrainingLogger:
             log_line_parts.append(f"teacher_frac {logs['/Teacher/teacher_fraction_steps']:.2f}")
         if self.args.store_denied_actions and last_denied_samples > 0:
             log_line_parts.append(f"denied {last_denied_samples}")
+        if timing_summary:
+            step_ms = float(timing_summary.get("Perf/timing/step_ms_mean", 0.0))
+            env_ms = float(timing_summary.get("Perf/timing/env_step_ms_mean", 0.0))
+            sample_ms = float(timing_summary.get("Perf/timing/sample_ms_mean", 0.0))
+            update_ms = float(timing_summary.get("Perf/timing/update_ms_mean", 0.0))
+            log_line_parts.append(
+                f"tms step={step_ms:.1f} env={env_ms:.1f} sample={sample_ms:.1f} update={update_ms:.1f}"
+            )
         console_line = "[FastSAC] " + " | ".join(log_line_parts)
         print(console_line, flush=True)
         self.record_progress(console_line)

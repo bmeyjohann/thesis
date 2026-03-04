@@ -5,7 +5,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
-python train_fast_sac_ogbench.py \
+python train_fast_sac_ogbench_maze.py \
   --env_name pointmaze-arena-danger-lethal-v0 \
   --num_envs 8 \
   --total_timesteps 20000 \

@@ -46,7 +46,7 @@ BASE_ARGS="--obs_mode state --reward_type sparse --dense_reward_scale 0.0 --step
 
 echo "Launching FastSAC demo comparison runs on ${ENV_ID}"
 
-WANDB_MODE=offline CUDA_VISIBLE_DEVICES=0 python -u train_fast_sac_ogbench.py \
+WANDB_MODE=offline CUDA_VISIBLE_DEVICES=0 python -u train_fast_sac_ogbench_maze.py \
   --env_name ${ENV_ID} \
   --exp_name "fastsac_${ENV_ID}_prefill_replay_${SLURM_JOB_ID}" \
   --demo_prefill_steps ${DEMO_PREFILL_STEPS} \
@@ -57,7 +57,7 @@ WANDB_MODE=offline CUDA_VISIBLE_DEVICES=0 python -u train_fast_sac_ogbench.py \
   2>&1 | tee logs/${ENV_ID}_fastsac_prefill_replay_${SLURM_JOB_ID}.log &
 PID_A=$!
 
-WANDB_MODE=offline CUDA_VISIBLE_DEVICES=1 python -u train_fast_sac_ogbench.py \
+WANDB_MODE=offline CUDA_VISIBLE_DEVICES=1 python -u train_fast_sac_ogbench_maze.py \
   --env_name ${ENV_ID} \
   --exp_name "fastsac_${ENV_ID}_demo_buffer_${SLURM_JOB_ID}" \
   --demo_buffer_enable --demo_buffer_capacity ${DEMO_BUFFER_CAPACITY} \

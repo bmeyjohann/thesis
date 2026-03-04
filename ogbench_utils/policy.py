@@ -30,13 +30,18 @@ class IdentityNormalizer(nn.Module):
 class MLPBackbone(nn.Module):
     """Two-layer MLP feature extractor."""
 
-    def __init__(self, input_dim: int, hidden_dim: int):
+    def __init__(self, input_dim: int, hidden_dim: int, use_layer_norm: bool = False, layer_norm_eps: float = 1e-5):
         super().__init__()
+        layers: list[nn.Module] = [nn.Linear(input_dim, hidden_dim)]
+        if use_layer_norm:
+            layers.append(nn.LayerNorm(hidden_dim, eps=float(layer_norm_eps)))
+        layers.append(nn.ReLU())
+        layers.append(nn.Linear(hidden_dim, hidden_dim))
+        if use_layer_norm:
+            layers.append(nn.LayerNorm(hidden_dim, eps=float(layer_norm_eps)))
+        layers.append(nn.ReLU())
         self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+            *layers,
         )
         self.output_dim = hidden_dim
 
@@ -108,16 +113,30 @@ class GaussianPolicyHead(nn.Module):
     LOG_STD_MAX = 2
     LOG_STD_MIN = -5
 
-    def __init__(self, feature_dim: int, action_dim: int, hidden_dim: int, init_scale: float):
+    def __init__(
+        self,
+        feature_dim: int,
+        action_dim: int,
+        hidden_dim: int,
+        init_scale: float,
+        use_layer_norm: bool = False,
+        layer_norm_eps: float = 1e-5,
+    ):
         super().__init__()
+        hidden_dim_2 = max(1, hidden_dim // 2)
+        layers: list[nn.Module] = [nn.Linear(feature_dim, hidden_dim)]
+        if use_layer_norm:
+            layers.append(nn.LayerNorm(hidden_dim, eps=float(layer_norm_eps)))
+        layers.append(nn.ReLU())
+        layers.append(nn.Linear(hidden_dim, hidden_dim_2))
+        if use_layer_norm:
+            layers.append(nn.LayerNorm(hidden_dim_2, eps=float(layer_norm_eps)))
+        layers.append(nn.ReLU())
         self.net = nn.Sequential(
-            nn.Linear(feature_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
+            *layers,
         )
-        self.fc_mu = nn.Linear(hidden_dim // 2, action_dim)
-        self.fc_logstd = nn.Linear(hidden_dim // 2, action_dim)
+        self.fc_mu = nn.Linear(hidden_dim_2, action_dim)
+        self.fc_logstd = nn.Linear(hidden_dim_2, action_dim)
         nn.init.normal_(self.fc_mu.weight, 0.0, init_scale)
         nn.init.constant_(self.fc_mu.bias, 0.0)
 
@@ -139,14 +158,20 @@ class GaussianPolicyHead(nn.Module):
 class CriticHead(nn.Module):
     """Single Q-value head."""
 
-    def __init__(self, feature_dim: int, action_dim: int, hidden_dim: int):
+    def __init__(self, feature_dim: int, action_dim: int, hidden_dim: int, use_layer_norm: bool = False, layer_norm_eps: float = 1e-5):
         super().__init__()
+        hidden_dim_2 = max(1, hidden_dim // 2)
+        layers: list[nn.Module] = [nn.Linear(feature_dim + action_dim, hidden_dim)]
+        if use_layer_norm:
+            layers.append(nn.LayerNorm(hidden_dim, eps=float(layer_norm_eps)))
+        layers.append(nn.ReLU())
+        layers.append(nn.Linear(hidden_dim, hidden_dim_2))
+        if use_layer_norm:
+            layers.append(nn.LayerNorm(hidden_dim_2, eps=float(layer_norm_eps)))
+        layers.append(nn.ReLU())
+        layers.append(nn.Linear(hidden_dim_2, 1))
         self.net = nn.Sequential(
-            nn.Linear(feature_dim + action_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 2, 1),
+            *layers,
         )
 
     def forward(self, features: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
@@ -157,10 +182,25 @@ class CriticHead(nn.Module):
 class CriticEnsemble(nn.Module):
     """Ensemble of critic heads."""
 
-    def __init__(self, feature_dim: int, action_dim: int, hidden_dim: int, num_heads: int):
+    def __init__(
+        self,
+        feature_dim: int,
+        action_dim: int,
+        hidden_dim: int,
+        num_heads: int,
+        use_layer_norm: bool = False,
+        layer_norm_eps: float = 1e-5,
+    ):
         super().__init__()
         self.heads = nn.ModuleList([
-            CriticHead(feature_dim, action_dim, hidden_dim) for _ in range(num_heads)
+            CriticHead(
+                feature_dim,
+                action_dim,
+                hidden_dim,
+                use_layer_norm=use_layer_norm,
+                layer_norm_eps=layer_norm_eps,
+            )
+            for _ in range(num_heads)
         ])
 
     def forward(self, features: torch.Tensor, actions: torch.Tensor) -> list[torch.Tensor]:

@@ -179,6 +179,53 @@ def _prepare_run_dirs(args, variant_tag: str) -> RunPaths:
     return RunPaths(log_dir=log_dir, model_dir=model_dir)
 
 
+def _maybe_init_wandb(args, *, variant: str, run_paths: RunPaths):
+    if not bool(getattr(args, "use_wandb", False)):
+        return None
+    try:
+        import wandb  # type: ignore
+    except Exception as exc:
+        raise RuntimeError("--use_wandb was set, but wandb could not be imported.") from exc
+
+    project = str(getattr(args, "wandb_project", "thesis-safetygym"))
+    mode = str(getattr(args, "wandb_mode", "offline"))
+    name = str(getattr(args, "wandb_run_name", "")).strip() or str(getattr(args, "exp_name", "")).strip()
+    entity = str(getattr(args, "wandb_entity", "")).strip()
+    group = str(getattr(args, "wandb_group", "")).strip()
+
+    init_kwargs = {
+        "project": project,
+        "mode": mode,
+        "config": {**vars(args), "variant": variant},
+        "dir": str(run_paths.log_dir),
+    }
+    if name:
+        init_kwargs["name"] = name
+    if entity:
+        init_kwargs["entity"] = entity
+    if group:
+        init_kwargs["group"] = group
+    return wandb.init(**init_kwargs)
+
+
+def _emit_metrics(
+    *,
+    payload: Dict[str, float],
+    log_path: Path,
+    wandb_run=None,
+    step: Optional[int] = None,
+) -> None:
+    line = json.dumps(payload, sort_keys=True)
+    print(line, flush=True)
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(line + "\n")
+    if wandb_run is not None:
+        if step is None:
+            wandb_run.log(payload)
+        else:
+            wandb_run.log(payload, step=int(step))
+
+
 def _make_env_with_wrappers(
     *,
     args,
@@ -524,6 +571,7 @@ def run_training(args, *, variant: str) -> None:
 
     run_paths = _prepare_run_dirs(args, variant_tag=variant)
     log_path = run_paths.log_dir / "training.log"
+    wandb_run = _maybe_init_wandb(args, variant=variant, run_paths=run_paths)
 
     controller = None
     with_intervention = bool(args.use_intervention)
@@ -660,20 +708,14 @@ def run_training(args, *, variant: str) -> None:
         variant=variant,
     )
     if prefill_logs:
-        prefill_line = json.dumps(prefill_logs, sort_keys=True)
-        print(prefill_line, flush=True)
-        with log_path.open("a", encoding="utf-8") as f:
-            f.write(prefill_line + "\n")
+        _emit_metrics(payload=prefill_logs, log_path=log_path, wandb_run=wandb_run, step=0)
 
     last_update: Optional[SACUpdateMetrics] = None
     pretrain_update, pretrain_logs = _run_demo_pretrain(args=args, sac=sac, demo_rb=demo_rb)
     if pretrain_update is not None:
         last_update = pretrain_update
     if pretrain_logs:
-        pretrain_line = json.dumps(pretrain_logs, sort_keys=True)
-        print(pretrain_line, flush=True)
-        with log_path.open("a", encoding="utf-8") as f:
-            f.write(pretrain_line + "\n")
+        _emit_metrics(payload=pretrain_logs, log_path=log_path, wandb_run=wandb_run, step=0)
 
     pretrain_updates_run = int(pretrain_logs.get("train/pretrain_updates_run", 0.0)) if pretrain_logs else 0
     if bool(getattr(args, "critic_reset_after_pretrain", False)) and pretrain_updates_run > 0:
@@ -686,15 +728,19 @@ def run_training(args, *, variant: str) -> None:
             weight_decay=float(args.weight_decay),
             device=device,
         )
-        reset_line = json.dumps({"train/critic_reset_after_pretrain": 1.0}, sort_keys=True)
-        print(reset_line, flush=True)
-        with log_path.open("a", encoding="utf-8") as f:
-            f.write(reset_line + "\n")
+        _emit_metrics(
+            payload={"train/critic_reset_after_pretrain": 1.0},
+            log_path=log_path,
+            wandb_run=wandb_run,
+            step=0,
+        )
     elif bool(getattr(args, "critic_reset_after_pretrain", False)):
-        reset_skip_line = json.dumps({"train/critic_reset_after_pretrain": 0.0}, sort_keys=True)
-        print(reset_skip_line, flush=True)
-        with log_path.open("a", encoding="utf-8") as f:
-            f.write(reset_skip_line + "\n")
+        _emit_metrics(
+            payload={"train/critic_reset_after_pretrain": 0.0},
+            log_path=log_path,
+            wandb_run=wandb_run,
+            step=0,
+        )
 
     obs, _ = env.reset(seed=args.seed)
     obs = np.asarray(obs, dtype=np.float32).reshape(-1)
@@ -946,12 +992,32 @@ def run_training(args, *, variant: str) -> None:
                 "train/step": float(step),
                 "train/fps": fps,
                 "train/replay_size": float(main_rb.size),
+                "train/replay_capacity": float(getattr(main_rb, "capacity", getattr(args, "buffer_size", 0))),
                 "train/effective_learning_starts": float(effective_learning_starts),
                 "train/live_window_steps": float(live_window_steps),
                 "train/live_intervention_steps": float(live_window_intervention_steps),
                 "train/live_intervention_fraction": float(live_window_intervention_steps / max(1, live_window_steps)),
                 "train/live_controller_ms_per_step": float(live_window_controller_ms / max(1, live_window_steps)),
             }
+            # Always emit buffer state for consistent dashboards across variants.
+            logs["train/buffer_main_size"] = float(main_rb.size)
+            logs["train/buffer_main_capacity"] = float(
+                getattr(main_rb, "capacity", getattr(args, "buffer_size", 0))
+            )
+            logs["train/buffer_demo_size"] = float(demo_rb.size if demo_rb is not None else 0)
+            logs["train/buffer_demo_capacity"] = float(
+                getattr(demo_rb, "capacity", getattr(args, "buffer_size", 0)) if demo_rb is not None else 0
+            )
+            logs["train/buffer_novice_size"] = float(novice_rb.size if novice_rb is not None else 0)
+            logs["train/buffer_novice_capacity"] = float(
+                getattr(novice_rb, "capacity", getattr(args, "buffer_size", 0)) if novice_rb is not None else 0
+            )
+            logs["train/buffer_human_size"] = float(human_rb.size if human_rb is not None else 0)
+            logs["train/buffer_human_capacity"] = float(
+                getattr(human_rb, "capacity", getattr(args, "buffer_size", 0)) if human_rb is not None else 0
+            )
+            logs["train/buffer_pref_size"] = float(len(pref_pairs))
+            logs["train/buffer_pref_capacity"] = float(pref_capacity)
             if uncertainty_enabled:
                 logs.update(_summary_stats(live_window_uncertainty_all, "train/uncertainty_all"))
                 logs.update(_summary_stats(live_window_uncertainty_intervention, "train/uncertainty_intervention"))
@@ -991,8 +1057,7 @@ def run_training(args, *, variant: str) -> None:
             if variant == "pvp" and novice_rb is not None and human_rb is not None:
                 logs["train/novice_replay_size"] = float(novice_rb.size)
                 logs["train/human_replay_size"] = float(human_rb.size)
-            if demo_rb is not None:
-                logs["train/demo_replay_size"] = float(demo_rb.size)
+            logs["train/demo_replay_size"] = float(demo_rb.size if demo_rb is not None else 0)
             if last_update is not None:
                 logs.update(
                     {
@@ -1004,10 +1069,7 @@ def run_training(args, *, variant: str) -> None:
                     }
                 )
 
-            line = json.dumps(logs, sort_keys=True)
-            print(line, flush=True)
-            with log_path.open("a", encoding="utf-8") as f:
-                f.write(line + "\n")
+            _emit_metrics(payload=logs, log_path=log_path, wandb_run=wandb_run, step=step)
             live_window_steps = 0
             live_window_intervention_steps = 0
             live_window_controller_ms = 0.0
@@ -1027,10 +1089,7 @@ def run_training(args, *, variant: str) -> None:
             next_eval += int(args.eval_interval)
             eval_metrics = _run_eval(sac.actor, args, device, eval_seed=args.seed + 100000 + step)
             eval_metrics["eval/step"] = float(step)
-            line = json.dumps(eval_metrics, sort_keys=True)
-            print(line, flush=True)
-            with log_path.open("a", encoding="utf-8") as f:
-                f.write(line + "\n")
+            _emit_metrics(payload=eval_metrics, log_path=log_path, wandb_run=wandb_run, step=step)
 
         if next_save > 0 and step >= next_save:
             next_save += int(args.save_interval)
@@ -1061,3 +1120,5 @@ def run_training(args, *, variant: str) -> None:
     env.close()
     if controller is not None:
         controller.close()
+    if wandb_run is not None:
+        wandb_run.finish()

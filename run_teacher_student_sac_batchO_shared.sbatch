@@ -48,28 +48,28 @@ BASE_ARGS="--env_name ${ENV_ID} --num_envs ${NUM_ENVS} --total_timesteps ${TOTAL
 echo "Launching Batch O (shared trunk sweep) on ${ENV_ID}"
 
 # 1) Baseline MLP (no shared trunk, 2 critics)
-CUDA_VISIBLE_DEVICES=0 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
+CUDA_VISIBLE_DEVICES=0 python -u train_fast_sac_ogbench_maze.py ${BASE_ARGS} \
   --num_critics 2 \
   --exp_name "O_mlp_base_${SLURM_JOB_ID}" \
   2>&1 | tee logs/${ENV_ID}_sac_O_mlp_base_${SLURM_JOB_ID}.log &
 PID1=$!
 
 # 2) Shared trunk (2 critics)
-CUDA_VISIBLE_DEVICES=1 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
+CUDA_VISIBLE_DEVICES=1 python -u train_fast_sac_ogbench_maze.py ${BASE_ARGS} \
   --arch_shared_trunk --shared_hidden_dim ${SHARED_DIM} --num_critics 2 \
   --exp_name "O_shared2_${SLURM_JOB_ID}" \
   2>&1 | tee logs/${ENV_ID}_sac_O_shared2_${SLURM_JOB_ID}.log &
 PID2=$!
 
 # 3) Shared trunk (3 critics)
-CUDA_VISIBLE_DEVICES=2 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
+CUDA_VISIBLE_DEVICES=2 python -u train_fast_sac_ogbench_maze.py ${BASE_ARGS} \
   --arch_shared_trunk --shared_hidden_dim ${SHARED_DIM} --num_critics 3 \
   --exp_name "O_shared3_${SLURM_JOB_ID}" \
   2>&1 | tee logs/${ENV_ID}_sac_O_shared3_${SLURM_JOB_ID}.log &
 PID3=$!
 
 # 4) Baseline (no shared trunk, 3 critics)
-CUDA_VISIBLE_DEVICES=3 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
+CUDA_VISIBLE_DEVICES=3 python -u train_fast_sac_ogbench_maze.py ${BASE_ARGS} \
   --num_critics 3 \
   --exp_name "O_mlp_3crit_${SLURM_JOB_ID}" \
   2>&1 | tee logs/${ENV_ID}_sac_O_mlp_3crit_${SLURM_JOB_ID}.log &

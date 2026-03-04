@@ -7,9 +7,34 @@ Navigating challenging terrains without continuous human oversight is critical f
 ## Quick Start for gridworld experiments
 
 - Remote training: `source sc_venv_template/activate.sh` then `python train_rsl_rl_integrated.py --env_name [pointmaze-medium-v0, pointmaze-arena-danger-{wall,lethal,sticky,floor}-v0]`
-- Local training: `conda activate fasttd3` then `python train_fast_sac_ogbench.py --env_name [pointmaze-medium-v0, pointmaze-arena-danger-{wall,lethal,sticky,floor}-v0]`
+- Local training (maze): `conda activate fasttd3` then `python train_fast_sac_ogbench_maze.py --env_name [pointmaze-medium-v0, pointmaze-arena-danger-{wall,lethal,sticky,floor}-v0]`
+- Local training (manip): `conda activate fasttd3` then `python train_fast_sac_ogbench_manip.py --env_name [cube-double-v0, cube-triple-singletask-task5-v0, visual-cube-double-v0]`
+- Shared FastSAC pipeline modules: `ogbench_utils/fastsac_ogbench_{cli,train,env,setup,loop}.py` (invoked via the maze/manip entrypoints above).
 - Evaluate: `python eval_interactive.py --model_path models/<file>.pt --env_name [pointmaze-medium-v0, pointmaze-arena-danger-{wall,lethal,sticky,floor}-v0]`
 - Submit on SLURM: `bash submit_job.sh [experiment_name].sbatch`
+
+## Quick Start for Safety-Gymnasium human intervention
+
+- Own method (FastSAC-state): `conda activate fasttd3` then run `python train_fast_sac_safetygym.py --env_name SafetyCarGoal2-v0 --num_envs 1 --use_intervention`
+- PVP variant (FastSAC-state): `conda activate fasttd3` then run `python train_fastsac_pvp_safetygym.py --env_name SafetyCarGoal2-v0 --num_envs 1 --use_intervention`
+- HILSERL variant (FastSAC-state): `conda activate fasttd3` then run `python train_fastsac_hilserl_safetygym.py --env_name SafetyCarGoal2-v0 --num_envs 1 --use_intervention`
+- Interactive eval: `python eval_interactive_safetygym.py --model_path models/safetygym/<run>/final.pt --env_name SafetyCarGoal2-v0 --controller policy --intervention_mode human`
+- Reward modes are configurable across train/eval via `--reward_mode {sparse,dense,none}`; dense uses progress-delta shaping (`d_prev - d_cur`).
+- Surface defaults to `--surface_mode default`; use `--surface_mode grippy` only if you explicitly want reduced slip.
+- Use `--profile_timing` in training to log per-cycle timing breakdown (`action`, `env_step`, `update`, etc.).
+- Car env keyboard control uses differential wheel mixing in intervention mode:
+  - `W/S`: both wheels forward/backward
+  - `A/D`: opposite wheel directions (turn-in-place)
+  - combos like `W+A` and `W+D` map to one-wheel-forward steering as expected.
+- Car wheel command range is expanded by default to `[-2, 2]`:
+  - `W+A` maps to `(2, 0)`, `W+D` maps to `(0, 2)`, etc.
+  - tune via `--car_wheel_command_limit` and `--car_force_scale`.
+- `--controller_fps_limit` sets an optional cap for the keyboard overlay window (`0` means uncapped).
+- `--controller_overlay_hz` controls how often the keyboard overlay is redrawn (polling stays per-step); lowering this can improve FPS.
+- `--torch_num_threads` / `--torch_num_interop_threads` (defaults `1`) reduce CPU thread overhead and often improve interactive FPS substantially.
+- `--update_every` and `--updates_per_cycle` let you decimate optimizer updates for smoother interactive control while still training.
+- Smoke all 3 variants non-interactive: `bash scripts/smoke_safetygym_all.sh`
+- Smoke with keyboard intervention enabled: `USE_INTERVENTION=1 bash scripts/smoke_safetygym_all.sh` (focus the `SafetyGym Controls` window)
 
 ## Apptainer for Isaac Sim experiments
 

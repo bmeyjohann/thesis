@@ -23,7 +23,7 @@ VIZ_FIRST_STEP=${VIZ_FIRST_STEP:-5000}
 VIZ_GRID_RES=${VIZ_GRID_RES:-16}
 VIZ_QUIVER_STRIDE=${VIZ_QUIVER_STRIDE:-2}
 
-python -u train_fast_sac_ogbench.py \
+python -u train_fast_sac_ogbench_maze.py \
   --env_name ${ENV_ID} \
   --obs_mode state \
   --reward_type sparse --dense_reward_scale 0.0 --step_penalty 0.0 \

@@ -60,10 +60,11 @@ from drqv2.pref_buffer import PreferencePairStorage, PreferencePairDataset  # no
 
 from ogbench_utils import (  # noqa: E402
     TeacherMetricsAccumulator,
-    build_ogbench_wrapper,
     build_train_parser,
     maybe_set_goal_color,
 )
+from ogbench_utils.env_wrappers_manip import build_ogbench_manip_wrapper  # noqa: E402
+from ogbench_utils.env_wrappers_maze import build_ogbench_maze_wrapper  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -1097,7 +1098,11 @@ def train():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" else torch.device(args.device)
     cudnn.benchmark = True
     utils.set_seed_everywhere(args.seed)
-    train_wrappers = [build_ogbench_wrapper(
+    build_wrapper = (
+        build_ogbench_manip_wrapper if is_manip_env(args.env_name) else build_ogbench_maze_wrapper
+    )
+    train_wrappers = [build_wrapper(
+        env_name=args.env_name,
         obs_mode=args.obs_mode,
         include_goal=args.include_goal,
         include_distance=args.include_distance,
@@ -1118,7 +1123,8 @@ def train():
         teacher_target_mode=args.teacher_target_mode,
         cube_success_tolerance=args.cube_success_tolerance,
     )]
-    eval_wrappers = [build_ogbench_wrapper(
+    eval_wrappers = [build_wrapper(
+        env_name=args.env_name,
         obs_mode=args.obs_mode,
         include_goal=args.include_goal,
         include_distance=args.include_distance,

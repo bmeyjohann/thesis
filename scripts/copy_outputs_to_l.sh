@@ -1,20 +1,28 @@
 #!/bin/bash
 
+set -euo pipefail
+
+REMOTE_HOST=${REMOTE_HOST:-meyjohann1@juwels-booster.fz-juelich.de}
+REMOTE_BASE=${REMOTE_BASE:-/p/project1/hai_1074/meyjohann1/thesis}
+CONTROL_SOCKET=${CONTROL_SOCKET:-~/.ssh/juwels-master}
+
 # Start SSH master connection to reuse authentication
-ssh -M -S ~/.ssh/juwels-master -f -N meyjohann1@juwels-booster.fz-juelich.de
+ssh -M -S "${CONTROL_SOCKET}" -f -N "${REMOTE_HOST}"
 
 # Use the master connection for all rsync commands
-rsync -avz --progress -e "ssh -S ~/.ssh/juwels-master" meyjohann1@juwels-booster.fz-juelich.de:/p/home/jusers/meyjohann1/juwels/meyjohann1/thesis/wandb/ ./wandb/
-# rsync -avz --progress -e "ssh -S ~/.ssh/juwels-master" meyjohann1@juwels-booster.fz-juelich.de:/p/home/jusers/meyjohann1/juwels/meyjohann1/thesis/models/ ./models/
-rsync -avz --progress -e "ssh -S ~/.ssh/juwels-master" meyjohann1@juwels-booster.fz-juelich.de:/p/home/jusers/meyjohann1/juwels/meyjohann1/thesis/logs/ ./logs/
+rsync -avz --progress -e "ssh -S ${CONTROL_SOCKET}" "${REMOTE_HOST}:${REMOTE_BASE}/wandb/" ./wandb/
+rsync -avz --progress -e "ssh -S ${CONTROL_SOCKET}" "${REMOTE_HOST}:${REMOTE_BASE}/logs/" ./logs/
+
+# For policy evaluation runs, sync FastSAC checkpoints as well.
+rsync -avz --progress -e "ssh -S ${CONTROL_SOCKET}" "${REMOTE_HOST}:${REMOTE_BASE}/models/fast_sac/" ./models/fast_sac/
 
 # Close the master connection
-ssh -S ~/.ssh/juwels-master -O exit meyjohann1@juwels-booster.fz-juelich.de
+ssh -S "${CONTROL_SOCKET}" -O exit "${REMOTE_HOST}"
 
-echo "🔧 Fixing broken symlinks in wandb files..."
+echo "Fixing broken symlinks in wandb files..."
 
 # Fix broken symlinks in wandb files by replacing them with actual files
-find ./wandb/*/files/ -type l -name "*.pt" -o -name "*.diff" | while read -r symlink; do
+find ./wandb/*/files/ -type l \( -name "*.pt" -o -name "*.diff" \) | while read -r symlink; do
     echo "Fixing broken symlink: $symlink"
     
     # Get the target path (what the symlink points to)
@@ -36,4 +44,4 @@ find ./wandb/*/files/ -type l -name "*.pt" -o -name "*.diff" | while read -r sym
     fi
 done
 
-echo "✅ Symlink fixing complete!"
+echo "Symlink fixing complete."

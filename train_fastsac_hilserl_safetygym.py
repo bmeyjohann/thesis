@@ -60,6 +60,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--uncertainty_oversight_mode", type=str, default="signal_only", choices=["off", "signal_only"])
     p.add_argument("--uncertainty_oversight_threshold", type=float, default=0.0)
     p.add_argument("--uncertainty_oversight_ema_alpha", type=float, default=0.05)
+    p.add_argument("--use_wandb", action="store_true", default=False)
+    p.add_argument("--wandb_project", type=str, default="thesis-safetygym")
+    p.add_argument("--wandb_entity", type=str, default="")
+    p.add_argument("--wandb_mode", type=str, default="offline", choices=["online", "offline", "disabled"])
+    p.add_argument("--wandb_run_name", type=str, default="")
+    p.add_argument("--wandb_group", type=str, default="")
 
     p.set_defaults(uncertainty_log_every_step=True)
 

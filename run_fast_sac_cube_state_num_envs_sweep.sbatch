@@ -59,7 +59,7 @@ launch_nenv_run () {
   local GPU_ID=$1
   local NENV=$2
 
-  WANDB_MODE=offline CUDA_VISIBLE_DEVICES=${GPU_ID} python -u train_fast_sac_ogbench.py \
+  WANDB_MODE=offline CUDA_VISIBLE_DEVICES=${GPU_ID} python -u train_fast_sac_ogbench_manip.py \
     --env_name "${ENV_ID}" \
     --num_envs "${NENV}" \
     ${BASE_ARGS} \

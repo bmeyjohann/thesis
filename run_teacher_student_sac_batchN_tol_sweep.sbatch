@@ -44,28 +44,28 @@ BASE_ARGS="--env_name ${ENV_ID} --num_envs ${NUM_ENVS} --total_timesteps ${TOTAL
 echo "Launching Batch N (tolerance sweep) on ${ENV_ID}"
 
 # 1) Tolerance 5 degrees
-CUDA_VISIBLE_DEVICES=0 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
+CUDA_VISIBLE_DEVICES=0 python -u train_fast_sac_ogbench_maze.py ${BASE_ARGS} \
   --tolerance_type angle --tolerance_value 5 \
   --exp_name "N_pref_tol5_${SLURM_JOB_ID}" \
   2>&1 | tee logs/${ENV_ID}_sac_N_pref_tol5_${SLURM_JOB_ID}.log &
 PID1=$!
 
 # 2) Tolerance 15 degrees
-CUDA_VISIBLE_DEVICES=1 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
+CUDA_VISIBLE_DEVICES=1 python -u train_fast_sac_ogbench_maze.py ${BASE_ARGS} \
   --tolerance_type angle --tolerance_value 15 \
   --exp_name "N_pref_tol15_${SLURM_JOB_ID}" \
   2>&1 | tee logs/${ENV_ID}_sac_N_pref_tol15_${SLURM_JOB_ID}.log &
 PID2=$!
 
 # 3) Tolerance 30 degrees
-CUDA_VISIBLE_DEVICES=2 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
+CUDA_VISIBLE_DEVICES=2 python -u train_fast_sac_ogbench_maze.py ${BASE_ARGS} \
   --tolerance_type angle --tolerance_value 30 \
   --exp_name "N_pref_tol30_${SLURM_JOB_ID}" \
   2>&1 | tee logs/${ENV_ID}_sac_N_pref_tol30_${SLURM_JOB_ID}.log &
 PID3=$!
 
 # 4) Safety-only (block lethal only, no tolerance)
-CUDA_VISIBLE_DEVICES=3 python -u train_fast_sac_ogbench.py ${BASE_ARGS} \
+CUDA_VISIBLE_DEVICES=3 python -u train_fast_sac_ogbench_maze.py ${BASE_ARGS} \
   --tolerance_type angle --tolerance_value 180 \
   --pref_rank_weight 0.8 \
   --exp_name "N_pref_safety_${SLURM_JOB_ID}" \

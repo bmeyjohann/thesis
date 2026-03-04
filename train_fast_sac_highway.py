@@ -3,7 +3,7 @@
 FastSAC training entrypoint for HighwayEnv continuous-control tasks.
 
 This is intentionally minimal and mirrors the logging/run structure used by
-train_fast_sac_ogbench.py while relying only on the pieces we need.
+train_fast_sac_ogbench_maze.py while relying only on the pieces we need.
 """
 
 from __future__ import annotations

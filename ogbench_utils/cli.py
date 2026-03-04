@@ -4,16 +4,34 @@ import argparse
 
 def build_train_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
+    cube_reward_choices = [
+        'sparse_final',
+        'sparse_intermediate',
+        'dense',
+    ]
     # Env
     p.add_argument('--env_name', type=str, default='pointmaze-arena-danger-lethal-v0')
     p.add_argument('--num_envs', type=int, default=64)
     p.add_argument('--total_timesteps', type=int, default=1_000_000)
     p.add_argument('--device', type=str, default='auto')
+    p.add_argument('--train_render_mode', type=str, default='none', choices=['none', 'human'],
+                   help='Optional live rendering during training (recommended only with num_envs=1).')
+    p.add_argument('--static_reset_seed', type=int, default=None,
+                   help='If set, forces identical reset seed on every episode reset (deterministic static initial states).')
     # Observations
     p.add_argument('--include_goal', action='store_true', default=True)
     p.add_argument('--include_distance', action='store_true', default=False)
     p.add_argument('--include_direction', action='store_true', default=False)
     p.add_argument('--include_velocity', action='store_true', default=False)
+    p.add_argument(
+        '--include_relative_cube_features',
+        action='store_true',
+        default=False,
+        help=(
+            'Manip state only: append target-relative features '
+            '(effector->target cube and target cube->goal position/yaw deltas) to observations.'
+        ),
+    )
     p.add_argument('--goal_marker_color', type=str, default='auto',
                    choices=['auto', 'red', 'green', 'blue'],
                    help='Override maze goal marker color (auto keeps env default)')
@@ -22,6 +40,26 @@ def build_train_parser() -> argparse.ArgumentParser:
     p.add_argument('--dense_reward_scale', type=float, default=0.01)
     p.add_argument('--step_penalty', type=float, default=0.0)
     p.add_argument('--reward_switch_after_steps', type=int, default=0)
+    p.add_argument('--cube_reward_mode', type=str, default='dense', choices=cube_reward_choices,
+                   help=(
+                       'Cube-state reward mode: sparse_final (episode success), '
+                       'sparse_intermediate (per cube solved), '
+                       'dense (phase-based progress: reach->grasp->carry->place).'
+                   ))
+    p.add_argument('--cube_success_reward', type=float, default=1.0,
+                   help='Sparse success reward used by cube reward modes.')
+    p.add_argument('--cube_subgoal_grasp_reward', type=float, default=0.25,
+                   help='Sparse grasp-event reward used by cube subgoal modes.')
+    p.add_argument('--cube_subgoal_place_reward', type=float, default=1.0,
+                   help='Sparse place-event reward used by cube subgoal modes.')
+    p.add_argument('--cube_subgoal_drop_penalty', type=float, default=0.0,
+                   help='Drop penalty applied on solved-count regressions in subgoal modes (typically <= 0).')
+    p.add_argument('--cube_subgoal_grasp_error_threshold', type=float, default=0.08,
+                   help='Error threshold used to trigger a one-time grasp event proxy in subgoal modes.')
+    p.add_argument('--cube_dense_progress_scale', type=float, default=1.0,
+                   help='Scale for dense phase-progress reward increments (reach/carry progress terms).')
+    p.add_argument('--cube_dense_progress_clip', type=float, default=0.0,
+                   help='Optional max per-step phase progress contribution before scaling (0 disables clipping).')
     p.add_argument('--switch_env_name', type=str, default=None,
                    help='Optional OGBench env id to switch to after a curriculum step')
     p.add_argument('--switch_env_after_steps', type=int, default=0,
@@ -29,10 +67,52 @@ def build_train_parser() -> argparse.ArgumentParser:
     # Intervention / Teacher
     p.add_argument('--use_intervention', action='store_true', default=False)
     p.add_argument('--intervention_mode', type=str, default='agent',
-                   choices=['human', 'agent', 'agent_safety_align', 'agent_safety_progress'])
+                   choices=['human', 'agent', 'agent_always', 'agent_safety_align', 'agent_safety_progress', 'agent_reward_progress', 'agent_manual_gripper'])
     p.add_argument('--teacher_type', type=str, default='bfs', choices=['bfs', 'cube_plan', 'cube_markov'])
     p.add_argument('--tolerance_type', type=str, default='angle', choices=['angle','l2'])
     p.add_argument('--tolerance_value', type=float, default=30.0)
+    p.add_argument(
+        '--tolerance_channel_weights',
+        type=str,
+        default='',
+        help='Optional per-action weights for l2 tolerance. Provide one scalar or comma-separated list matching action dim.',
+    )
+    p.add_argument(
+        '--binary_gripper_actions',
+        action='store_true',
+        default=False,
+        help='If set, force action[4] to binary {-1,+1} using --binary_gripper_threshold.',
+    )
+    p.add_argument(
+        '--binary_gripper_threshold',
+        type=float,
+        default=0.0,
+        help='Threshold for binary gripper mapping: action[4] >= threshold -> +1 else -1.',
+    )
+    p.add_argument(
+        '--hard_gripper_intervention',
+        action='store_true',
+        default=False,
+        help='Force teacher takeover on gripper mismatch during critical manipulation phases.',
+    )
+    p.add_argument(
+        '--gripper_intervene_pick_radius',
+        type=float,
+        default=0.06,
+        help='Critical radius (m) around target block where gripper mismatch triggers hard intervention.',
+    )
+    p.add_argument(
+        '--gripper_intervene_place_radius',
+        type=float,
+        default=0.06,
+        help='Critical radius (m) to target placement where gripper mismatch triggers hard intervention.',
+    )
+    p.add_argument(
+        '--gripper_intervene_contact_threshold',
+        type=float,
+        default=0.3,
+        help='Contact threshold above which gripper is considered holding for hard intervention gating.',
+    )
     p.add_argument('--hard_block_lethal', action='store_true', default=True)
     p.add_argument('--no_hard_block_lethal', dest='hard_block_lethal', action='store_false')
     p.add_argument('--intervention_enable_after_steps', type=int, default=0)
@@ -40,6 +120,10 @@ def build_train_parser() -> argparse.ArgumentParser:
                    help='Safety margin as a fraction of maze cell size for safety-based intervention modes')
     p.add_argument('--intervention_release_steps', type=int, default=3,
                    help='Consecutive aligned/progressing steps required to release safety intervention')
+    p.add_argument('--intervention_reward_patience_steps', type=int, default=5,
+                   help='Reward-progress intervention: trigger after this many non-improving steps and release after this many improving steps.')
+    p.add_argument('--intervention_reward_improvement_epsilon', type=float, default=1e-6,
+                   help='Minimum reward-progress signal increase counted as an improvement.')
     p.add_argument('--intervention_episode_prob', type=float, default=1.0,
                    help='Probability of enabling interventions each episode (1.0 = always)')
     p.add_argument('--intervention_episode_prob_min', type=float, default=0.0,
@@ -57,7 +141,12 @@ def build_train_parser() -> argparse.ArgumentParser:
     # SAC core (trimmed reasonable defaults)
     p.add_argument('--actor_learning_rate', type=float, default=3e-4)
     p.add_argument('--critic_learning_rate', type=float, default=3e-4)
-    p.add_argument('--batch_size', type=int, default=1024)
+    p.add_argument(
+        '--batch_size',
+        type=int,
+        default=1024,
+        help='Total samples per optimizer update (not divided by num_envs).',
+    )
     p.add_argument('--buffer_size', type=int, default=1_000_000)
     p.add_argument('--gamma', type=float, default=0.99)
     p.add_argument('--tau', type=float, default=0.01)
@@ -68,13 +157,25 @@ def build_train_parser() -> argparse.ArgumentParser:
     p.add_argument('--init_scale', type=float, default=0.01)
     p.add_argument('--actor_hidden_dim', type=int, default=512)
     p.add_argument('--critic_hidden_dim', type=int, default=1024)
+    p.add_argument(
+        '--use_layer_norm',
+        action='store_true',
+        default=False,
+        help='Apply LayerNorm after hidden Linear layers in FastSAC MLP backbone/heads.',
+    )
+    p.add_argument(
+        '--layer_norm_eps',
+        type=float,
+        default=1e-5,
+        help='Epsilon used by LayerNorm when --use_layer_norm is enabled.',
+    )
 
     p.add_argument('--arch_shared_trunk', action='store_true', default=False,
                    help='Share an observation trunk between actor and critic(s)')
     p.add_argument('--shared_hidden_dim', type=int, default=512,
                    help='Hidden size for shared trunk when enabled')
     p.add_argument('--num_critics', type=int, default=2,
-                   help='Number of critic heads (2 or 3 supported)')
+                   help='Number of critic heads in the ensemble (>=2 recommended)')
     p.add_argument('--obs_mode', type=str, default='state', choices=['state', 'pixels'],
                    help='Observation mode: vector state or pixel images')
     p.add_argument('--pixel_width', type=int, default=64,
@@ -128,21 +229,13 @@ def build_train_parser() -> argparse.ArgumentParser:
                    help='Add denied student actions to replay buffer with penalty reward')
     p.add_argument('--denied_action_penalty', type=float, default=-1.0,
                    help='Reward assigned to denied student actions when stored')
-    # Intervention reward shaping variants
-    p.add_argument('--intervention_reward_mode', type=str, default='none',
-                   choices=['none', 'penalty_student', 'bonus_teacher'],
-                   help='How to shape reward/actions on intervention')
-    p.add_argument('--intervention_reward_value', type=float, default=0.0,
-                   help='Magnitude for intervention reward shaping (e.g., 0.1)')
-    p.add_argument('--bonus_teacher_value', type=float, default=0.0,
-                   help='Additional reward added when teacher action is applied (can combine with penalty modes)')
     # Demo prefill (teacher-generated data)
     p.add_argument('--demo_prefill_steps', type=int, default=0,
                    help='Number of env steps to prefill replay buffer with teacher demos (0 disables)')
     p.add_argument('--demo_prefill_episodes', type=int, default=0,
                    help='Number of demo episodes to prefill (0 disables, overrides steps)')
     p.add_argument('--demo_prefill_intervention_mode', type=str, default='agent_safety_progress',
-                   choices=['human', 'agent', 'agent_safety_align', 'agent_safety_progress'],
+                   choices=['human', 'agent', 'agent_always', 'agent_safety_align', 'agent_safety_progress', 'agent_reward_progress', 'agent_manual_gripper'],
                    help='Intervention mode to use during demo prefill')
     p.add_argument('--demo_prefill_enable_after_steps', type=int, default=0,
                    help='Warm-up steps per env before demo interventions engage')
@@ -166,6 +259,26 @@ def build_train_parser() -> argparse.ArgumentParser:
     p.add_argument('--save_interval', type=int, default=200000,
                    help='Env-step interval for checkpoint saves (0 disables)')
     p.add_argument('--log_interval', type=int, default=200)
+    p.add_argument(
+        '--eval_render_mode',
+        type=str,
+        default='none',
+        choices=['none', 'human'],
+        help='Optional live rendering during periodic training eval (human requires eval_num_envs=1).',
+    )
+    p.add_argument(
+        '--allow_simultaneous_train_eval_render',
+        action='store_true',
+        default=False,
+        help=(
+            'Allow train_render_mode=human and eval_render_mode=human at the same time. '
+            'Disabled by default to avoid dual-viewer instability/segfaults.'
+        ),
+    )
+    p.add_argument('--profile_timing', action='store_true', default=False,
+                   help='Log per-step timing breakdown (ms + %): action/env/info/replay-sample/update/misc')
+    p.add_argument('--compute_q_diagnostics', action='store_true', default=False,
+                   help='Compute per-step critic disagreement/Q-min diagnostics (adds extra critic forward each env step).')
     p.add_argument('--post_switch_viz_multiplier', type=int, default=1,
                    help='Reduce checkpoint/viz interval by this factor after curriculum/env switch (>=1)')
     p.add_argument('--disagreement_hist_edges', type=str, default='',
@@ -176,17 +289,6 @@ def build_train_parser() -> argparse.ArgumentParser:
     p.add_argument('--compile', action='store_true', default=False)
     p.add_argument('--amp', action='store_true', default=True)
     p.add_argument('--amp_dtype', type=str, default='bf16', choices=['bf16','fp16'])
-    # Counterfactual buffer (student-denied actions) for fast adaptation
-    p.add_argument('--cf_buffer_enable', action='store_true', default=False,
-                   help='Enable counterfactual buffer for denied student actions')
-    p.add_argument('--cf_capacity', type=int, default=100000,
-                   help='Capacity of CF buffer (rows)')
-    p.add_argument('--cf_sample_ratio', type=float, default=0.5,
-                   help='Fraction of batch for CF critic loss (0..1)')
-    p.add_argument('--cf_penalty', type=float, default=1.0,
-                   help='Positive penalty magnitude; critic target becomes -abs(value) for denied actions')
-    p.add_argument('--cf_q_weight', type=float, default=1.0,
-                   help='Weight for CF critic penalty loss')
     # Preference buffer (pairwise ranking on intervened rows: teacher vs student)
     p.add_argument('--pref_buffer_enable', action='store_true', default=False,
                    help='Enable preference buffer storing pairs (s, a_teacher, a_student) and ranking loss')
@@ -194,23 +296,78 @@ def build_train_parser() -> argparse.ArgumentParser:
                    help='Capacity of preference buffer (pairs)')
     p.add_argument('--pref_sample_ratio', type=float, default=0.5,
                    help='Fraction of update batch for preference pairs (0..1)')
+    p.add_argument(
+        '--pref_sampling_mode',
+        type=str,
+        default='independent',
+        choices=['independent', 'linked'],
+        help=(
+            "Preference sample source: 'independent' uses PreferencePairBuffer sampling; "
+            "'linked' derives preference pairs directly from sampled replay transitions "
+            "(teacher action = executed action, student action = stored student proposal)."
+        ),
+    )
+    p.add_argument(
+        '--pref_linked_action_epsilon',
+        type=float,
+        default=1e-6,
+        help=(
+            "Intervention detection threshold for linked preference sampling. "
+            "A replay row is treated as intervention-linked when ||a_exec - a_student||_1 > epsilon."
+        ),
+    )
     p.add_argument('--pref_rank_weight', type=float, default=1.0,
                    help='Weight for the pairwise ranking loss added to critic loss')
     p.add_argument('--pref_rank_margin', type=float, default=0.1,
                    help='Margin for ranking loss: softplus(margin - (Qpos - Qneg))')
-    # Preference-TD buffer (balanced TD samples: teacher real transition; student synthetic terminal negative)
-    p.add_argument('--pref_td_buffer_enable', action='store_true', default=False,
-                   help='Enable preference-TD buffer that keeps balanced teacher/student TD transitions')
-    p.add_argument('--pref_td_capacity', type=int, default=100000,
-                   help='Capacity per-role (teacher/student) for preference-TD buffer')
-    p.add_argument('--pref_td_sample_ratio', type=float, default=0.5,
-                   help='Fraction of update batch to draw from preference-TD buffer (split 50/50 teacher/student)')
-    p.add_argument('--pref_td_q_weight', type=float, default=1.0,
-                   help='Weight for additional critic TD loss from preference-TD samples')
-    p.add_argument('--pref_td_penalty_value', type=float, default=0.1,
-                   help='Negative reward assigned to synthetic student terminal in preference-TD buffer')
-    p.add_argument('--pref_td_teacher_bonus_value', type=float, default=0.0,
-                   help='Optional extra reward added to teacher transitions in preference-TD buffer')
+    p.add_argument(
+        '--pref_loss_type',
+        type=str,
+        default='margin',
+        choices=['margin', 'bradley_terry', 'lagrangian'],
+        help='Preference loss formulation for critic updates.',
+    )
+    p.add_argument(
+        '--pref_lambda_init',
+        type=float,
+        default=0.0,
+        help='Initial Lagrange multiplier value used when --pref_loss_type=lagrangian.',
+    )
+    p.add_argument(
+        '--pref_lambda_lr',
+        type=float,
+        default=1e-3,
+        help='Dual ascent step size for lagrangian preference optimization.',
+    )
+    p.add_argument(
+        '--pref_lambda_max',
+        type=float,
+        default=10.0,
+        help='Upper clip for Lagrange multiplier (<=0 disables clipping).',
+    )
+    p.add_argument(
+        '--pref_lambda_ema',
+        type=float,
+        default=0.9,
+        help='EMA factor for preference violation in dual update (0 disables EMA).',
+    )
+    p.add_argument(
+        '--pref_violation_clip',
+        type=float,
+        default=10.0,
+        help='Clip positive violation before lagrangian loss (<=0 disables clipping).',
+    )
+    p.add_argument(
+        '--pref_stopgrad_positive',
+        action='store_true',
+        default=False,
+        help='Detach positive preference Q term so ranking loss only pushes down the negative sample.',
+    )
+    # Supervised actor regularization (DAgger-style BC on teacher actions)
+    p.add_argument('--actor_bc_weight_demo', type=float, default=0.0,
+                   help='Weight for actor BC loss on demo-buffer actions (0 disables)')
+    p.add_argument('--actor_bc_weight_pref', type=float, default=0.0,
+                   help='Weight for actor BC loss on teacher actions sampled from preference buffer (0 disables)')
     # Replay buffer reset on curriculum switch
     p.add_argument('--reset_replay_on_switch', action='store_true', default=False,
                    help='Reset main replay buffer when reward_switch_after_steps is reached')
@@ -234,6 +391,11 @@ def build_train_parser() -> argparse.ArgumentParser:
 def build_eval_parser() -> argparse.ArgumentParser:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description='Interactive evaluation of trained RSL-RL agents')
+    cube_reward_choices = [
+        'sparse_final',
+        'sparse_intermediate',
+        'dense',
+    ]
     
     # Model and environment
     parser.add_argument('--model_path', type=str, default=None,
@@ -341,6 +503,26 @@ def build_eval_parser() -> argparse.ArgumentParser:
                         help='Per-step penalty applied by DetailedRewardWrapper')
     parser.add_argument('--reward_switch_after_steps', type=int, default=0,
                         help='Switch reward to sparse after this many steps (curriculum)')
+    parser.add_argument('--cube_reward_mode', type=str, default='dense', choices=cube_reward_choices,
+                        help=(
+                            'Cube-state reward mode: sparse_final (episode success), '
+                            'sparse_intermediate (per cube solved), '
+                            'dense (phase-based progress: reach->grasp->carry->place).'
+                        ))
+    parser.add_argument('--cube_success_reward', type=float, default=1.0,
+                        help='Sparse success reward used by cube reward modes.')
+    parser.add_argument('--cube_subgoal_grasp_reward', type=float, default=0.25,
+                        help='Sparse grasp-event reward used by cube subgoal modes.')
+    parser.add_argument('--cube_subgoal_place_reward', type=float, default=1.0,
+                        help='Sparse place-event reward used by cube subgoal modes.')
+    parser.add_argument('--cube_subgoal_drop_penalty', type=float, default=0.0,
+                        help='Drop penalty applied on solved-count regressions in subgoal modes (typically <= 0).')
+    parser.add_argument('--cube_subgoal_grasp_error_threshold', type=float, default=0.08,
+                        help='Error threshold used to trigger a one-time grasp event proxy in subgoal modes.')
+    parser.add_argument('--cube_dense_progress_scale', type=float, default=1.0,
+                        help='Scale for dense phase-progress reward increments (reach/carry progress terms).')
+    parser.add_argument('--cube_dense_progress_clip', type=float, default=0.0,
+                        help='Optional max per-step phase progress contribution before scaling (0 disables clipping).')
 
     # Evaluation
     parser.add_argument('--max_episode_steps', type=int, default=500,
@@ -356,7 +538,7 @@ def build_eval_parser() -> argparse.ArgumentParser:
 
     # Intervention / Teleop
     parser.add_argument('--intervention_mode', type=str, default='none',
-                        choices=['none', 'human', 'agent', 'agent_safety_align', 'agent_safety_progress'],
+                        choices=['none', 'human', 'agent', 'agent_always', 'agent_safety_align', 'agent_safety_progress', 'agent_reward_progress', 'agent_manual_gripper'],
                         help='Intervention mode: none, human teleop, or agent teacher')
     parser.add_argument('--teacher_type', type=str, default='bfs', choices=['bfs', 'cube_plan', 'cube_markov'],
                         help='Teacher type when intervention_mode=agent')
@@ -364,6 +546,12 @@ def build_eval_parser() -> argparse.ArgumentParser:
                         help='Intervention tolerance metric (agent mode)')
     parser.add_argument('--tolerance_value', type=float, default=30.0,
                         help='Tolerance threshold (deg for angle; abs for l2)')
+    parser.add_argument(
+        '--tolerance_channel_weights',
+        type=str,
+        default='',
+        help='Optional per-action weights for l2 tolerance. Provide one scalar or comma-separated list matching action dim.',
+    )
     parser.add_argument('--hard_block_lethal', action='store_true', default=True,
                         help='Intervene if student would step into lethal cell')
     parser.add_argument('--no_hard_block_lethal', dest='hard_block_lethal', action='store_false')
@@ -373,6 +561,10 @@ def build_eval_parser() -> argparse.ArgumentParser:
                         help='Safety margin as a fraction of maze cell size for safety-based intervention modes')
     parser.add_argument('--intervention_release_steps', type=int, default=3,
                         help='Consecutive aligned/progressing steps required to release safety intervention')
+    parser.add_argument('--intervention_reward_patience_steps', type=int, default=5,
+                        help='Reward-progress intervention: trigger after this many non-improving steps and release after this many improving steps.')
+    parser.add_argument('--intervention_reward_improvement_epsilon', type=float, default=1e-6,
+                        help='Minimum reward-progress signal increase counted as an improvement.')
     
     # Action processing (should match training settings)
     parser.add_argument('--action_scale', type=float, default=1.0,
