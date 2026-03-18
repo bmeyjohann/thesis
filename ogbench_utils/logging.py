@@ -262,6 +262,22 @@ class TrainingLogger:
         self.next_log_step = args.log_interval if args.log_interval > 0 else None
         self.wandb_run = None
 
+    def ensure_wandb_run(self):
+        if not self.args.use_wandb:
+            return None
+        if self.wandb_run is None:
+            import wandb
+
+            self.wandb_run = wandb.init(
+                project=self.args.project,
+                name=self.args.exp_name,
+                id=self.args.exp_name,
+                config=vars(self.args),
+                reinit=True,
+                resume="allow",
+            )
+        return self.wandb_run
+
     def should_log(self, total_env_steps: int, force: bool = False) -> bool:
         if force:
             return True
@@ -319,14 +335,22 @@ class TrainingLogger:
             logs["Train/pref_lambda"] = metrics_accumulator["pref_lambda"] / denom
             logs["Train/pref_lambda_delta"] = metrics_accumulator["pref_lambda_delta"] / denom
             logs["Train/pref_dual_violation"] = metrics_accumulator["pref_dual_violation"] / denom
+            logs["Train/pref_dual_signal"] = metrics_accumulator["pref_dual_signal"] / denom
             logs["Train/pref_violation"] = metrics_accumulator["pref_violation"] / denom
             logs["Train/pref_violation_ema"] = metrics_accumulator["pref_violation_ema"] / denom
             logs["Train/pref_lagrangian_loss"] = metrics_accumulator["pref_lagrangian_loss"] / denom
             logs["Train/pref_lagrangian_enabled"] = lagrangian_enabled
+            pref_lagrangian_violation_type = str(
+                getattr(self.args, "pref_lagrangian_violation_type", "hinge")
+            ).strip().lower()
+            logs["Train/pref_lagrangian_violation_is_smooth"] = (
+                1.0 if pref_lagrangian_violation_type == "smooth" else 0.0
+            )
             logs["Train/pref_lambda_lr"] = float(getattr(self.args, "pref_lambda_lr", 0.0))
             logs["Train/pref_lambda_max"] = float(getattr(self.args, "pref_lambda_max", 0.0))
             logs["Train/pref_lambda_ema_cfg"] = float(getattr(self.args, "pref_lambda_ema", 0.0))
             logs["Train/pref_violation_clip"] = float(getattr(self.args, "pref_violation_clip", 0.0))
+            logs["Train/pref_violation_target"] = float(getattr(self.args, "pref_violation_target", 0.0))
             logs["Train/actor_loss"] = metrics_accumulator["actor_loss"] / denom
             logs["Train/actor_loss_sac"] = metrics_accumulator["actor_loss_sac"] / denom
             logs["Train/actor_bc_loss_demo"] = metrics_accumulator["actor_bc_loss_demo"] / denom
@@ -336,8 +360,24 @@ class TrainingLogger:
             logs["Train/action_l2"] = metrics_accumulator["action_norm"] / denom
             logs["Train/target_q_mean"] = metrics_accumulator["target_q"] / denom
             logs["Train/q_min_pi_mean"] = metrics_accumulator["q_min_pi"] / denom
+            logs["Train/q_min_data_mean"] = metrics_accumulator["q_min_data"] / denom
             logs["Train/q_disagreement_data_mean"] = metrics_accumulator["q_disagreement_data"] / denom
             logs["Train/q_disagreement_pi_mean"] = metrics_accumulator["q_disagreement_pi"] / denom
+            teacher_q_count = float(metrics_accumulator.get("q_min_teacher_data_count", 0.0))
+            if teacher_q_count > 0.0:
+                logs["Train/q_min_teacher_action_mean"] = (
+                    float(metrics_accumulator["q_min_teacher_data_sum"]) / teacher_q_count
+                )
+            non_teacher_q_count = float(metrics_accumulator.get("q_min_non_teacher_data_count", 0.0))
+            if non_teacher_q_count > 0.0:
+                logs["Train/q_min_non_teacher_action_mean"] = (
+                    float(metrics_accumulator["q_min_non_teacher_data_sum"]) / non_teacher_q_count
+                )
+            pref_q_delta_count = float(metrics_accumulator.get("pref_q_delta_count", 0.0))
+            if pref_q_delta_count > 0.0:
+                logs["Train/pref_q_delta_mean"] = (
+                    float(metrics_accumulator["pref_q_delta_sum"]) / pref_q_delta_count
+                )
             logs["Train/replay_reward_mean"] = metrics_accumulator["reward"] / denom
             logs["Train/replay_reward_abs_mean"] = metrics_accumulator["reward_abs"] / denom
             logs["Train/alpha"] = metrics_accumulator["alpha_value"] / denom
@@ -418,19 +458,9 @@ class TrainingLogger:
         print(console_line, flush=True)
         self.record_progress(console_line)
 
-        if self.args.use_wandb:
-            import wandb
-
-            if self.wandb_run is None:
-                self.wandb_run = wandb.init(
-                    project=self.args.project,
-                    name=self.args.exp_name,
-                    id=self.args.exp_name,
-                    config=vars(self.args),
-                    reinit=True,
-                    resume="allow",
-                )
-            self.wandb_run.log(logs, step=total_env_steps)
+        wandb_run = self.ensure_wandb_run()
+        if wandb_run is not None:
+            wandb_run.log(logs, step=total_env_steps)
 
         self.teacher_metrics.reset_after_log()
         return logs
@@ -441,19 +471,18 @@ class TrainingLogger:
         console_line = f"[Eval] steps={total_env_steps} {msg}"
         print(console_line, flush=True)
         self.record_progress(console_line)
-        if self.args.use_wandb:
-            import wandb
+        wandb_run = self.ensure_wandb_run()
+        if wandb_run is not None:
+            wandb_run.log(payload, step=total_env_steps)
 
-            if self.wandb_run is None:
-                self.wandb_run = wandb.init(
-                    project=self.args.project,
-                    name=self.args.exp_name,
-                    id=self.args.exp_name,
-                    config=vars(self.args),
-                    reinit=True,
-                    resume="allow",
-                )
-            self.wandb_run.log(payload, step=total_env_steps)
+    def log_prefill(self, *, pseudo_step: int, payload: Dict[str, float]) -> None:
+        console_metrics = ", ".join(f"{k}={v:.3f}" for k, v in sorted(payload.items()))
+        console_line = f"[DemoPrefill] step={pseudo_step} {console_metrics}"
+        print(console_line, flush=True)
+        self.record_progress(console_line)
+        wandb_run = self.ensure_wandb_run()
+        if wandb_run is not None:
+            wandb_run.log(payload, step=int(pseudo_step))
 
     def finish(self):
         if self.wandb_run is not None:

@@ -70,6 +70,9 @@ def make_wrappers(args, env_family: str):
         wrapper_kwargs["include_relative_cube_features"] = bool(
             getattr(args, "include_relative_cube_features", False)
         )
+        wrapper_kwargs["relative_only_obs"] = bool(
+            getattr(args, "relative_only_obs", False)
+        )
     wrapper = build_wrapper(**wrapper_kwargs)
     return [wrapper]
 
@@ -118,6 +121,9 @@ def make_eval_wrappers(args, env_family: str):
         wrapper_kwargs["cube_reward_mode"] = args.cube_reward_mode
         wrapper_kwargs["include_relative_cube_features"] = bool(
             getattr(args, "include_relative_cube_features", False)
+        )
+        wrapper_kwargs["relative_only_obs"] = bool(
+            getattr(args, "relative_only_obs", False)
         )
     wrapper = build_wrapper(**wrapper_kwargs)
     return [wrapper]

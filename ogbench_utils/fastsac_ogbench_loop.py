@@ -45,6 +45,7 @@ def prefill_replay_buffer_with_demos(
     obs_normalizer,
     model: ModelComponents,
     record_progress,
+    training_logger=None,
 ) -> None:
     """Optional teacher-demo prefill stage executed before main training."""
     max_prefill_steps = int(max(0, args.demo_prefill_steps))
@@ -62,6 +63,9 @@ def prefill_replay_buffer_with_demos(
         target_label = "replay"
 
     demo_args = copy.deepcopy(args)
+    demo_num_envs = int(getattr(args, "demo_prefill_num_envs", 0))
+    if demo_num_envs > 0:
+        demo_args.num_envs = demo_num_envs
     demo_args.use_intervention = True
     demo_args.intervention_mode = args.demo_prefill_intervention_mode
     demo_args.intervention_enable_after_steps = args.demo_prefill_enable_after_steps
@@ -70,6 +74,7 @@ def prefill_replay_buffer_with_demos(
     demo_args.intervention_episode_prob_decay_steps = 0
     demo_args.intervention_episode_prob_decay_start = 0
     demo_args.hard_block_lethal = args.demo_prefill_hard_block_lethal
+    demo_args.train_render_mode = "none"
 
     wrappers = make_wrappers(demo_args, env_family)
     env_kwargs = _build_env_kwargs(demo_args)
@@ -93,7 +98,10 @@ def prefill_replay_buffer_with_demos(
         prefill_goal = f"{target_prefill_episodes} episodes"
     else:
         prefill_goal = f"{max_prefill_steps} env steps"
-    record_progress(f"[Demo] Prefilling {target_label} buffer for {prefill_goal}")
+    record_progress(
+        f"[Demo] Prefilling {target_label} buffer for {prefill_goal} using {demo_args.num_envs} envs "
+        f"(main training uses {args.num_envs})"
+    )
     obs_raw = demo_envs.reset()
     obs = prepare_observation(
         obs_raw,
@@ -105,11 +113,23 @@ def prefill_replay_buffer_with_demos(
 
     total_steps = 0
     total_episodes = 0
+    total_teacher_steps = 0
+    raw_total_steps = 0
+    pending_episode_rows: list[list[TensorDict]] = [[] for _ in range(demo_args.num_envs)]
+    pending_episode_teacher_steps = [0 for _ in range(demo_args.num_envs)]
+    next_prefill_log_step = max(1, int(getattr(args, "log_interval", 1)))
+    last_status_time = time.time()
     actor_backbone = model.actor_backbone
     actor_head = model.actor_head
     actor_backbone.eval()
     actor_head.eval()
     try:
+        start_line = (
+            f"[Demo] rollout started: target={prefill_goal}, prefill_envs={demo_args.num_envs}, "
+            f"train_envs={args.num_envs}, target_buffer={target_label}"
+        )
+        print(start_line, flush=True)
+        record_progress(start_line)
         while True:
             if target_prefill_episodes > 0:
                 if total_episodes >= target_prefill_episodes:
@@ -202,18 +222,112 @@ def prefill_replay_buffer_with_demos(
                 batch_size=(demo_envs.num_envs,),
                 device=device,
             )
-            target_buffer.extend(transition)
 
             obs = next_obs
-            total_episodes += int(dones.sum().item())
-            total_steps += demo_envs.num_envs
+            step_teacher_mask = torch.zeros(demo_envs.num_envs, device=device, dtype=torch.bool)
+            if isinstance(infos, dict):
+                teacher_mask_raw = infos.get("teacher_intervened")
+                if teacher_mask_raw is not None:
+                    teacher_mask = _as_tensor_batch(
+                        teacher_mask_raw, device=device, dtype=torch.bool, num_envs=demo_envs.num_envs
+                    )
+                    step_teacher_mask = teacher_mask.to(torch.bool)
+            raw_total_steps += demo_envs.num_envs
+
+            if target_prefill_episodes > 0:
+                for env_idx in range(demo_envs.num_envs):
+                    row_td = transition[env_idx : env_idx + 1]
+                    pending_episode_rows[env_idx].append(row_td)
+                    if bool(step_teacher_mask[env_idx].item()):
+                        pending_episode_teacher_steps[env_idx] += 1
+                    if bool(dones[env_idx].item()):
+                        if total_episodes < target_prefill_episodes:
+                            episode_rows = pending_episode_rows[env_idx]
+                            for episode_row in episode_rows:
+                                target_buffer.extend(episode_row)
+                            total_steps += len(episode_rows)
+                            total_teacher_steps += int(pending_episode_teacher_steps[env_idx])
+                            total_episodes += 1
+                        pending_episode_rows[env_idx] = []
+                        pending_episode_teacher_steps[env_idx] = 0
+            else:
+                buffer_envs = int(getattr(target_buffer, "n_env", demo_envs.num_envs))
+                if buffer_envs == demo_envs.num_envs:
+                    target_buffer.extend(transition)
+                else:
+                    for env_idx in range(demo_envs.num_envs):
+                        target_buffer.extend(transition[env_idx : env_idx + 1])
+                total_teacher_steps += int(step_teacher_mask.to(torch.int32).sum().item())
+                total_episodes += int(dones.sum().item())
+                total_steps += demo_envs.num_envs
+
+            now = time.time()
+            if (now - last_status_time) >= 2.0:
+                teacher_fraction = float(total_teacher_steps / max(1, total_steps))
+                progress_line = (
+                    f"[Demo] progress raw_env_steps={raw_total_steps} committed_env_steps={total_steps} episodes={total_episodes}"
+                    f"/{target_prefill_episodes if target_prefill_episodes > 0 else '-'}"
+                    f" teacher_frac={teacher_fraction:.3f}"
+                    f" buffer_size={int(getattr(target_buffer, 'size', 0))}"
+                )
+                print(progress_line, flush=True)
+                record_progress(progress_line)
+                last_status_time = now
+            if training_logger is not None and total_steps >= next_prefill_log_step:
+                teacher_fraction = float(total_teacher_steps / max(1, total_steps))
+                episode_progress = (
+                    float(total_episodes / max(1, target_prefill_episodes))
+                    if target_prefill_episodes > 0
+                    else 0.0
+                )
+                target_buffer_size = float(getattr(target_buffer, "size", 0))
+                target_buffer_capacity = float(getattr(target_buffer, "capacity", 0))
+                training_logger.log_prefill(
+                    pseudo_step=-1_000_000 + total_steps,
+                    payload={
+                        "DemoPrefill/raw_env_steps": float(raw_total_steps),
+                        "DemoPrefill/env_steps": float(total_steps),
+                        "DemoPrefill/episodes": float(total_episodes),
+                        "DemoPrefill/episodes_target": float(target_prefill_episodes),
+                        "DemoPrefill/episodes_progress": float(episode_progress),
+                        "DemoPrefill/teacher_fraction": float(teacher_fraction),
+                        "DemoPrefill/target_buffer_size": target_buffer_size,
+                        "DemoPrefill/target_buffer_capacity": target_buffer_capacity,
+                        "DemoPrefill/num_envs": float(demo_args.num_envs),
+                    },
+                )
+                next_prefill_log_step += max(1, int(getattr(args, "log_interval", 1)))
     finally:
         demo_envs.close()
         actor_backbone.train()
         actor_head.train()
-        record_progress(
+        completion_line = (
             f"[Demo] Prefill complete: {total_steps} env steps, {total_episodes} episodes added to {target_label} buffer"
         )
+        print(completion_line, flush=True)
+        record_progress(completion_line)
+        if training_logger is not None:
+            teacher_fraction = float(total_teacher_steps / max(1, total_steps))
+            episode_progress = (
+                float(total_episodes / max(1, target_prefill_episodes))
+                if target_prefill_episodes > 0
+                else 0.0
+            )
+            training_logger.log_prefill(
+                pseudo_step=-999999 + total_steps,
+                payload={
+                    "DemoPrefill/raw_env_steps": float(raw_total_steps),
+                    "DemoPrefill/env_steps": float(total_steps),
+                    "DemoPrefill/episodes": float(total_episodes),
+                    "DemoPrefill/episodes_target": float(target_prefill_episodes),
+                    "DemoPrefill/episodes_progress": float(episode_progress),
+                    "DemoPrefill/teacher_fraction": float(teacher_fraction),
+                    "DemoPrefill/target_buffer_size": float(getattr(target_buffer, "size", 0)),
+                    "DemoPrefill/target_buffer_capacity": float(getattr(target_buffer, "capacity", 0)),
+                    "DemoPrefill/num_envs": float(demo_args.num_envs),
+                    "DemoPrefill/completed": 1.0,
+                },
+            )
 
 
 def run_eval_metrics(
@@ -1050,8 +1164,13 @@ def run_training_loop(
             log_requested = training_logger.should_log(total_env_steps) or total_env_steps >= args.total_timesteps
             if log_requested:
                 collection_time = time.time() - start_time
-                pref_size = int(getattr(pref_buffer, "size", 0)) if pref_buffer is not None else 0
-                pref_capacity = int(getattr(pref_buffer, "capacity", 0)) if pref_buffer is not None else 0
+                pref_sampling_mode = str(getattr(args, "pref_sampling_mode", "independent")).strip().lower()
+                if pref_sampling_mode == "linked":
+                    pref_size = int(rb.linked_pref_pair_count())
+                    pref_capacity = int(getattr(rb, "capacity", 0))
+                else:
+                    pref_size = int(getattr(pref_buffer, "size", 0)) if pref_buffer is not None else 0
+                    pref_capacity = int(getattr(pref_buffer, "capacity", 0)) if pref_buffer is not None else 0
                 demo_size = int(getattr(demo_buffer, "size", 0)) if demo_buffer is not None else 0
                 demo_capacity = int(getattr(demo_buffer, "capacity", 0)) if demo_buffer is not None else 0
                 timing_summary = timing_window.summary("Perf/timing") if timing_enabled else None

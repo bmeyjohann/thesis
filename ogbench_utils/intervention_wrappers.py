@@ -110,9 +110,16 @@ class InterventionWrapper(gym.Wrapper):
         threshold: float = 0.1,
         hold_time: float = 0.5,
         # Agent/teacher params
-        tolerance_type: str = 'angle',  # 'angle' or 'l2'
+        tolerance_type: str = 'angle',  # 'angle', 'l2', or 'component'
         tolerance_value: float = 30.0,  # degrees for angle, absolute for l2
         tolerance_channel_weights: Optional[object] = None,  # optional per-action weights for l2 metric
+        tolerance_xyz_value: float = -1.0,
+        tolerance_yaw_value: float = -1.0,
+        tolerance_gripper_value: float = -1.0,
+        tolerance_adaptive_enable: bool = True,
+        tolerance_adaptive_near_distance: float = 0.08,
+        tolerance_adaptive_far_distance: float = 0.30,
+        tolerance_adaptive_near_scale: float = 0.35,
         binary_gripper_actions: bool = False,
         binary_gripper_threshold: float = 0.0,
         hard_gripper_intervention: bool = False,
@@ -135,7 +142,7 @@ class InterventionWrapper(gym.Wrapper):
         super().__init__(env)
 
         assert mode in ('human', 'agent')
-        assert tolerance_type in ('angle', 'l2')
+        assert tolerance_type in ('angle', 'l2', 'component')
         assert agent_mode in ('always', 'divergence', 'safety_align', 'safety_progress', 'reward_progress', 'manual_gripper')
         self.mode = mode
         self.teacher_type = teacher_type
@@ -144,6 +151,13 @@ class InterventionWrapper(gym.Wrapper):
         self.hold_time = float(hold_time)
         self.tolerance_type = tolerance_type
         self.tolerance_value = float(tolerance_value)
+        self.tolerance_xyz_value = float(tolerance_xyz_value)
+        self.tolerance_yaw_value = float(tolerance_yaw_value)
+        self.tolerance_gripper_value = float(tolerance_gripper_value)
+        self.tolerance_adaptive_enable = bool(tolerance_adaptive_enable)
+        self.tolerance_adaptive_near_distance = float(tolerance_adaptive_near_distance)
+        self.tolerance_adaptive_far_distance = float(tolerance_adaptive_far_distance)
+        self.tolerance_adaptive_near_scale = float(tolerance_adaptive_near_scale)
         self._action_dim = int(np.prod(getattr(getattr(self.env, "action_space", None), "shape", (0,))))
         self.tolerance_channel_weights = self._parse_tolerance_channel_weights(
             tolerance_channel_weights,
@@ -485,6 +499,84 @@ class InterventionWrapper(gym.Wrapper):
         diag["teacher_reason_component_is_gripper"] = float(1.0 if component == "gripper" else 0.0)
         diag["teacher_reason_component_is_mixed"] = float(1.0 if component == "mixed" else 0.0)
         return component, diag
+
+    def _component_tolerance_scale(self, info: Optional[dict]) -> float:
+        if not self.tolerance_adaptive_enable:
+            return 1.0
+        if info is None or not isinstance(info, dict):
+            return 1.0
+        try:
+            target_block = int(info.get("privileged/target_block", 0))
+            eff_pos = np.asarray(info.get("proprio/effector_pos"), dtype=np.float32).reshape(-1)
+            block_pos = np.asarray(info.get(f"privileged/block_{target_block}_pos"), dtype=np.float32).reshape(-1)
+            target_pos = np.asarray(info.get("privileged/target_block_pos"), dtype=np.float32).reshape(-1)
+            if eff_pos.size < 3 or block_pos.size < 3 or target_pos.size < 3:
+                return 1.0
+            eff_block_dist = float(np.linalg.norm(eff_pos[:3] - block_pos[:3]))
+            block_target_dist = float(np.linalg.norm(block_pos[:3] - target_pos[:3]))
+            d = float(min(eff_block_dist, block_target_dist))
+            near = max(0.0, self.tolerance_adaptive_near_distance)
+            far = max(near + 1e-6, self.tolerance_adaptive_far_distance)
+            near_scale = float(np.clip(self.tolerance_adaptive_near_scale, 1e-3, 1.0))
+            if d <= near:
+                return near_scale
+            if d >= far:
+                return 1.0
+            alpha = (d - near) / (far - near)
+            return float(near_scale + alpha * (1.0 - near_scale))
+        except Exception:
+            return 1.0
+
+    def _component_thresholds(self, info: Optional[dict]) -> tuple[float, float, float, float]:
+        xyz_base = self.tolerance_xyz_value if self.tolerance_xyz_value > 0.0 else self.tolerance_value
+        yaw_base = self.tolerance_yaw_value if self.tolerance_yaw_value > 0.0 else self.tolerance_value
+        grip_base = self.tolerance_gripper_value if self.tolerance_gripper_value > 0.0 else self.tolerance_value
+        scale = self._component_tolerance_scale(info)
+        return float(xyz_base * scale), float(yaw_base * scale), float(grip_base * scale), float(scale)
+
+    def _component_diverged(
+        self,
+        policy_action: Optional[np.ndarray],
+        teacher_action: Optional[np.ndarray],
+        info: Optional[dict],
+    ) -> tuple[bool, dict]:
+        diag = {
+            "teacher_component_threshold_xyz": 0.0,
+            "teacher_component_threshold_yaw": 0.0,
+            "teacher_component_threshold_gripper": 0.0,
+            "teacher_component_threshold_scale": 1.0,
+            "teacher_component_diverged_xyz": 0.0,
+            "teacher_component_diverged_yaw": 0.0,
+            "teacher_component_diverged_gripper": 0.0,
+            "teacher_component_diverged_any": 0.0,
+        }
+        if policy_action is None or teacher_action is None:
+            return False, diag
+        p = np.asarray(policy_action, dtype=np.float32).reshape(-1)
+        t = np.asarray(teacher_action, dtype=np.float32).reshape(-1)
+        n = min(p.size, t.size)
+        if n <= 0:
+            return False, diag
+        d = np.abs(p[:n] - t[:n]).astype(np.float32)
+        xyz_l2 = float(np.linalg.norm(d[:3])) if n >= 3 else 0.0
+        yaw_abs = float(d[3]) if n >= 4 else 0.0
+        gripper_abs = float(d[4]) if n >= 5 else 0.0
+
+        thr_xyz, thr_yaw, thr_grip, scale = self._component_thresholds(info)
+        div_xyz = bool(xyz_l2 > thr_xyz) if n >= 3 else False
+        div_yaw = bool(yaw_abs > thr_yaw) if n >= 4 else False
+        div_grip = bool(gripper_abs > thr_grip) if n >= 5 else False
+        diverged = bool(div_xyz or div_yaw or div_grip)
+
+        diag["teacher_component_threshold_xyz"] = float(thr_xyz)
+        diag["teacher_component_threshold_yaw"] = float(thr_yaw)
+        diag["teacher_component_threshold_gripper"] = float(thr_grip)
+        diag["teacher_component_threshold_scale"] = float(scale)
+        diag["teacher_component_diverged_xyz"] = float(1.0 if div_xyz else 0.0)
+        diag["teacher_component_diverged_yaw"] = float(1.0 if div_yaw else 0.0)
+        diag["teacher_component_diverged_gripper"] = float(1.0 if div_grip else 0.0)
+        diag["teacher_component_diverged_any"] = float(1.0 if diverged else 0.0)
+        return diverged, diag
 
     def _current_episode_prob(self) -> float:
         if self.episode_intervention_prob_decay_steps <= 0:
@@ -891,6 +983,17 @@ class InterventionWrapper(gym.Wrapper):
         manual_gate_active = False
         component_reason = "none"
         component_diag = {}
+        component_diag_for_logging = {}
+        component_threshold_diag = {
+            "teacher_component_threshold_xyz": 0.0,
+            "teacher_component_threshold_yaw": 0.0,
+            "teacher_component_threshold_gripper": 0.0,
+            "teacher_component_threshold_scale": 1.0,
+            "teacher_component_diverged_xyz": 0.0,
+            "teacher_component_diverged_yaw": 0.0,
+            "teacher_component_diverged_gripper": 0.0,
+            "teacher_component_diverged_any": 0.0,
+        }
 
         if self.mode == 'human':
             human = self._human_action()
@@ -914,6 +1017,15 @@ class InterventionWrapper(gym.Wrapper):
                     teacher_delta_l2_raw = self._l2_delta(policy_action, teacher_candidate_action, weighted=False)
                     teacher_delta_l2 = self._l2_delta(policy_action, teacher_candidate_action, weighted=True)
                     teacher_delta_angle_deg = float(self._angle_deg(policy_action, teacher_candidate_action))
+                    _, component_diag_for_logging = self._classify_intervention_component(
+                        policy_action, teacher_candidate_action, None
+                    )
+                    if self.tolerance_type == "component":
+                        _, component_threshold_diag = self._component_diverged(
+                            policy_action,
+                            teacher_candidate_action,
+                            self._last_info or {},
+                        )
                 gripper_lock_violation, gripper_lock_action, gripper_lock_diag = self._gripper_lock_violation(
                     self._last_info or {},
                     policy_action,
@@ -951,6 +1063,10 @@ class InterventionWrapper(gym.Wrapper):
                         if self.tolerance_type == 'angle':
                             ang = self._angle_deg(policy_action, teacher_action)
                             diverged = ang > self.tolerance_value
+                        elif self.tolerance_type == 'component':
+                            diverged, component_threshold_diag = self._component_diverged(
+                                policy_action, teacher_action, self._last_info or {}
+                            )
                         else:
                             diverged = self._l2_delta(policy_action, teacher_action, weighted=True) > self.tolerance_value
                     if gripper_lock_violation:
@@ -975,6 +1091,11 @@ class InterventionWrapper(gym.Wrapper):
                         if teacher_action is not None and policy_action is not None:
                             if self.tolerance_type == 'angle':
                                 aligned = self._angle_deg(policy_action, teacher_action) <= self.tolerance_value
+                            elif self.tolerance_type == 'component':
+                                diverged_component, component_threshold_diag = self._component_diverged(
+                                    policy_action, teacher_action, self._last_info or {}
+                                )
+                                aligned = not diverged_component
                             else:
                                 aligned = self._l2_delta(policy_action, teacher_action, weighted=True) <= self.tolerance_value
                         if aligned:
@@ -1177,6 +1298,10 @@ class InterventionWrapper(gym.Wrapper):
             info.update(gripper_diag)
         if gripper_sync_diag:
             info.update(gripper_sync_diag)
+        if component_diag_for_logging:
+            info.update(component_diag_for_logging)
+        if component_threshold_diag:
+            info.update(component_threshold_diag)
         if component_diag:
             info.update(component_diag)
         if intervened:

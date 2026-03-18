@@ -20,6 +20,8 @@ def build_train_parser() -> argparse.ArgumentParser:
                    help='If set, forces identical reset seed on every episode reset (deterministic static initial states).')
     # Observations
     p.add_argument('--include_goal', action='store_true', default=True)
+    p.add_argument('--no_include_goal', dest='include_goal', action='store_false',
+                   help='Disable goal concatenation in state observations.')
     p.add_argument('--include_distance', action='store_true', default=False)
     p.add_argument('--include_direction', action='store_true', default=False)
     p.add_argument('--include_velocity', action='store_true', default=False)
@@ -30,6 +32,15 @@ def build_train_parser() -> argparse.ArgumentParser:
         help=(
             'Manip state only: append target-relative features '
             '(effector->target cube and target cube->goal position/yaw deltas) to observations.'
+        ),
+    )
+    p.add_argument(
+        '--relative_only_obs',
+        action='store_true',
+        default=False,
+        help=(
+            'Manip state only: keep compact proprioception (effector xyz/yaw + gripper open/contact) '
+            'and optional relative cube features while dropping absolute/joint-heavy state fields.'
         ),
     )
     p.add_argument('--goal_marker_color', type=str, default='auto',
@@ -69,13 +80,61 @@ def build_train_parser() -> argparse.ArgumentParser:
     p.add_argument('--intervention_mode', type=str, default='agent',
                    choices=['human', 'agent', 'agent_always', 'agent_safety_align', 'agent_safety_progress', 'agent_reward_progress', 'agent_manual_gripper'])
     p.add_argument('--teacher_type', type=str, default='bfs', choices=['bfs', 'cube_plan', 'cube_markov'])
-    p.add_argument('--tolerance_type', type=str, default='angle', choices=['angle','l2'])
+    p.add_argument('--tolerance_type', type=str, default='angle', choices=['angle', 'l2', 'component'])
     p.add_argument('--tolerance_value', type=float, default=30.0)
     p.add_argument(
         '--tolerance_channel_weights',
         type=str,
         default='',
         help='Optional per-action weights for l2 tolerance. Provide one scalar or comma-separated list matching action dim.',
+    )
+    p.add_argument(
+        '--tolerance_xyz_value',
+        type=float,
+        default=-1.0,
+        help='Component mode: xyz L2 threshold. <=0 falls back to --tolerance_value.',
+    )
+    p.add_argument(
+        '--tolerance_yaw_value',
+        type=float,
+        default=-1.0,
+        help='Component mode: yaw abs threshold. <=0 falls back to --tolerance_value.',
+    )
+    p.add_argument(
+        '--tolerance_gripper_value',
+        type=float,
+        default=-1.0,
+        help='Component mode: gripper abs threshold. <=0 falls back to --tolerance_value.',
+    )
+    p.add_argument(
+        '--tolerance_adaptive_enable',
+        action='store_true',
+        default=True,
+        help='Enable adaptive tightening of component thresholds near target interaction zones.',
+    )
+    p.add_argument(
+        '--no_tolerance_adaptive_enable',
+        dest='tolerance_adaptive_enable',
+        action='store_false',
+        help='Disable adaptive tightening for component thresholds.',
+    )
+    p.add_argument(
+        '--tolerance_adaptive_near_distance',
+        type=float,
+        default=0.08,
+        help='Distance where adaptive threshold scale reaches near-scale.',
+    )
+    p.add_argument(
+        '--tolerance_adaptive_far_distance',
+        type=float,
+        default=0.30,
+        help='Distance where adaptive threshold scale is 1.0.',
+    )
+    p.add_argument(
+        '--tolerance_adaptive_near_scale',
+        type=float,
+        default=0.35,
+        help='Multiplier applied to component thresholds in near zone (0,1].',
     )
     p.add_argument(
         '--binary_gripper_actions',
@@ -234,6 +293,8 @@ def build_train_parser() -> argparse.ArgumentParser:
                    help='Number of env steps to prefill replay buffer with teacher demos (0 disables)')
     p.add_argument('--demo_prefill_episodes', type=int, default=0,
                    help='Number of demo episodes to prefill (0 disables, overrides steps)')
+    p.add_argument('--demo_prefill_num_envs', type=int, default=0,
+                   help='Number of vector envs to use during demo prefill only (0 reuses --num_envs)')
     p.add_argument('--demo_prefill_intervention_mode', type=str, default='agent_safety_progress',
                    choices=['human', 'agent', 'agent_always', 'agent_safety_align', 'agent_safety_progress', 'agent_reward_progress', 'agent_manual_gripper'],
                    help='Intervention mode to use during demo prefill')
@@ -356,6 +417,19 @@ def build_train_parser() -> argparse.ArgumentParser:
         type=float,
         default=10.0,
         help='Clip positive violation before lagrangian loss (<=0 disables clipping).',
+    )
+    p.add_argument(
+        '--pref_violation_target',
+        type=float,
+        default=0.0,
+        help='Target violation level for lagrangian dual update: lambda += lr * (violation_estimate - target).',
+    )
+    p.add_argument(
+        '--pref_lagrangian_violation_type',
+        type=str,
+        default='hinge',
+        choices=['hinge', 'smooth'],
+        help='Violation shape used when --pref_loss_type=lagrangian.',
     )
     p.add_argument(
         '--pref_stopgrad_positive',

@@ -118,6 +118,7 @@ def run_fastsac_ogbench_manip(args, generate_policy_map=None) -> None:
         obs_normalizer=obs_normalizer,
         model=model,
         record_progress=record_progress,
+        training_logger=logging_components.training_logger,
     )
 
     try:

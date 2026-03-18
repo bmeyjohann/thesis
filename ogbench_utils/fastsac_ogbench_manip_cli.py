@@ -7,16 +7,16 @@ import argparse
 from .cli import build_train_parser
 
 _FASTSAC_EVAL_ARGS = (
-    ("--eval_interval", dict(type=int, default=1_000, help="Environment step interval between evaluation runs (0 disables)")),
-    ("--num_eval_episodes", dict(type=int, default=10, help="Number of evaluation episodes to run each interval")),
-    ("--eval_num_envs", dict(type=int, default=8, help="Number of parallel envs to use for evaluation")),
+    ("--eval_interval", dict(type=int, default=10_000, help="Environment step interval between evaluation runs (0 disables)")),
+    ("--num_eval_episodes", dict(type=int, default=1, help="Number of evaluation episodes to run each interval")),
+    ("--eval_num_envs", dict(type=int, default=10, help="Number of parallel envs to use for evaluation")),
 )
 
 _MANIP_DEFAULTS = {
     "env_name": "cube-single-v0",
     "teacher_type": "cube_plan",
     "obs_mode": "state",
-    "save_interval": 1_000,
+    "save_interval": 10_000,
     "log_interval": 64,
 }
 

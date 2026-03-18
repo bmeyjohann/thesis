@@ -72,6 +72,7 @@ class FastSACUpdater:
         self.pref_lambda_max = float(getattr(args, "pref_lambda_max", 10.0))
         self.pref_lambda_ema = float(getattr(args, "pref_lambda_ema", 0.9))
         self.pref_violation_clip = float(getattr(args, "pref_violation_clip", 10.0))
+        self.pref_violation_target = float(getattr(args, "pref_violation_target", 0.0))
         self._pref_violation_ema = 0.0
 
     def actor_forward(self, obs_flat: torch.Tensor):
@@ -108,6 +109,7 @@ class FastSACUpdater:
             "pref_lambda": 0.0,
             "pref_lambda_delta": 0.0,
             "pref_dual_violation": 0.0,
+            "pref_dual_signal": 0.0,
             "pref_violation": 0.0,
             "pref_violation_ema": 0.0,
             "pref_lagrangian_loss": 0.0,
@@ -122,6 +124,13 @@ class FastSACUpdater:
             "q_min_pi": 0.0,
             "q_disagreement_data": 0.0,
             "q_disagreement_pi": 0.0,
+            "q_min_data": 0.0,
+            "q_min_teacher_data_sum": 0.0,
+            "q_min_teacher_data_count": 0.0,
+            "q_min_non_teacher_data_sum": 0.0,
+            "q_min_non_teacher_data_count": 0.0,
+            "pref_q_delta_sum": 0.0,
+            "pref_q_delta_count": 0.0,
             "reward": 0.0,
             "reward_abs": 0.0,
             "alpha_value": 0.0,
@@ -178,6 +187,7 @@ class FastSACUpdater:
                 current_features = current_backbone(self.reshape_obs(obs_batch))
                 current_q_list = self.critic_heads(current_features, actions_batch)
                 q_stack_data = torch.stack(current_q_list, dim=0).squeeze(-1)
+                min_q_data = torch.min(q_stack_data, dim=0).values
                 qf_loss_replay_sum = torch.tensor(0.0, device=self.device)
                 for q_pred in current_q_list:
                     qf_loss_replay_sum = qf_loss_replay_sum + F.mse_loss(q_pred, target_q)
@@ -188,6 +198,7 @@ class FastSACUpdater:
                 rank_loss_weighted = torch.tensor(0.0, device=self.device)
                 pref_violation_value = 0.0
                 pref_dual_violation_value = 0.0
+                pref_dual_signal_value = 0.0
                 pref_violation_ema_value = float(self._pref_violation_ema)
                 pref_lambda_value = float(self.pref_lambda)
                 pref_lambda_delta_value = 0.0
@@ -195,6 +206,18 @@ class FastSACUpdater:
                 critic_loss_replay_value = float(critic_loss_replay_tensor.detach().cpu().item())
                 q_disagreement_data = torch.max(q_stack_data, dim=0).values - torch.min(q_stack_data, dim=0).values
                 q_disagreement_data_value = float(q_disagreement_data.detach().mean().cpu().item())
+                q_min_data_value = float(min_q_data.detach().mean().cpu().item())
+
+                has_teacher_intervened = False
+                teacher_mask = None
+                try:
+                    has_teacher_intervened = "teacher_intervened" in batch.keys(include_nested=False)
+                except TypeError:
+                    has_teacher_intervened = "teacher_intervened" in batch.keys()
+                except Exception:
+                    has_teacher_intervened = "teacher_intervened" in batch
+                if has_teacher_intervened:
+                    teacher_mask = batch["teacher_intervened"].to(torch.bool)
 
                 # Preference ranking loss
                 pref_sampling_mode = str(getattr(args, "pref_sampling_mode", "independent")).strip().lower()
@@ -265,7 +288,13 @@ class FastSACUpdater:
                             rank_loss_weighted = float(args.pref_rank_weight) * rank_loss
                         elif pref_loss_type == "lagrangian":
                             prev_pref_lambda = float(self.pref_lambda)
-                            violation = torch.clamp(margin - delta, min=0.0)
+                            pref_lagrangian_violation_type = str(
+                                getattr(args, "pref_lagrangian_violation_type", "hinge")
+                            ).strip().lower()
+                            if pref_lagrangian_violation_type == "smooth":
+                                violation = F.softplus(margin - delta)
+                            else:
+                                violation = torch.clamp(margin - delta, min=0.0)
                             pref_violation_value = float(violation.detach().mean().cpu().item())
                             if self.pref_violation_clip > 0.0:
                                 violation = torch.clamp(violation, max=self.pref_violation_clip)
@@ -278,8 +307,9 @@ class FastSACUpdater:
                             else:
                                 dual_violation = float(pref_violation_value)
                             pref_dual_violation_value = float(dual_violation)
+                            pref_dual_signal_value = float(dual_violation - self.pref_violation_target)
                             if self.pref_lambda_lr > 0.0:
-                                self.pref_lambda = max(0.0, self.pref_lambda + self.pref_lambda_lr * dual_violation)
+                                self.pref_lambda = max(0.0, self.pref_lambda + self.pref_lambda_lr * pref_dual_signal_value)
                                 if self.pref_lambda_max > 0.0:
                                     self.pref_lambda = min(self.pref_lambda, self.pref_lambda_max)
                             pref_lambda_value = float(self.pref_lambda)
@@ -291,6 +321,9 @@ class FastSACUpdater:
                         else:
                             rank_loss = F.softplus(margin - delta).mean()
                             rank_loss_weighted = float(args.pref_rank_weight) * rank_loss
+                        pref_q_delta_value = float(delta.detach().mean().cpu().item())
+                        metrics_accumulator["pref_q_delta_sum"] += pref_q_delta_value
+                        metrics_accumulator["pref_q_delta_count"] += 1.0
                         qf_loss = qf_loss + rank_loss_weighted
                         pref_states_for_actor = pref_states
                         pref_teacher_actions_for_actor = pref_teacher_actions
@@ -408,6 +441,7 @@ class FastSACUpdater:
             metrics_accumulator["pref_lambda"] += pref_lambda_value
             metrics_accumulator["pref_lambda_delta"] += pref_lambda_delta_value
             metrics_accumulator["pref_dual_violation"] += pref_dual_violation_value
+            metrics_accumulator["pref_dual_signal"] += pref_dual_signal_value
             metrics_accumulator["pref_violation"] += pref_violation_value
             metrics_accumulator["pref_violation_ema"] += pref_violation_ema_value
             metrics_accumulator["pref_lagrangian_loss"] += (
@@ -424,6 +458,21 @@ class FastSACUpdater:
             metrics_accumulator["q_min_pi"] += min_q_pi_mean
             metrics_accumulator["q_disagreement_data"] += q_disagreement_data_value
             metrics_accumulator["q_disagreement_pi"] += q_disagreement_pi_value
+            metrics_accumulator["q_min_data"] += q_min_data_value
+            if teacher_mask is not None:
+                teacher_count = float(teacher_mask.sum().item())
+                if teacher_count > 0.0:
+                    metrics_accumulator["q_min_teacher_data_sum"] += float(
+                        min_q_data[teacher_mask].detach().sum().cpu().item()
+                    )
+                    metrics_accumulator["q_min_teacher_data_count"] += teacher_count
+                non_teacher_mask = ~teacher_mask
+                non_teacher_count = float(non_teacher_mask.sum().item())
+                if non_teacher_count > 0.0:
+                    metrics_accumulator["q_min_non_teacher_data_sum"] += float(
+                        min_q_data[non_teacher_mask].detach().sum().cpu().item()
+                    )
+                    metrics_accumulator["q_min_non_teacher_data_count"] += non_teacher_count
             metrics_accumulator["reward"] += reward_mean
             metrics_accumulator["reward_abs"] += float(rewards_batch.detach().abs().mean().cpu().item())
             metrics_accumulator["alpha_value"] += alpha_value

@@ -309,6 +309,106 @@ class ManipRelativeCubeFeaturesWrapper(gym.Wrapper):
         return obs_aug, reward, terminated, truncated, info
 
 
+class ManipRelativeOnlyObsWrapper(gym.Wrapper):
+    """Keep only compact proprioception and optional relative cube features."""
+
+    PROPRIO_DIM = 7  # eff_xyz(3), eff_yaw_cos_sin(2), gripper_open/contact(2)
+
+    def __init__(
+        self,
+        env: gym.Env,
+        *,
+        include_relative_cube_features: bool,
+        relative_feature_dim: int = ManipRelativeCubeFeaturesWrapper.FEATURE_DIM,
+    ):
+        super().__init__(env)
+        self.include_relative_cube_features = bool(include_relative_cube_features)
+        self.relative_feature_dim = int(max(0, relative_feature_dim))
+        obs_dim = self.PROPRIO_DIM + (self.relative_feature_dim if self.include_relative_cube_features else 0)
+        self.observation_space = gym.spaces.Box(
+            low=np.full((obs_dim,), -np.inf, dtype=np.float32),
+            high=np.full((obs_dim,), np.inf, dtype=np.float32),
+            dtype=np.float32,
+        )
+
+    @staticmethod
+    def _infer_num_cubes(base_dim: int) -> Optional[int]:
+        for n_cubes in range(1, 9):
+            rem = int(base_dim) - (7 + 9 * n_cubes)
+            if rem >= 0 and rem % 2 == 0:
+                return int(n_cubes)
+        return None
+
+    def _split_obs(self, obs_vec: np.ndarray, info: Optional[dict]) -> tuple[np.ndarray, np.ndarray]:
+        core = np.asarray(obs_vec, dtype=np.float32).reshape(-1)
+        rel = np.zeros((0,), dtype=np.float32)
+        if self.include_relative_cube_features and core.size >= self.relative_feature_dim:
+            rel = core[-self.relative_feature_dim :].astype(np.float32, copy=False)
+            core = core[: -self.relative_feature_dim]
+
+        if isinstance(info, dict):
+            goal = info.get("goal")
+            if goal is not None:
+                try:
+                    goal_vec = np.asarray(goal, dtype=np.float32).reshape(-1)
+                    if goal_vec.size > 0 and core.size == 2 * goal_vec.size:
+                        core = core[: goal_vec.size]
+                except Exception:
+                    pass
+
+        return core, rel
+
+    def _extract_proprio(self, core_obs: np.ndarray) -> np.ndarray:
+        base_dim = int(core_obs.size)
+        n_cubes = self._infer_num_cubes(base_dim)
+        if n_cubes is None:
+            out = np.zeros((self.PROPRIO_DIM,), dtype=np.float32)
+            n_take = min(self.PROPRIO_DIM, base_dim)
+            if n_take > 0:
+                out[:n_take] = core_obs[:n_take]
+            return out
+
+        rem = int(base_dim) - (7 + 9 * n_cubes)
+        n_joint = rem // 2
+        i = 2 * n_joint
+        eff_xyz = core_obs[i : i + 3]
+        i += 3
+        eff_yaw = core_obs[i : i + 2]
+        i += 2
+        grip_open = core_obs[i : i + 1]
+        i += 1
+        grip_contact = core_obs[i : i + 1]
+        return np.concatenate([eff_xyz, eff_yaw, grip_open, grip_contact], axis=0).astype(np.float32, copy=False)
+
+    def _compose(self, obs, info: Optional[dict]) -> tuple[np.ndarray, Optional[dict]]:
+        obs_vec = np.asarray(obs, dtype=np.float32).reshape(-1)
+        core, rel = self._split_obs(obs_vec, info)
+        proprio = self._extract_proprio(core)
+        if self.include_relative_cube_features:
+            rel_safe = rel
+            if rel_safe.size != self.relative_feature_dim:
+                rel_safe = np.zeros((self.relative_feature_dim,), dtype=np.float32)
+            out = np.concatenate([proprio, rel_safe], axis=0).astype(np.float32, copy=False)
+        else:
+            out = proprio
+
+        if isinstance(info, dict):
+            info["diag/obs_relative_only_active"] = 1
+            info["diag/obs_relative_only_dim"] = int(out.size)
+            info["diag/obs_relative_only_proprio_dim"] = int(self.PROPRIO_DIM)
+            info["diag/obs_relative_only_rel_dim"] = int(self.relative_feature_dim if self.include_relative_cube_features else 0)
+        return out, info
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        return self._compose(obs, info)
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        obs_new, info = self._compose(obs, info)
+        return obs_new, reward, terminated, truncated, info
+
+
 def is_cube_env_name(env_name: Optional[str]) -> bool:
     return "cube" in str(env_name or "").lower()
 
@@ -944,6 +1044,7 @@ def build_ogbench_manip_wrapper(
     include_direction: bool = False,
     include_velocity: bool = False,
     include_relative_cube_features: bool = False,
+    relative_only_obs: bool = False,
     reward_type: str,
     dense_reward_scale: float,
     step_penalty: float,
@@ -954,6 +1055,13 @@ def build_ogbench_manip_wrapper(
     tolerance_type: str = "angle",
     tolerance_value: float = 30.0,
     tolerance_channel_weights: Optional[str] = None,
+    tolerance_xyz_value: float = -1.0,
+    tolerance_yaw_value: float = -1.0,
+    tolerance_gripper_value: float = -1.0,
+    tolerance_adaptive_enable: bool = True,
+    tolerance_adaptive_near_distance: float = 0.08,
+    tolerance_adaptive_far_distance: float = 0.30,
+    tolerance_adaptive_near_scale: float = 0.35,
     binary_gripper_actions: bool = False,
     binary_gripper_threshold: float = 0.0,
     hard_gripper_intervention: bool = False,
@@ -982,6 +1090,12 @@ def build_ogbench_manip_wrapper(
     def _apply(env: gym.Env):
         wrapper_chain: list[str] = []
         cube_mode = canonicalize_cube_reward_mode(cube_reward_mode)
+        effective_include_goal = bool(include_goal)
+        if relative_only_obs and effective_include_goal:
+            warnings.warn(
+                "relative_only_obs requested; forcing include_goal=False to avoid absolute goal-state leakage."
+            )
+            effective_include_goal = False
         if static_reset_seed is not None:
             env = FixedResetSeedWrapper(env, reset_seed=int(static_reset_seed))
             wrapper_chain.append(f"FixedResetSeed({int(static_reset_seed)})")
@@ -993,7 +1107,7 @@ def build_ogbench_manip_wrapper(
                     "uses native environment state observations."
                 )
             wrapper_chain.append("NativeManipState")
-            if include_goal:
+            if effective_include_goal:
                 env = ManipGoalConditionedObsWrapper(env)
                 wrapper_chain.append("ManipGoalConditionedObsWrapper")
 
@@ -1026,6 +1140,13 @@ def build_ogbench_manip_wrapper(
         if include_relative_cube_features and obs_mode == "state":
             env = ManipRelativeCubeFeaturesWrapper(env)
             wrapper_chain.append("ManipRelativeCubeFeaturesWrapper")
+        if relative_only_obs and obs_mode == "state":
+            env = ManipRelativeOnlyObsWrapper(
+                env,
+                include_relative_cube_features=include_relative_cube_features,
+                relative_feature_dim=ManipRelativeCubeFeaturesWrapper.FEATURE_DIM,
+            )
+            wrapper_chain.append("ManipRelativeOnlyObsWrapper")
 
         env, intervention_name = maybe_wrap_intervention(
             env,
@@ -1034,6 +1155,13 @@ def build_ogbench_manip_wrapper(
             tolerance_type=tolerance_type,
             tolerance_value=tolerance_value,
             tolerance_channel_weights=tolerance_channel_weights,
+            tolerance_xyz_value=tolerance_xyz_value,
+            tolerance_yaw_value=tolerance_yaw_value,
+            tolerance_gripper_value=tolerance_gripper_value,
+            tolerance_adaptive_enable=tolerance_adaptive_enable,
+            tolerance_adaptive_near_distance=tolerance_adaptive_near_distance,
+            tolerance_adaptive_far_distance=tolerance_adaptive_far_distance,
+            tolerance_adaptive_near_scale=tolerance_adaptive_near_scale,
             binary_gripper_actions=binary_gripper_actions,
             binary_gripper_threshold=binary_gripper_threshold,
             hard_gripper_intervention=hard_gripper_intervention,

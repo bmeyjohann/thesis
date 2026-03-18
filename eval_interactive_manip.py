@@ -617,11 +617,12 @@ def _load_checkpoint_args_dict(model_path: Optional[str]) -> dict[str, Any]:
 _CLI_FLAG_ALIASES: dict[str, tuple[str, ...]] = {
     "env_name": ("--env_name",),
     "obs_mode": ("--obs_mode",),
-    "include_goal": ("--include_goal",),
+    "include_goal": ("--include_goal", "--no_include_goal"),
     "include_distance": ("--include_distance",),
     "include_direction": ("--include_direction",),
     "include_velocity": ("--include_velocity",),
     "include_relative_cube_features": ("--include_relative_cube_features",),
+    "relative_only_obs": ("--relative_only_obs",),
     "reward_type": ("--reward_type",),
     "dense_reward_scale": ("--dense_reward_scale",),
     "step_penalty": ("--step_penalty",),
@@ -637,6 +638,13 @@ _CLI_FLAG_ALIASES: dict[str, tuple[str, ...]] = {
     "tolerance_type": ("--tolerance_type",),
     "tolerance_value": ("--tolerance_value",),
     "tolerance_channel_weights": ("--tolerance_channel_weights",),
+    "tolerance_xyz_value": ("--tolerance_xyz_value",),
+    "tolerance_yaw_value": ("--tolerance_yaw_value",),
+    "tolerance_gripper_value": ("--tolerance_gripper_value",),
+    "tolerance_adaptive_enable": ("--tolerance_adaptive_enable", "--no_tolerance_adaptive_enable"),
+    "tolerance_adaptive_near_distance": ("--tolerance_adaptive_near_distance",),
+    "tolerance_adaptive_far_distance": ("--tolerance_adaptive_far_distance",),
+    "tolerance_adaptive_near_scale": ("--tolerance_adaptive_near_scale",),
     "binary_gripper_actions": ("--binary_gripper_actions",),
     "binary_gripper_threshold": ("--binary_gripper_threshold",),
     "hard_gripper_intervention": ("--hard_gripper_intervention",),
@@ -684,6 +692,7 @@ def apply_model_config_defaults(args: argparse.Namespace) -> None:
         "include_direction",
         "include_velocity",
         "include_relative_cube_features",
+        "relative_only_obs",
         "reward_type",
         "dense_reward_scale",
         "step_penalty",
@@ -699,6 +708,13 @@ def apply_model_config_defaults(args: argparse.Namespace) -> None:
         "tolerance_type",
         "tolerance_value",
         "tolerance_channel_weights",
+        "tolerance_xyz_value",
+        "tolerance_yaw_value",
+        "tolerance_gripper_value",
+        "tolerance_adaptive_enable",
+        "tolerance_adaptive_near_distance",
+        "tolerance_adaptive_far_distance",
+        "tolerance_adaptive_near_scale",
         "binary_gripper_actions",
         "binary_gripper_threshold",
         "hard_gripper_intervention",
@@ -827,6 +843,7 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--obs_mode", type=str, default="state", choices=["state"])
     p.add_argument("--include_goal", action="store_true", default=True)
+    p.add_argument("--no_include_goal", dest="include_goal", action="store_false")
     p.add_argument("--include_distance", action="store_true", default=False)
     p.add_argument("--include_direction", action="store_true", default=False)
     p.add_argument("--include_velocity", action="store_true", default=False)
@@ -835,6 +852,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         default=False,
         help="Append target-relative cube features to state observations (must match training config).",
+    )
+    p.add_argument(
+        "--relative_only_obs",
+        action="store_true",
+        default=False,
+        help="Use compact proprio + relative features only (must match training checkpoint config).",
     )
 
     p.add_argument(
@@ -877,7 +900,7 @@ def parse_args() -> argparse.Namespace:
         choices=["none", "agent", "agent_always", "agent_reward_progress", "agent_manual_gripper"],
     )
     p.add_argument("--teacher_type", type=str, default="cube_plan", choices=["cube_plan", "cube_markov"])
-    p.add_argument("--tolerance_type", type=str, default="l2", choices=["l2", "angle"])
+    p.add_argument("--tolerance_type", type=str, default="l2", choices=["l2", "angle", "component"])
     p.add_argument("--tolerance_value", type=float, default=0.02)
     p.add_argument(
         "--tolerance_channel_weights",
@@ -885,6 +908,14 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Optional per-action weights for l2 tolerance. One scalar or comma-separated list matching action dim.",
     )
+    p.add_argument("--tolerance_xyz_value", type=float, default=-1.0)
+    p.add_argument("--tolerance_yaw_value", type=float, default=-1.0)
+    p.add_argument("--tolerance_gripper_value", type=float, default=-1.0)
+    p.add_argument("--tolerance_adaptive_enable", action="store_true", default=True)
+    p.add_argument("--no_tolerance_adaptive_enable", dest="tolerance_adaptive_enable", action="store_false")
+    p.add_argument("--tolerance_adaptive_near_distance", type=float, default=0.08)
+    p.add_argument("--tolerance_adaptive_far_distance", type=float, default=0.30)
+    p.add_argument("--tolerance_adaptive_near_scale", type=float, default=0.35)
     p.add_argument(
         "--binary_gripper_actions",
         action="store_true",
@@ -1244,6 +1275,7 @@ def create_env(args: argparse.Namespace) -> gym.Env:
         include_direction=args.include_direction,
         include_velocity=args.include_velocity,
         include_relative_cube_features=args.include_relative_cube_features,
+        relative_only_obs=args.relative_only_obs,
         reward_type=args.reward_type,
         dense_reward_scale=args.dense_reward_scale,
         step_penalty=args.step_penalty,
@@ -1253,6 +1285,13 @@ def create_env(args: argparse.Namespace) -> gym.Env:
         tolerance_type=args.tolerance_type,
         tolerance_value=args.tolerance_value,
         tolerance_channel_weights=args.tolerance_channel_weights,
+        tolerance_xyz_value=args.tolerance_xyz_value,
+        tolerance_yaw_value=args.tolerance_yaw_value,
+        tolerance_gripper_value=args.tolerance_gripper_value,
+        tolerance_adaptive_enable=args.tolerance_adaptive_enable,
+        tolerance_adaptive_near_distance=args.tolerance_adaptive_near_distance,
+        tolerance_adaptive_far_distance=args.tolerance_adaptive_far_distance,
+        tolerance_adaptive_near_scale=args.tolerance_adaptive_near_scale,
         binary_gripper_actions=args.binary_gripper_actions,
         binary_gripper_threshold=args.binary_gripper_threshold,
         hard_gripper_intervention=args.hard_gripper_intervention,
