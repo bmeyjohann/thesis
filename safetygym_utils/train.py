@@ -215,6 +215,9 @@ def _emit_metrics(
     wandb_run=None,
     step: Optional[int] = None,
 ) -> None:
+    summary_line = _console_metrics_line(payload)
+    if summary_line:
+        print(summary_line, flush=True)
     line = json.dumps(payload, sort_keys=True)
     print(line, flush=True)
     with log_path.open("a", encoding="utf-8") as f:
@@ -224,6 +227,64 @@ def _emit_metrics(
             wandb_run.log(payload)
         else:
             wandb_run.log(payload, step=int(step))
+
+
+def _fmt_metric(payload: Dict[str, float], key: str, *, digits: int = 3) -> str:
+    value = payload.get(key)
+    if value is None:
+        return "-"
+    try:
+        return f"{float(value):.{digits}f}"
+    except Exception:
+        return "-"
+
+
+def _console_metrics_line(payload: Dict[str, float]) -> str:
+    if "eval/step" in payload:
+        return (
+            "[Eval] "
+            f"step={int(payload.get('eval/step', 0.0))} "
+            f"return={_fmt_metric(payload, 'eval/episode_return_mean')} "
+            f"cost={_fmt_metric(payload, 'eval/episode_cost_sum_mean')} "
+            f"success={_fmt_metric(payload, 'eval/outcome_success_mean')} "
+            f"timeout={_fmt_metric(payload, 'eval/outcome_timeout_mean')} "
+            f"kill={_fmt_metric(payload, 'eval/outcome_kill_mean')} "
+            f"final_dist={_fmt_metric(payload, 'eval/final_distance_to_goal_mean')} "
+            f"episodes={int(payload.get('eval/episodes', 0.0))}"
+        )
+    if "train/pretrain_updates_requested" in payload:
+        return (
+            "[Pretrain] "
+            f"updates={int(payload.get('train/pretrain_updates_run', 0.0))}/"
+            f"{int(payload.get('train/pretrain_updates_requested', 0.0))} "
+            f"critic_loss={_fmt_metric(payload, 'train/pretrain_critic_loss_mean')} "
+            f"actor_loss={_fmt_metric(payload, 'train/pretrain_actor_loss_mean')} "
+            f"target_q={_fmt_metric(payload, 'train/pretrain_target_q_mean')}"
+        )
+    if "train/prefill_episodes" in payload:
+        return (
+            "[Prefill] "
+            f"episodes={int(payload.get('train/prefill_episodes', 0.0))} "
+            f"steps={int(payload.get('train/prefill_steps', 0.0))} "
+            f"demo_steps={int(payload.get('train/prefill_demo_steps', 0.0))} "
+            f"demo_frac={_fmt_metric(payload, 'train/prefill_demo_fraction')} "
+            f"duration_s={_fmt_metric(payload, 'train/prefill_duration_s', digits=2)}"
+        )
+    if "train/step" in payload:
+        return (
+            "[Train] "
+            f"step={int(payload.get('train/step', 0.0))} "
+            f"fps={_fmt_metric(payload, 'train/fps', digits=1)} "
+            f"return={_fmt_metric(payload, 'train/episode_return_mean')} "
+            f"cost={_fmt_metric(payload, 'train/episode_cost_sum_mean')} "
+            f"success={_fmt_metric(payload, 'train/outcome_success_mean')} "
+            f"final_dist={_fmt_metric(payload, 'train/final_distance_to_goal_mean')} "
+            f"int_frac={_fmt_metric(payload, 'train/live_intervention_fraction')} "
+            f"replay={int(payload.get('train/buffer_main_size', 0.0))} "
+            f"demo={int(payload.get('train/buffer_demo_size', 0.0))} "
+            f"pref={int(payload.get('train/buffer_pref_size', 0.0))}"
+        )
+    return ""
 
 
 def _make_env_with_wrappers(
@@ -476,6 +537,14 @@ def _run_demo_pretrain(
             pref_batch=None,
             pref_rank_weight=0.0,
             pref_rank_margin=float(getattr(args, "pref_rank_margin", 0.1)),
+            pref_loss_type=str(getattr(args, "pref_loss_type", "margin")),
+            pref_stopgrad_positive=bool(getattr(args, "pref_stopgrad_positive", False)),
+            pref_lambda_lr=float(getattr(args, "pref_lambda_lr", 1e-3)),
+            pref_lambda_max=float(getattr(args, "pref_lambda_max", 10.0)),
+            pref_lambda_ema=float(getattr(args, "pref_lambda_ema", 0.9)),
+            pref_violation_clip=float(getattr(args, "pref_violation_clip", 10.0)),
+            pref_violation_target=float(getattr(args, "pref_violation_target", 0.0)),
+            pref_lagrangian_violation_type=str(getattr(args, "pref_lagrangian_violation_type", "hinge")),
         )
         critic_losses.append(float(last_update.critic_loss))
         actor_losses.append(float(last_update.actor_loss))
@@ -631,6 +700,8 @@ def run_training(args, *, variant: str) -> None:
         num_envs=1,
         device=device,
     )
+    sac.pref_lambda = float(getattr(args, "pref_lambda_init", 0.0))
+    sac.pref_violation_ema = 0.0
 
     main_rb = SimpleReplayBuffer(
         n_env=1,
@@ -941,6 +1012,14 @@ def run_training(args, *, variant: str) -> None:
                     pref_batch=pref_batch,
                     pref_rank_weight=float(getattr(args, "pref_rank_weight", 0.0)),
                     pref_rank_margin=float(getattr(args, "pref_rank_margin", 0.1)),
+                    pref_loss_type=str(getattr(args, "pref_loss_type", "margin")),
+                    pref_stopgrad_positive=bool(getattr(args, "pref_stopgrad_positive", False)),
+                    pref_lambda_lr=float(getattr(args, "pref_lambda_lr", 1e-3)),
+                    pref_lambda_max=float(getattr(args, "pref_lambda_max", 10.0)),
+                    pref_lambda_ema=float(getattr(args, "pref_lambda_ema", 0.9)),
+                    pref_violation_clip=float(getattr(args, "pref_violation_clip", 10.0)),
+                    pref_violation_target=float(getattr(args, "pref_violation_target", 0.0)),
+                    pref_lagrangian_violation_type=str(getattr(args, "pref_lagrangian_violation_type", "hinge")),
                 )
             t_update += time.perf_counter() - t0
 
@@ -1062,12 +1141,38 @@ def run_training(args, *, variant: str) -> None:
                 logs.update(
                     {
                         "train/critic_loss": last_update.critic_loss,
+                        "train/critic_loss_pref": last_update.critic_loss_pref,
+                        "train/critic_loss_pref_weighted": last_update.critic_loss_pref_weighted,
                         "train/actor_loss": last_update.actor_loss,
                         "train/alpha_loss": last_update.alpha_loss,
                         "train/alpha": last_update.alpha,
                         "train/target_q_mean": last_update.target_q_mean,
+                        "train/pref_q_delta": last_update.pref_q_delta,
+                        "train/pref_lambda": last_update.pref_lambda,
+                        "train/pref_lambda_delta": last_update.pref_lambda_delta,
+                        "train/pref_dual_violation": last_update.pref_dual_violation,
+                        "train/pref_dual_signal": last_update.pref_dual_signal,
+                        "train/pref_violation": last_update.pref_violation,
+                        "train/pref_violation_ema": last_update.pref_violation_ema,
+                        "train/pref_lagrangian_loss": last_update.pref_lagrangian_loss,
                     }
                 )
+                pref_loss_type = str(getattr(args, "pref_loss_type", "margin")).strip().lower()
+                pref_lagrangian_violation_type = str(
+                    getattr(args, "pref_lagrangian_violation_type", "hinge")
+                ).strip().lower()
+                logs["train/pref_lagrangian_enabled"] = 1.0 if pref_loss_type == "lagrangian" else 0.0
+                logs["train/pref_lagrangian_violation_is_smooth"] = (
+                    1.0 if pref_lagrangian_violation_type == "smooth" else 0.0
+                )
+                logs["train/pref_stopgrad_positive_enabled"] = (
+                    1.0 if bool(getattr(args, "pref_stopgrad_positive", False)) else 0.0
+                )
+                logs["train/pref_lambda_lr"] = float(getattr(args, "pref_lambda_lr", 0.0))
+                logs["train/pref_lambda_max"] = float(getattr(args, "pref_lambda_max", 0.0))
+                logs["train/pref_lambda_ema_cfg"] = float(getattr(args, "pref_lambda_ema", 0.0))
+                logs["train/pref_violation_clip"] = float(getattr(args, "pref_violation_clip", 0.0))
+                logs["train/pref_violation_target"] = float(getattr(args, "pref_violation_target", 0.0))
 
             _emit_metrics(payload=logs, log_path=log_path, wandb_run=wandb_run, step=step)
             live_window_steps = 0

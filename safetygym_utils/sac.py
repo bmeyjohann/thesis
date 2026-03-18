@@ -29,6 +29,8 @@ class SACTensors:
     alpha_optimizer: torch.optim.Optimizer
     log_alpha: torch.Tensor
     target_entropy: float
+    pref_lambda: float = 0.0
+    pref_violation_ema: float = 0.0
 
 
 @dataclass
@@ -38,6 +40,16 @@ class SACUpdateMetrics:
     alpha_loss: float
     alpha: float
     target_q_mean: float
+    critic_loss_pref: float = 0.0
+    critic_loss_pref_weighted: float = 0.0
+    pref_q_delta: float = 0.0
+    pref_lambda: float = 0.0
+    pref_lambda_delta: float = 0.0
+    pref_dual_violation: float = 0.0
+    pref_dual_signal: float = 0.0
+    pref_violation: float = 0.0
+    pref_violation_ema: float = 0.0
+    pref_lagrangian_loss: float = 0.0
 
 
 @dataclass
@@ -172,6 +184,14 @@ def sac_update_step(
     pref_batch=None,
     pref_rank_weight: float = 0.0,
     pref_rank_margin: float = 0.1,
+    pref_loss_type: str = "margin",
+    pref_stopgrad_positive: bool = False,
+    pref_lambda_lr: float = 1e-3,
+    pref_lambda_max: float = 10.0,
+    pref_lambda_ema: float = 0.9,
+    pref_violation_clip: float = 10.0,
+    pref_violation_target: float = 0.0,
+    pref_lagrangian_violation_type: str = "hinge",
 ) -> SACUpdateMetrics:
     obs = batch["observations"]
     actions = batch["actions"]
@@ -190,6 +210,16 @@ def sac_update_step(
 
     q1, q2 = sac.critic(obs, actions)
     critic_loss = F.mse_loss(q1, target_q) + F.mse_loss(q2, target_q)
+    critic_loss_pref = torch.tensor(0.0, device=obs.device)
+    critic_loss_pref_weighted = torch.tensor(0.0, device=obs.device)
+    pref_q_delta = 0.0
+    pref_lambda_value = float(sac.pref_lambda)
+    pref_lambda_delta = 0.0
+    pref_dual_violation = float(sac.pref_violation_ema)
+    pref_dual_signal = 0.0
+    pref_violation = 0.0
+    pref_violation_ema_value = float(sac.pref_violation_ema)
+    pref_lagrangian_loss = 0.0
 
     if pref_batch is not None and float(pref_rank_weight) > 0.0:
         pref_obs = pref_batch["obs"]
@@ -197,10 +227,49 @@ def sac_update_step(
         pref_student = pref_batch["student_actions"]
         tq1, tq2 = sac.critic(pref_obs, pref_teacher)
         sq1, sq2 = sac.critic(pref_obs, pref_student)
-        q_teacher = torch.min(tq1, tq2)
-        q_student = torch.min(sq1, sq2)
-        rank_loss = F.softplus(float(pref_rank_margin) - (q_teacher - q_student)).mean()
-        critic_loss = critic_loss + float(pref_rank_weight) * rank_loss
+        q_teacher = torch.stack((tq1, tq2), dim=0)
+        q_student = torch.stack((sq1, sq2), dim=0)
+        q_teacher_term = q_teacher.detach() if bool(pref_stopgrad_positive) else q_teacher
+        delta = q_teacher_term - q_student
+        pref_q_delta = float(delta.detach().mean().cpu().item())
+        pref_loss_mode = str(pref_loss_type).strip().lower()
+        if pref_loss_mode == "bradley_terry":
+            critic_loss_pref = F.softplus(-delta).mean()
+            critic_loss_pref_weighted = float(pref_rank_weight) * critic_loss_pref
+        elif pref_loss_mode == "lagrangian":
+            prev_pref_lambda = float(sac.pref_lambda)
+            violation_mode = str(pref_lagrangian_violation_type).strip().lower()
+            margin_gap = float(pref_rank_margin) - delta
+            if violation_mode == "smooth":
+                violation_tensor = F.softplus(margin_gap)
+            else:
+                violation_tensor = torch.clamp(margin_gap, min=0.0)
+            pref_violation = float(violation_tensor.detach().mean().cpu().item())
+            if float(pref_violation_clip) > 0.0:
+                violation_tensor = torch.clamp(violation_tensor, max=float(pref_violation_clip))
+            if float(pref_lambda_ema) > 0.0:
+                sac.pref_violation_ema = (
+                    float(pref_lambda_ema) * float(sac.pref_violation_ema)
+                    + (1.0 - float(pref_lambda_ema)) * float(pref_violation)
+                )
+                pref_dual_violation = float(sac.pref_violation_ema)
+            else:
+                pref_dual_violation = float(pref_violation)
+            pref_dual_signal = float(pref_dual_violation - float(pref_violation_target))
+            if float(pref_lambda_lr) > 0.0:
+                sac.pref_lambda = max(0.0, float(sac.pref_lambda) + float(pref_lambda_lr) * pref_dual_signal)
+                if float(pref_lambda_max) > 0.0:
+                    sac.pref_lambda = min(float(sac.pref_lambda), float(pref_lambda_max))
+            pref_lambda_value = float(sac.pref_lambda)
+            pref_lambda_delta = float(pref_lambda_value - prev_pref_lambda)
+            pref_violation_ema_value = float(sac.pref_violation_ema)
+            critic_loss_pref = (pref_lambda_value * violation_tensor).mean()
+            critic_loss_pref_weighted = critic_loss_pref
+            pref_lagrangian_loss = float(critic_loss_pref_weighted.detach().cpu().item())
+        else:
+            critic_loss_pref = F.softplus(float(pref_rank_margin) - delta).mean()
+            critic_loss_pref_weighted = float(pref_rank_weight) * critic_loss_pref
+        critic_loss = critic_loss + critic_loss_pref_weighted
 
     sac.critic_optimizer.zero_grad(set_to_none=True)
     critic_loss.backward()
@@ -232,4 +301,14 @@ def sac_update_step(
         alpha_loss=float(alpha_loss.detach().cpu().item()),
         alpha=float(sac.log_alpha.exp().detach().cpu().item()),
         target_q_mean=float(target_q.detach().mean().cpu().item()),
+        critic_loss_pref=float(critic_loss_pref.detach().cpu().item()),
+        critic_loss_pref_weighted=float(critic_loss_pref_weighted.detach().cpu().item()),
+        pref_q_delta=float(pref_q_delta),
+        pref_lambda=float(pref_lambda_value),
+        pref_lambda_delta=float(pref_lambda_delta),
+        pref_dual_violation=float(pref_dual_violation),
+        pref_dual_signal=float(pref_dual_signal),
+        pref_violation=float(pref_violation),
+        pref_violation_ema=float(pref_violation_ema_value),
+        pref_lagrangian_loss=float(pref_lagrangian_loss),
     )

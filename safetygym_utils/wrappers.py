@@ -121,7 +121,7 @@ class HumanInterventionWrapper(gym.Wrapper):
 
 
 class RewardModeWrapper(gym.Wrapper):
-    """Apply sparse/dense/none reward modes for Safety-Gymnasium."""
+    """Apply sparse/dense reward modes for Safety-Gymnasium."""
 
     def __init__(
         self,
@@ -133,7 +133,7 @@ class RewardModeWrapper(gym.Wrapper):
     ):
         super().__init__(env)
         mode = str(reward_mode).lower()
-        if mode not in {"sparse", "dense", "none"}:
+        if mode not in {"sparse", "dense", "dense_plus_sparse", "none"}:
             raise ValueError(f"Unsupported reward_mode: {reward_mode}")
         self.reward_mode = mode
         self.dense_reward_scale = float(dense_reward_scale)
@@ -161,6 +161,14 @@ class RewardModeWrapper(gym.Wrapper):
                 rew = self.dense_reward_scale * float(prev - cur_dist)
             else:
                 rew = 0.0
+        elif self.reward_mode == "dense_plus_sparse":
+            prev = self._prev_goal_distance
+            if np.isfinite(prev) and np.isfinite(cur_dist):
+                rew = self.dense_reward_scale * float(prev - cur_dist)
+            else:
+                rew = 0.0
+            if goal_met:
+                rew += 1.0
         elif self.reward_mode == "none":
             rew = 0.0
 

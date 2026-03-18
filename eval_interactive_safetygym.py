@@ -43,7 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--num_episodes", type=int, default=10)
     p.add_argument("--fps", type=int, default=30)
 
-    p.add_argument("--reward_mode", type=str, default="sparse", choices=["sparse", "dense", "none"])
+    p.add_argument("--reward_mode", type=str, default="sparse", choices=["sparse", "dense", "dense_plus_sparse", "none"])
     p.add_argument("--dense_reward_scale", type=float, default=1.0)
     p.add_argument("--step_penalty", type=float, default=0.0)
 
