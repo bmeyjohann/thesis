@@ -26,3 +26,6 @@
 [submodule "HighwayEnv"]
 	path = HighwayEnv
 	url = git@github.com:bmeyjohann/HighwayEnv.git
+[submodule "safety-gymnasium"]
+	path = safety-gymnasium
+	url = git@github.com:bmeyjohann/safety-gymnasium.git
