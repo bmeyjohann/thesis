@@ -12,6 +12,7 @@ from typing import Any, Optional
 
 DEFAULT_VR_PORT = 8765
 DEFAULT_VR_CACHE_PATH = Path("codex/vr_last_endpoint.json")
+DEFAULT_VR_SERVE_HOST = "0.0.0.0"
 
 
 OPENVR_BUTTON_ALIASES: dict[str, int] = {

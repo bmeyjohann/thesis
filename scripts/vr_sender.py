@@ -16,6 +16,7 @@ sys.path.append(str(ROOT / "ogbench_utils"))
 from vr_teleop import (  # noqa: E402
     DEFAULT_VR_CACHE_PATH,
     DEFAULT_VR_PORT,
+    DEFAULT_VR_SERVE_HOST,
     OPENVR_BUTTON_ALIASES,
     VRPublisherServer,
     load_cached_endpoint,
@@ -28,7 +29,15 @@ from vr_teleop import (  # noqa: E402
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Publish raw VR controller state for thesis teleoperation.")
     p.add_argument("--mode", type=str, default="serve", choices=["serve", "push"])
-    p.add_argument("--host", type=str, default="", help="Bind host in serve mode, receiver host in push mode.")
+    p.add_argument(
+        "--host",
+        type=str,
+        default="",
+        help=(
+            "Bind host in serve mode, receiver host in push mode. "
+            f"Blank defaults to {DEFAULT_VR_SERVE_HOST} in serve mode."
+        ),
+    )
     p.add_argument("--port", type=int, default=DEFAULT_VR_PORT)
     p.add_argument("--backend", type=str, default="demo", choices=["demo", "openvr"])
     p.add_argument("--rate_hz", type=float, default=60.0)
@@ -271,7 +280,13 @@ def _run_push_mode(args: argparse.Namespace, backend: Any) -> int:
 
 def _run_serve_mode(args: argparse.Namespace, backend: Any) -> int:
     cache_path = Path(args.cache_path)
-    host = str(args.host).strip() or "0.0.0.0"
+    host = str(args.host).strip() or DEFAULT_VR_SERVE_HOST
+    if host in {"127.0.0.1", "localhost"}:
+        print(
+            "warning: binding the VR publisher to loopback only; remote laptops/WSL clients cannot connect. "
+            f"Use --host {DEFAULT_VR_SERVE_HOST} for LAN access.",
+            flush=True,
+        )
     publisher = VRPublisherServer(
         backend,
         host=host,
