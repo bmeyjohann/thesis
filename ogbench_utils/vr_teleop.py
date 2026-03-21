@@ -348,7 +348,7 @@ class VRRawStateClient:
         return snap
 
     def banner_text(self) -> str:
-        return f"VR receiver connecting to publisher at {self.host}:{self.port}"
+        return f"VR receiver configured to connect to publisher at {self.host}:{self.port}"
 
 
 class _PublishedSampleStore:
@@ -851,7 +851,7 @@ class VRTeleopInterface:
 class VRStatusPanel:
     """Optional pygame status window for receiver-side address and stream state."""
 
-    def __init__(self, title: str = "VR Receiver", width: int = 960, height: int = 280):
+    def __init__(self, title: str = "VR Receiver", width: int = 960, height: int = 520):
         pygame = _optional_pygame()
         if pygame is None:
             raise RuntimeError("pygame is not installed")
@@ -862,9 +862,203 @@ class VRStatusPanel:
         self._font = pygame.font.SysFont("Arial", 18)
         self._small = pygame.font.SysFont("Arial", 16)
         self._snapshot: dict[str, Any] = {}
+        self._history_by_hand: dict[str, list[dict[str, Any]]] = {"left": [], "right": []}
+        self._last_history_seq: Optional[int] = None
 
     def set_snapshot(self, snapshot: dict[str, Any]) -> None:
         self._snapshot = dict(snapshot or {})
+        latest = self._snapshot.get("latest_sample")
+        if not isinstance(latest, dict):
+            return
+        try:
+            seq = int(latest.get("seq", -1))
+        except Exception:
+            seq = -1
+        if seq >= 0 and seq == self._last_history_seq:
+            return
+        self._last_history_seq = seq if seq >= 0 else None
+        for hand in ("left", "right"):
+            controller = extract_controller_state(latest, hand)
+            pose_data = self._controller_pose_data(controller)
+            if pose_data is None:
+                continue
+            history = self._history_by_hand[hand]
+            history.append(pose_data)
+            if len(history) > 90:
+                del history[:-90]
+
+    def _controller_pose_data(self, controller: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        if not isinstance(controller, dict):
+            return None
+        if not bool(controller.get("tracked", False)):
+            return None
+        pose = controller.get("pose")
+        if not isinstance(pose, dict):
+            return None
+        try:
+            position = [float(v) for v in pose.get("position", [0.0, 0.0, 0.0])[:3]]
+        except Exception:
+            return None
+        yaw = quaternion_wxyz_to_yaw(pose.get("quaternion_wxyz", [1.0, 0.0, 0.0, 0.0]))
+        return {"position": position, "yaw": float(yaw)}
+
+    def _draw_meter(self, rect, value: float, *, label: str, min_value: float, max_value: float) -> None:
+        pygame = self._pygame
+        screen = self._screen
+        small = self._small
+        pygame.draw.rect(screen, (34, 34, 42), rect, border_radius=6)
+        pygame.draw.rect(screen, (100, 100, 120), rect, 1, border_radius=6)
+        clamped = max(min_value, min(max_value, float(value)))
+        frac = 0.0 if max_value <= min_value else (clamped - min_value) / (max_value - min_value)
+        fill_h = int((rect.height - 6) * frac)
+        fill_rect = pygame.Rect(rect.x + 3, rect.bottom - 3 - fill_h, rect.width - 6, fill_h)
+        pygame.draw.rect(screen, (84, 170, 120), fill_rect, border_radius=5)
+        screen.blit(small.render(label, True, (230, 230, 230)), (rect.x, rect.y - 18))
+        screen.blit(small.render(f"{clamped:.2f}", True, (230, 230, 230)), (rect.x - 2, rect.bottom + 2))
+
+    def _draw_axis_pad(self, rect, *, label: str, x_value: float, y_value: float) -> None:
+        pygame = self._pygame
+        screen = self._screen
+        small = self._small
+        pygame.draw.rect(screen, (34, 34, 42), rect, border_radius=6)
+        pygame.draw.rect(screen, (100, 100, 120), rect, 1, border_radius=6)
+        cx = rect.centerx
+        cy = rect.centery
+        pygame.draw.line(screen, (72, 72, 84), (rect.x + 8, cy), (rect.right - 8, cy), 1)
+        pygame.draw.line(screen, (72, 72, 84), (cx, rect.y + 8), (cx, rect.bottom - 8), 1)
+        px = int(cx + max(-1.0, min(1.0, float(x_value))) * (rect.width * 0.35))
+        py = int(cy - max(-1.0, min(1.0, float(y_value))) * (rect.height * 0.35))
+        pygame.draw.circle(screen, (220, 190, 80), (px, py), 6)
+        screen.blit(small.render(label, True, (230, 230, 230)), (rect.x, rect.y - 18))
+        screen.blit(
+            small.render(f"x={float(x_value):+.2f} y={float(y_value):+.2f}", True, (210, 210, 210)),
+            (rect.x, rect.bottom + 2),
+        )
+
+    def _draw_yaw_gauge(self, rect, *, yaw: float) -> None:
+        pygame = self._pygame
+        screen = self._screen
+        small = self._small
+        pygame.draw.rect(screen, (34, 34, 42), rect, border_radius=6)
+        pygame.draw.rect(screen, (100, 100, 120), rect, 1, border_radius=6)
+        center = rect.center
+        radius = max(16, min(rect.width, rect.height) // 2 - 12)
+        pygame.draw.circle(screen, (90, 90, 108), center, radius, 1)
+        pygame.draw.line(screen, (70, 70, 84), (center[0], rect.y + 12), (center[0], rect.bottom - 12), 1)
+        pygame.draw.line(screen, (70, 70, 84), (rect.x + 12, center[1]), (rect.right - 12, center[1]), 1)
+        tip = (
+            int(center[0] + math.cos(float(yaw)) * radius * 0.85),
+            int(center[1] - math.sin(float(yaw)) * radius * 0.85),
+        )
+        pygame.draw.line(screen, (220, 190, 80), center, tip, 3)
+        pygame.draw.circle(screen, (220, 190, 80), center, 4)
+        screen.blit(small.render("Yaw", True, (230, 230, 230)), (rect.x, rect.y - 18))
+        screen.blit(small.render(f"{float(yaw):+.2f} rad", True, (210, 210, 210)), (rect.x, rect.bottom + 2))
+
+    def _draw_position_plot(self, rect, *, hand: str, current_position: Optional[list[float]]) -> None:
+        pygame = self._pygame
+        screen = self._screen
+        small = self._small
+        pygame.draw.rect(screen, (34, 34, 42), rect, border_radius=6)
+        pygame.draw.rect(screen, (100, 100, 120), rect, 1, border_radius=6)
+        screen.blit(small.render("XY motion trail", True, (230, 230, 230)), (rect.x, rect.y - 18))
+        cx = rect.centerx
+        cy = rect.centery
+        pygame.draw.line(screen, (72, 72, 84), (rect.x + 10, cy), (rect.right - 10, cy), 1)
+        pygame.draw.line(screen, (72, 72, 84), (cx, rect.y + 10), (cx, rect.bottom - 10), 1)
+        scale_m = 0.15
+        points: list[tuple[int, int]] = []
+        history = self._history_by_hand.get(hand, [])
+        if current_position is None and history:
+            current_position = history[-1]["position"]
+        if current_position is not None:
+            cur_x, cur_y = float(current_position[0]), float(current_position[1])
+            for item in history:
+                pos = item.get("position")
+                if not isinstance(pos, list) or len(pos) < 2:
+                    continue
+                dx = (float(pos[0]) - cur_x) / scale_m
+                dy = (float(pos[1]) - cur_y) / scale_m
+                px = int(cx + dx * (rect.width * 0.42))
+                py = int(cy - dy * (rect.height * 0.42))
+                px = max(rect.x + 8, min(rect.right - 8, px))
+                py = max(rect.y + 8, min(rect.bottom - 8, py))
+                points.append((px, py))
+        if len(points) >= 2:
+            pygame.draw.lines(screen, (94, 154, 226), False, points, 2)
+        if points:
+            pygame.draw.circle(screen, (220, 190, 80), points[-1], 6)
+        if current_position is None:
+            screen.blit(small.render("no tracked pose", True, (190, 190, 190)), (rect.x + 12, rect.y + 12))
+        else:
+            screen.blit(
+                small.render(
+                    f"x={float(current_position[0]):+.3f} y={float(current_position[1]):+.3f} z={float(current_position[2]):+.3f}",
+                    True,
+                    (210, 210, 210),
+                ),
+                (rect.x + 10, rect.bottom + 2),
+            )
+
+    def _draw_controller_card(self, rect, *, label: str, hand: str, controller: Optional[dict[str, Any]]) -> None:
+        pygame = self._pygame
+        screen = self._screen
+        small = self._small
+        pygame.draw.rect(screen, (42, 42, 52), rect, border_radius=6)
+        pygame.draw.rect(screen, (100, 100, 120), rect, 1, border_radius=6)
+
+        trigger = controller_axis_value(controller, "trigger")
+        joy_x = controller_axis_value(controller, "joystick_x")
+        joy_y = controller_axis_value(controller, "joystick_y")
+        pad_x = controller_axis_value(controller, "trackpad_x")
+        pad_y = controller_axis_value(controller, "trackpad_y")
+        buttons = controller.get("pressed_button_ids", []) if isinstance(controller, dict) else []
+        pose = controller.get("pose") if isinstance(controller, dict) else None
+        position = None
+        yaw = 0.0
+        if isinstance(pose, dict):
+            try:
+                position = [float(v) for v in pose.get("position", [0.0, 0.0, 0.0])[:3]]
+            except Exception:
+                position = None
+            yaw = quaternion_wxyz_to_yaw(pose.get("quaternion_wxyz", [1.0, 0.0, 0.0, 0.0]))
+
+        header_lines = [
+            f"{label}: connected={int(bool(isinstance(controller, dict) and controller.get('connected', False)))} tracked={int(bool(isinstance(controller, dict) and controller.get('tracked', False)))}",
+            f"role={controller.get('role', hand) if isinstance(controller, dict) else hand} device_index={controller.get('device_index', -1) if isinstance(controller, dict) else -1}",
+            f"buttons={buttons}",
+        ]
+        y_text = rect.y + 10
+        for text in header_lines:
+            screen.blit(small.render(text, True, (230, 230, 230)), (rect.x + 12, y_text))
+            y_text += 22
+
+        inner_x = rect.x + 12
+        inner_y = rect.y + 86
+        inner_w = rect.width - 24
+        plot_w = min(214, max(170, inner_w // 2))
+        plot_h = 148
+        gap = 12
+        right_x = inner_x + plot_w + gap
+        right_w = max(120, rect.right - 12 - right_x)
+        yaw_w = min(88, max(74, right_w // 2 - 8))
+        yaw_h = 88
+        trigger_w = min(22, max(18, right_w - yaw_w - gap))
+        pad_gap = 12
+        pad_w = max(72, (right_w - pad_gap) // 2)
+        joy_w = max(72, right_w - pad_gap - pad_w)
+
+        plot_rect = pygame.Rect(inner_x, inner_y, plot_w, plot_h)
+        yaw_rect = pygame.Rect(right_x, inner_y + 12, yaw_w, yaw_h)
+        trigger_rect = pygame.Rect(yaw_rect.right + gap, inner_y + 12, trigger_w, yaw_h)
+        pad_rect = pygame.Rect(right_x, inner_y + 168, pad_w, 80)
+        joy_rect = pygame.Rect(pad_rect.right + pad_gap, inner_y + 168, joy_w, 80)
+
+        self._draw_position_plot(plot_rect, hand=hand, current_position=position)
+        self._draw_yaw_gauge(yaw_rect, yaw=yaw)
+        self._draw_meter(trigger_rect, trigger, label="Trigger", min_value=0.0, max_value=1.0)
+        self._draw_axis_pad(pad_rect, label="Trackpad", x_value=pad_x, y_value=pad_y)
+        self._draw_axis_pad(joy_rect, label="Joystick", x_value=joy_x, y_value=joy_y)
 
     def poll(self) -> tuple[bool, bool, bool, bool, float]:
         pygame = self._pygame
@@ -903,9 +1097,10 @@ class VRStatusPanel:
         screen.fill((20, 20, 24))
         mode = str(snapshot.get("mode", "listen"))
         if mode == "connect":
+            link_state = "CONNECTED" if snapshot.get("connected", False) else "DISCONNECTED (retrying)"
             lines = [
-                f"Receiver connected target: {snapshot.get('host', '127.0.0.1')}:{snapshot.get('port', DEFAULT_VR_PORT)}",
-                f"Link state: {'CONNECTED' if snapshot.get('connected', False) else 'reconnecting'}",
+                f"Receiver target: {snapshot.get('host', '127.0.0.1')}:{snapshot.get('port', DEFAULT_VR_PORT)}",
+                f"Link state: {link_state}",
                 f"Last error: {snapshot.get('last_error', '') or '-'}",
                 f"Last remote: {snapshot.get('last_client', '-') or '-'}",
             ]
@@ -937,28 +1132,8 @@ class VRStatusPanel:
             y += 28
 
         screen.blit(font.render("Latest stream sample", True, (220, 190, 80)), (16, 140))
-        block_y = 172
-        blocks = [("Left", left), ("Right", right)]
-        x = 16
-        for label, controller in blocks:
-            rect = pygame.Rect(x, block_y, 450, 84)
-            pygame.draw.rect(screen, (42, 42, 52), rect, border_radius=6)
-            pygame.draw.rect(screen, (100, 100, 120), rect, 1, border_radius=6)
-            if isinstance(controller, dict):
-                trigger = controller_axis_value(controller, "trigger")
-                buttons = controller.get("pressed_button_ids", [])
-                text_lines = [
-                    f"{label}: connected={int(bool(controller.get('connected', False)))} tracked={int(bool(controller.get('tracked', False)))}",
-                    f"trigger={float(trigger):.3f} buttons={buttons}",
-                    f"role={controller.get('role', label.lower())} device_index={controller.get('device_index', -1)}",
-                ]
-            else:
-                text_lines = [f"{label}: no data", "", ""]
-            y_text = block_y + 10
-            for text in text_lines:
-                screen.blit(small.render(text, True, (230, 230, 230)), (x + 12, y_text))
-                y_text += 22
-            x += 478
+        self._draw_controller_card(pygame.Rect(16, 172, 456, 340), label="Left", hand="left", controller=left)
+        self._draw_controller_card(pygame.Rect(488, 172, 456, 340), label="Right", hand="right", controller=right)
         pygame.display.flip()
 
     def close(self) -> None:

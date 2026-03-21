@@ -80,11 +80,15 @@ def main() -> int:
                 latest = snapshot.get("latest_sample")
                 right = extract_controller_state(latest, "right")
                 left = extract_controller_state(latest, "left")
+                connected = bool(snapshot.get("connected", snapshot.get("connected_clients", 0)))
+                state = "CONNECTED" if connected else "DISCONNECTED"
                 print(
                     "monitor "
                     f"mode={snapshot.get('mode', args.mode)} "
-                    f"connected={int(bool(snapshot.get('connected', snapshot.get('connected_clients', 0))))} "
+                    f"state={state} "
+                    f"connected={int(connected)} "
                     f"last_peer={snapshot.get('last_client', '-') or '-'} "
+                    f"last_error={snapshot.get('last_error', '') or '-'} "
                     f"left_tracked={int(bool(left and left.get('tracked', False)))} "
                     f"right_tracked={int(bool(right and right.get('tracked', False)))}",
                     flush=True,

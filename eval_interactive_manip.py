@@ -433,6 +433,7 @@ class VRController:
         )
         self._panel = None
         self._last_diag: dict[str, Any] = {}
+        self._last_status_line: Optional[str] = None
         if (not args.headless) and bool(args.vr_show_status_panel):
             try:
                 self._panel = VRStatusPanel(title="VR Receiver")
@@ -447,11 +448,15 @@ class VRController:
         advance_requested = False
         fps_delta = 0.0
         snapshot = self.source.snapshot()
+        self._maybe_log_status(snapshot)
         if self._panel is not None:
             self._panel.set_snapshot(snapshot)
             prev_requested, next_requested, quit_requested, advance_requested, fps_delta = self._panel.poll()
             self._panel.draw()
         action, diag = self.mapper.map_sample(snapshot.get("latest_sample"))
+        diag["link_connected"] = bool(snapshot.get("connected", snapshot.get("connected_clients", 0)))
+        diag["last_error"] = str(snapshot.get("last_error", "") or "")
+        diag["last_received_wall_time"] = float(snapshot.get("last_received_wall_time", 0.0) or 0.0)
         self._last_diag = diag
         return action, prev_requested, next_requested, quit_requested, advance_requested, fps_delta
 
@@ -462,6 +467,26 @@ class VRController:
 
     def diagnostics(self) -> dict[str, Any]:
         return dict(self._last_diag)
+
+    def _maybe_log_status(self, snapshot: dict[str, Any]) -> None:
+        connected = bool(snapshot.get("connected", snapshot.get("connected_clients", 0)))
+        last_error = str(snapshot.get("last_error", "") or "-")
+        last_peer = str(snapshot.get("last_client", "-") or "-")
+        last_rx = float(snapshot.get("last_received_wall_time", 0.0) or 0.0)
+        has_sample = snapshot.get("latest_sample") is not None
+        if connected and has_sample:
+            age = max(0.0, time.time() - last_rx) if last_rx > 0.0 else float("nan")
+            if np.isfinite(age):
+                line = f"vr_link=CONNECTED vr_data=present peer={last_peer} age_s={age:.2f}"
+            else:
+                line = f"vr_link=CONNECTED vr_data=present peer={last_peer}"
+        elif connected:
+            line = f"vr_link=CONNECTED vr_data=waiting peer={last_peer}"
+        else:
+            line = f"vr_link=DISCONNECTED vr_data=none last_error={last_error}"
+        if line != self._last_status_line:
+            print(line, flush=True)
+            self._last_status_line = line
 
 
 class EpisodeControlPanel:
@@ -1960,9 +1985,24 @@ def run(args: argparse.Namespace) -> None:
                             raw_piece = f" raw_obs={_flatten_preview(raw_obs, args.print_obs_dims)}"
                         except Exception:
                             raw_piece = " raw_obs=<unavailable>"
+                    vr_piece = ""
+                    if args.controller == "vr":
+                        try:
+                            vr_diag = controller.diagnostics()
+                            vr_piece = (
+                                " "
+                                f"vr[connected={int(bool(vr_diag.get('link_connected', False)))}"
+                                f",tracked={int(bool(vr_diag.get('tracked', False)))}"
+                                f",gate={int(bool(vr_diag.get('gate_pressed', False)))}"
+                                f",motion={int(bool(vr_diag.get('motion_active', False)))}"
+                                f",trigger={float(vr_diag.get('trigger_value', 0.0)):.3f}"
+                                f",err={str(vr_diag.get('last_error', '') or '-')}]"
+                            )
+                        except Exception:
+                            vr_piece = " vr[diag_unavailable]"
                     print(
                         f"step={ep_len:04d} debug action={act_preview} "
-                        f"obs_before={obs_before_preview} obs_after={obs_after_preview}{raw_piece}",
+                        f"obs_before={obs_before_preview} obs_after={obs_after_preview}{raw_piece}{vr_piece}",
                         flush=True,
                     )
                 if args.print_obs_delta_every > 0 and ep_len % int(args.print_obs_delta_every) == 0:
