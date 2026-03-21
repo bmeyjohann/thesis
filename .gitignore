@@ -9,6 +9,7 @@
 *_l.json
 *_l.csv
 local/*
+codex/
 
 # Python
 __pycache__/

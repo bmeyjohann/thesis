@@ -45,6 +45,16 @@ from ogbench_utils.env_wrappers_manip import (
     canonicalize_cube_reward_mode,
     cube_reward_mode_active,
 )
+from ogbench_utils.vr_teleop import (
+    DEFAULT_VR_CACHE_PATH,
+    DEFAULT_VR_PORT,
+    VRManipActionMapper,
+    VRManipMappingConfig,
+    VRRawStateClient,
+    VRRawStateServer,
+    VRStatusPanel,
+    resolve_cached_endpoint,
+)
 
 
 def _yaw_from_quat_wxyz(quat_wxyz: np.ndarray) -> float:
@@ -372,6 +382,86 @@ class KeyboardController:
 
     def close(self) -> None:
         pygame.quit()
+
+
+class VRController:
+    """Receiver-side controller that converts streamed raw VR state into manip actions."""
+
+    def __init__(self, action_dim: int, args: argparse.Namespace):
+        self.action_dim = int(action_dim)
+        self.cache_path = Path(args.vr_cache_path)
+        if args.vr_mode == "listen":
+            listen_port = int(args.vr_port) if int(args.vr_port) > 0 else DEFAULT_VR_PORT
+            self.source = VRRawStateServer(host=str(args.vr_host).strip() or "0.0.0.0", port=listen_port)
+            self.source.start()
+        else:
+            host, port, from_cache = resolve_cached_endpoint(
+                args.vr_host,
+                args.vr_port,
+                cache_path=self.cache_path,
+                default_host="127.0.0.1",
+                default_port=DEFAULT_VR_PORT,
+            )
+            self.source = VRRawStateClient(
+                host=host,
+                port=port,
+                reconnect_seconds=float(args.vr_reconnect_seconds),
+                cache_path=self.cache_path,
+                save_cache=True,
+            )
+            self.source.start()
+            print(f"vr endpoint resolved to {host}:{port} (from_cache={int(from_cache)})", flush=True)
+        self.mapper = VRManipActionMapper(
+            action_dim=self.action_dim,
+            config=VRManipMappingConfig(
+                hand=args.vr_hand,
+                require_gate=bool(args.vr_require_gate),
+                gate_button=args.vr_gate_button,
+                mirror_gripper_when_inactive=bool(args.vr_mirror_gripper_when_inactive),
+                position_gain=float(args.vr_position_gain),
+                yaw_gain=float(args.vr_yaw_gain),
+                gripper_gain=float(args.vr_gripper_gain),
+                trigger_axis=args.vr_gripper_axis,
+                binary_gripper=bool(args.vr_binary_gripper),
+                trigger_close_threshold=float(args.vr_trigger_close_threshold),
+                trigger_open_threshold=float(args.vr_trigger_open_threshold),
+                invert_x=bool(args.vr_invert_x),
+                invert_y=bool(args.vr_invert_y),
+                invert_z=bool(args.vr_invert_z),
+                invert_yaw=bool(args.vr_invert_yaw),
+            ),
+        )
+        self._panel = None
+        self._last_diag: dict[str, Any] = {}
+        if (not args.headless) and bool(args.vr_show_status_panel):
+            try:
+                self._panel = VRStatusPanel(title="VR Receiver")
+            except Exception:
+                self._panel = None
+        print(self.source.banner_text(), flush=True)
+
+    def action(self) -> tuple[np.ndarray, bool, bool, bool, bool, float]:
+        prev_requested = False
+        next_requested = False
+        quit_requested = False
+        advance_requested = False
+        fps_delta = 0.0
+        snapshot = self.source.snapshot()
+        if self._panel is not None:
+            self._panel.set_snapshot(snapshot)
+            prev_requested, next_requested, quit_requested, advance_requested, fps_delta = self._panel.poll()
+            self._panel.draw()
+        action, diag = self.mapper.map_sample(snapshot.get("latest_sample"))
+        self._last_diag = diag
+        return action, prev_requested, next_requested, quit_requested, advance_requested, fps_delta
+
+    def close(self) -> None:
+        if self._panel is not None:
+            self._panel.close()
+        self.source.close()
+
+    def diagnostics(self) -> dict[str, Any]:
+        return dict(self._last_diag)
 
 
 class EpisodeControlPanel:
@@ -835,7 +925,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--num_episodes", type=int, default=1, help="0 => run forever")
     p.add_argument("--max_episode_steps", type=int, default=500)
-    p.add_argument("--controller", type=str, default="random", choices=["policy", "random", "keyboard", "human", "idle"])
+    p.add_argument("--controller", type=str, default="random", choices=["policy", "random", "keyboard", "human", "idle", "vr"])
     p.add_argument("--render_mode", type=str, default="human", choices=["human", "rgb_array"])
     p.add_argument("--mujoco_gl", type=str, default="auto", choices=["auto", "glfw", "egl"])
     p.add_argument("--fps", type=int, default=20)
@@ -944,6 +1034,38 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--action_scale", type=float, default=1.0)
     p.add_argument("--keyboard_scale", type=float, default=0.5)
+    p.add_argument("--vr_mode", type=str, default="connect", choices=["connect", "listen"])
+    p.add_argument("--vr_host", type=str, default="", help="Desktop publisher host in connect mode, bind host in listen mode.")
+    p.add_argument("--vr_port", type=int, default=0)
+    p.add_argument("--vr_cache_path", type=str, default=str(DEFAULT_VR_CACHE_PATH))
+    p.add_argument("--vr_reconnect_seconds", type=float, default=2.0)
+    p.add_argument("--vr_hand", type=str, default="right", choices=["left", "right"])
+    p.add_argument("--vr_require_gate", action="store_true", default=False)
+    p.add_argument(
+        "--vr_gate_button",
+        type=str,
+        default="grip",
+        help="Named button alias or numeric OpenVR button id used as the movement clutch/gate.",
+    )
+    p.add_argument(
+        "--vr_mirror_gripper_when_inactive",
+        action="store_true",
+        default=False,
+        help="Allow trigger-driven gripper deltas even while the movement gate is inactive.",
+    )
+    p.add_argument("--vr_position_gain", type=float, default=25.0)
+    p.add_argument("--vr_yaw_gain", type=float, default=2.5)
+    p.add_argument("--vr_gripper_gain", type=float, default=5.0)
+    p.add_argument("--vr_gripper_axis", type=str, default="trigger")
+    p.add_argument("--vr_binary_gripper", action="store_true", default=False)
+    p.add_argument("--vr_trigger_close_threshold", type=float, default=0.6)
+    p.add_argument("--vr_trigger_open_threshold", type=float, default=0.2)
+    p.add_argument("--vr_invert_x", action="store_true", default=False)
+    p.add_argument("--vr_invert_y", action="store_true", default=False)
+    p.add_argument("--vr_invert_z", action="store_true", default=False)
+    p.add_argument("--vr_invert_yaw", action="store_true", default=False)
+    p.add_argument("--vr_show_status_panel", action="store_true", default=True)
+    p.add_argument("--no_vr_show_status_panel", dest="vr_show_status_panel", action="store_false")
     p.add_argument(
         "--clip_action_l2",
         action="store_true",
@@ -1481,8 +1603,8 @@ def run(args: argparse.Namespace) -> None:
     if args.step_through and args.print_every > 1:
         print("step_through: forcing --print_every=1 so each stepped transition prints metrics.")
         args.print_every = 1
-    if args.controller in ("keyboard", "human") and args.print_every > 1:
-        print("human/keyboard control: forcing --print_every=1 to print per-step reward channels.")
+    if args.controller in ("keyboard", "human", "vr") and args.print_every > 1:
+        print("manual control: forcing --print_every=1 to print per-step reward channels.")
         args.print_every = 1
 
     env = create_env(args)
@@ -1500,6 +1622,8 @@ def run(args: argparse.Namespace) -> None:
         controller = RandomController(action_space)
     elif args.controller == "idle":
         controller = IdleController(action_dim)
+    elif args.controller == "vr":
+        controller = VRController(action_dim, args)
     else:
         # "human" is an alias for keyboard teleop.
         controller = KeyboardController(action_dim, magnitude=float(args.keyboard_scale))
@@ -1507,7 +1631,7 @@ def run(args: argparse.Namespace) -> None:
     control_panel = None
     use_panel = (
         (not args.headless)
-        and (args.controller not in ("keyboard", "human"))
+        and (args.controller not in ("keyboard", "human", "vr"))
         and ((not args.disable_control_panel) or args.step_through)
     )
     if use_panel:
@@ -1518,6 +1642,16 @@ def run(args: argparse.Namespace) -> None:
     print(f"controller={args.controller}")
     if args.controller == "policy":
         print(f"model={args.model_path}")
+    elif args.controller == "vr":
+        endpoint_port = str(args.vr_port) if int(args.vr_port) > 0 else "<cache/default>"
+        print(
+            "vr_transport="
+            f"{args.vr_mode} "
+            f"endpoint={args.vr_host or '<cache>'}:{endpoint_port} "
+            f"hand={args.vr_hand} "
+            f"gate={args.vr_gate_button} "
+            f"require_gate={int(bool(args.vr_require_gate))}"
+        )
     print(f"teacher={args.teacher_type}, mode={args.intervention_mode}")
     print(f"tolerance={args.tolerance_type}:{args.tolerance_value}")
     if str(args.tolerance_channel_weights).strip():
@@ -1712,7 +1846,7 @@ def run(args: argparse.Namespace) -> None:
                 if (
                     args.freeze_when_idle
                     and not args.step_through
-                    and args.controller in ("keyboard", "human", "idle")
+                    and args.controller in ("keyboard", "human", "idle", "vr")
                     and float(np.linalg.norm(action)) <= 1e-8
                 ):
                     if not args.headless and args.render_mode == "human":

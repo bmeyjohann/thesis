@@ -1,0 +1,3 @@
+# Desktop-side requirements for the persistent VR publisher.
+openvr
+pygame
