@@ -14,7 +14,7 @@ from .env_wrappers_manip import build_ogbench_manip_wrapper
 MANIP_CLIP_ACTIONS = None
 
 
-def make_manip_wrappers(args):
+def make_manip_wrappers(args, teleop_interface=None):
     reward_switch = args.reward_switch_after_steps // max(1, args.num_envs)
     intervention_mode = args.intervention_mode if args.use_intervention else "none"
     wrapper = build_ogbench_manip_wrapper(
@@ -29,6 +29,7 @@ def make_manip_wrappers(args):
         reward_type=args.reward_type,
         dense_reward_scale=args.dense_reward_scale,
         step_penalty=args.step_penalty,
+        disable_rotation=bool(getattr(args, "disable_rotation", False)),
         reward_switch_after_steps=reward_switch,
         cube_reward_mode=args.cube_reward_mode,
         intervention_mode=intervention_mode,
@@ -60,9 +61,12 @@ def make_manip_wrappers(args):
         intervention_episode_prob_decay_steps=args.intervention_episode_prob_decay_steps,
         intervention_episode_prob_decay_start=args.intervention_episode_prob_decay_start,
         intervention_episode_prob_seed=args.intervention_episode_prob_seed,
+        human_intervention_threshold=args.human_intervention_threshold,
+        human_intervention_hold_time=args.human_intervention_hold_time,
         teacher_target_mode=args.teacher_target_mode,
         cube_success_tolerance=args.cube_success_tolerance,
         static_reset_seed=args.static_reset_seed,
+        teleop_interface=teleop_interface,
     )
     return [wrapper]
 
@@ -81,6 +85,7 @@ def make_manip_eval_wrappers(args):
         reward_type=args.reward_type,
         dense_reward_scale=args.dense_reward_scale,
         step_penalty=args.step_penalty,
+        disable_rotation=bool(getattr(args, "disable_rotation", False)),
         reward_switch_after_steps=reward_switch,
         cube_reward_mode=args.cube_reward_mode,
         intervention_mode="none",
@@ -123,6 +128,7 @@ def build_manip_environment(
     args,
     device: torch.device,
     record_progress,
+    teleop_interface=None,
 ) -> Tuple[
     OGBenchVecEnvAdapter,
     list,
@@ -132,10 +138,16 @@ def build_manip_environment(
     int,
     torch.Tensor | None,
 ]:
-    wrappers = make_manip_wrappers(args)
+    wrappers = make_manip_wrappers(args, teleop_interface=teleop_interface)
     env_kwargs: dict[str, Any] = {}
     if str(getattr(args, "train_render_mode", "none")).lower() == "human":
         env_kwargs["render_mode"] = "human"
+    env_kwargs["hold_targets_on_zero_action"] = bool(getattr(args, "hold_targets_on_zero_action", False))
+    env_kwargs["noop_action_threshold"] = float(getattr(args, "noop_action_threshold", 1e-6))
+    env_kwargs["disable_rotation"] = bool(getattr(args, "disable_rotation", False))
+    max_episode_steps = int(getattr(args, "max_episode_steps", 0) or 0)
+    if max_episode_steps > 0:
+        env_kwargs["max_episode_steps"] = max_episode_steps
     record_progress("[Init] constructing manip vector env adapter")
     envs = OGBenchVecEnvAdapter(
         env_name=args.env_name,
@@ -168,6 +180,12 @@ def build_manip_eval_environment(args, device: torch.device) -> OGBenchVecEnvAda
     wrappers = make_manip_eval_wrappers(args)
     eval_num_envs = max(1, int(args.eval_num_envs))
     env_kwargs: dict[str, Any] = {}
+    env_kwargs["hold_targets_on_zero_action"] = bool(getattr(args, "hold_targets_on_zero_action", False))
+    env_kwargs["noop_action_threshold"] = float(getattr(args, "noop_action_threshold", 1e-6))
+    env_kwargs["disable_rotation"] = bool(getattr(args, "disable_rotation", False))
+    max_episode_steps = int(getattr(args, "max_episode_steps", 0) or 0)
+    if max_episode_steps > 0:
+        env_kwargs["max_episode_steps"] = max_episode_steps
     train_render_human = str(getattr(args, "train_render_mode", "none")).lower() == "human"
     eval_render_human = str(getattr(args, "eval_render_mode", "none")).lower() == "human"
     allow_dual_render = bool(getattr(args, "allow_simultaneous_train_eval_render", False))

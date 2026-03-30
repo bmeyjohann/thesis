@@ -20,6 +20,31 @@ class FixedResetSeedWrapper(gym.Wrapper):
         return self.env.reset(**kwargs)
 
 
+class TeleopRobotStateSyncWrapper(gym.Wrapper):
+    """Keep teleop-side robot state synchronized from env reset/step infos."""
+
+    def __init__(self, env: gym.Env, teleop_interface: object):
+        super().__init__(env)
+        self._teleop = teleop_interface
+
+    def _sync(self, info) -> None:
+        if hasattr(self._teleop, "update_robot_state"):
+            try:
+                self._teleop.update_robot_state(info if isinstance(info, dict) else None)
+            except Exception:
+                pass
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        self._sync(info)
+        return obs, info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        self._sync(info)
+        return obs, reward, terminated, truncated, info
+
+
 def infer_ogbench_env_family(env_name: Optional[str]) -> str:
     """Infer broad OGBench family from env id/name."""
     name = str(env_name or "").lower()
@@ -80,16 +105,20 @@ def maybe_wrap_intervention(
     intervention_episode_prob_decay_steps: int,
     intervention_episode_prob_decay_start: int,
     intervention_episode_prob_seed: Optional[int],
+    human_threshold: float = 0.1,
+    human_hold_time: float = 0.5,
     teleop_interface: Optional[object] = None,
 ) -> tuple[gym.Env, Optional[str]]:
     """Apply intervention wrapper when configured and return (env, wrapper-name)."""
     if intervention_mode == "human":
+        if teleop_interface is not None and hasattr(teleop_interface, "update_robot_state"):
+            env = TeleopRobotStateSyncWrapper(env, teleop_interface)
         env = InterventionWrapper(
             env,
             teleop_interface=teleop_interface,
             mode="human",
-            threshold=0.1,
-            hold_time=0.5,
+            threshold=float(human_threshold),
+            hold_time=float(human_hold_time),
             binary_gripper_actions=binary_gripper_actions,
             binary_gripper_threshold=binary_gripper_threshold,
             hard_gripper_intervention=hard_gripper_intervention,

@@ -74,6 +74,7 @@ class FastSACUpdater:
         self.pref_violation_clip = float(getattr(args, "pref_violation_clip", 10.0))
         self.pref_violation_target = float(getattr(args, "pref_violation_target", 0.0))
         self._pref_violation_ema = 0.0
+        self._critic_update_count = 0
 
     def actor_forward(self, obs_flat: torch.Tensor):
         obs_in = self.reshape_obs(obs_flat)
@@ -136,8 +137,11 @@ class FastSACUpdater:
             "alpha_value": 0.0,
             "timing_sample_s": 0.0,
             "timing_opt_s": 0.0,
+            "actor_update_count": 0.0,
+            "alpha_update_count": 0.0,
         }
         updates_count = 0
+        cta_ratio = max(1, int(getattr(args, "cta_ratio", 1)))
 
         for _ in range(args.num_updates):
             sample_t0 = time.perf_counter()
@@ -337,92 +341,108 @@ class FastSACUpdater:
                 self.critic_params, max_norm=args.max_grad_norm if args.max_grad_norm > 0 else float("inf")
             )
             self.scaler.step(self.critic_optimizer)
+            self._critic_update_count += 1
 
-            # Actor update
-            self.actor_optimizer.zero_grad(set_to_none=True)
-            with autocast(device_type=self.amp_device_type, dtype=self.amp_dtype, enabled=self.amp_enabled):
-                pi_actions, log_pi, _, _ = self.actor_forward(obs_batch)
-                actor_backbone_eval = current_backbone
-                q_pi_list = self.critic_heads(actor_backbone_eval(self.reshape_obs(obs_batch)), pi_actions)
-                q_stack_pi = torch.stack(q_pi_list, dim=0)
-                min_q_pi = torch.min(q_stack_pi, dim=0).values
-                actor_loss_sac = (self.log_alpha.exp().detach() * log_pi - min_q_pi).mean()
-                actor_loss = actor_loss_sac
-                bc_loss_demo = torch.tensor(0.0, device=self.device)
-                bc_loss_pref = torch.tensor(0.0, device=self.device)
-
-                if (
-                    float(getattr(args, "actor_bc_weight_demo", 0.0)) > 0.0
-                    and demo_bc_obs is not None
-                    and demo_bc_actions is not None
-                ):
-                    demo_obs_norm = self.normalize_obs(demo_bc_obs)
-                    demo_pi, _, _, _ = self.actor_forward(demo_obs_norm)
-                    bc_loss_demo = F.mse_loss(demo_pi, demo_bc_actions)
-                    actor_loss = actor_loss + float(args.actor_bc_weight_demo) * bc_loss_demo
-
-                if (
-                    float(getattr(args, "actor_bc_weight_pref", 0.0)) > 0.0
-                    and pref_states_for_actor is not None
-                    and pref_teacher_actions_for_actor is not None
-                ):
-                    pref_pi, _, _, _ = self.actor_forward(pref_states_for_actor)
-                    bc_loss_pref = F.mse_loss(pref_pi, pref_teacher_actions_for_actor)
-                    actor_loss = actor_loss + float(args.actor_bc_weight_pref) * bc_loss_pref
-
-            actor_loss_value = float(actor_loss.detach().cpu().item())
-            actor_loss_sac_value = float(actor_loss_sac.detach().cpu().item())
-            bc_demo_loss_value = float(bc_loss_demo.detach().cpu().item())
-            bc_pref_loss_value = float(bc_loss_pref.detach().cpu().item())
-            entropy_value = float((-log_pi).detach().mean().cpu().item())
-            action_norm_value = float(pi_actions.detach().norm(dim=-1).mean().cpu().item())
-            target_q_mean = float(target_q.detach().mean().cpu().item())
-            min_q_pi_mean = float(min_q_pi.detach().mean().cpu().item())
-            q_disagreement_pi = torch.max(q_stack_pi, dim=0).values - torch.min(q_stack_pi, dim=0).values
-            q_disagreement_pi_value = float(q_disagreement_pi.detach().mean().cpu().item())
+            actor_loss_value = 0.0
+            actor_loss_sac_value = 0.0
+            bc_demo_loss_value = 0.0
+            bc_pref_loss_value = 0.0
+            entropy_value = 0.0
+            action_norm_value = 0.0
+            min_q_pi_mean = 0.0
+            q_disagreement_pi_value = 0.0
             reward_mean = float(rewards_batch.detach().mean().cpu().item())
+            target_q_mean = float(target_q.detach().mean().cpu().item())
+            alpha_loss_value = 0.0
+            alpha_value = float(self.log_alpha.exp().detach().cpu().item())
 
-            self.scaler.scale(actor_loss).backward()
-            self.scaler.unscale_(self.actor_optimizer)
-            if args.arch_shared_trunk and self.trunk_optimizer is not None:
-                self.scaler.unscale_(self.trunk_optimizer)
-            torch.nn.utils.clip_grad_norm_(
-                self.actor_params, max_norm=args.max_grad_norm if args.max_grad_norm > 0 else float("inf")
-            )
-            if args.arch_shared_trunk and self.trunk_optimizer is not None and self.trunk_params is not None:
+            should_update_actor = (self._critic_update_count % cta_ratio) == 0
+            if should_update_actor:
+                # Actor update
+                self.actor_optimizer.zero_grad(set_to_none=True)
+                with autocast(device_type=self.amp_device_type, dtype=self.amp_dtype, enabled=self.amp_enabled):
+                    pi_actions, log_pi, _, _ = self.actor_forward(obs_batch)
+                    actor_backbone_eval = current_backbone
+                    q_pi_list = self.critic_heads(actor_backbone_eval(self.reshape_obs(obs_batch)), pi_actions)
+                    q_stack_pi = torch.stack(q_pi_list, dim=0)
+                    min_q_pi = torch.min(q_stack_pi, dim=0).values
+                    actor_loss_sac = (self.log_alpha.exp().detach() * log_pi - min_q_pi).mean()
+                    actor_loss = actor_loss_sac
+                    bc_loss_demo = torch.tensor(0.0, device=self.device)
+                    bc_loss_pref = torch.tensor(0.0, device=self.device)
+
+                    if (
+                        float(getattr(args, "actor_bc_weight_demo", 0.0)) > 0.0
+                        and demo_bc_obs is not None
+                        and demo_bc_actions is not None
+                    ):
+                        demo_obs_norm = self.normalize_obs(demo_bc_obs)
+                        demo_pi, _, _, _ = self.actor_forward(demo_obs_norm)
+                        bc_loss_demo = F.mse_loss(demo_pi, demo_bc_actions)
+                        actor_loss = actor_loss + float(args.actor_bc_weight_demo) * bc_loss_demo
+
+                    if (
+                        float(getattr(args, "actor_bc_weight_pref", 0.0)) > 0.0
+                        and pref_states_for_actor is not None
+                        and pref_teacher_actions_for_actor is not None
+                    ):
+                        pref_pi, _, _, _ = self.actor_forward(pref_states_for_actor)
+                        bc_loss_pref = F.mse_loss(pref_pi, pref_teacher_actions_for_actor)
+                        actor_loss = actor_loss + float(args.actor_bc_weight_pref) * bc_loss_pref
+
+                actor_loss_value = float(actor_loss.detach().cpu().item())
+                actor_loss_sac_value = float(actor_loss_sac.detach().cpu().item())
+                bc_demo_loss_value = float(bc_loss_demo.detach().cpu().item())
+                bc_pref_loss_value = float(bc_loss_pref.detach().cpu().item())
+                entropy_value = float((-log_pi).detach().mean().cpu().item())
+                action_norm_value = float(pi_actions.detach().norm(dim=-1).mean().cpu().item())
+                min_q_pi_mean = float(min_q_pi.detach().mean().cpu().item())
+                q_disagreement_pi = torch.max(q_stack_pi, dim=0).values - torch.min(q_stack_pi, dim=0).values
+                q_disagreement_pi_value = float(q_disagreement_pi.detach().mean().cpu().item())
+
+                self.scaler.scale(actor_loss).backward()
+                self.scaler.unscale_(self.actor_optimizer)
+                if args.arch_shared_trunk and self.trunk_optimizer is not None:
+                    self.scaler.unscale_(self.trunk_optimizer)
                 torch.nn.utils.clip_grad_norm_(
-                    self.trunk_params, max_norm=args.max_grad_norm if args.max_grad_norm > 0 else float("inf")
+                    self.actor_params, max_norm=args.max_grad_norm if args.max_grad_norm > 0 else float("inf")
                 )
-            self.scaler.step(self.actor_optimizer)
-            if args.arch_shared_trunk and self.trunk_optimizer is not None:
-                self.scaler.step(self.trunk_optimizer)
-            self.scaler.update()
+                if args.arch_shared_trunk and self.trunk_optimizer is not None and self.trunk_params is not None:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.trunk_params, max_norm=args.max_grad_norm if args.max_grad_norm > 0 else float("inf")
+                    )
+                self.scaler.step(self.actor_optimizer)
+                if args.arch_shared_trunk and self.trunk_optimizer is not None:
+                    self.scaler.step(self.trunk_optimizer)
+                self.scaler.update()
+                metrics_accumulator["actor_update_count"] += 1.0
 
-            # Alpha update
-            if total_env_steps < int(getattr(args, "alpha_freeze_steps", 0)):
-                self.alpha_optimizer.zero_grad(set_to_none=True)
-                alpha_loss_value = 0.0
-                alpha_value = float(self.log_alpha.exp().detach().cpu().item())
-            else:
-                self.alpha_optimizer.zero_grad(set_to_none=True)
-                _, log_pi_curr, _, _ = self.actor_forward(obs_batch)
-                log_pi_detached = log_pi_curr.detach()
-                alpha_loss = (-self.log_alpha.exp() * (log_pi_detached + self.target_entropy)).mean()
-                alpha_loss.backward()
-                self.alpha_optimizer.step()
-                with torch.no_grad():
-                    min_log_alpha = None
-                    if float(args.alpha_min) > 0.0:
-                        min_log_alpha = np.log(max(1e-6, float(args.alpha_min)))
-                    max_log_alpha = None
-                    if float(args.alpha_max) > 0.0:
-                        max_log_alpha = np.log(float(args.alpha_max))
-                    lower = min_log_alpha if min_log_alpha is not None else -torch.inf
-                    upper = max_log_alpha if max_log_alpha is not None else torch.inf
-                    if not np.isinf(lower) or not np.isinf(upper):
-                        self.log_alpha.clamp_(min=lower, max=upper)
-                alpha_loss_value = float(alpha_loss.detach().cpu().item())
-                alpha_value = float(self.log_alpha.exp().detach().cpu().item())
+                # Alpha update
+                if total_env_steps < int(getattr(args, "alpha_freeze_steps", 0)):
+                    self.alpha_optimizer.zero_grad(set_to_none=True)
+                    alpha_loss_value = 0.0
+                    alpha_value = float(self.log_alpha.exp().detach().cpu().item())
+                else:
+                    self.alpha_optimizer.zero_grad(set_to_none=True)
+                    _, log_pi_curr, _, _ = self.actor_forward(obs_batch)
+                    log_pi_detached = log_pi_curr.detach()
+                    alpha_loss = (-self.log_alpha.exp() * (log_pi_detached + self.target_entropy)).mean()
+                    alpha_loss.backward()
+                    self.alpha_optimizer.step()
+                    with torch.no_grad():
+                        min_log_alpha = None
+                        if float(args.alpha_min) > 0.0:
+                            min_log_alpha = np.log(max(1e-6, float(args.alpha_min)))
+                        max_log_alpha = None
+                        if float(args.alpha_max) > 0.0:
+                            max_log_alpha = np.log(float(args.alpha_max))
+                        lower = min_log_alpha if min_log_alpha is not None else -torch.inf
+                        upper = max_log_alpha if max_log_alpha is not None else torch.inf
+                        if not np.isinf(lower) or not np.isinf(upper):
+                            self.log_alpha.clamp_(min=lower, max=upper)
+                    alpha_loss_value = float(alpha_loss.detach().cpu().item())
+                    alpha_value = float(self.log_alpha.exp().detach().cpu().item())
+                metrics_accumulator["alpha_update_count"] += 1.0
 
             # Soft update targets
             source_backbone = self.actor_backbone if args.arch_shared_trunk else self.critic_backbone

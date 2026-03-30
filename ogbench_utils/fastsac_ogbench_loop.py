@@ -597,6 +597,12 @@ def run_training_loop(
     """Main rollout/update loop for FastSAC OGBench training."""
     rb = replay_buffer
     pref_buffer = buffers.pref_buffer
+    store_intervened_in_demo_buffer = bool(getattr(args, "store_intervened_in_demo_buffer", False))
+    if store_intervened_in_demo_buffer:
+        if demo_buffer is None:
+            raise ValueError("--store_intervened_in_demo_buffer requires --demo_buffer_enable.")
+        if int(getattr(demo_buffer, "n_env", 1)) != 1:
+            raise ValueError("store_intervened_in_demo_buffer requires demo_buffer.n_env == 1.")
 
     actor_backbone = model.actor_backbone
     actor_head = model.actor_head
@@ -701,6 +707,7 @@ def run_training_loop(
         human_debug_episode_idx = 0
         human_debug_episode_reward = 0.0
         human_debug_episode_steps = 0
+        total_interventions = 0
         if human_reward_debug:
             print(
                 "[HumanRewardDebug] enabled: episode-only reward summary "
@@ -800,6 +807,7 @@ def run_training_loop(
                 if teacher_mask is not None
                 else torch.zeros(envs.num_envs, dtype=torch.bool, device=device)
             )
+            total_interventions += int(teacher_intervened_for_replay.to(torch.int64).sum().item())
             dones_eff = dones
             last_denied_samples = 0
             if teacher_mask is not None:
@@ -928,6 +936,10 @@ def run_training_loop(
                     f"Failed to build transition TensorDict for num_envs={envs.num_envs}; shapes={shape_dbg}"
                 ) from exc
             rb.extend(transition)
+            if store_intervened_in_demo_buffer:
+                intervened_ids = torch.nonzero(teacher_intervened_for_replay.to(torch.bool), as_tuple=False).flatten()
+                for env_idx in intervened_ids.tolist():
+                    demo_buffer.extend(transition[env_idx : env_idx + 1])
             t_replay += time.perf_counter() - replay_t0
 
             if bool(getattr(args, "compute_q_diagnostics", False)):
@@ -1227,6 +1239,9 @@ def run_training_loop(
                     reward_mode_logs["Train/placed_episode_rate_last100"] = torch.tensor(
                         [float(np.mean(episode_placed_rate_buffer))], device=device, dtype=torch.float32
                     )
+                reward_mode_logs["Train/total_interventions"] = torch.tensor(
+                    [float(total_interventions)], device=device, dtype=torch.float32
+                )
                 if reward_mode_logs:
                     infos_for_logging = dict(infos) if isinstance(infos, dict) else {"log": {}}
                     existing_log = infos_for_logging.get("log")

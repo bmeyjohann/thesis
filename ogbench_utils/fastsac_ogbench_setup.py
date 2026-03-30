@@ -297,10 +297,11 @@ def create_replay_buffer(
     n_obs: int,
     n_act: int,
     buffer_size: Optional[int] = None,
+    n_env_override: Optional[int] = None,
 ) -> SimpleReplayBuffer:
     """Create replay buffer compatible with FastSAC state observations."""
     return SimpleReplayBuffer(
-        n_env=args.num_envs,
+        n_env=int(n_env_override if n_env_override is not None else args.num_envs),
         buffer_size=int(buffer_size if buffer_size is not None else args.buffer_size),
         n_obs=n_obs,
         n_act=n_act,

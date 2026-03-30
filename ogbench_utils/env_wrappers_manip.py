@@ -409,6 +409,48 @@ class ManipRelativeOnlyObsWrapper(gym.Wrapper):
         return obs_new, reward, terminated, truncated, info
 
 
+class ManipDisableRotationActionWrapper(gym.ActionWrapper):
+    """Expose manipulation control as 4D xyz + gripper while fixing yaw internally."""
+
+    def __init__(self, env: gym.Env):
+        super().__init__(env)
+        self.action_space = gym.spaces.Box(
+            low=-np.ones((4,), dtype=np.float32),
+            high=np.ones((4,), dtype=np.float32),
+            shape=(4,),
+            dtype=np.float32,
+        )
+
+    @staticmethod
+    def _project_action_like(value):
+        if value is None:
+            return None
+        try:
+            arr = np.asarray(value, dtype=np.float32)
+        except Exception:
+            return value
+        if arr.ndim == 0 or arr.shape[-1] < 5:
+            return value
+        return np.concatenate([arr[..., :3], arr[..., 4:5]], axis=-1).astype(np.float32, copy=False)
+
+    def action(self, action):
+        arr = np.asarray(action, dtype=np.float32).reshape(-1)
+        if arr.shape[0] != 4:
+            raise ValueError(f"Expected 4D xyz+gripper action, got shape={tuple(arr.shape)}")
+        full = np.zeros((5,), dtype=np.float32)
+        full[:3] = arr[:3]
+        full[4] = arr[3]
+        return full
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = super().step(action)
+        info = dict(info) if isinstance(info, dict) else {}
+        for key in ("teacher_action", "student_action", "teacher_actions", "student_actions", "applied_actions"):
+            if key in info:
+                info[key] = self._project_action_like(info.get(key))
+        return obs, reward, terminated, truncated, info
+
+
 def is_cube_env_name(env_name: Optional[str]) -> bool:
     return "cube" in str(env_name or "").lower()
 
@@ -1048,6 +1090,7 @@ def build_ogbench_manip_wrapper(
     reward_type: str,
     dense_reward_scale: float,
     step_penalty: float,
+    disable_rotation: bool = False,
     reward_switch_after_steps: int = 0,
     cube_reward_mode: str = "dense",
     intervention_mode: str = "none",
@@ -1080,6 +1123,8 @@ def build_ogbench_manip_wrapper(
     intervention_episode_prob_decay_steps: int = 0,
     intervention_episode_prob_decay_start: int = 0,
     intervention_episode_prob_seed: Optional[int] = None,
+    human_intervention_threshold: float = 0.1,
+    human_intervention_hold_time: float = 0.5,
     teacher_target_mode: str = "sequential",
     cube_success_tolerance: float = 0.04,
     static_reset_seed: Optional[int] = None,
@@ -1180,10 +1225,15 @@ def build_ogbench_manip_wrapper(
             intervention_episode_prob_decay_steps=intervention_episode_prob_decay_steps,
             intervention_episode_prob_decay_start=intervention_episode_prob_decay_start,
             intervention_episode_prob_seed=intervention_episode_prob_seed,
+            human_threshold=human_intervention_threshold,
+            human_hold_time=human_intervention_hold_time,
             teleop_interface=teleop_interface,
         )
         if intervention_name is not None:
             wrapper_chain.append(intervention_name)
+        if disable_rotation:
+            env = ManipDisableRotationActionWrapper(env)
+            wrapper_chain.append("ManipDisableRotationActionWrapper")
 
         stack_key = (
             env_id,
@@ -1192,6 +1242,7 @@ def build_ogbench_manip_wrapper(
             teacher_type,
             wrapper_reward_type,
             cube_mode,
+            bool(disable_rotation),
             tuple(wrapper_chain),
         )
         if stack_key not in _WRAPPER_STACK_PRINTED:

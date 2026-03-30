@@ -268,18 +268,19 @@ class InterventionWrapper(gym.Wrapper):
         if action is None:
             return None
         out = np.asarray(action, dtype=np.float32).copy()
-        if not self.binary_gripper_actions or out.shape[-1] < 5:
+        if not self.binary_gripper_actions or out.shape[-1] < 4:
             return out
-        out[..., 4] = 1.0 if out[..., 4] >= self.binary_gripper_threshold else -1.0
+        gripper_idx = out.shape[-1] - 1
+        out[..., gripper_idx] = 1.0 if out[..., gripper_idx] >= self.binary_gripper_threshold else -1.0
         return out
 
     def _gripper_sign(self, action: Optional[np.ndarray]) -> int:
         if action is None:
             return 0
         arr = np.asarray(action, dtype=np.float32).reshape(-1)
-        if arr.size < 5:
+        if arr.size < 4:
             return 0
-        return 1 if float(arr[4]) >= self.binary_gripper_threshold else -1
+        return 1 if float(arr[-1]) >= self.binary_gripper_threshold else -1
 
     def _force_gripper_to_teacher(
         self,
@@ -306,6 +307,34 @@ class InterventionWrapper(gym.Wrapper):
         forced = p.copy()
         forced[4] = 1.0 if teacher_sign > 0 else -1.0
         forced = self._apply_gripper_binary(forced)
+        diag["teacher_gripper_sync_applied"] = 1.0
+        return forced, diag
+
+    def _force_gripper_channel_to_teacher(
+        self,
+        policy_action: Optional[np.ndarray],
+        teacher_action: Optional[np.ndarray],
+    ) -> tuple[Optional[np.ndarray], dict]:
+        diag = {
+            "teacher_gripper_sync_applied": 0.0,
+            "teacher_gripper_sync_policy_sign": 0.0,
+            "teacher_gripper_sync_teacher_sign": 0.0,
+        }
+        if policy_action is None or teacher_action is None:
+            return None, diag
+        p = np.asarray(policy_action, dtype=np.float32).reshape(-1)
+        t = np.asarray(teacher_action, dtype=np.float32).reshape(-1)
+        if p.size < 5 or t.size < 5:
+            return None, diag
+        policy_sign = self._gripper_sign(p)
+        teacher_sign = self._gripper_sign(t)
+        diag["teacher_gripper_sync_policy_sign"] = float(policy_sign)
+        diag["teacher_gripper_sync_teacher_sign"] = float(teacher_sign)
+        forced = p.copy()
+        forced[4] = t[4]
+        forced = self._apply_gripper_binary(forced)
+        if abs(float(forced[4]) - float(p[4])) <= 1e-6:
+            return None, diag
         diag["teacher_gripper_sync_applied"] = 1.0
         return forced, diag
 
@@ -921,6 +950,11 @@ class InterventionWrapper(gym.Wrapper):
         obs, info = self.env.reset(**kwargs)
         self._last_obs = obs
         self._last_info = info
+        if self.mode == 'human' and self.teleop is not None and hasattr(self.teleop, "reset"):
+            try:
+                self.teleop.reset()
+            except Exception:
+                pass
         if self.teacher_type in {"cube_plan", "cube_markov"}:
             if self._oracle is None or self._oracle_type != self.teacher_type:
                 if self.teacher_type == "cube_plan":
@@ -998,8 +1032,26 @@ class InterventionWrapper(gym.Wrapper):
         if self.mode == 'human':
             human = self._human_action()
             if human is not None:
-                teacher_action = self._apply_gripper_binary(human)
-                reason = 'human'
+                teacher_candidate_action = self._apply_gripper_binary(human)
+                teacher_candidate_available = teacher_candidate_action is not None
+                teleop_diag = {}
+                if self.teleop is not None and hasattr(self.teleop, "get_last_diag"):
+                    try:
+                        teleop_diag = dict(self.teleop.get_last_diag() or {})
+                    except Exception:
+                        teleop_diag = {}
+                gate_pressed = bool(teleop_diag.get("gate_pressed", False))
+                reset_gate_latched = bool(teleop_diag.get("reset_gate_latched", False))
+                if gate_pressed and not reset_gate_latched:
+                    teacher_action = teacher_candidate_action
+                    reason = 'human'
+                else:
+                    teacher_action, gripper_sync_diag = self._force_gripper_channel_to_teacher(
+                        policy_action,
+                        teacher_candidate_action,
+                    )
+                    if teacher_action is not None:
+                        reason = 'gripper_sync'
         else:  # agent mode
             if not self._episode_interventions_enabled:
                 teacher_action = None

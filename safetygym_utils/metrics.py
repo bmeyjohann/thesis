@@ -65,3 +65,27 @@ class EpisodeWindow:
             out[f"{prefix}/{key}_mean"] = float(np.mean(vals))
         out[f"{prefix}/episodes"] = float(len(self._eps))
         return out
+
+
+def augment_rollout_summary(summary: Dict[str, float], prefix: str) -> Dict[str, float]:
+    if not summary:
+        return {}
+    out = dict(summary)
+    episodes = float(out.get(f"{prefix}/episodes", 0.0))
+    goal_rate = float(out.get(f"{prefix}/goal_met_mean", out.get(f"{prefix}/outcome_success_mean", 0.0)))
+    out[f"{prefix}/goal_success_rate"] = goal_rate
+    out[f"{prefix}/goals_solved"] = float(goal_rate * episodes)
+    out[f"{prefix}/goals_attempted"] = float(episodes)
+    out[f"{prefix}/teacher_fraction_steps"] = float(out.get(f"{prefix}/intervention_fraction_mean", 0.0))
+    out[f"{prefix}/teacher_intervention_steps"] = float(out.get(f"{prefix}/intervention_steps_mean", 0.0))
+    if f"{prefix}/reward_shaped_sum_mean" in out:
+        out[f"{prefix}/reward_shaped_return_mean"] = float(out[f"{prefix}/reward_shaped_sum_mean"])
+    if f"{prefix}/reward_raw_env_sum_mean" in out:
+        out[f"{prefix}/reward_raw_env_return_mean"] = float(out[f"{prefix}/reward_raw_env_sum_mean"])
+    if f"{prefix}/reward_dense_sum_mean" in out:
+        out[f"{prefix}/reward_dense_return_mean"] = float(out[f"{prefix}/reward_dense_sum_mean"])
+    if f"{prefix}/reward_sparse_sum_mean" in out:
+        out[f"{prefix}/reward_sparse_return_mean"] = float(out[f"{prefix}/reward_sparse_sum_mean"])
+    if f"{prefix}/reward_step_penalty_sum_mean" in out:
+        out[f"{prefix}/reward_step_penalty_return_mean"] = float(out[f"{prefix}/reward_step_penalty_sum_mean"])
+    return out

@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import random
 import time
-from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -34,7 +33,7 @@ from .dataset_io import (
 from .gamepad import DEFAULT_SAFETY_GAMEPAD_CACHE_PATH, DEFAULT_SAFETY_GAMEPAD_CONFIG_PATH, DEFAULT_SAFETY_GAMEPAD_PORT
 from .env import clip_action_to_space, extract_goal_distance, extract_step_limit, make_safety_env
 from .io import save_args_json
-from .metrics import EpisodeWindow, classify_outcome
+from .metrics import EpisodeWindow, augment_rollout_summary, classify_outcome
 from .rendering import build_external_viewer, resolve_env_render_mode, wants_external_viewer
 from .sac import (
     SACTensors,
@@ -142,19 +141,6 @@ def _summary_stats(values: list[float], prefix: str) -> Dict[str, float]:
     }
 
 
-def _linear_slope(values: list[float]) -> float:
-    if len(values) < 2:
-        return 0.0
-    y = np.asarray(values, dtype=np.float64)
-    x = np.arange(y.shape[0], dtype=np.float64)
-    x_center = x - np.mean(x)
-    denom = float(np.sum(x_center * x_center))
-    if denom <= 0.0:
-        return 0.0
-    y_center = y - np.mean(y)
-    return float(np.sum(x_center * y_center) / denom)
-
-
 def _compute_uncertainty_signal(
     *,
     sac: SACTensors,
@@ -251,12 +237,17 @@ def _fmt_metric(payload: Dict[str, float], key: str, *, digits: int = 3) -> str:
 
 def _console_metrics_line(payload: Dict[str, float]) -> str:
     if "eval/step" in payload:
+        goals_solved = int(round(float(payload.get("eval/goals_solved", 0.0))))
+        goals_attempted = int(round(float(payload.get("eval/goals_attempted", payload.get("eval/episodes", 0.0)))))
         return (
             "[Eval] "
             f"step={int(payload.get('eval/step', 0.0))} "
             f"return={_fmt_metric(payload, 'eval/episode_return_mean')} "
+            f"dense={_fmt_metric(payload, 'eval/reward_dense_return_mean')} "
+            f"sparse={_fmt_metric(payload, 'eval/reward_sparse_return_mean')} "
             f"cost={_fmt_metric(payload, 'eval/episode_cost_sum_mean')} "
             f"success={_fmt_metric(payload, 'eval/outcome_success_mean')} "
+            f"goals={goals_solved}/{goals_attempted} "
             f"timeout={_fmt_metric(payload, 'eval/outcome_timeout_mean')} "
             f"kill={_fmt_metric(payload, 'eval/outcome_kill_mean')} "
             f"final_dist={_fmt_metric(payload, 'eval/final_distance_to_goal_mean')} "
@@ -281,15 +272,20 @@ def _console_metrics_line(payload: Dict[str, float]) -> str:
             f"duration_s={_fmt_metric(payload, 'train/prefill_duration_s', digits=2)}"
         )
     if "train/step" in payload:
+        goals_solved = int(round(float(payload.get("train/goals_solved", 0.0))))
+        goals_attempted = int(round(float(payload.get("train/goals_attempted", payload.get("train/episodes", 0.0)))))
         return (
             "[Train] "
             f"step={int(payload.get('train/step', 0.0))} "
             f"fps={_fmt_metric(payload, 'train/fps', digits=1)} "
             f"return={_fmt_metric(payload, 'train/episode_return_mean')} "
+            f"dense={_fmt_metric(payload, 'train/reward_dense_return_mean')} "
+            f"sparse={_fmt_metric(payload, 'train/reward_sparse_return_mean')} "
             f"cost={_fmt_metric(payload, 'train/episode_cost_sum_mean')} "
             f"success={_fmt_metric(payload, 'train/outcome_success_mean')} "
+            f"goals={goals_solved}/{goals_attempted} "
             f"final_dist={_fmt_metric(payload, 'train/final_distance_to_goal_mean')} "
-            f"int_frac={_fmt_metric(payload, 'train/live_intervention_fraction')} "
+            f"teacher_frac={_fmt_metric(payload, 'train/teacher_fraction_steps')} "
             f"replay={int(payload.get('train/buffer_main_size', 0.0))} "
             f"demo={int(payload.get('train/buffer_demo_size', 0.0))} "
             f"pref={int(payload.get('train/buffer_pref_size', 0.0))}"
@@ -420,6 +416,10 @@ def _episode_metrics_from_info(
     info: Dict[str, Any],
     ep_return: float,
     ep_cost: float,
+    ep_reward_raw_env: float,
+    ep_reward_dense: float,
+    ep_reward_sparse: float,
+    ep_reward_step_penalty: float,
     ep_len: int,
     max_episode_steps: int,
     terminated: bool,
@@ -433,6 +433,11 @@ def _episode_metrics_from_info(
         "episode_cost_sum": float(ep_cost),
         "episode_cost_rate": float(ep_cost / max(1, ep_len)),
         "episode_length": float(ep_len),
+        "reward_shaped_sum": float(ep_return),
+        "reward_raw_env_sum": float(ep_reward_raw_env),
+        "reward_dense_sum": float(ep_reward_dense),
+        "reward_sparse_sum": float(ep_reward_sparse),
+        "reward_step_penalty_sum": float(ep_reward_step_penalty),
         "intervention_steps": float(info.get("teacher_intervention_steps", 0.0)),
         "intervention_fraction": float(info.get("teacher_fraction_steps", 0.0)),
         "intervention_num_bursts": float(info.get("teacher_num_bursts", 0.0)),
@@ -728,6 +733,10 @@ def _run_eval(actor, args, device: torch.device, eval_seed: int) -> Dict[str, fl
     obs = np.asarray(obs, dtype=np.float32).reshape(-1)
     ep_ret = 0.0
     ep_cost = 0.0
+    ep_reward_raw_env = 0.0
+    ep_reward_dense = 0.0
+    ep_reward_sparse = 0.0
+    ep_reward_step_penalty = 0.0
     ep_len = 0
 
     while episodes < args.num_eval_episodes:
@@ -741,6 +750,10 @@ def _run_eval(actor, args, device: torch.device, eval_seed: int) -> Dict[str, fl
 
         ep_ret += float(reward)
         ep_cost += float(cost)
+        ep_reward_raw_env += float(info.get("reward_raw_env", 0.0))
+        ep_reward_dense += float(info.get("reward_dense_component", 0.0))
+        ep_reward_sparse += float(info.get("reward_sparse_component", 0.0))
+        ep_reward_step_penalty += float(info.get("reward_step_penalty_component", 0.0))
         ep_len += 1
 
         if terminated or truncated:
@@ -749,6 +762,10 @@ def _run_eval(actor, args, device: torch.device, eval_seed: int) -> Dict[str, fl
                 info=dict(info),
                 ep_return=ep_ret,
                 ep_cost=ep_cost,
+                ep_reward_raw_env=ep_reward_raw_env,
+                ep_reward_dense=ep_reward_dense,
+                ep_reward_sparse=ep_reward_sparse,
+                ep_reward_step_penalty=ep_reward_step_penalty,
                 ep_len=ep_len,
                 max_episode_steps=max_steps,
                 terminated=bool(terminated),
@@ -761,12 +778,16 @@ def _run_eval(actor, args, device: torch.device, eval_seed: int) -> Dict[str, fl
             obs = np.asarray(obs, dtype=np.float32).reshape(-1)
             ep_ret = 0.0
             ep_cost = 0.0
+            ep_reward_raw_env = 0.0
+            ep_reward_dense = 0.0
+            ep_reward_sparse = 0.0
+            ep_reward_step_penalty = 0.0
             ep_len = 0
         else:
             obs = next_obs
 
     env.close()
-    return win.summary("eval")
+    return augment_rollout_summary(win.summary("eval"), "eval")
 
 
 def run_training(args, *, variant: str) -> None:
@@ -1121,6 +1142,10 @@ def run_training(args, *, variant: str) -> None:
 
     ep_ret = 0.0
     ep_cost = 0.0
+    ep_reward_raw_env = 0.0
+    ep_reward_dense = 0.0
+    ep_reward_sparse = 0.0
+    ep_reward_step_penalty = 0.0
     ep_len = 0
 
     next_log = int(args.log_interval)
@@ -1135,14 +1160,11 @@ def run_training(args, *, variant: str) -> None:
     live_window_oversight_required_steps = 0
     live_window_uncertainty_all: list[float] = []
     live_window_uncertainty_intervention: list[float] = []
-    live_window_uncertainty_no_intervention: list[float] = []
-    live_window_uncertainty_qmin: list[float] = []
-    live_window_uncertainty_qmax: list[float] = []
-    live_window_preint_delta: list[float] = []
-    live_window_preint_slope: list[float] = []
-    live_window_preint_z: list[float] = []
-    preint_hist = deque(maxlen=max(2, int(getattr(args, "uncertainty_pre_intervention_window", 25))))
-    ep_uncertainty_values: list[float] = []
+    live_window_reward_raw_env: list[float] = []
+    live_window_reward_shaped: list[float] = []
+    live_window_reward_dense: list[float] = []
+    live_window_reward_sparse: list[float] = []
+    live_window_reward_step_penalty: list[float] = []
     prev_teacher_intervened = False
     oversight_mode = str(getattr(args, "uncertainty_oversight_mode", "signal_only")).lower()
     oversight_threshold = float(getattr(args, "uncertainty_oversight_threshold", 0.0))
@@ -1238,29 +1260,8 @@ def run_training(args, *, variant: str) -> None:
             )
             unc_val = float(unc["abs_diff"])
             live_window_uncertainty_all.append(unc_val)
-            live_window_uncertainty_qmin.append(float(unc["q_min"]))
-            live_window_uncertainty_qmax.append(float(unc["q_max"]))
             if teacher_intervened:
                 live_window_uncertainty_intervention.append(unc_val)
-            else:
-                live_window_uncertainty_no_intervention.append(unc_val)
-
-            if teacher_intervened and not prev_teacher_intervened and len(preint_hist) >= 2:
-                hist_vals = [float(v) for v in list(preint_hist)]
-                delta = float(hist_vals[-1] - hist_vals[0])
-                slope = float(_linear_slope(hist_vals))
-                if len(ep_uncertainty_values) >= 2:
-                    ep_mu = float(np.mean(np.asarray(ep_uncertainty_values, dtype=np.float64)))
-                    ep_std = float(np.std(np.asarray(ep_uncertainty_values, dtype=np.float64)))
-                    z = float((hist_vals[-1] - ep_mu) / max(1e-6, ep_std))
-                else:
-                    z = 0.0
-                live_window_preint_delta.append(delta)
-                live_window_preint_slope.append(slope)
-                live_window_preint_z.append(z)
-
-            preint_hist.append(unc_val)
-            ep_uncertainty_values.append(unc_val)
 
             if oversight_enabled:
                 if oversight_ema is None:
@@ -1278,6 +1279,15 @@ def run_training(args, *, variant: str) -> None:
         obs = next_obs
         ep_ret += float(reward)
         ep_cost += float(cost)
+        ep_reward_raw_env += float(info.get("reward_raw_env", 0.0))
+        ep_reward_dense += float(info.get("reward_dense_component", 0.0))
+        ep_reward_sparse += float(info.get("reward_sparse_component", 0.0))
+        ep_reward_step_penalty += float(info.get("reward_step_penalty_component", 0.0))
+        live_window_reward_raw_env.append(float(info.get("reward_raw_env", 0.0)))
+        live_window_reward_shaped.append(float(reward))
+        live_window_reward_dense.append(float(info.get("reward_dense_component", 0.0)))
+        live_window_reward_sparse.append(float(info.get("reward_sparse_component", 0.0)))
+        live_window_reward_step_penalty.append(float(info.get("reward_step_penalty_component", 0.0)))
         ep_len += 1
 
         rb_ready = main_rb.size >= int(args.batch_size)
@@ -1354,6 +1364,10 @@ def run_training(args, *, variant: str) -> None:
                 info=dict(info),
                 ep_return=ep_ret,
                 ep_cost=ep_cost,
+                ep_reward_raw_env=ep_reward_raw_env,
+                ep_reward_dense=ep_reward_dense,
+                ep_reward_sparse=ep_reward_sparse,
+                ep_reward_step_penalty=ep_reward_step_penalty,
                 ep_len=ep_len,
                 max_episode_steps=max_steps,
                 terminated=bool(terminated),
@@ -1368,9 +1382,11 @@ def run_training(args, *, variant: str) -> None:
                 viewer.draw_env(env)
             ep_ret = 0.0
             ep_cost = 0.0
+            ep_reward_raw_env = 0.0
+            ep_reward_dense = 0.0
+            ep_reward_sparse = 0.0
+            ep_reward_step_penalty = 0.0
             ep_len = 0
-            preint_hist.clear()
-            ep_uncertainty_values = []
             prev_teacher_intervened = False
             t_episode_end += time.perf_counter() - t0
 
@@ -1439,29 +1455,6 @@ def run_training(args, *, variant: str) -> None:
             if uncertainty_enabled:
                 logs.update(_summary_stats(live_window_uncertainty_all, "train/uncertainty_all"))
                 logs.update(_summary_stats(live_window_uncertainty_intervention, "train/uncertainty_intervention"))
-                logs.update(_summary_stats(live_window_uncertainty_no_intervention, "train/uncertainty_no_intervention"))
-                logs.update(_summary_stats(live_window_uncertainty_qmin, "train/qmin_all"))
-                logs.update(_summary_stats(live_window_uncertainty_qmax, "train/qmax_all"))
-                logs["train/uncertainty_gap_intervention_minus_no_intervention"] = float(
-                    logs.get("train/uncertainty_intervention_mean", 0.0)
-                    - logs.get("train/uncertainty_no_intervention_mean", 0.0)
-                )
-                logs["train/uncertainty_preint_events"] = float(len(live_window_preint_delta))
-                logs["train/uncertainty_preint_delta_mean"] = float(
-                    np.mean(np.asarray(live_window_preint_delta, dtype=np.float64))
-                    if live_window_preint_delta
-                    else 0.0
-                )
-                logs["train/uncertainty_preint_slope_mean"] = float(
-                    np.mean(np.asarray(live_window_preint_slope, dtype=np.float64))
-                    if live_window_preint_slope
-                    else 0.0
-                )
-                logs["train/uncertainty_preint_z_mean"] = float(
-                    np.mean(np.asarray(live_window_preint_z, dtype=np.float64))
-                    if live_window_preint_z
-                    else 0.0
-                )
             if oversight_enabled:
                 logs["train/oversight_threshold"] = float(oversight_threshold)
                 logs["train/oversight_required_steps"] = float(live_window_oversight_required_steps)
@@ -1471,7 +1464,12 @@ def run_training(args, *, variant: str) -> None:
                 logs["train/oversight_ema"] = float(oversight_ema if oversight_ema is not None else 0.0)
             if timing_enabled:
                 logs.update(timing_window.summary("train_timing"))
-            logs.update(train_win.summary("train"))
+            logs.update(_summary_stats(live_window_reward_raw_env, "train/live_reward_raw_env"))
+            logs.update(_summary_stats(live_window_reward_shaped, "train/live_reward_shaped"))
+            logs.update(_summary_stats(live_window_reward_dense, "train/live_reward_dense"))
+            logs.update(_summary_stats(live_window_reward_sparse, "train/live_reward_sparse"))
+            logs.update(_summary_stats(live_window_reward_step_penalty, "train/live_reward_step_penalty"))
+            logs.update(augment_rollout_summary(train_win.summary("train"), "train"))
             if variant == "pvp" and novice_rb is not None and human_rb is not None:
                 logs["train/novice_replay_size"] = float(novice_rb.size)
                 logs["train/human_replay_size"] = float(human_rb.size)
@@ -1520,12 +1518,11 @@ def run_training(args, *, variant: str) -> None:
             live_window_oversight_required_steps = 0
             live_window_uncertainty_all = []
             live_window_uncertainty_intervention = []
-            live_window_uncertainty_no_intervention = []
-            live_window_uncertainty_qmin = []
-            live_window_uncertainty_qmax = []
-            live_window_preint_delta = []
-            live_window_preint_slope = []
-            live_window_preint_z = []
+            live_window_reward_raw_env = []
+            live_window_reward_shaped = []
+            live_window_reward_dense = []
+            live_window_reward_sparse = []
+            live_window_reward_step_penalty = []
             if timing_enabled:
                 timing_window.reset()
 

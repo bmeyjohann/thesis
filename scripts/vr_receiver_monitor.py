@@ -11,6 +11,8 @@ sys.path.append(str(ROOT / "ogbench_utils"))
 
 from vr_teleop import (  # noqa: E402
     DEFAULT_VR_CACHE_PATH,
+    DEFAULT_VR_MAPPING_PATH,
+    DEFAULT_VR_MAPPING_WEB_PORT,
     DEFAULT_VR_PORT,
     VRRawStateClient,
     VRRawStateServer,
@@ -28,6 +30,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--ui", type=str, default="auto", choices=["auto", "none", "pygame"])
     p.add_argument("--print_every", type=float, default=1.0, help="Console summary cadence in seconds.")
     p.add_argument("--cache_path", type=str, default=str(DEFAULT_VR_CACHE_PATH))
+    p.add_argument("--mapping_path", type=str, default=str(DEFAULT_VR_MAPPING_PATH))
     p.add_argument("--reconnect_seconds", type=float, default=2.0)
     return p.parse_args()
 
@@ -57,11 +60,12 @@ def main() -> int:
         source.start()
         print(f"resolved endpoint: {host}:{port} (from_cache={int(from_cache)})", flush=True)
     print(source.banner_text(), flush=True)
+    print(f"mapping ui: run `python scripts/vr_mapping_web.py --port {DEFAULT_VR_MAPPING_WEB_PORT}` and open http://127.0.0.1:{DEFAULT_VR_MAPPING_WEB_PORT}", flush=True)
 
     panel = None
     if args.ui in {"auto", "pygame"}:
         try:
-            panel = VRStatusPanel(title="VR Receiver Monitor")
+            panel = VRStatusPanel(title="VR Receiver Monitor", mapping_path=Path(args.mapping_path))
         except Exception:
             if args.ui == "pygame":
                 raise

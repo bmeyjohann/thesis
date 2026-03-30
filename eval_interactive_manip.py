@@ -47,13 +47,17 @@ from ogbench_utils.env_wrappers_manip import (
 )
 from ogbench_utils.vr_teleop import (
     DEFAULT_VR_CACHE_PATH,
+    DEFAULT_VR_MAPPING_PATH,
     DEFAULT_VR_PORT,
+    apply_vr_mapping_profile,
+    load_vr_mapping_config,
     VRManipActionMapper,
     VRManipMappingConfig,
     VRRawStateClient,
     VRRawStateServer,
     VRStatusPanel,
     resolve_cached_endpoint,
+    vr_mapping_config_to_dict,
 )
 
 
@@ -240,11 +244,11 @@ class IdleController:
 
 class KeyboardController:
     """
-    Keyboard mapping for 5D manip action spaces:
+    Keyboard mapping for 4D/5D manip action spaces:
     - a/d: x
     - w/s: y
     - q/e: z
-    - z/c: wrist yaw
+    - z/c: wrist yaw (5D only)
     - r/t: gripper close/open
     """
 
@@ -289,8 +293,13 @@ class KeyboardController:
     def _draw_help(self) -> None:
         bg = (120, 20, 20) if self._intervention_active else (20, 20, 20)
         self._screen.fill(bg)
+        control_line = (
+            "Controls: WASD+Q/E=move, Z/C=yaw, R/T=gripper, ENTER/.=step, LEFT=prev episode, RIGHT=next episode, ESC=quit"
+            if self.action_dim >= 5
+            else "Controls: WASD+Q/E=move, R/T=gripper, ENTER/.=step, LEFT=prev episode, RIGHT=next episode, ESC=quit"
+        )
         lines = [
-            "Controls: WASD+Q/E=move, Z/C=yaw, R/T=gripper, ENTER/.=step, LEFT=prev episode, RIGHT=next episode, ESC=quit",
+            control_line,
             "Speed: UP=faster, DOWN=slower",
             "Focus this control window for keyboard input. Env view is in native MuJoCo window.",
         ]
@@ -366,12 +375,17 @@ class KeyboardController:
                 a[2] += mag
             if keys[pygame.K_e]:
                 a[2] -= mag
-        if self.action_dim >= 4:
+        if self.action_dim >= 5:
             if keys[pygame.K_z]:
                 a[3] -= mag
             if keys[pygame.K_c]:
                 a[3] += mag
-        if self.action_dim >= 5:
+        if self.action_dim == 4:
+            if keys[pygame.K_r]:
+                a[3] += mag
+            if keys[pygame.K_t]:
+                a[3] -= mag
+        elif self.action_dim >= 5:
             if keys[pygame.K_r]:
                 a[4] += mag
             if keys[pygame.K_t]:
@@ -390,6 +404,7 @@ class VRController:
     def __init__(self, action_dim: int, args: argparse.Namespace):
         self.action_dim = int(action_dim)
         self.cache_path = Path(args.vr_cache_path)
+        self.mapping_path = Path(args.vr_mapping_path)
         if args.vr_mode == "listen":
             listen_port = int(args.vr_port) if int(args.vr_port) > 0 else DEFAULT_VR_PORT
             self.source = VRRawStateServer(host=str(args.vr_host).strip() or "0.0.0.0", port=listen_port)
@@ -411,32 +426,52 @@ class VRController:
             )
             self.source.start()
             print(f"vr endpoint resolved to {host}:{port} (from_cache={int(from_cache)})", flush=True)
+        mapping_config = VRManipMappingConfig(
+            hand=args.vr_hand,
+            require_gate=bool(args.vr_require_gate),
+            gate_button=args.vr_gate_button,
+            gripper_mirror_toggle_button=args.vr_gripper_mirror_toggle_button,
+            action_x_source="x",
+            action_y_source="y",
+            action_z_source="z",
+            rotation_source="global_yaw",
+            mirror_gripper_when_inactive=bool(args.vr_mirror_gripper_when_inactive),
+            position_gain=float(args.vr_position_gain),
+            yaw_gain=float(args.vr_yaw_gain),
+            gripper_gain=float(args.vr_gripper_gain),
+            trigger_axis=args.vr_gripper_axis,
+            binary_gripper=bool(args.vr_binary_gripper),
+            trigger_close_threshold=float(args.vr_trigger_close_threshold),
+            trigger_open_threshold=float(args.vr_trigger_open_threshold),
+            invert_x=bool(args.vr_invert_x),
+            invert_y=bool(args.vr_invert_y),
+            invert_z=bool(args.vr_invert_z),
+            invert_yaw=bool(args.vr_invert_yaw),
+        )
+        mapping_from_profile = False
+        if bool(args.vr_use_saved_mapping):
+            mapping_config, mapping_from_profile = apply_vr_mapping_profile(mapping_config, self.mapping_path)
+            if mapping_from_profile:
+                print(f"loaded vr mapping profile from {self.mapping_path}", flush=True)
         self.mapper = VRManipActionMapper(
             action_dim=self.action_dim,
-            config=VRManipMappingConfig(
-                hand=args.vr_hand,
-                require_gate=bool(args.vr_require_gate),
-                gate_button=args.vr_gate_button,
-                mirror_gripper_when_inactive=bool(args.vr_mirror_gripper_when_inactive),
-                position_gain=float(args.vr_position_gain),
-                yaw_gain=float(args.vr_yaw_gain),
-                gripper_gain=float(args.vr_gripper_gain),
-                trigger_axis=args.vr_gripper_axis,
-                binary_gripper=bool(args.vr_binary_gripper),
-                trigger_close_threshold=float(args.vr_trigger_close_threshold),
-                trigger_open_threshold=float(args.vr_trigger_open_threshold),
-                invert_x=bool(args.vr_invert_x),
-                invert_y=bool(args.vr_invert_y),
-                invert_z=bool(args.vr_invert_z),
-                invert_yaw=bool(args.vr_invert_yaw),
-            ),
+            config=mapping_config,
         )
         self._panel = None
         self._last_diag: dict[str, Any] = {}
         self._last_status_line: Optional[str] = None
+        self._mapping_mtime: float = 0.0
+        try:
+            self._mapping_mtime = float(self.mapping_path.stat().st_mtime)
+        except Exception:
+            self._mapping_mtime = 0.0
         if (not args.headless) and bool(args.vr_show_status_panel):
             try:
-                self._panel = VRStatusPanel(title="VR Receiver")
+                self._panel = VRStatusPanel(
+                    title="VR Receiver",
+                    mapping_config=self.mapper.config,
+                    mapping_path=self.mapping_path,
+                )
             except Exception:
                 self._panel = None
         print(self.source.banner_text(), flush=True)
@@ -447,6 +482,7 @@ class VRController:
         quit_requested = False
         advance_requested = False
         fps_delta = 0.0
+        self._reload_mapping_if_changed()
         snapshot = self.source.snapshot()
         self._maybe_log_status(snapshot)
         if self._panel is not None:
@@ -467,6 +503,26 @@ class VRController:
 
     def diagnostics(self) -> dict[str, Any]:
         return dict(self._last_diag)
+
+    def _reload_mapping_if_changed(self) -> None:
+        try:
+            current_mtime = float(self.mapping_path.stat().st_mtime)
+        except Exception:
+            current_mtime = 0.0
+        if current_mtime <= 0.0 or current_mtime == self._mapping_mtime:
+            return
+        loaded = load_vr_mapping_config(self.mapping_path)
+        if loaded is None:
+            self._mapping_mtime = current_mtime
+            return
+        loaded_dict = vr_mapping_config_to_dict(loaded)
+        current_dict = vr_mapping_config_to_dict(self.mapper.config)
+        if loaded_dict != current_dict:
+            for key, value in loaded_dict.items():
+                setattr(self.mapper.config, key, value)
+            self.mapper.reset()
+            print(f"reloaded vr mapping profile from {self.mapping_path}", flush=True)
+        self._mapping_mtime = current_mtime
 
     def _maybe_log_status(self, snapshot: dict[str, Any]) -> None:
         connected = bool(snapshot.get("connected", snapshot.get("connected_clients", 0)))
@@ -659,8 +715,9 @@ def clip_action(
         norm = float(np.linalg.norm(out))
         if norm > 1.0 and norm > 1e-8:
             out = out / norm
-    if binary_gripper_actions and out.shape[-1] >= 5:
-        out[4] = 1.0 if out[4] >= float(binary_gripper_threshold) else -1.0
+    if binary_gripper_actions and out.shape[-1] >= 4:
+        gripper_idx = out.shape[-1] - 1
+        out[gripper_idx] = 1.0 if out[gripper_idx] >= float(binary_gripper_threshold) else -1.0
     return out
 
 
@@ -772,6 +829,7 @@ _CLI_FLAG_ALIASES: dict[str, tuple[str, ...]] = {
     "teacher_target_mode": ("--teacher_target_mode",),
     "cube_success_tolerance": ("--cube_success_tolerance",),
     "max_episode_steps": ("--max_episode_steps",),
+    "disable_rotation": ("--disable_rotation",),
     "static_reset_seed": ("--static_reset_seed",),
 }
 
@@ -841,6 +899,7 @@ def apply_model_config_defaults(args: argparse.Namespace) -> None:
         "teacher_target_mode",
         "cube_success_tolerance",
         "max_episode_steps",
+        "disable_rotation",
         "static_reset_seed",
     ]
     applied = []
@@ -955,6 +1014,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mujoco_gl", type=str, default="auto", choices=["auto", "glfw", "egl"])
     p.add_argument("--fps", type=int, default=20)
     p.add_argument("--headless", action="store_true", default=False)
+    p.add_argument("--hold_targets_on_zero_action", action="store_true", default=False)
+    p.add_argument("--noop_action_threshold", type=float, default=1e-6)
+    p.add_argument("--disable_rotation", action="store_true", default=False)
 
     p.add_argument("--obs_mode", type=str, default="state", choices=["state"])
     p.add_argument("--include_goal", action="store_true", default=True)
@@ -1035,13 +1097,13 @@ def parse_args() -> argparse.Namespace:
         "--binary_gripper_actions",
         action="store_true",
         default=False,
-        help="If set, force action[4] to binary {-1,+1} using --binary_gripper_threshold.",
+        help="If set, force the final gripper action channel to binary {-1,+1} using --binary_gripper_threshold.",
     )
     p.add_argument(
         "--binary_gripper_threshold",
         type=float,
         default=0.0,
-        help="Threshold for binary gripper mapping: action[4] >= threshold -> +1 else -1.",
+        help="Threshold for binary gripper mapping: final gripper action channel >= threshold -> +1 else -1.",
     )
     p.add_argument(
         "--hard_gripper_intervention",
@@ -1063,6 +1125,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--vr_host", type=str, default="", help="Desktop publisher host in connect mode, bind host in listen mode.")
     p.add_argument("--vr_port", type=int, default=0)
     p.add_argument("--vr_cache_path", type=str, default=str(DEFAULT_VR_CACHE_PATH))
+    p.add_argument("--vr_mapping_path", type=str, default=str(DEFAULT_VR_MAPPING_PATH))
+    p.add_argument("--vr_use_saved_mapping", action="store_true", default=True)
+    p.add_argument("--no_vr_use_saved_mapping", dest="vr_use_saved_mapping", action="store_false")
     p.add_argument("--vr_reconnect_seconds", type=float, default=2.0)
     p.add_argument("--vr_hand", type=str, default="right", choices=["left", "right"])
     p.add_argument("--vr_require_gate", action="store_true", default=False)
@@ -1071,6 +1136,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="grip",
         help="Named button alias or numeric OpenVR button id used as the movement clutch/gate.",
+    )
+    p.add_argument(
+        "--vr_gripper_mirror_toggle_button",
+        type=str,
+        default="none",
+        help="Named button alias that toggles gate-off gripper mirroring at runtime.",
     )
     p.add_argument(
         "--vr_mirror_gripper_when_inactive",
@@ -1413,7 +1484,15 @@ def create_env(args: argparse.Namespace) -> gym.Env:
     # Manip env ignores render_mode and always returns rgb arrays from render().
     # Use None for interactive mode and native passive viewer instead.
     render_mode = "rgb_array" if args.headless else (None if args.render_mode == "human" else args.render_mode)
-    env = gym.make(args.env_name, max_episode_steps=args.max_episode_steps, render_mode=render_mode)
+    make_kwargs = {
+        "render_mode": render_mode,
+        "hold_targets_on_zero_action": bool(args.hold_targets_on_zero_action),
+        "noop_action_threshold": float(args.noop_action_threshold),
+        "disable_rotation": bool(args.disable_rotation),
+    }
+    if int(args.max_episode_steps) > 0:
+        make_kwargs["max_episode_steps"] = int(args.max_episode_steps)
+    env = gym.make(args.env_name, **make_kwargs)
     env = build_ogbench_manip_wrapper(
         env_name=args.env_name,
         obs_mode=args.obs_mode,
@@ -1427,6 +1506,7 @@ def create_env(args: argparse.Namespace) -> gym.Env:
         dense_reward_scale=args.dense_reward_scale,
         step_penalty=args.step_penalty,
         cube_reward_mode=args.cube_reward_mode,
+        disable_rotation=bool(args.disable_rotation),
         intervention_mode=args.intervention_mode,
         teacher_type=args.teacher_type,
         tolerance_type=args.tolerance_type,
@@ -1669,13 +1749,25 @@ def run(args: argparse.Namespace) -> None:
         print(f"model={args.model_path}")
     elif args.controller == "vr":
         endpoint_port = str(args.vr_port) if int(args.vr_port) > 0 else "<cache/default>"
+        vr_cfg = controller.mapper.config
         print(
             "vr_transport="
             f"{args.vr_mode} "
             f"endpoint={args.vr_host or '<cache>'}:{endpoint_port} "
-            f"hand={args.vr_hand} "
-            f"gate={args.vr_gate_button} "
-            f"require_gate={int(bool(args.vr_require_gate))}"
+            f"hand={vr_cfg.hand} "
+            f"gate={vr_cfg.gate_button} "
+            f"require_gate={int(bool(vr_cfg.require_gate))}"
+        )
+        print(
+            "vr_mapping="
+            f"x={vr_cfg.action_x_source} "
+            f"y={vr_cfg.action_y_source} "
+            f"z={vr_cfg.action_z_source} "
+            f"rot={vr_cfg.rotation_source} "
+            f"xyz_gain={float(vr_cfg.position_gain):.2f} "
+            f"yaw_gain={float(vr_cfg.yaw_gain):.2f} "
+            f"gripper_axis={vr_cfg.trigger_axis} "
+            f"gripper_gain={float(vr_cfg.gripper_gain):.2f}"
         )
     print(f"teacher={args.teacher_type}, mode={args.intervention_mode}")
     print(f"tolerance={args.tolerance_type}:{args.tolerance_value}")

@@ -20,7 +20,7 @@ from safetygym_utils.gamepad import (
 )
 from safetygym_utils.env import clip_action_to_space, extract_goal_distance, extract_step_limit, make_safety_env
 from safetygym_utils.io import load_args_json, maybe_find_args_json_from_model
-from safetygym_utils.metrics import EpisodeWindow, classify_outcome
+from safetygym_utils.metrics import EpisodeWindow, augment_rollout_summary, classify_outcome
 from safetygym_utils.rendering import build_external_viewer, resolve_env_render_mode, wants_external_viewer
 from safetygym_utils.sac import SafetyActor
 from safetygym_utils.wrappers import HumanInterventionWrapper, RewardModeWrapper
@@ -329,7 +329,20 @@ def _build_env(args: argparse.Namespace, controller):
     return env
 
 
-def _episode_metrics(info: Dict[str, Any], ep_return: float, ep_cost: float, ep_len: int, max_steps: int, terminated: bool, truncated: bool, final_distance: float) -> Dict[str, float]:
+def _episode_metrics(
+    info: Dict[str, Any],
+    ep_return: float,
+    ep_cost: float,
+    ep_reward_raw_env: float,
+    ep_reward_dense: float,
+    ep_reward_sparse: float,
+    ep_reward_step_penalty: float,
+    ep_len: int,
+    max_steps: int,
+    terminated: bool,
+    truncated: bool,
+    final_distance: float,
+) -> Dict[str, float]:
     goal_met = bool(info.get("goal_met", False))
     outcome = classify_outcome(goal_met=goal_met, episode_steps=ep_len, max_episode_steps=max_steps)
     return {
@@ -337,6 +350,11 @@ def _episode_metrics(info: Dict[str, Any], ep_return: float, ep_cost: float, ep_
         "episode_cost_sum": float(ep_cost),
         "episode_cost_rate": float(ep_cost / max(1, ep_len)),
         "episode_length": float(ep_len),
+        "reward_shaped_sum": float(ep_return),
+        "reward_raw_env_sum": float(ep_reward_raw_env),
+        "reward_dense_sum": float(ep_reward_dense),
+        "reward_sparse_sum": float(ep_reward_sparse),
+        "reward_step_penalty_sum": float(ep_reward_step_penalty),
         "intervention_steps": float(info.get("teacher_intervention_steps", 0.0)),
         "intervention_fraction": float(info.get("teacher_fraction_steps", 0.0)),
         "intervention_num_bursts": float(info.get("teacher_num_bursts", 0.0)),
@@ -449,6 +467,10 @@ def main() -> int:
 
     ep_ret = 0.0
     ep_cost = 0.0
+    ep_reward_raw_env = 0.0
+    ep_reward_dense = 0.0
+    ep_reward_sparse = 0.0
+    ep_reward_step_penalty = 0.0
     ep_len = 0
     episodes = 0
 
@@ -481,6 +503,10 @@ def main() -> int:
 
         ep_ret += float(reward)
         ep_cost += float(cost)
+        ep_reward_raw_env += float(info.get("reward_raw_env", 0.0))
+        ep_reward_dense += float(info.get("reward_dense_component", 0.0))
+        ep_reward_sparse += float(info.get("reward_sparse_component", 0.0))
+        ep_reward_step_penalty += float(info.get("reward_step_penalty_component", 0.0))
         ep_len += 1
 
         if terminated or truncated:
@@ -489,6 +515,10 @@ def main() -> int:
                 dict(info),
                 ep_return=ep_ret,
                 ep_cost=ep_cost,
+                ep_reward_raw_env=ep_reward_raw_env,
+                ep_reward_dense=ep_reward_dense,
+                ep_reward_sparse=ep_reward_sparse,
+                ep_reward_step_penalty=ep_reward_step_penalty,
                 ep_len=ep_len,
                 max_steps=max_steps,
                 terminated=bool(terminated),
@@ -499,6 +529,7 @@ def main() -> int:
             outcome = "success" if ep["outcome_success"] > 0.5 else ("timeout" if ep["outcome_timeout"] > 0.5 else "kill")
             print(
                 f"episode={episodes+1} outcome={outcome} return={ep_ret:.3f} cost={ep_cost:.3f} "
+                f"dense={ep_reward_dense:.3f} sparse={ep_reward_sparse:.3f} "
                 f"len={ep_len} final_dist={final_dist:.3f} interventions={int(ep['intervention_steps'])}",
                 flush=True,
             )
@@ -509,6 +540,10 @@ def main() -> int:
                 viewer.draw_env(env)
             ep_ret = 0.0
             ep_cost = 0.0
+            ep_reward_raw_env = 0.0
+            ep_reward_dense = 0.0
+            ep_reward_sparse = 0.0
+            ep_reward_step_penalty = 0.0
             ep_len = 0
         else:
             obs = next_obs
@@ -516,7 +551,7 @@ def main() -> int:
         if args.fps > 0:
             time.sleep(1.0 / float(args.fps))
 
-    summary = win.summary("eval")
+    summary = augment_rollout_summary(win.summary("eval"), "eval")
     print(json.dumps(summary, sort_keys=True), flush=True)
 
     env.close()

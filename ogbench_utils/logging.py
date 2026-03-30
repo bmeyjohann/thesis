@@ -325,6 +325,8 @@ class TrainingLogger:
         if last_update_metrics is not None:
             metrics_accumulator, updates_count = last_update_metrics
             denom = float(max(1, updates_count))
+            actor_denom = float(max(1.0, metrics_accumulator.get("actor_update_count", float(updates_count))))
+            alpha_denom = float(max(1.0, metrics_accumulator.get("alpha_update_count", float(updates_count))))
             pref_loss_type = str(getattr(self.args, "pref_loss_type", "margin")).strip().lower()
             lagrangian_enabled = 1.0 if pref_loss_type == "lagrangian" else 0.0
             logs["Train/critic_loss"] = metrics_accumulator["critic_loss"] / denom
@@ -351,18 +353,18 @@ class TrainingLogger:
             logs["Train/pref_lambda_ema_cfg"] = float(getattr(self.args, "pref_lambda_ema", 0.0))
             logs["Train/pref_violation_clip"] = float(getattr(self.args, "pref_violation_clip", 0.0))
             logs["Train/pref_violation_target"] = float(getattr(self.args, "pref_violation_target", 0.0))
-            logs["Train/actor_loss"] = metrics_accumulator["actor_loss"] / denom
-            logs["Train/actor_loss_sac"] = metrics_accumulator["actor_loss_sac"] / denom
-            logs["Train/actor_bc_loss_demo"] = metrics_accumulator["actor_bc_loss_demo"] / denom
-            logs["Train/actor_bc_loss_pref"] = metrics_accumulator["actor_bc_loss_pref"] / denom
-            logs["Train/alpha_loss"] = metrics_accumulator["alpha_loss"] / denom
-            logs["Train/policy_entropy"] = metrics_accumulator["entropy"] / denom
-            logs["Train/action_l2"] = metrics_accumulator["action_norm"] / denom
+            logs["Train/actor_loss"] = metrics_accumulator["actor_loss"] / actor_denom
+            logs["Train/actor_loss_sac"] = metrics_accumulator["actor_loss_sac"] / actor_denom
+            logs["Train/actor_bc_loss_demo"] = metrics_accumulator["actor_bc_loss_demo"] / actor_denom
+            logs["Train/actor_bc_loss_pref"] = metrics_accumulator["actor_bc_loss_pref"] / actor_denom
+            logs["Train/alpha_loss"] = metrics_accumulator["alpha_loss"] / alpha_denom
+            logs["Train/policy_entropy"] = metrics_accumulator["entropy"] / actor_denom
+            logs["Train/action_l2"] = metrics_accumulator["action_norm"] / actor_denom
             logs["Train/target_q_mean"] = metrics_accumulator["target_q"] / denom
-            logs["Train/q_min_pi_mean"] = metrics_accumulator["q_min_pi"] / denom
+            logs["Train/q_min_pi_mean"] = metrics_accumulator["q_min_pi"] / actor_denom
             logs["Train/q_min_data_mean"] = metrics_accumulator["q_min_data"] / denom
             logs["Train/q_disagreement_data_mean"] = metrics_accumulator["q_disagreement_data"] / denom
-            logs["Train/q_disagreement_pi_mean"] = metrics_accumulator["q_disagreement_pi"] / denom
+            logs["Train/q_disagreement_pi_mean"] = metrics_accumulator["q_disagreement_pi"] / actor_denom
             teacher_q_count = float(metrics_accumulator.get("q_min_teacher_data_count", 0.0))
             if teacher_q_count > 0.0:
                 logs["Train/q_min_teacher_action_mean"] = (
@@ -380,8 +382,10 @@ class TrainingLogger:
                 )
             logs["Train/replay_reward_mean"] = metrics_accumulator["reward"] / denom
             logs["Train/replay_reward_abs_mean"] = metrics_accumulator["reward_abs"] / denom
-            logs["Train/alpha"] = metrics_accumulator["alpha_value"] / denom
+            logs["Train/alpha"] = metrics_accumulator["alpha_value"] / alpha_denom
             logs["Train/updates_per_iter"] = updates_count
+            logs["Train/actor_updates_per_iter"] = float(metrics_accumulator.get("actor_update_count", 0.0))
+            logs["Train/alpha_updates_per_iter"] = float(metrics_accumulator.get("alpha_update_count", 0.0))
         else:
             logs["Train/alpha"] = float(log_alpha.exp().detach().cpu().item())
 

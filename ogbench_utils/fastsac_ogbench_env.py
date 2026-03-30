@@ -130,7 +130,17 @@ def make_eval_wrappers(args, env_family: str):
 
 
 def _build_env_kwargs(args) -> Dict[str, Any]:
-    return {}
+    env_kwargs: Dict[str, Any] = {}
+    if hasattr(args, "hold_targets_on_zero_action"):
+        env_kwargs["hold_targets_on_zero_action"] = bool(getattr(args, "hold_targets_on_zero_action", False))
+    if hasattr(args, "noop_action_threshold"):
+        env_kwargs["noop_action_threshold"] = float(getattr(args, "noop_action_threshold", 1e-6))
+    if hasattr(args, "disable_rotation"):
+        env_kwargs["disable_rotation"] = bool(getattr(args, "disable_rotation", False))
+    max_episode_steps = int(getattr(args, "max_episode_steps", 0) or 0)
+    if max_episode_steps > 0:
+        env_kwargs["max_episode_steps"] = max_episode_steps
+    return env_kwargs
 
 
 def _default_clip_actions(env_family: str) -> float | None:
@@ -238,13 +248,14 @@ def _reward_window_to_log_tensors(
 
 
 def _apply_binary_gripper_action(action: torch.Tensor, *, enabled: bool, threshold: float) -> torch.Tensor:
-    """Map the gripper channel (index 4) to {-1, +1} when enabled."""
+    """Map the final gripper channel to {-1, +1} when enabled."""
     if not enabled:
         return action
-    if action.ndim == 0 or action.shape[-1] < 5:
+    if action.ndim == 0 or action.shape[-1] < 4:
         return action
     out = action.clone()
-    out[..., 4] = torch.where(out[..., 4] >= float(threshold), 1.0, -1.0)
+    gripper_idx = out.shape[-1] - 1
+    out[..., gripper_idx] = torch.where(out[..., gripper_idx] >= float(threshold), 1.0, -1.0)
     return out
 
 

@@ -7,11 +7,21 @@ import sys
 
 import torch
 
+
+def _default_wandb_mode() -> str:
+    explicit = str(os.environ.get("WANDB_MODE", "")).strip()
+    if explicit:
+        return explicit
+    cluster_markers = ("SLURM_JOB_ID", "SLURM_CLUSTER_NAME", "SLURM_JOB_NODELIST")
+    on_cluster = any(str(os.environ.get(key, "")).strip() for key in cluster_markers)
+    return "offline" if on_cluster else "online"
+
+
 # Ensure EGL is the default MuJoCo backend unless users override it explicitly.
 os.environ.setdefault("MUJOCO_GL", os.environ.get("MUJOCO_GL", "egl"))
 
-# Defer WANDB mode selection until after args are parsed; default to offline unless explicitly enabled.
-os.environ.setdefault("WANDB_MODE", "offline")
+# Default WANDB to online for local runs, but keep SLURM/cluster runs offline unless explicitly overridden.
+os.environ.setdefault("WANDB_MODE", _default_wandb_mode())
 os.environ.setdefault("WANDB_CONSOLE", "off")
 os.environ.setdefault("WANDB_SILENT", "true")
 
@@ -78,7 +88,14 @@ def run_fastsac_ogbench_maze(args, generate_policy_map=None) -> None:
     buffers = initialize_buffers(args, device, n_obs, n_act, obs_normalizer)
     replay_buffer = create_replay_buffer(args, device, n_obs, n_act)
     demo_buffer = (
-        create_replay_buffer(args, device, n_obs, n_act, buffer_size=args.demo_buffer_capacity)
+        create_replay_buffer(
+            args,
+            device,
+            n_obs,
+            n_act,
+            buffer_size=args.demo_buffer_capacity,
+            n_env_override=1,
+        )
         if args.demo_buffer_enable
         else None
     )
@@ -148,4 +165,3 @@ def run_fastsac_ogbench_maze(args, generate_policy_map=None) -> None:
             eval_envs.close()
         except Exception:
             pass
-

@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PYTHON_BIN="${PYTHON_BIN:-python}"
+WANDB_MODE_VALUE="${WANDB_MODE:-online}"
+PROJECT="${PROJECT:-ogbench-manip-reward-debug}"
+ENV_NAME="${ENV_NAME:-cube-single-singletask-task1-v0}"
+DEMO_SAMPLE_RATIO="${DEMO_SAMPLE_RATIO:-0.5}"
+DEMO_PREFILL_EPISODES="${DEMO_PREFILL_EPISODES:-20}"
+DEMO_PREFILL_NUM_ENVS="${DEMO_PREFILL_NUM_ENVS:-20}"
+INTERVENTION_EPISODE_PROB="${INTERVENTION_EPISODE_PROB:-1.0}"
+GAMMA="${GAMMA:-0.97}"
+
+NUM_ENVS="${NUM_ENVS:-32}"
+TOTAL_TIMESTEPS="${TOTAL_TIMESTEPS:-120000}"
+LEARNING_STARTS="${LEARNING_STARTS:-2000}"
+BATCH_SIZE="${BATCH_SIZE:-256}"
+NUM_CRITICS="${NUM_CRITICS:-2}"
+ACTOR_HIDDEN_DIM="${ACTOR_HIDDEN_DIM:-256}"
+CRITIC_HIDDEN_DIM="${CRITIC_HIDDEN_DIM:-512}"
+NUM_UPDATES="${NUM_UPDATES:-1}"
+CTA_RATIO="${CTA_RATIO:-1}"
+
+PREF_RANK_WEIGHT="${PREF_RANK_WEIGHT:-1.0}"
+PREF_RANK_MARGIN="${PREF_RANK_MARGIN:-0.01}"
+PREF_LAMBDA_INIT="${PREF_LAMBDA_INIT:-1.0}"
+PREF_LAMBDA_LR="${PREF_LAMBDA_LR:-1e-3}"
+PREF_LAMBDA_MAX="${PREF_LAMBDA_MAX:-10.0}"
+PREF_LAMBDA_EMA="${PREF_LAMBDA_EMA:-0.9}"
+PREF_VIOLATION_CLIP="${PREF_VIOLATION_CLIP:-10.0}"
+PREF_VIOLATION_TARGET="${PREF_VIOLATION_TARGET:-0.0}"
+
+EVAL_INTERVAL="${EVAL_INTERVAL:-5000}"
+NUM_EVAL_EPISODES="${NUM_EVAL_EPISODES:-5}"
+EVAL_NUM_ENVS="${EVAL_NUM_ENVS:-1}"
+SAVE_INTERVAL="${SAVE_INTERVAL:-10000}"
+LOG_INTERVAL="${LOG_INTERVAL:-64}"
+
+TOL_NEAR_DIST="${TOL_NEAR_DIST:-0.08}"
+TOL_FAR_DIST="${TOL_FAR_DIST:-0.30}"
+TOL_NEAR_SCALE="${TOL_NEAR_SCALE:-0.35}"
+
+TS="$(date +%Y%m%d_%H%M%S)"
+EXP_NAME="${EXP_NAME:-cube_single_task1_relonly_layernorm_newteacher_utd1_120k_own_interv_${INTERVENTION_EPISODE_PROB}_${TS}}"
+LOG_FILE="logs/${EXP_NAME}.log"
+mkdir -p logs
+
+echo "=== Starting ${EXP_NAME} ==="
+echo "Log file: ${LOG_FILE}"
+echo "WANDB mode: ${WANDB_MODE_VALUE}"
+echo "Teacher demo prefill: ${DEMO_PREFILL_EPISODES} episodes into demo buffer"
+echo "Sampling replay/demo ratio: 50/50 (demo_sample_ratio=${DEMO_SAMPLE_RATIO})"
+echo "Intervention episode probability: ${INTERVENTION_EPISODE_PROB}"
+echo "Gamma: ${GAMMA}"
+echo "CTA ratio: ${CTA_RATIO}"
+echo "Preference rank weight: ${PREF_RANK_WEIGHT}"
+
+WANDB_MODE="${WANDB_MODE_VALUE}" \
+WANDB_CONSOLE=off \
+WANDB_SILENT=true \
+"${PYTHON_BIN}" train_fast_sac_ogbench_manip.py \
+  --env_name "${ENV_NAME}" \
+  --num_envs "${NUM_ENVS}" \
+  --total_timesteps "${TOTAL_TIMESTEPS}" \
+  --device auto \
+  --train_render_mode none \
+  --obs_mode state \
+  --no_include_goal \
+  --include_relative_cube_features \
+  --relative_only_obs \
+  --reward_type sparse \
+  --cube_reward_mode dense \
+  --use_intervention \
+  --teacher_type cube_markov \
+  --hard_block_lethal \
+  --num_critics "${NUM_CRITICS}" \
+  --actor_hidden_dim "${ACTOR_HIDDEN_DIM}" \
+  --critic_hidden_dim "${CRITIC_HIDDEN_DIM}" \
+  --batch_size "${BATCH_SIZE}" \
+  --num_updates "${NUM_UPDATES}" \
+  --cta_ratio "${CTA_RATIO}" \
+  --learning_starts "${LEARNING_STARTS}" \
+  --gamma "${GAMMA}" \
+  --alpha_min 0.0 \
+  --alpha_max 1.0 \
+  --alpha_freeze_steps 0 \
+  --use_layer_norm \
+  --demo_buffer_enable \
+  --demo_prefill_episodes "${DEMO_PREFILL_EPISODES}" \
+  --demo_prefill_num_envs "${DEMO_PREFILL_NUM_ENVS}" \
+  --demo_prefill_target demo \
+  --demo_prefill_intervention_mode agent_always \
+  --demo_sample_ratio "${DEMO_SAMPLE_RATIO}" \
+  --pref_buffer_enable \
+  --pref_sampling_mode linked \
+  --pref_sample_ratio 0.0 \
+  --pref_rank_weight "${PREF_RANK_WEIGHT}" \
+  --pref_rank_margin "${PREF_RANK_MARGIN}" \
+  --pref_loss_type lagrangian \
+  --pref_lambda_init "${PREF_LAMBDA_INIT}" \
+  --pref_lambda_lr "${PREF_LAMBDA_LR}" \
+  --pref_lambda_max "${PREF_LAMBDA_MAX}" \
+  --pref_lambda_ema "${PREF_LAMBDA_EMA}" \
+  --pref_violation_clip "${PREF_VIOLATION_CLIP}" \
+  --pref_violation_target "${PREF_VIOLATION_TARGET}" \
+  --pref_lagrangian_violation_type hinge \
+  --pref_stopgrad_positive \
+  --intervention_episode_prob "${INTERVENTION_EPISODE_PROB}" \
+  --intervention_episode_prob_min "${INTERVENTION_EPISODE_PROB}" \
+  --intervention_episode_prob_decay_steps 0 \
+  --eval_interval "${EVAL_INTERVAL}" \
+  --num_eval_episodes "${NUM_EVAL_EPISODES}" \
+  --eval_num_envs "${EVAL_NUM_ENVS}" \
+  --eval_render_mode none \
+  --save_interval "${SAVE_INTERVAL}" \
+  --log_interval "${LOG_INTERVAL}" \
+  --use_wandb \
+  --project "${PROJECT}" \
+  --exp_name "${EXP_NAME}" \
+  --tolerance_adaptive_near_distance "${TOL_NEAR_DIST}" \
+  --tolerance_adaptive_far_distance "${TOL_FAR_DIST}" \
+  --tolerance_adaptive_near_scale "${TOL_NEAR_SCALE}" \
+  2>&1 | tee "${LOG_FILE}"
+
+echo "=== Finished ${EXP_NAME} ==="

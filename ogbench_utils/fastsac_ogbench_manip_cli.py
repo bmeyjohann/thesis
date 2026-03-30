@@ -43,6 +43,13 @@ def parse_fastsac_manip_args():
         raise ValueError(f"Manip FastSAC entrypoint received maze env_name={args.env_name!r}.")
     if getattr(args, "train_render_mode", "none") == "human" and int(getattr(args, "num_envs", 1)) != 1:
         raise ValueError("--train_render_mode=human requires --num_envs=1.")
+    if (
+        bool(getattr(args, "use_intervention", False))
+        and str(getattr(args, "intervention_mode", "")).lower() == "human"
+        and str(getattr(args, "human_input_device", "keyboard")).lower() == "vr"
+        and int(getattr(args, "num_envs", 1)) != 1
+    ):
+        raise ValueError("Human VR intervention training currently requires --num_envs=1.")
     if int(getattr(args, "num_critics", 2)) < 1:
         raise ValueError("--num_critics must be >= 1.")
     return args

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 
+from .vr_teleop import DEFAULT_VR_CACHE_PATH, DEFAULT_VR_MAPPING_PATH, DEFAULT_VR_PORT
+
 def build_train_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
     cube_reward_choices = [
@@ -12,6 +14,26 @@ def build_train_parser() -> argparse.ArgumentParser:
     # Env
     p.add_argument('--env_name', type=str, default='pointmaze-arena-danger-lethal-v0')
     p.add_argument('--num_envs', type=int, default=64)
+    p.add_argument('--max_episode_steps', type=int, default=0,
+                   help='Optional positive per-episode step limit override for train/eval env creation (0 uses the env default).')
+    p.add_argument(
+        '--hold_targets_on_zero_action',
+        action='store_true',
+        default=False,
+        help='Manip only: skip IK recomputation on true zero xyz/yaw actions and hold the previous joint targets.',
+    )
+    p.add_argument(
+        '--noop_action_threshold',
+        type=float,
+        default=1e-6,
+        help='Manip only: absolute threshold for treating xyz/yaw (and gripper, when enabled) as zero for target-hold optimization.',
+    )
+    p.add_argument(
+        '--disable_rotation',
+        action='store_true',
+        default=False,
+        help='Manip only: lock effector/cube/goal yaw and expose a 4D xyz+gripper action space.',
+    )
     p.add_argument('--total_timesteps', type=int, default=1_000_000)
     p.add_argument('--device', type=str, default='auto')
     p.add_argument('--train_render_mode', type=str, default='none', choices=['none', 'human'],
@@ -79,6 +101,38 @@ def build_train_parser() -> argparse.ArgumentParser:
     p.add_argument('--use_intervention', action='store_true', default=False)
     p.add_argument('--intervention_mode', type=str, default='agent',
                    choices=['human', 'agent', 'agent_always', 'agent_safety_align', 'agent_safety_progress', 'agent_reward_progress', 'agent_manual_gripper'])
+    p.add_argument('--human_input_device', type=str, default='keyboard', choices=['keyboard', 'vr'],
+                   help='Human intervention input device. Use vr to consume the persistent raw VR stream.')
+    p.add_argument('--human_intervention_threshold', type=float, default=0.1,
+                   help='Human intervention action-norm threshold. For VR this is auto-relaxed to ~0 unless explicitly overridden.')
+    p.add_argument('--human_intervention_hold_time', type=float, default=0.5,
+                   help='Hold time for human intervention takeover logic.')
+    p.add_argument('--vr_mode', type=str, default='connect', choices=['connect', 'listen'],
+                   help='VR transport mode when --human_input_device vr is active.')
+    p.add_argument('--vr_host', type=str, default='',
+                   help='VR publisher host when --vr_mode connect. Empty uses the cached endpoint or localhost.')
+    p.add_argument('--vr_port', type=int, default=0,
+                   help=f'VR transport port (0 uses default {DEFAULT_VR_PORT}).')
+    p.add_argument('--vr_cache_path', type=str, default=str(DEFAULT_VR_CACHE_PATH),
+                   help='Path to the cached VR endpoint file.')
+    p.add_argument('--vr_mapping_path', type=str, default=str(DEFAULT_VR_MAPPING_PATH),
+                   help='Path to the saved VR mapping profile.')
+    p.add_argument('--vr_reconnect_seconds', type=float, default=2.0,
+                   help='Reconnect interval for VR client mode.')
+    p.add_argument('--vr_use_saved_mapping', action='store_true', default=True,
+                   help='Load the saved VR mapping profile before starting training.')
+    p.add_argument('--no_vr_use_saved_mapping', dest='vr_use_saved_mapping', action='store_false',
+                   help='Do not load the saved VR mapping profile.')
+    p.add_argument('--vr_hand', type=str, default='right', choices=['left', 'right'],
+                   help='Fallback VR controller hand if no saved mapping profile is loaded.')
+    p.add_argument('--vr_gate_button', type=str, default='grip',
+                   help='Fallback VR intervention button if no saved mapping profile is loaded.')
+    p.add_argument('--vr_gripper_mirror_toggle_button', type=str, default='none',
+                   help='Fallback VR button that toggles gate-off gripper mirroring at runtime if no saved mapping profile is loaded.')
+    p.add_argument('--vr_require_gate', action='store_true', default=True,
+                   help='Require the configured VR gate button for motion if no saved mapping profile is loaded.')
+    p.add_argument('--no_vr_require_gate', dest='vr_require_gate', action='store_false',
+                   help='Allow VR motion without a gate button if no saved mapping profile is loaded.')
     p.add_argument('--teacher_type', type=str, default='bfs', choices=['bfs', 'cube_plan', 'cube_markov'])
     p.add_argument('--tolerance_type', type=str, default='angle', choices=['angle', 'l2', 'component'])
     p.add_argument('--tolerance_value', type=float, default=30.0)
@@ -140,13 +194,13 @@ def build_train_parser() -> argparse.ArgumentParser:
         '--binary_gripper_actions',
         action='store_true',
         default=False,
-        help='If set, force action[4] to binary {-1,+1} using --binary_gripper_threshold.',
+        help='If set, force the final gripper action channel to binary {-1,+1} using --binary_gripper_threshold.',
     )
     p.add_argument(
         '--binary_gripper_threshold',
         type=float,
         default=0.0,
-        help='Threshold for binary gripper mapping: action[4] >= threshold -> +1 else -1.',
+        help='Threshold for binary gripper mapping: final gripper action channel >= threshold -> +1 else -1.',
     )
     p.add_argument(
         '--hard_gripper_intervention',
@@ -211,6 +265,12 @@ def build_train_parser() -> argparse.ArgumentParser:
     p.add_argument('--tau', type=float, default=0.01)
     p.add_argument('--policy_frequency', type=int, default=1)
     p.add_argument('--num_updates', type=int, default=1)
+    p.add_argument(
+        '--cta_ratio',
+        type=int,
+        default=1,
+        help='Critic-to-actor update ratio. 1 means update actor every critic step, 2 every second critic step.',
+    )
     p.add_argument('--learning_starts', type=int, default=10_000)
     p.add_argument('--max_grad_norm', type=float, default=10.0)
     p.add_argument('--init_scale', type=float, default=0.01)
@@ -313,6 +373,18 @@ def build_train_parser() -> argparse.ArgumentParser:
                    help='Capacity of the demo replay buffer')
     p.add_argument('--demo_sample_ratio', type=float, default=0.0,
                    help='Fraction of each update batch sampled from demo buffer (0..1)')
+    p.add_argument('--store_intervened_in_demo_buffer', action='store_true', default=False,
+                   help='When online interventions occur, also copy those executed transitions into the demo buffer (requires --demo_buffer_enable).')
+    p.add_argument('--demo_dataset_path', type=str, default='',
+                   help='Optional offline manipulation transition dataset (.npz) to load into replay/demo before training.')
+    p.add_argument('--demo_dataset_dir', type=str, default='',
+                   help='Dataset search root for --demo_dataset_auto_load (defaults to the shared manipulation dataset dir).')
+    p.add_argument('--demo_dataset_auto_load', action='store_true', default=False,
+                   help='Automatically load the latest matching manipulation dataset for env_name before training.')
+    p.add_argument('--demo_dataset_target', type=str, default='demo', choices=['demo', 'replay'],
+                   help='Target buffer for offline manipulation dataset loading.')
+    p.add_argument('--demo_dataset_max_rows', type=int, default=0,
+                   help='Optional max number of rows to load from the offline manipulation dataset (0 = all).')
     # Logging
     p.add_argument('--use_wandb', action='store_true', default=False)
     p.add_argument('--project', type=str, default='ogbench-rsl-rl')
@@ -337,7 +409,7 @@ def build_train_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument('--profile_timing', action='store_true', default=False,
-                   help='Log per-step timing breakdown (ms + %): action/env/info/replay-sample/update/misc')
+                   help='Log per-step timing breakdown (ms + %%): action/env/info/replay-sample/update/misc')
     p.add_argument('--compute_q_diagnostics', action='store_true', default=False,
                    help='Compute per-step critic disagreement/Q-min diagnostics (adds extra critic forward each env step).')
     p.add_argument('--post_switch_viz_multiplier', type=int, default=1,
