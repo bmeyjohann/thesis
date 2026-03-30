@@ -22,10 +22,20 @@ if _FAST_SAC_PATH.exists():
 
 from fast_sac_utils import SimpleReplayBuffer
 
-from .controllers import KeyboardConfig, PygameKeyboardController, infer_control_scheme
+from .controllers import build_human_controller
+from .dataset_io import (
+    DEFAULT_SAFETYGYM_DATASET_DIR,
+    build_dataset_path,
+    extend_buffer_from_dataset,
+    find_latest_transition_dataset,
+    load_transition_dataset,
+    save_buffer_as_transition_dataset,
+)
+from .gamepad import DEFAULT_SAFETY_GAMEPAD_CACHE_PATH, DEFAULT_SAFETY_GAMEPAD_CONFIG_PATH, DEFAULT_SAFETY_GAMEPAD_PORT
 from .env import clip_action_to_space, extract_goal_distance, extract_step_limit, make_safety_env
 from .io import save_args_json
 from .metrics import EpisodeWindow, classify_outcome
+from .rendering import build_external_viewer, resolve_env_render_mode, wants_external_viewer
 from .sac import (
     SACTensors,
     SACUpdateMetrics,
@@ -292,11 +302,11 @@ def _make_env_with_wrappers(
     args,
     seed: int,
     with_intervention: bool,
-    controller: Optional[PygameKeyboardController],
+    controller,
 ):
     env = make_safety_env(
         args.env_name,
-        render_mode=args.render_mode,
+        render_mode=resolve_env_render_mode(args.render_mode),
         max_episode_steps=args.max_episode_steps,
         surface_mode=getattr(args, "surface_mode", "default"),
         car_wheel_command_limit=float(getattr(args, "car_wheel_command_limit", 2.0)),
@@ -342,6 +352,39 @@ def _sample_pref_batch(pref_pairs: list[Dict[str, np.ndarray]], batch_size: int,
     }
 
 
+def _sample_linked_pref_batch(
+    replay_buffer: SimpleReplayBuffer,
+    batch_size: int,
+    device: torch.device,
+):
+    if int(getattr(replay_buffer, "n_env", 1)) != 1:
+        raise ValueError("SafetyGym linked preference sampling currently expects a single-env replay buffer.")
+    cap = int(replay_buffer.env_capacities[0])
+    if cap <= 1 or int(replay_buffer.filled[0].item()) <= 0:
+        return None
+    valid_mask = (
+        replay_buffer.transition_ready[0, :cap]
+        & replay_buffer.valid_next_mask[0, :cap]
+        & replay_buffer.teacher_intervened[0, :cap]
+    )
+    valid_indices = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1)
+    if valid_indices.numel() <= 0:
+        return None
+    n = min(int(batch_size), int(valid_indices.numel()))
+    if n <= 0:
+        return None
+    sample_ids = torch.randperm(valid_indices.numel(), device=replay_buffer.storage_device)[:n]
+    idx = valid_indices.index_select(0, sample_ids)
+    obs = replay_buffer._gather_observations(0, idx).to(device=device, dtype=torch.float32, non_blocking=True)
+    teacher = replay_buffer.actions[0, idx].to(device=device, dtype=torch.float32, non_blocking=True)
+    student = replay_buffer.student_actions[0, idx].to(device=device, dtype=torch.float32, non_blocking=True)
+    return {
+        "obs": obs,
+        "teacher_actions": teacher,
+        "student_actions": student,
+    }
+
+
 def _build_transition(
     *,
     obs: np.ndarray,
@@ -351,22 +394,25 @@ def _build_transition(
     done: bool,
     truncated: bool,
     device: torch.device,
+    student_action: np.ndarray | None = None,
+    teacher_intervened: bool | None = None,
 ) -> TensorDict:
-    return TensorDict(
-        {
-            "observations": torch.as_tensor(obs[None, :], device=device, dtype=torch.float32),
-            "actions": torch.as_tensor(action[None, :], device=device, dtype=torch.float32),
-            "next": {
-                "observations": torch.as_tensor(next_obs[None, :], device=device, dtype=torch.float32),
-                "rewards": torch.as_tensor([reward], device=device, dtype=torch.float32),
-                "dones": torch.as_tensor([done], device=device, dtype=torch.bool),
-                "truncations": torch.as_tensor([truncated], device=device, dtype=torch.bool),
-                "effective_n_steps": torch.ones(1, device=device, dtype=torch.float32),
-            },
+    payload: Dict[str, Any] = {
+        "observations": torch.as_tensor(obs[None, :], device=device, dtype=torch.float32),
+        "actions": torch.as_tensor(action[None, :], device=device, dtype=torch.float32),
+        "next": {
+            "observations": torch.as_tensor(next_obs[None, :], device=device, dtype=torch.float32),
+            "rewards": torch.as_tensor([reward], device=device, dtype=torch.float32),
+            "dones": torch.as_tensor([done], device=device, dtype=torch.bool),
+            "truncations": torch.as_tensor([truncated], device=device, dtype=torch.bool),
+            "effective_n_steps": torch.ones(1, device=device, dtype=torch.float32),
         },
-        batch_size=(1,),
-        device=device,
-    )
+    }
+    if student_action is not None:
+        payload["student_actions"] = torch.as_tensor(student_action[None, :], device=device, dtype=torch.float32)
+    if teacher_intervened is not None:
+        payload["teacher_intervened"] = torch.as_tensor([bool(teacher_intervened)], device=device, dtype=torch.bool)
+    return TensorDict(payload, batch_size=(1,), device=device)
 
 
 def _episode_metrics_from_info(
@@ -434,6 +480,7 @@ def _run_demo_prefill(
     novice_rb: Optional[SimpleReplayBuffer],
     human_rb: Optional[SimpleReplayBuffer],
     variant: str,
+    viewer: PygameRGBArrayViewer | None = None,
 ) -> Dict[str, float]:
     if int(getattr(args, "prefill_demo_episodes", 0)) <= 0:
         return {}
@@ -450,12 +497,16 @@ def _run_demo_prefill(
     for ep_idx in range(target_episodes):
         obs, _ = env.reset(seed=args.seed + 10_000 + ep_idx)
         obs = np.asarray(obs, dtype=np.float32).reshape(-1)
+        if viewer is not None:
+            viewer.draw_env(env)
         ep_steps = 0
         while True:
             student_action = _select_prefill_action(policy=prefill_policy, obs=obs, env=env, sac=sac, device=device)
             student_action = clip_action_to_space(student_action, env.action_space)
             next_obs, reward, _cost, terminated, truncated, info = env.step(student_action)
             next_obs = np.asarray(next_obs, dtype=np.float32).reshape(-1)
+            if viewer is not None:
+                viewer.draw_env(env)
 
             ep_steps += 1
             total_steps += 1
@@ -563,6 +614,110 @@ def _run_demo_pretrain(
     return last_update, logs
 
 
+def _maybe_load_sac_checkpoint(
+    *,
+    args,
+    sac: SACTensors,
+    device: torch.device,
+) -> Dict[str, float]:
+    checkpoint_path = str(getattr(args, "init_checkpoint_path", "") or "").strip()
+    if not checkpoint_path:
+        return {}
+
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    loaded_actor = 0.0
+    loaded_critic = 0.0
+    loaded_target = 0.0
+    loaded_alpha = 0.0
+    loaded_optim = 0.0
+
+    if bool(getattr(args, "load_actor_from_checkpoint", True)) and "actor_state_dict" in checkpoint:
+        sac.actor.load_state_dict(checkpoint["actor_state_dict"])
+        loaded_actor = 1.0
+    if bool(getattr(args, "load_critic_from_checkpoint", True)) and "critic_state_dict" in checkpoint:
+        sac.critic.load_state_dict(checkpoint["critic_state_dict"])
+        loaded_critic = 1.0
+    if bool(getattr(args, "load_critic_target_from_checkpoint", True)) and "critic_target_state_dict" in checkpoint:
+        sac.critic_target.load_state_dict(checkpoint["critic_target_state_dict"])
+        loaded_target = 1.0
+    elif loaded_critic > 0.0:
+        sac.critic_target.load_state_dict(sac.critic.state_dict())
+        loaded_target = 1.0
+    if bool(getattr(args, "load_alpha_from_checkpoint", True)) and "log_alpha" in checkpoint:
+        log_alpha = torch.as_tensor(checkpoint["log_alpha"], device=device, dtype=torch.float32).reshape_as(sac.log_alpha)
+        sac.log_alpha.data.copy_(log_alpha)
+        loaded_alpha = 1.0
+
+    if bool(getattr(args, "load_optimizer_state_from_checkpoint", False)):
+        if loaded_actor > 0.0 and "actor_optimizer_state_dict" in checkpoint:
+            sac.actor_optimizer.load_state_dict(checkpoint["actor_optimizer_state_dict"])
+            loaded_optim = 1.0
+        if loaded_critic > 0.0 and "critic_optimizer_state_dict" in checkpoint:
+            sac.critic_optimizer.load_state_dict(checkpoint["critic_optimizer_state_dict"])
+            loaded_optim = 1.0
+        if loaded_alpha > 0.0 and "alpha_optimizer_state_dict" in checkpoint:
+            sac.alpha_optimizer.load_state_dict(checkpoint["alpha_optimizer_state_dict"])
+            loaded_optim = 1.0
+
+    print(f"[Checkpoint] initialized SafetyGym training from {checkpoint_path}", flush=True)
+    return {
+        "train/init_checkpoint_loaded": 1.0,
+        "train/init_checkpoint_loaded_actor": loaded_actor,
+        "train/init_checkpoint_loaded_critic": loaded_critic,
+        "train/init_checkpoint_loaded_critic_target": loaded_target,
+        "train/init_checkpoint_loaded_alpha": loaded_alpha,
+        "train/init_checkpoint_loaded_optimizer_state": loaded_optim,
+    }
+
+
+def _maybe_export_final_buffer_dataset(
+    *,
+    args,
+    buffer,
+    env_name: str,
+    variant: str,
+    reward_mode: str,
+    label_suffix: str,
+    explicit_path: str,
+    enabled: bool,
+    filter_mode: str = "all",
+) -> Dict[str, float]:
+    if buffer is None or not enabled:
+        return {}
+    dataset_path = str(explicit_path or "").strip()
+    if not dataset_path:
+        dataset_root = str(getattr(args, "export_dataset_dir", "") or "").strip() or str(DEFAULT_SAFETYGYM_DATASET_DIR)
+        dataset_path = str(
+            build_dataset_path(
+                env_name=env_name,
+                dataset_dir=dataset_root,
+                label=f"{variant}_{reward_mode}_{label_suffix}",
+            )
+        )
+    metadata = {
+        "env_name": str(env_name),
+        "variant": str(variant),
+        "reward_mode": str(reward_mode),
+        "source_buffer": str(label_suffix),
+        "filter_mode": str(filter_mode),
+        "total_timesteps": int(getattr(args, "total_timesteps", 0)),
+        "init_checkpoint_path": str(getattr(args, "init_checkpoint_path", "") or ""),
+    }
+    stats = save_buffer_as_transition_dataset(
+        buffer=buffer,
+        path=dataset_path,
+        metadata=metadata,
+        max_rows=int(getattr(args, "export_dataset_max_rows", 0)),
+        filter_mode=filter_mode,
+    )
+    print(f"[Dataset] exported {stats['rows_saved']} rows from {label_suffix} buffer to {stats['path']}", flush=True)
+    metric_prefix = f"train/export_{label_suffix}"
+    return {
+        f"{metric_prefix}_rows": float(stats["rows_saved"]),
+        f"{metric_prefix}_saved": 1.0,
+    }
+
+
 def _run_eval(actor, args, device: torch.device, eval_seed: int) -> Dict[str, float]:
     env = _make_env_with_wrappers(args=args, seed=eval_seed, with_intervention=False, controller=None)
     max_steps = extract_step_limit(env)
@@ -641,20 +796,33 @@ def run_training(args, *, variant: str) -> None:
     run_paths = _prepare_run_dirs(args, variant_tag=variant)
     log_path = run_paths.log_dir / "training.log"
     wandb_run = _maybe_init_wandb(args, variant=variant, run_paths=run_paths)
+    viewer = build_external_viewer(
+        render_mode=getattr(args, "render_mode", "human"),
+        title=f"SafetyGym {args.env_name}",
+        draw_hz=float(getattr(args, "viewer_fps", 20.0)),
+        scale=float(getattr(args, "viewer_scale", 1.0)),
+    ) if wants_external_viewer(getattr(args, "render_mode", "human")) else None
 
     controller = None
     with_intervention = bool(args.use_intervention)
-    control_scheme = infer_control_scheme(args.env_name)
     if with_intervention:
-        controller = PygameKeyboardController(
+        controller = build_human_controller(
+            input_device=str(getattr(args, "human_input_device", "keyboard")),
             action_dim=2,
-            config=KeyboardConfig(
-                action_scale=args.human_action_scale,
-                control_scheme=control_scheme,
-                overlay_fps_limit=int(getattr(args, "controller_fps_limit", 0)),
-                overlay_draw_hz=float(getattr(args, "controller_overlay_hz", 20.0)),
-                wheel_command_limit=float(getattr(args, "car_wheel_command_limit", 2.0)),
-            ),
+            env_name=args.env_name,
+            action_scale=float(args.human_action_scale),
+            wheel_command_limit=float(getattr(args, "car_wheel_command_limit", 2.0)),
+            overlay_fps_limit=int(getattr(args, "controller_fps_limit", 0)),
+            overlay_draw_hz=float(getattr(args, "controller_overlay_hz", 20.0)),
+            gamepad_mode=str(getattr(args, "gamepad_mode", "local")),
+            gamepad_host=str(getattr(args, "gamepad_host", "")),
+            gamepad_port=int(getattr(args, "gamepad_port", 0) or DEFAULT_SAFETY_GAMEPAD_PORT),
+            gamepad_cache_path=getattr(args, "gamepad_cache_path", DEFAULT_SAFETY_GAMEPAD_CACHE_PATH),
+            gamepad_reconnect_seconds=float(getattr(args, "gamepad_reconnect_seconds", 2.0)),
+            gamepad_config_path=getattr(args, "gamepad_config_path", DEFAULT_SAFETY_GAMEPAD_CONFIG_PATH),
+            gamepad_use_saved_config=bool(getattr(args, "gamepad_use_saved_config", True)),
+            gamepad_device_index=int(getattr(args, "gamepad_device_index", 0)),
+            prefer_separate_keyboard_window=wants_external_viewer(getattr(args, "render_mode", "human")),
         )
 
     env = _make_env_with_wrappers(
@@ -666,25 +834,37 @@ def run_training(args, *, variant: str) -> None:
 
     obs, _ = env.reset(seed=args.seed)
     obs = np.asarray(obs, dtype=np.float32).reshape(-1)
+    if viewer is not None:
+        viewer.draw_env(env)
     obs_dim = int(obs.shape[0])
     act_dim = int(np.prod(env.action_space.shape))
 
     if with_intervention and controller is not None and controller.action_dim != act_dim:
         controller.close()
-        controller = PygameKeyboardController(
+        controller = build_human_controller(
+            input_device=str(getattr(args, "human_input_device", "keyboard")),
             action_dim=act_dim,
-            config=KeyboardConfig(
-                action_scale=args.human_action_scale,
-                control_scheme=control_scheme,
-                overlay_fps_limit=int(getattr(args, "controller_fps_limit", 0)),
-                overlay_draw_hz=float(getattr(args, "controller_overlay_hz", 20.0)),
-                wheel_command_limit=float(getattr(args, "car_wheel_command_limit", 2.0)),
-            ),
+            env_name=args.env_name,
+            action_scale=float(args.human_action_scale),
+            wheel_command_limit=float(getattr(args, "car_wheel_command_limit", 2.0)),
+            overlay_fps_limit=int(getattr(args, "controller_fps_limit", 0)),
+            overlay_draw_hz=float(getattr(args, "controller_overlay_hz", 20.0)),
+            gamepad_mode=str(getattr(args, "gamepad_mode", "local")),
+            gamepad_host=str(getattr(args, "gamepad_host", "")),
+            gamepad_port=int(getattr(args, "gamepad_port", 0) or DEFAULT_SAFETY_GAMEPAD_PORT),
+            gamepad_cache_path=getattr(args, "gamepad_cache_path", DEFAULT_SAFETY_GAMEPAD_CACHE_PATH),
+            gamepad_reconnect_seconds=float(getattr(args, "gamepad_reconnect_seconds", 2.0)),
+            gamepad_config_path=getattr(args, "gamepad_config_path", DEFAULT_SAFETY_GAMEPAD_CONFIG_PATH),
+            gamepad_use_saved_config=bool(getattr(args, "gamepad_use_saved_config", True)),
+            gamepad_device_index=int(getattr(args, "gamepad_device_index", 0)),
+            prefer_separate_keyboard_window=wants_external_viewer(getattr(args, "render_mode", "human")),
         )
         env.close()
         env = _make_env_with_wrappers(args=args, seed=args.seed, with_intervention=True, controller=controller)
         obs, _ = env.reset(seed=args.seed)
         obs = np.asarray(obs, dtype=np.float32).reshape(-1)
+        if viewer is not None:
+            viewer.draw_env(env)
 
     max_steps = extract_step_limit(env)
 
@@ -693,6 +873,9 @@ def run_training(args, *, variant: str) -> None:
         act_dim=act_dim,
         hidden_actor=args.actor_hidden_dim,
         hidden_critic=args.critic_hidden_dim,
+        num_critics=int(getattr(args, "num_critics", 2)),
+        use_layer_norm=bool(getattr(args, "use_layer_norm", False)),
+        layer_norm_eps=float(getattr(args, "layer_norm_eps", 1e-5)),
         init_scale=args.init_scale,
         lr_actor=args.actor_learning_rate,
         lr_critic=args.critic_learning_rate,
@@ -702,6 +885,9 @@ def run_training(args, *, variant: str) -> None:
     )
     sac.pref_lambda = float(getattr(args, "pref_lambda_init", 0.0))
     sac.pref_violation_ema = 0.0
+    init_logs = _maybe_load_sac_checkpoint(args=args, sac=sac, device=device)
+    if init_logs:
+        _emit_metrics(payload=init_logs, log_path=log_path, wandb_run=wandb_run, step=0)
 
     main_rb = SimpleReplayBuffer(
         n_env=1,
@@ -747,7 +933,17 @@ def run_training(args, *, variant: str) -> None:
             device=device,
             pixel_shape=None,
         )
-    if variant == "hilserl" or int(getattr(args, "prefill_demo_episodes", 0)) > 0 or int(getattr(args, "demo_pretrain_updates", 0)) > 0:
+    dataset_target = str(getattr(args, "demo_dataset_target", "variant")).strip().lower()
+    dataset_requested = bool(str(getattr(args, "demo_dataset_path", "") or "").strip()) or bool(
+        getattr(args, "demo_dataset_auto_load", False)
+    )
+    if (
+        variant == "hilserl"
+        or bool(getattr(args, "store_intervened_in_demo_buffer", False))
+        or int(getattr(args, "prefill_demo_episodes", 0)) > 0
+        or int(getattr(args, "demo_pretrain_updates", 0)) > 0
+        or (dataset_requested and dataset_target in {"demo", "variant"})
+    ):
         demo_rb = SimpleReplayBuffer(
             n_env=1,
             buffer_size=args.buffer_size,
@@ -764,6 +960,105 @@ def run_training(args, *, variant: str) -> None:
 
     pref_pairs: list[Dict[str, np.ndarray]] = []
     pref_capacity = int(max(0, getattr(args, "pref_capacity", 0)))
+    pref_sampling_mode = str(getattr(args, "pref_sampling_mode", "linked")).strip().lower()
+
+    demo_dataset_path = str(getattr(args, "demo_dataset_path", "") or "").strip()
+    if not demo_dataset_path and bool(getattr(args, "demo_dataset_auto_load", False)):
+        dataset_root = str(getattr(args, "demo_dataset_dir", "") or "").strip() or str(DEFAULT_SAFETYGYM_DATASET_DIR)
+        found = find_latest_transition_dataset(env_name=args.env_name, dataset_dir=dataset_root)
+        if found is not None:
+            demo_dataset_path = str(found)
+            print(f"[Dataset] auto-selected SafetyGym dataset {demo_dataset_path}", flush=True)
+    if demo_dataset_path:
+        max_rows = int(getattr(args, "demo_dataset_max_rows", 0))
+        if dataset_target == "replay":
+            stats = extend_buffer_from_dataset(
+                buffer=main_rb,
+                dataset_path=demo_dataset_path,
+                device=device,
+                max_rows=max_rows,
+                expected_obs_dim=obs_dim,
+                expected_act_dim=act_dim,
+            )
+            print(f"[Dataset] loaded {stats['rows_loaded']} rows into replay buffer", flush=True)
+        elif dataset_target == "demo":
+            if demo_rb is None:
+                raise ValueError("--demo_dataset_target demo requires a demo buffer.")
+            stats = extend_buffer_from_dataset(
+                buffer=demo_rb,
+                dataset_path=demo_dataset_path,
+                device=device,
+                max_rows=max_rows,
+                expected_obs_dim=obs_dim,
+                expected_act_dim=act_dim,
+            )
+            print(f"[Dataset] loaded {stats['rows_loaded']} rows into demo buffer", flush=True)
+        else:
+            variant_data = load_transition_dataset(demo_dataset_path)
+            stats_main = extend_buffer_from_dataset(
+                buffer=main_rb,
+                dataset_path=demo_dataset_path,
+                device=device,
+                max_rows=max_rows,
+                expected_obs_dim=obs_dim,
+                expected_act_dim=act_dim,
+            )
+            print(f"[Dataset] loaded {stats_main['rows_loaded']} rows into replay buffer", flush=True)
+            if variant == "hilserl":
+                if demo_rb is None:
+                    raise ValueError("variant dataset load for hilserl requires a demo buffer.")
+                stats_demo = extend_buffer_from_dataset(
+                    buffer=demo_rb,
+                    dataset_path=demo_dataset_path,
+                    device=device,
+                    max_rows=max_rows,
+                    expected_obs_dim=obs_dim,
+                    expected_act_dim=act_dim,
+                    filter_mode="intervened",
+                )
+                print(f"[Dataset] loaded {stats_demo['rows_loaded']} intervened rows into demo buffer", flush=True)
+            elif variant == "pvp":
+                if human_rb is None or novice_rb is None:
+                    raise ValueError("variant dataset load for pvp requires human_rb and novice_rb.")
+                stats_h = extend_buffer_from_dataset(
+                    buffer=human_rb,
+                    dataset_path=demo_dataset_path,
+                    device=device,
+                    max_rows=max_rows,
+                    expected_obs_dim=obs_dim,
+                    expected_act_dim=act_dim,
+                    filter_mode="intervened",
+                )
+                stats_n = extend_buffer_from_dataset(
+                    buffer=novice_rb,
+                    dataset_path=demo_dataset_path,
+                    device=device,
+                    max_rows=max_rows,
+                    expected_obs_dim=obs_dim,
+                    expected_act_dim=act_dim,
+                    filter_mode="non_intervened",
+                )
+                print(
+                    f"[Dataset] loaded {stats_h['rows_loaded']} intervened rows into human_rb "
+                    f"and {stats_n['rows_loaded']} non-intervened rows into novice_rb",
+                    flush=True,
+                )
+            elif variant == "own" and pref_capacity > 0 and pref_sampling_mode != "linked":
+                teacher_intervened = np.asarray(variant_data["teacher_intervened"], dtype=np.bool_)
+                teacher_actions = np.asarray(variant_data["actions"], dtype=np.float32)
+                student_actions = np.asarray(variant_data["student_actions"], dtype=np.float32)
+                observations = np.asarray(variant_data["observations"], dtype=np.float32)
+                for idx in np.nonzero(teacher_intervened)[0].tolist():
+                    pref_pairs.append(
+                        {
+                            "obs": observations[idx].copy(),
+                            "teacher_actions": clip_action_to_space(teacher_actions[idx], env.action_space),
+                            "student_actions": clip_action_to_space(student_actions[idx], env.action_space),
+                        }
+                    )
+                if len(pref_pairs) > pref_capacity:
+                    pref_pairs = pref_pairs[-pref_capacity:]
+                print(f"[Dataset] loaded {len(pref_pairs)} preference pairs from intervened dataset rows", flush=True)
 
     train_win = EpisodeWindow(size=200)
 
@@ -777,6 +1072,7 @@ def run_training(args, *, variant: str) -> None:
         novice_rb=novice_rb,
         human_rb=human_rb,
         variant=variant,
+        viewer=viewer,
     )
     if prefill_logs:
         _emit_metrics(payload=prefill_logs, log_path=log_path, wandb_run=wandb_run, step=0)
@@ -795,6 +1091,9 @@ def run_training(args, *, variant: str) -> None:
             obs_dim=obs_dim,
             act_dim=act_dim,
             hidden_critic=int(args.critic_hidden_dim),
+            num_critics=int(getattr(args, "num_critics", 2)),
+            use_layer_norm=bool(getattr(args, "use_layer_norm", False)),
+            layer_norm_eps=float(getattr(args, "layer_norm_eps", 1e-5)),
             lr_critic=float(args.critic_learning_rate),
             weight_decay=float(args.weight_decay),
             device=device,
@@ -815,6 +1114,8 @@ def run_training(args, *, variant: str) -> None:
 
     obs, _ = env.reset(seed=args.seed)
     obs = np.asarray(obs, dtype=np.float32).reshape(-1)
+    if viewer is not None:
+        viewer.draw_env(env)
     prefill_steps_completed = int(prefill_logs.get("train/prefill_steps", 0.0)) if prefill_logs else 0
     effective_learning_starts = max(0, int(args.learning_starts) - prefill_steps_completed)
 
@@ -829,6 +1130,7 @@ def run_training(args, *, variant: str) -> None:
     start_time = time.time()
     live_window_steps = 0
     live_window_intervention_steps = 0
+    total_interventions = 0
     live_window_controller_ms = 0.0
     live_window_oversight_required_steps = 0
     live_window_uncertainty_all: list[float] = []
@@ -850,6 +1152,8 @@ def run_training(args, *, variant: str) -> None:
     uncertainty_enabled = bool(getattr(args, "uncertainty_log_every_step", True)) or oversight_enabled
     timing_enabled = bool(getattr(args, "profile_timing", False))
     timing_window = TimingWindow()
+    env_fps_limit = float(max(0.0, getattr(args, "env_fps_limit", 0.0)))
+    env_step_period = (1.0 / env_fps_limit) if env_fps_limit > 0.0 else 0.0
 
     for step in range(1, int(args.total_timesteps) + 1):
         step_t0 = time.perf_counter()
@@ -874,6 +1178,8 @@ def run_training(args, *, variant: str) -> None:
         t0 = time.perf_counter()
         next_obs, reward, cost, terminated, truncated, info = env.step(student_action)
         next_obs = np.asarray(next_obs, dtype=np.float32).reshape(-1)
+        if viewer is not None:
+            viewer.draw_env(env)
         t_env += time.perf_counter() - t0
 
         t0 = time.perf_counter()
@@ -882,6 +1188,7 @@ def run_training(args, *, variant: str) -> None:
         live_window_controller_ms += float(info.get("teacher_controller_ms", 0.0))
         if teacher_intervened:
             live_window_intervention_steps += 1
+            total_interventions += 1
         applied_action = np.asarray(info.get("teacher_action", student_action), dtype=np.float32)
         applied_action = clip_action_to_space(applied_action, env.action_space)
 
@@ -893,6 +1200,8 @@ def run_training(args, *, variant: str) -> None:
             done=bool(terminated or truncated),
             truncated=bool(truncated),
             device=device,
+            student_action=student_action,
+            teacher_intervened=teacher_intervened,
         )
 
         main_rb.extend(transition)
@@ -901,10 +1210,12 @@ def run_training(args, *, variant: str) -> None:
                 human_rb.extend(transition)
             elif novice_rb is not None:
                 novice_rb.extend(transition)
-        if teacher_intervened and demo_rb is not None:
+        if teacher_intervened and demo_rb is not None and (
+            variant == "hilserl" or bool(getattr(args, "store_intervened_in_demo_buffer", False))
+        ):
             demo_rb.extend(transition)
 
-        if teacher_intervened and pref_capacity > 0 and variant == "own":
+        if teacher_intervened and pref_capacity > 0 and variant == "own" and pref_sampling_mode != "linked":
             teacher_action = np.asarray(info.get("teacher_action", applied_action), dtype=np.float32)
             student_logged = np.asarray(info.get("student_action", student_action), dtype=np.float32)
             pref_pairs.append(
@@ -986,8 +1297,14 @@ def run_training(args, *, variant: str) -> None:
                         batch = TensorDict.cat([batch_n, batch_h], dim=0)
                     else:
                         batch = novice_rb.sample(int(args.batch_size))
-                elif variant == "hilserl" and demo_rb is not None and demo_rb.size > 0 and float(args.demo_sample_ratio) > 0.0:
-                    demo_n = int(max(1, args.batch_size * float(args.demo_sample_ratio)))
+                elif (
+                    variant in {"hilserl", "own"}
+                    and demo_rb is not None
+                    and demo_rb.size > 0
+                    and float(getattr(args, "demo_sample_ratio", 0.0)) > 0.0
+                ):
+                    demo_ratio = float(getattr(args, "demo_sample_ratio", 0.0))
+                    demo_n = int(max(1, args.batch_size * demo_ratio))
                     base_n = max(1, int(args.batch_size - demo_n))
                     if main_rb.size >= base_n and demo_rb.size >= demo_n:
                         batch_main = main_rb.sample(base_n)
@@ -999,7 +1316,14 @@ def run_training(args, *, variant: str) -> None:
                     batch = main_rb.sample(int(args.batch_size))
 
                 pref_batch = None
-                if variant == "own" and float(args.pref_sample_ratio) > 0.0 and pref_pairs:
+                if (
+                    variant == "own"
+                    and float(args.pref_sample_ratio) > 0.0
+                    and pref_sampling_mode == "linked"
+                ):
+                    pref_n = max(1, int(args.batch_size * float(args.pref_sample_ratio)))
+                    pref_batch = _sample_linked_pref_batch(main_rb, pref_n, device)
+                elif variant == "own" and float(args.pref_sample_ratio) > 0.0 and pref_pairs:
                     pref_n = max(1, int(args.batch_size * float(args.pref_sample_ratio)))
                     pref_batch = _sample_pref_batch(pref_pairs, pref_n, device)
 
@@ -1040,6 +1364,8 @@ def run_training(args, *, variant: str) -> None:
 
             obs, _ = env.reset(seed=args.seed + step)
             obs = np.asarray(obs, dtype=np.float32).reshape(-1)
+            if viewer is not None:
+                viewer.draw_env(env)
             ep_ret = 0.0
             ep_cost = 0.0
             ep_len = 0
@@ -1047,6 +1373,11 @@ def run_training(args, *, variant: str) -> None:
             ep_uncertainty_values = []
             prev_teacher_intervened = False
             t_episode_end += time.perf_counter() - t0
+
+        if env_step_period > 0.0:
+            remaining = env_step_period - (time.perf_counter() - step_t0)
+            if remaining > 0.0:
+                time.sleep(remaining)
 
         step_total = time.perf_counter() - step_t0
         known = t_action + t_env + t_data + t_update + t_uncertainty + t_episode_end
@@ -1076,6 +1407,7 @@ def run_training(args, *, variant: str) -> None:
                 "train/live_window_steps": float(live_window_steps),
                 "train/live_intervention_steps": float(live_window_intervention_steps),
                 "train/live_intervention_fraction": float(live_window_intervention_steps / max(1, live_window_steps)),
+                "train/total_interventions": float(total_interventions),
                 "train/live_controller_ms_per_step": float(live_window_controller_ms / max(1, live_window_steps)),
             }
             # Always emit buffer state for consistent dashboards across variants.
@@ -1095,8 +1427,15 @@ def run_training(args, *, variant: str) -> None:
             logs["train/buffer_human_capacity"] = float(
                 getattr(human_rb, "capacity", getattr(args, "buffer_size", 0)) if human_rb is not None else 0
             )
-            logs["train/buffer_pref_size"] = float(len(pref_pairs))
-            logs["train/buffer_pref_capacity"] = float(pref_capacity)
+            if variant == "own" and pref_sampling_mode == "linked":
+                logs["train/buffer_pref_size"] = float(main_rb.linked_pref_pair_count())
+                logs["train/buffer_pref_capacity"] = float(
+                    getattr(main_rb, "capacity", getattr(args, "buffer_size", 0))
+                )
+            else:
+                logs["train/buffer_pref_size"] = float(len(pref_pairs))
+                logs["train/buffer_pref_capacity"] = float(pref_capacity)
+            logs["train/pref_sampling_mode_linked"] = 1.0 if pref_sampling_mode == "linked" else 0.0
             if uncertainty_enabled:
                 logs.update(_summary_stats(live_window_uncertainty_all, "train/uncertainty_all"))
                 logs.update(_summary_stats(live_window_uncertainty_intervention, "train/uncertainty_intervention"))
@@ -1204,8 +1543,13 @@ def run_training(args, *, variant: str) -> None:
                     "actor_state_dict": sac.actor.state_dict(),
                     "critic_state_dict": sac.critic.state_dict(),
                     "critic_target_state_dict": sac.critic_target.state_dict(),
+                    "actor_optimizer_state_dict": sac.actor_optimizer.state_dict(),
+                    "critic_optimizer_state_dict": sac.critic_optimizer.state_dict(),
+                    "alpha_optimizer_state_dict": sac.alpha_optimizer.state_dict(),
                     "log_alpha": sac.log_alpha.detach().cpu(),
                     "args": vars(args),
+                    "global_step": int(step),
+                    "variant": str(variant),
                 },
                 ckpt_path,
             )
@@ -1216,14 +1560,55 @@ def run_training(args, *, variant: str) -> None:
             "actor_state_dict": sac.actor.state_dict(),
             "critic_state_dict": sac.critic.state_dict(),
             "critic_target_state_dict": sac.critic_target.state_dict(),
+            "actor_optimizer_state_dict": sac.actor_optimizer.state_dict(),
+            "critic_optimizer_state_dict": sac.critic_optimizer.state_dict(),
+            "alpha_optimizer_state_dict": sac.alpha_optimizer.state_dict(),
             "log_alpha": sac.log_alpha.detach().cpu(),
             "args": vars(args),
+            "global_step": int(args.total_timesteps),
+            "variant": str(variant),
         },
         final_ckpt,
     )
+    final_export_logs: Dict[str, float] = {}
+    final_export_logs.update(
+        _maybe_export_final_buffer_dataset(
+            args=args,
+            buffer=main_rb,
+            env_name=args.env_name,
+            variant=variant,
+            reward_mode=args.reward_mode,
+            label_suffix="replay",
+            explicit_path=str(getattr(args, "export_final_replay_dataset_path", "") or ""),
+            enabled=bool(getattr(args, "export_final_replay_dataset", False)),
+            filter_mode="all",
+        )
+    )
+    final_export_logs.update(
+        _maybe_export_final_buffer_dataset(
+            args=args,
+            buffer=demo_rb,
+            env_name=args.env_name,
+            variant=variant,
+            reward_mode=args.reward_mode,
+            label_suffix="demo",
+            explicit_path=str(getattr(args, "export_final_demo_dataset_path", "") or ""),
+            enabled=bool(getattr(args, "export_final_demo_dataset", False)),
+            filter_mode="all",
+        )
+    )
+    if final_export_logs:
+        _emit_metrics(
+            payload=final_export_logs,
+            log_path=log_path,
+            wandb_run=wandb_run,
+            step=int(args.total_timesteps),
+        )
 
     env.close()
     if controller is not None:
         controller.close()
+    if viewer is not None:
+        viewer.close()
     if wandb_run is not None:
         wandb_run.finish()

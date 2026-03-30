@@ -133,6 +133,8 @@ class RewardModeWrapper(gym.Wrapper):
     ):
         super().__init__(env)
         mode = str(reward_mode).lower()
+        if mode == "dual":
+            mode = "dense_plus_sparse"
         if mode not in {"sparse", "dense", "dense_plus_sparse", "none"}:
             raise ValueError(f"Unsupported reward_mode: {reward_mode}")
         self.reward_mode = mode
@@ -151,24 +153,38 @@ class RewardModeWrapper(gym.Wrapper):
 
         goal_met = bool(info.get("goal_met", False))
         cur_dist = extract_goal_distance(self.env)
+        prev_dist = self._prev_goal_distance
         rew = 0.0
+        dense_component = 0.0
+        sparse_component = 0.0
+        dense_goal_resample_skip = False
 
         if self.reward_mode == "sparse":
-            rew = 1.0 if goal_met else 0.0
+            sparse_component = 1.0 if goal_met else 0.0
+            rew = sparse_component
         elif self.reward_mode == "dense":
-            prev = self._prev_goal_distance
-            if np.isfinite(prev) and np.isfinite(cur_dist):
-                rew = self.dense_reward_scale * float(prev - cur_dist)
+            if goal_met:
+                dense_goal_resample_skip = True
+                dense_component = 0.0
+                rew = 0.0
+            elif np.isfinite(prev_dist) and np.isfinite(cur_dist):
+                dense_component = self.dense_reward_scale * float(prev_dist - cur_dist)
+                rew = dense_component
             else:
                 rew = 0.0
         elif self.reward_mode == "dense_plus_sparse":
-            prev = self._prev_goal_distance
-            if np.isfinite(prev) and np.isfinite(cur_dist):
-                rew = self.dense_reward_scale * float(prev - cur_dist)
+            if goal_met:
+                dense_goal_resample_skip = True
+                dense_component = 0.0
+                rew = 0.0
+            elif np.isfinite(prev_dist) and np.isfinite(cur_dist):
+                dense_component = self.dense_reward_scale * float(prev_dist - cur_dist)
+                rew = dense_component
             else:
                 rew = 0.0
             if goal_met:
-                rew += 1.0
+                sparse_component = 1.0
+                rew += sparse_component
         elif self.reward_mode == "none":
             rew = 0.0
 
@@ -177,6 +193,16 @@ class RewardModeWrapper(gym.Wrapper):
         info["reward_mode"] = self.reward_mode
         info["reward_raw_env"] = float(env_reward)
         info["reward_shaped"] = float(rew)
+        info["reward_dense_component"] = float(dense_component)
+        info["reward_sparse_component"] = float(sparse_component)
+        info["reward_step_penalty_component"] = float(self.step_penalty)
+        info["reward_dense_goal_resample_skip"] = 1.0 if dense_goal_resample_skip else 0.0
+        if np.isfinite(prev_dist):
+            info["goal_distance_prev"] = float(prev_dist)
+        if np.isfinite(cur_dist) and np.isfinite(prev_dist):
+            raw_delta = float(cur_dist - prev_dist)
+            info["goal_distance_delta_raw"] = raw_delta
+            info["goal_distance_delta"] = 0.0 if dense_goal_resample_skip else raw_delta
         if np.isfinite(cur_dist):
             info["goal_distance"] = float(cur_dist)
 

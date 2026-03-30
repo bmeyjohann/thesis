@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 
 from safetygym_utils.train import run_training
 
@@ -26,16 +27,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--actor_learning_rate", type=float, default=3e-4)
     p.add_argument("--critic_learning_rate", type=float, default=3e-4)
     p.add_argument("--weight_decay", type=float, default=0.0)
-    p.add_argument("--actor_hidden_dim", type=int, default=512)
-    p.add_argument("--critic_hidden_dim", type=int, default=1024)
+    p.add_argument("--actor_hidden_dim", type=int, default=256)
+    p.add_argument("--critic_hidden_dim", type=int, default=512)
+    p.add_argument("--num_critics", type=int, default=2)
+    p.add_argument("--use_layer_norm", action="store_true", default=False)
+    p.add_argument("--layer_norm_eps", type=float, default=1e-5)
     p.add_argument("--init_scale", type=float, default=0.01)
     p.add_argument("--max_grad_norm", type=float, default=10.0)
 
-    p.add_argument("--reward_mode", type=str, default="sparse", choices=["sparse", "dense", "none"])
+    p.add_argument("--reward_mode", type=str, default="sparse", choices=["sparse", "dense", "dense_plus_sparse", "dual", "none"])
     p.add_argument("--dense_reward_scale", type=float, default=1.0)
     p.add_argument("--step_penalty", type=float, default=0.0)
 
-    p.add_argument("--render_mode", type=str, default="human", choices=["human", "rgb_array", "none"])
+    p.add_argument("--render_mode", type=str, default="human", choices=["human", "rgb_array", "none", "pygame", "topdown"])
+    p.add_argument("--viewer_fps", type=float, default=20.0)
+    p.add_argument("--viewer_scale", type=float, default=1.0)
+    p.add_argument("--env_fps_limit", type=float, default=0.0)
     p.add_argument("--surface_mode", type=str, default="default", choices=["default", "grippy"])
     p.add_argument("--car_wheel_command_limit", type=float, default=2.0)
     p.add_argument("--car_force_scale", type=float, default=2.0)
@@ -44,13 +51,29 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--intervention_threshold", type=float, default=0.1)
     p.add_argument("--intervention_hold_seconds", type=float, default=0.25)
     p.add_argument("--human_action_scale", type=float, default=1.0)
+    p.add_argument("--human_input_device", type=str, default="keyboard", choices=["keyboard", "gamepad"])
     p.add_argument("--controller_fps_limit", type=int, default=0)
     p.add_argument("--controller_overlay_hz", type=float, default=20.0)
+    p.add_argument("--gamepad_mode", type=str, default="local", choices=["local", "connect"])
+    p.add_argument("--gamepad_host", type=str, default="")
+    p.add_argument("--gamepad_port", type=int, default=0)
+    p.add_argument("--gamepad_cache_path", type=str, default=str(Path.home() / ".config" / "thesis" / "safetygym_gamepad" / "last_endpoint.json"))
+    p.add_argument("--gamepad_reconnect_seconds", type=float, default=2.0)
+    p.add_argument("--gamepad_config_path", type=str, default=str(Path.home() / ".config" / "thesis" / "safetygym_gamepad" / "mapping_profile.json"))
+    p.add_argument("--gamepad_use_saved_config", action="store_true", default=True)
+    p.add_argument("--no_gamepad_use_saved_config", dest="gamepad_use_saved_config", action="store_false")
+    p.add_argument("--gamepad_device_index", type=int, default=0)
 
     p.add_argument("--demo_sample_ratio", type=float, default=0.5)
     p.add_argument("--prefill_demo_episodes", type=int, default=0)
     p.add_argument("--prefill_max_steps_per_episode", type=int, default=0)
     p.add_argument("--prefill_policy", type=str, default="student", choices=["student", "random", "zero"])
+    p.add_argument("--store_intervened_in_demo_buffer", action="store_true", default=False)
+    p.add_argument("--demo_dataset_path", type=str, default="")
+    p.add_argument("--demo_dataset_dir", type=str, default="")
+    p.add_argument("--demo_dataset_auto_load", action="store_true", default=False)
+    p.add_argument("--demo_dataset_target", type=str, default="variant", choices=["variant", "replay", "demo"])
+    p.add_argument("--demo_dataset_max_rows", type=int, default=0)
     p.add_argument("--pref_loss_type", type=str, default="margin", choices=["margin", "bradley_terry", "lagrangian"])
     p.add_argument("--pref_lambda_init", type=float, default=1.0)
     p.add_argument("--pref_lambda_lr", type=float, default=1e-3)
@@ -63,6 +86,26 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--demo_pretrain_updates", type=int, default=0)
     p.add_argument("--demo_pretrain_batch_size", type=int, default=0)
     p.add_argument("--critic_reset_after_pretrain", action="store_true", default=False)
+    p.add_argument("--init_checkpoint_path", type=str, default="")
+    p.add_argument("--load_actor_from_checkpoint", action="store_true", default=True)
+    p.add_argument("--no_load_actor_from_checkpoint", dest="load_actor_from_checkpoint", action="store_false")
+    p.add_argument("--load_critic_from_checkpoint", action="store_true", default=True)
+    p.add_argument("--no_load_critic_from_checkpoint", dest="load_critic_from_checkpoint", action="store_false")
+    p.add_argument("--load_critic_target_from_checkpoint", action="store_true", default=True)
+    p.add_argument(
+        "--no_load_critic_target_from_checkpoint",
+        dest="load_critic_target_from_checkpoint",
+        action="store_false",
+    )
+    p.add_argument("--load_alpha_from_checkpoint", action="store_true", default=True)
+    p.add_argument("--no_load_alpha_from_checkpoint", dest="load_alpha_from_checkpoint", action="store_false")
+    p.add_argument("--load_optimizer_state_from_checkpoint", action="store_true", default=False)
+    p.add_argument("--export_dataset_dir", type=str, default="")
+    p.add_argument("--export_dataset_max_rows", type=int, default=0)
+    p.add_argument("--export_final_replay_dataset", action="store_true", default=False)
+    p.add_argument("--export_final_replay_dataset_path", type=str, default="")
+    p.add_argument("--export_final_demo_dataset", action="store_true", default=False)
+    p.add_argument("--export_final_demo_dataset_path", type=str, default="")
     p.add_argument("--uncertainty_log_every_step", dest="uncertainty_log_every_step", action="store_true")
     p.add_argument("--no_uncertainty_log_every_step", dest="uncertainty_log_every_step", action="store_false")
     p.add_argument("--uncertainty_pre_intervention_window", type=int, default=25)

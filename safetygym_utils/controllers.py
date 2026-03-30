@@ -4,8 +4,23 @@ import os
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
 
 import numpy as np
+
+from .gamepad import (
+    DEFAULT_SAFETY_GAMEPAD_CACHE_PATH,
+    DEFAULT_SAFETY_GAMEPAD_CONFIG_PATH,
+    DEFAULT_SAFETY_GAMEPAD_PORT,
+    GamepadMappingConfig,
+    GamepadStateClient,
+    PygameGamepadController,
+    RemoteGamepadController,
+    apply_gamepad_mapping_profile,
+    infer_control_scheme,
+    resolve_cached_gamepad_endpoint,
+)
 
 
 @dataclass
@@ -18,14 +33,7 @@ class KeyboardConfig:
     overlay_fps_limit: int = 0
     overlay_draw_hz: float = 20.0
     wheel_command_limit: float = 2.0
-
-
-def infer_control_scheme(env_name: str) -> str:
-    name = str(env_name).lower()
-    if "car" in name:
-        return "differential_wheels"
-    return "planar_velocity"
-
+    show_overlay: bool = True
 
 class PygameKeyboardController:
     """Focused keyboard control window for continuous actions."""
@@ -131,7 +139,7 @@ class PygameKeyboardController:
         return np.clip(a, -1.0, 1.0).astype(np.float32, copy=False)
 
     def _draw_overlay(self, action: np.ndarray) -> None:
-        if not self._initialized:
+        if not self._initialized or not bool(self.config.show_overlay):
             return
         draw_hz = float(self.config.overlay_draw_hz)
         now = time.perf_counter()
@@ -189,3 +197,299 @@ class PygameKeyboardController:
         self._screen = None
         self._font = None
         self._clock = None
+
+
+class TkKeyboardController:
+    """Independent keyboard control window that does not use pygame.display."""
+
+    def __init__(self, action_dim: int, config: KeyboardConfig | None = None):
+        self.action_dim = int(action_dim)
+        self.config = config or KeyboardConfig()
+        self._keys_down: set[str] = set()
+        self._warned_no_display = False
+        self._initialized = False
+        self._closed = False
+        self._last_overlay_draw_ts = 0.0
+        self._tk = None
+        self._root = None
+        self._label: Optional[object] = None
+
+    @staticmethod
+    def _mix_differential_wheels(throttle: float, turn: float) -> tuple[float, float]:
+        left_wheel = float(throttle - turn)
+        right_wheel = float(throttle + turn)
+        return left_wheel, right_wheel
+
+    @staticmethod
+    def _has_graphical_display() -> bool:
+        if os.name == "nt":
+            return True
+        if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+            return True
+        return False
+
+    def _normalized_key(self, key: str) -> str:
+        key_l = str(key).strip().lower()
+        aliases = {
+            "left": "left",
+            "right": "right",
+            "up": "up",
+            "down": "down",
+            "a": "a",
+            "d": "d",
+            "w": "w",
+            "s": "s",
+            "q": "q",
+            "e": "e",
+            "r": "r",
+            "f": "f",
+            "t": "t",
+            "g": "g",
+        }
+        return aliases.get(key_l, key_l)
+
+    def _on_press(self, event) -> None:
+        key = self._normalized_key(getattr(event, "keysym", ""))
+        if key:
+            self._keys_down.add(key)
+
+    def _on_release(self, event) -> None:
+        key = self._normalized_key(getattr(event, "keysym", ""))
+        if key:
+            self._keys_down.discard(key)
+
+    def _on_close(self) -> None:
+        self._closed = True
+        root = self._root
+        if root is not None:
+            try:
+                root.destroy()
+            except Exception:
+                pass
+        self._root = None
+        self._label = None
+
+    def _init_tk(self) -> None:
+        if self._initialized:
+            return
+        if not self._has_graphical_display() and not self._warned_no_display:
+            print(
+                "Warning: no graphical display detected; keyboard intervention will not work in this session.",
+                file=sys.stderr,
+                flush=True,
+            )
+            self._warned_no_display = True
+        try:
+            import tkinter as tk
+        except Exception:
+            # Fall back to the existing pygame overlay when Tk is unavailable.
+            fallback = PygameKeyboardController(self.action_dim, self.config)
+            self.get_action = fallback.get_action  # type: ignore[method-assign]
+            self.close = fallback.close  # type: ignore[method-assign]
+            self._initialized = True
+            return
+
+        root = tk.Tk()
+        root.title(self.config.window_title)
+        root.geometry(f"{int(self.config.window_width)}x{int(self.config.window_height)}")
+        root.resizable(False, False)
+        root.configure(bg="#141418")
+        root.bind("<KeyPress>", self._on_press)
+        root.bind("<KeyRelease>", self._on_release)
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
+        label = tk.Label(
+            root,
+            text="Focus this window for intervention controls.",
+            justify="left",
+            anchor="nw",
+            bg="#141418",
+            fg="#e0e0e0",
+            font=("TkDefaultFont", 11),
+        )
+        label.pack(fill="both", expand=True, padx=12, pady=12)
+        try:
+            root.focus_force()
+        except Exception:
+            pass
+        self._tk = tk
+        self._root = root
+        self._label = label
+        self._initialized = True
+
+    def _pump_window(self) -> None:
+        self._init_tk()
+        root = self._root
+        if root is None or self._closed:
+            return
+        try:
+            root.update_idletasks()
+            root.update()
+        except Exception:
+            self._closed = True
+            self._root = None
+            self._label = None
+
+    def _read_keys(self) -> np.ndarray:
+        self._pump_window()
+        a = np.zeros((self.action_dim,), dtype=np.float32)
+        s = float(self.config.action_scale)
+        keys = self._keys_down
+
+        left = ("left" in keys) or ("a" in keys)
+        right = ("right" in keys) or ("d" in keys)
+        up = ("up" in keys) or ("w" in keys)
+        down = ("down" in keys) or ("s" in keys)
+
+        if self.config.control_scheme == "differential_wheels" and self.action_dim >= 2:
+            throttle = (1.0 if up else 0.0) - (1.0 if down else 0.0)
+            turn = (1.0 if right else 0.0) - (1.0 if left else 0.0)
+            a[0], a[1] = self._mix_differential_wheels(throttle=throttle, turn=turn)
+        else:
+            if self.action_dim >= 1:
+                a[0] = (1.0 if up else 0.0) - (1.0 if down else 0.0)
+            if self.action_dim >= 2:
+                a[1] = (1.0 if left else 0.0) - (1.0 if right else 0.0)
+
+        if self.action_dim >= 3:
+            a[2] = (1.0 if "q" in keys else 0.0) - (1.0 if "e" in keys else 0.0)
+        if self.action_dim >= 4:
+            a[3] = (1.0 if "r" in keys else 0.0) - (1.0 if "f" in keys else 0.0)
+        if self.action_dim >= 5:
+            a[4] = (1.0 if "t" in keys else 0.0) - (1.0 if "g" in keys else 0.0)
+
+        a *= s
+        if self.config.control_scheme == "differential_wheels" and self.action_dim >= 2:
+            lim = float(max(0.0, self.config.wheel_command_limit))
+            a[:2] = np.clip(a[:2], -lim, lim)
+            if self.action_dim > 2:
+                a[2:] = np.clip(a[2:], -1.0, 1.0)
+            return a.astype(np.float32, copy=False)
+        return np.clip(a, -1.0, 1.0).astype(np.float32, copy=False)
+
+    def _draw_overlay(self, action: np.ndarray) -> None:
+        if not bool(self.config.show_overlay):
+            return
+        draw_hz = float(self.config.overlay_draw_hz)
+        now = time.perf_counter()
+        if draw_hz > 0.0 and (now - self._last_overlay_draw_ts) < (1.0 / draw_hz):
+            return
+        self._last_overlay_draw_ts = now
+        label = self._label
+        if label is None:
+            return
+        if self.config.control_scheme == "differential_wheels":
+            lines = [
+                "Focus this window for keyboard intervention.",
+                "",
+                "W/S: both wheels forward/backward",
+                "A/D: turn left/right",
+                f"Wheel command cap: +/-{float(self.config.wheel_command_limit):.1f}",
+                "",
+                f"Action: {np.array2string(np.asarray(action), precision=2)}",
+            ]
+        else:
+            lines = [
+                "Focus this window for keyboard intervention.",
+                "",
+                "W/S or Up/Down: forward/backward",
+                "A/D or Left/Right: turn left/right",
+                "Extra dims: Q/E, R/F, T/G",
+                "",
+                f"Action: {np.array2string(np.asarray(action), precision=2)}",
+            ]
+        try:
+            label.config(text="\n".join(lines))
+        except Exception:
+            pass
+
+    def get_action(self) -> np.ndarray:
+        action = self._read_keys()
+        self._draw_overlay(action)
+        return action
+
+    def close(self) -> None:
+        root = self._root
+        if root is not None:
+            try:
+                root.destroy()
+            except Exception:
+                pass
+        self._root = None
+        self._label = None
+        self._closed = True
+
+
+def build_human_controller(
+    *,
+    input_device: str,
+    action_dim: int,
+    env_name: str,
+    action_scale: float,
+    wheel_command_limit: float,
+    overlay_fps_limit: int,
+    overlay_draw_hz: float,
+    gamepad_mode: str = "local",
+    gamepad_host: str = "",
+    gamepad_port: int = 0,
+    gamepad_cache_path: Path | str = DEFAULT_SAFETY_GAMEPAD_CACHE_PATH,
+    gamepad_reconnect_seconds: float = 2.0,
+    gamepad_config_path: Path | str = DEFAULT_SAFETY_GAMEPAD_CONFIG_PATH,
+    gamepad_use_saved_config: bool = True,
+    gamepad_device_index: int = 0,
+    show_overlay: bool = True,
+    prefer_separate_keyboard_window: bool = False,
+):
+    input_device = str(input_device).lower()
+    control_scheme = infer_control_scheme(env_name)
+    if input_device == "gamepad":
+        config = GamepadMappingConfig(
+            device_index=int(gamepad_device_index),
+            action_scale=float(action_scale),
+            wheel_command_limit=float(wheel_command_limit),
+        )
+        if bool(gamepad_use_saved_config):
+            config, _loaded = apply_gamepad_mapping_profile(config, Path(gamepad_config_path).expanduser())
+        mode = str(gamepad_mode).lower()
+        if mode == "connect":
+            host, port, from_cache = resolve_cached_gamepad_endpoint(
+                host=str(gamepad_host),
+                port=int(gamepad_port),
+                cache_path=gamepad_cache_path,
+            )
+            print(
+                f"gamepad endpoint resolved to {host}:{port} (from_cache={1 if from_cache else 0})",
+                flush=True,
+            )
+            client = GamepadStateClient(
+                host=host,
+                port=port,
+                reconnect_seconds=float(gamepad_reconnect_seconds),
+                cache_path=gamepad_cache_path,
+            )
+            return RemoteGamepadController(
+                action_dim=action_dim,
+                control_scheme=control_scheme,
+                client=client,
+                config=config,
+                config_path=gamepad_config_path,
+                hot_reload=True,
+            )
+        return PygameGamepadController(
+            action_dim=action_dim,
+            control_scheme=control_scheme,
+            config=config,
+            config_path=gamepad_config_path,
+            hot_reload=True,
+        )
+    keyboard_cls = TkKeyboardController if bool(prefer_separate_keyboard_window) else PygameKeyboardController
+    return keyboard_cls(
+        action_dim=action_dim,
+        config=KeyboardConfig(
+            action_scale=action_scale,
+            control_scheme=control_scheme,
+            overlay_fps_limit=int(overlay_fps_limit),
+            overlay_draw_hz=float(overlay_draw_hz),
+            wheel_command_limit=float(wheel_command_limit),
+            show_overlay=bool(show_overlay),
+        ),
+    )

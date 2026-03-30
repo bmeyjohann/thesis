@@ -2,28 +2,219 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Optional
-from pathlib import Path
-import sys
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
-# Ensure local FastSAC package is importable without installation.
-_FAST_SAC_PATH = Path(__file__).resolve().parent.parent / "fasttd3" / "fast_sac"
-if _FAST_SAC_PATH.exists():
-    _fast_sac_path_str = str(_FAST_SAC_PATH)
-    if _fast_sac_path_str not in sys.path:
-        sys.path.insert(0, _fast_sac_path_str)
+LOG_STD_MAX = 2
+LOG_STD_MIN = -5
 
-from fast_sac import Actor, Critic
+
+def _mlp_hidden_dims(hidden_dim: int) -> tuple[int, int, int]:
+    h1 = max(1, int(hidden_dim))
+    h2 = max(1, h1 // 2)
+    h3 = max(1, h2 // 2)
+    return h1, h2, h3
+
+
+def _linear_block(
+    in_dim: int,
+    out_dim: int,
+    *,
+    use_layer_norm: bool,
+    layer_norm_eps: float,
+    device: torch.device | None,
+) -> list[nn.Module]:
+    layers: list[nn.Module] = [nn.Linear(in_dim, out_dim, device=device)]
+    if use_layer_norm:
+        layers.append(nn.LayerNorm(out_dim, eps=float(layer_norm_eps), device=device))
+    layers.append(nn.ReLU())
+    return layers
+
+
+class SafetyActor(nn.Module):
+    def __init__(
+        self,
+        *,
+        n_obs: int,
+        n_act: int,
+        num_envs: int,
+        init_scale: float,
+        hidden_dim: int,
+        use_layer_norm: bool = False,
+        layer_norm_eps: float = 1e-5,
+        device: torch.device | None = None,
+    ):
+        super().__init__()
+        h1, h2, h3 = _mlp_hidden_dims(hidden_dim)
+        layers: list[nn.Module] = []
+        layers.extend(
+            _linear_block(
+                n_obs,
+                h1,
+                use_layer_norm=use_layer_norm,
+                layer_norm_eps=layer_norm_eps,
+                device=device,
+            )
+        )
+        layers.extend(
+            _linear_block(
+                h1,
+                h2,
+                use_layer_norm=use_layer_norm,
+                layer_norm_eps=layer_norm_eps,
+                device=device,
+            )
+        )
+        layers.extend(
+            _linear_block(
+                h2,
+                h3,
+                use_layer_norm=use_layer_norm,
+                layer_norm_eps=layer_norm_eps,
+                device=device,
+            )
+        )
+        self.net = nn.Sequential(*layers)
+        self.fc_mu = nn.Linear(h3, n_act, device=device)
+        self.fc_logstd = nn.Linear(h3, n_act, device=device)
+        nn.init.normal_(self.fc_mu.weight, 0.0, init_scale)
+        nn.init.constant_(self.fc_mu.bias, 0.0)
+        self.n_envs = int(num_envs)
+
+    def forward(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        x = self.net(obs)
+        mean = self.fc_mu(x)
+        log_std = self.fc_logstd(x)
+        log_std = torch.tanh(log_std)
+        log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (log_std + 1)
+
+        std = log_std.exp()
+        normal = torch.distributions.Normal(mean, std)
+        latent = normal.rsample()
+        action = torch.tanh(latent)
+        log_prob = normal.log_prob(latent)
+        log_prob -= torch.log(1 - action.pow(2) + 1e-6)
+        log_prob = log_prob.sum(1, keepdim=True)
+        mean = torch.tanh(mean)
+        return action, log_prob, mean
+
+
+class _QNetwork(nn.Module):
+    def __init__(
+        self,
+        *,
+        n_obs: int,
+        n_act: int,
+        hidden_dim: int,
+        use_layer_norm: bool = False,
+        layer_norm_eps: float = 1e-5,
+        device: torch.device | None = None,
+    ):
+        super().__init__()
+        h1, h2, h3 = _mlp_hidden_dims(hidden_dim)
+        layers: list[nn.Module] = []
+        layers.extend(
+            _linear_block(
+                n_obs + n_act,
+                h1,
+                use_layer_norm=use_layer_norm,
+                layer_norm_eps=layer_norm_eps,
+                device=device,
+            )
+        )
+        layers.extend(
+            _linear_block(
+                h1,
+                h2,
+                use_layer_norm=use_layer_norm,
+                layer_norm_eps=layer_norm_eps,
+                device=device,
+            )
+        )
+        layers.extend(
+            _linear_block(
+                h2,
+                h3,
+                use_layer_norm=use_layer_norm,
+                layer_norm_eps=layer_norm_eps,
+                device=device,
+            )
+        )
+        layers.append(nn.Linear(h3, 1, device=device))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, obs: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([obs, actions], dim=1)
+        return self.net(x)
+
+
+class SafetyCritic(nn.Module):
+    def __init__(
+        self,
+        *,
+        n_obs: int,
+        n_act: int,
+        hidden_dim: int,
+        num_critics: int,
+        use_layer_norm: bool = False,
+        layer_norm_eps: float = 1e-5,
+        device: torch.device | None = None,
+    ):
+        super().__init__()
+        self.num_critics = max(1, int(num_critics))
+        self.qnet1 = _QNetwork(
+            n_obs=n_obs,
+            n_act=n_act,
+            hidden_dim=hidden_dim,
+            use_layer_norm=use_layer_norm,
+            layer_norm_eps=layer_norm_eps,
+            device=device,
+        )
+        self.qnet2 = (
+            _QNetwork(
+                n_obs=n_obs,
+                n_act=n_act,
+                hidden_dim=hidden_dim,
+                use_layer_norm=use_layer_norm,
+                layer_norm_eps=layer_norm_eps,
+                device=device,
+            )
+            if self.num_critics >= 2
+            else None
+        )
+        self.extra_qnets = nn.ModuleList(
+            [
+                _QNetwork(
+                    n_obs=n_obs,
+                    n_act=n_act,
+                    hidden_dim=hidden_dim,
+                    use_layer_norm=use_layer_norm,
+                    layer_norm_eps=layer_norm_eps,
+                    device=device,
+                )
+                for _ in range(max(0, self.num_critics - 2))
+            ]
+        )
+
+    def _iter_qnets(self) -> list[_QNetwork]:
+        qnets: list[_QNetwork] = [self.qnet1]
+        if self.qnet2 is not None:
+            qnets.append(self.qnet2)
+        qnets.extend(list(self.extra_qnets))
+        return qnets
+
+    def forward(self, obs: torch.Tensor, actions: torch.Tensor) -> list[torch.Tensor]:
+        return [qnet(obs, actions) for qnet in self._iter_qnets()]
 
 
 @dataclass
 class SACTensors:
-    actor: Actor
-    critic: Critic
-    critic_target: Critic
+    actor: SafetyActor
+    critic: SafetyCritic
+    critic_target: SafetyCritic
     actor_optimizer: torch.optim.Optimizer
     critic_optimizer: torch.optim.Optimizer
     alpha_optimizer: torch.optim.Optimizer
@@ -68,6 +259,9 @@ def build_sac(
     act_dim: int,
     hidden_actor: int,
     hidden_critic: int,
+    num_critics: int,
+    use_layer_norm: bool,
+    layer_norm_eps: float,
     init_scale: float,
     lr_actor: float,
     lr_critic: float,
@@ -75,24 +269,32 @@ def build_sac(
     num_envs: int,
     device: torch.device,
 ) -> SACTensors:
-    actor = Actor(
+    actor = SafetyActor(
         n_obs=obs_dim,
         n_act=act_dim,
         num_envs=num_envs,
         init_scale=init_scale,
         hidden_dim=hidden_actor,
+        use_layer_norm=use_layer_norm,
+        layer_norm_eps=layer_norm_eps,
         device=device,
     )
-    critic = Critic(
+    critic = SafetyCritic(
         n_obs=obs_dim,
         n_act=act_dim,
         hidden_dim=hidden_critic,
+        num_critics=num_critics,
+        use_layer_norm=use_layer_norm,
+        layer_norm_eps=layer_norm_eps,
         device=device,
     )
-    critic_target = Critic(
+    critic_target = SafetyCritic(
         n_obs=obs_dim,
         n_act=act_dim,
         hidden_dim=hidden_critic,
+        num_critics=num_critics,
+        use_layer_norm=use_layer_norm,
+        layer_norm_eps=layer_norm_eps,
         device=device,
     )
     critic_target.load_state_dict(critic.state_dict())
@@ -123,21 +325,30 @@ def reset_critic(
     obs_dim: int,
     act_dim: int,
     hidden_critic: int,
+    num_critics: int,
+    use_layer_norm: bool,
+    layer_norm_eps: float,
     lr_critic: float,
     weight_decay: float,
     device: torch.device,
 ) -> None:
     """Reinitialize critic, target critic, and critic optimizer state."""
-    critic = Critic(
+    critic = SafetyCritic(
         n_obs=obs_dim,
         n_act=act_dim,
         hidden_dim=hidden_critic,
+        num_critics=num_critics,
+        use_layer_norm=use_layer_norm,
+        layer_norm_eps=layer_norm_eps,
         device=device,
     )
-    critic_target = Critic(
+    critic_target = SafetyCritic(
         n_obs=obs_dim,
         n_act=act_dim,
         hidden_dim=hidden_critic,
+        num_critics=num_critics,
+        use_layer_norm=use_layer_norm,
+        layer_norm_eps=layer_norm_eps,
         device=device,
     )
     critic_target.load_state_dict(critic.state_dict())
@@ -155,10 +366,13 @@ def compute_q_disagreement(
 ) -> QDisagreementMetrics:
     """Return scalar critic disagreement statistics for the given batch."""
     with torch.no_grad():
-        q1, q2 = sac.critic(obs, actions)
-        abs_diff = torch.abs(q1 - q2)
-        q_min = torch.min(q1, q2)
-        q_max = torch.max(q1, q2)
+        q_list = sac.critic(obs, actions)
+        stacked = torch.stack(q_list, dim=0)
+        q_min = torch.min(stacked, dim=0).values
+        q_max = torch.max(stacked, dim=0).values
+        abs_diff = q_max - q_min
+        q1 = q_list[0]
+        q2 = q_list[1] if len(q_list) > 1 else q_list[0]
     return QDisagreementMetrics(
         abs_diff_mean=float(abs_diff.mean().detach().cpu().item()),
         abs_diff_max=float(abs_diff.max().detach().cpu().item()),
@@ -204,12 +418,12 @@ def sac_update_step(
 
     with torch.no_grad():
         next_actions, next_log_pi, _ = sac.actor(next_obs)
-        q1_next, q2_next = sac.critic_target(next_obs, next_actions)
-        min_q_next = torch.min(q1_next, q2_next) - sac.log_alpha.exp() * next_log_pi
+        q_next_list = sac.critic_target(next_obs, next_actions)
+        min_q_next = torch.min(torch.stack(q_next_list, dim=0), dim=0).values - sac.log_alpha.exp() * next_log_pi
         target_q = rewards + bootstrap * discount * min_q_next
 
-    q1, q2 = sac.critic(obs, actions)
-    critic_loss = F.mse_loss(q1, target_q) + F.mse_loss(q2, target_q)
+    q_list = sac.critic(obs, actions)
+    critic_loss = torch.stack([F.mse_loss(q, target_q) for q in q_list], dim=0).mean()
     critic_loss_pref = torch.tensor(0.0, device=obs.device)
     critic_loss_pref_weighted = torch.tensor(0.0, device=obs.device)
     pref_q_delta = 0.0
@@ -225,10 +439,8 @@ def sac_update_step(
         pref_obs = pref_batch["obs"]
         pref_teacher = pref_batch["teacher_actions"]
         pref_student = pref_batch["student_actions"]
-        tq1, tq2 = sac.critic(pref_obs, pref_teacher)
-        sq1, sq2 = sac.critic(pref_obs, pref_student)
-        q_teacher = torch.stack((tq1, tq2), dim=0)
-        q_student = torch.stack((sq1, sq2), dim=0)
+        q_teacher = torch.stack(sac.critic(pref_obs, pref_teacher), dim=0)
+        q_student = torch.stack(sac.critic(pref_obs, pref_student), dim=0)
         q_teacher_term = q_teacher.detach() if bool(pref_stopgrad_positive) else q_teacher
         delta = q_teacher_term - q_student
         pref_q_delta = float(delta.detach().mean().cpu().item())
@@ -278,8 +490,7 @@ def sac_update_step(
     sac.critic_optimizer.step()
 
     pi_actions, log_pi, _ = sac.actor(obs)
-    q1_pi, q2_pi = sac.critic(obs, pi_actions)
-    q_pi = torch.min(q1_pi, q2_pi)
+    q_pi = torch.min(torch.stack(sac.critic(obs, pi_actions), dim=0), dim=0).values
     actor_loss = ((sac.log_alpha.exp().detach() * log_pi) - q_pi).mean()
 
     sac.actor_optimizer.zero_grad(set_to_none=True)
