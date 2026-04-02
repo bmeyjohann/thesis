@@ -188,10 +188,11 @@ A clean Codex session using only this skill plus the MCP server should be able t
 
 This skill is not meant to replace judgment. It is meant to provide a concrete operating procedure so Codex does not need prior conversational context to manage the queue sensibly.
 
-## Repo Wiring
+## Queue Wiring
 
-- The `experiment_queue` MCP is expected to be started through `scripts/run_experiment_queue_mcp.sh`.
-- Queue runtime lives under `experiment_queue/` in the repo root by default.
+- The `experiment_queue` MCP is expected to already be configured in the active Codex session.
+- In this repo, the machine-local MCP wiring normally lives in `~/.codex/config.toml` with absolute paths. Do not assume a repo-local relative launcher entry like `bash scripts/run_experiment_queue_mcp.sh`.
+- Queue runtime lives under the repo's `experiment_queue/` directory by default.
 - The default queued execution environment is the `fasttd3` conda env.
 - The current setup is intended for trusted launcher scripts in the thesis repo.
 - The MCP server is control-only; the actual queue worker is a daemon that is started on demand and exits automatically once the queue stays idle.
