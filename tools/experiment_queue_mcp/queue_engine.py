@@ -698,7 +698,7 @@ class ExperimentQueue:
 
     def _daemon_status_locked(self) -> dict[str, Any]:
         pid = self._read_worker_pid_locked()
-        running = pid is not None and self._pid_is_running(pid)
+        running = self._worker_lock_is_held_locked()
         return {
             "daemon_running": running,
             "daemon_pid": pid if running else None,
@@ -720,6 +720,26 @@ class ExperimentQueue:
     def _pid_is_running(self, pid: int) -> bool:
         proc_path = Path("/proc") / str(pid)
         return proc_path.exists()
+
+    def _worker_lock_is_held_locked(self) -> bool:
+        if self._worker_lock_handle is not None:
+            return True
+        handle = self.worker_lock_path.open("a+", encoding="utf-8")
+        acquired = False
+        try:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+            except BlockingIOError:
+                return True
+            return False
+        finally:
+            if acquired:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            handle.close()
 
     def _assert_job_control_allowed(
         self,

@@ -5,6 +5,8 @@ import subprocess
 import time
 from pathlib import Path
 
+from tools.experiment_queue_mcp.queue_engine import ExperimentQueue
+
 
 SERVER_PYTHON = "/usr/bin/python3"
 
@@ -523,3 +525,22 @@ def test_summary_tools_redact_paths_but_debug_tools_expose_them(tmp_path: Path) 
     finally:
         proc.kill()
         proc.wait(timeout=5)
+
+
+def test_daemon_status_ignores_stale_pid_text_when_lock_is_free(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    scripts_dir = workspace / "scripts"
+    queue_root = workspace / "experiment_queue"
+    scripts_dir.mkdir(parents=True)
+
+    queue = ExperimentQueue(
+        queue_root=queue_root,
+        workspace_root=workspace,
+        script_roots=[scripts_dir],
+        default_cwd=workspace,
+    )
+
+    queue.worker_lock_path.write_text("1\n", encoding="utf-8")
+    status = queue.daemon_status()
+    assert status["daemon_running"] is False
+    assert status["daemon_pid"] is None

@@ -55,6 +55,8 @@ args = [
 ]
 ```
 
+Do not rely on a repo-local `.codex/config.toml` entry like `bash scripts/run_experiment_queue_mcp.sh` for this server. Codex Desktop currently has an upstream bug where local MCP servers are not always launched in the workspace cwd, so relative launcher paths can fail during startup and surface as an MCP handshake error.
+
 ## Tool surface
 
 - `prime_queue_session`
@@ -93,6 +95,7 @@ args = [
 - The daemon exits automatically once the queue is empty and no job is active for a short idle grace period.
 - Multiple MCP sessions can attach to the same queue root because they all talk to the same daemon-backed queue state.
 - Running jobs can survive an MCP control-server restart because the daemon is independent of MCP client lifetime.
+- Daemon liveness is inferred from the actual queue worker file lock, not only from a stored PID, so cross-namespace PID mismatches do not prevent auto-start from waking the worker.
 - Removing the current script from `running/` requests cancellation.
 - `stop_now` sends `SIGTERM` to the job process group and escalates to `SIGKILL` after the configured grace period.
 - `stop_after_current` lets the active job finish, then stops dequeuing new jobs until resumed.
