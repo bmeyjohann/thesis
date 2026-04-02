@@ -1,0 +1,7 @@
+interface:
+  display_name: "Autonomous Research"
+  short_description: "Iterate on research via queued runs"
+  default_prompt: "Use $autonomous-research to pursue a research goal by queueing experiments, inspecting logs and WANDB, stopping runs once they are broken or informative enough, and choosing the next best follow-up."
+
+policy:
+  allow_implicit_invocation: true

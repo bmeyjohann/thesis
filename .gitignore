@@ -83,6 +83,10 @@ temp/
 *.tmp
 *.temp
 .cache/
+.pytest_tmp/
+.experiment_queue_mcp/
+.venv-experiment-queue-mcp/
+experiment_queue/
 
 # System files
 .pytest_cache/

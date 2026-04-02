@@ -1,0 +1,59 @@
+# Project-scoped Codex config intended to be safe to commit.
+# Keep secrets and machine-specific credentials in ~/.codex/config.toml or the environment.
+
+[mcp_servers.wandb]
+command = "bash"
+args = ["scripts/run_wandb_mcp.sh"]
+startup_timeout_sec = 30.0
+
+[mcp_servers.wandb.tools.query_wandb_tool]
+approval_mode = "approve"
+
+[mcp_servers.experiment_queue]
+command = "bash"
+args = ["scripts/run_experiment_queue_mcp.sh"]
+startup_timeout_sec = 30.0
+
+[mcp_servers.experiment_queue.tools.prime_queue_session]
+approval_mode = "approve"
+
+[mcp_servers.experiment_queue.tools.queue_status]
+approval_mode = "approve"
+
+[mcp_servers.experiment_queue.tools.list_jobs]
+approval_mode = "approve"
+
+[mcp_servers.experiment_queue.tools.enqueue_script]
+approval_mode = "approve"
+
+[mcp_servers.experiment_queue.tools.get_job]
+approval_mode = "approve"
+
+[mcp_servers.experiment_queue.tools.read_job_log]
+approval_mode = "approve"
+
+[mcp_servers.experiment_queue.tools.pause_queue]
+approval_mode = "approve"
+
+[mcp_servers.experiment_queue.tools.resume_queue]
+approval_mode = "approve"
+
+[mcp_servers.experiment_queue.tools.stop_after_current]
+approval_mode = "approve"
+
+[mcp_servers.experiment_queue.tools.stop_now]
+approval_mode = "approve"
+
+[mcp_servers.experiment_queue.tools.cancel_job]
+approval_mode = "approve"
+
+[mcp_servers.linear]
+url = "https://mcp.linear.app/mcp"
+
+[mcp_servers.zotero]
+command = "bash"
+args = ["scripts/run_zotero_mcp.sh"]
+startup_timeout_sec = 30.0
+
+[mcp_servers.zotero.env]
+ZOTERO_LOCAL = "true"
