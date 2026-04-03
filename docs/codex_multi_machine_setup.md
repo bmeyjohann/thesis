@@ -40,7 +40,13 @@ args = ["--from", "git+https://github.com/wandb/wandb-mcp-server", "wandb_mcp_se
 startup_timeout_sec = 30.0
 
 [mcp_servers.wandb.tools.query_wandb_tool]
-approval_mode = "approve"
+approval_mode = "auto"
+
+[mcp_servers.wandb.tools.get_run_history_tool]
+approval_mode = "auto"
+
+[mcp_servers.wandb.tools.query_wandb_entity_projects]
+approval_mode = "auto"
 
 [mcp_servers.experiment_queue]
 command = "/usr/bin/python3"
@@ -58,46 +64,7 @@ args = [
 ]
 startup_timeout_sec = 30.0
 
-[mcp_servers.experiment_queue.tools.prime_queue_session]
-approval_mode = "auto"
-
-[mcp_servers.experiment_queue.tools.daemon_status]
-approval_mode = "auto"
-
-[mcp_servers.experiment_queue.tools.queue_status]
-approval_mode = "auto"
-
-[mcp_servers.experiment_queue.tools.list_jobs]
-approval_mode = "auto"
-
-[mcp_servers.experiment_queue.tools.enqueue_script]
-approval_mode = "auto"
-
-[mcp_servers.experiment_queue.tools.get_job]
-approval_mode = "auto"
-
-[mcp_servers.experiment_queue.tools.read_job_log]
-approval_mode = "auto"
-
-[mcp_servers.experiment_queue.tools.pause_queue]
-approval_mode = "auto"
-
-[mcp_servers.experiment_queue.tools.shutdown_daemon]
-approval_mode = "auto"
-
-[mcp_servers.experiment_queue.tools.restart_daemon]
-approval_mode = "auto"
-
-[mcp_servers.experiment_queue.tools.stop_after_current]
-approval_mode = "auto"
-
-[mcp_servers.experiment_queue.tools.stop_now]
-approval_mode = "auto"
-
-[mcp_servers.experiment_queue.tools.cancel_job]
-approval_mode = "auto"
-
-[mcp_servers.experiment_queue.tools.resume_queue]
+[mcp_servers.experiment_queue.tools.queue]
 approval_mode = "auto"
 
 [mcp_servers.linear]
@@ -131,6 +98,7 @@ Notes on adapting that snippet on another machine:
 - if conda lives elsewhere, update `--conda-sh-path`
 - if the GPU device/cache layout differs, adjust `writable_roots` accordingly
 - keep `WANDB_API_KEY` out of this shared file; put it in the machine-local `~/.codex/config.toml` or shell env
+- if you want unattended autonomy, do not accidentally leave these MCP tools on `approval_mode = "approve"` in the live `~/.codex/config.toml`; that forces repeated prompts and defeats the queue warmup workflow
 
 ## Other Computer Bootstrap
 
@@ -207,7 +175,7 @@ If you want to verify the queue daemon path directly:
 bash scripts/run_experiment_queue_daemon.sh
 ```
 
-It should start, notice no work, and exit after the idle timeout.
+It should start and stay alive until explicitly shut down.
 
 ### Start Codex
 
@@ -217,7 +185,7 @@ Then start a fresh session and verify:
 
 - `wandb` MCP is available
 - `experiment_queue` MCP is available
-- `daemon_status`, `shutdown_daemon`, and `restart_daemon` are visible on `experiment_queue`
+- the unified `queue` tool is visible on `experiment_queue`
 - `linear` MCP is available
 - `zotero` MCP is available
 - the repo-local `autonomous-research` skill is visible

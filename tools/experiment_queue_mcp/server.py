@@ -157,7 +157,25 @@ def build_daemon_command(args: argparse.Namespace) -> list[str]:
 
 def create_mcp_server(queue: ExperimentQueue, daemon_command: list[str]) -> FastMCP:
     mcp = FastMCP("experiment-queue", json_response=True, log_level="INFO")
+    unified_actions = [
+        "help",
+        "prime_queue_session",
+        "enqueue_script",
+        "daemon_status",
+        "queue_status",
+        "list_jobs",
+        "get_job",
+        "read_job_log",
+        "pause_queue",
+        "resume_queue",
+        "shutdown_daemon",
+        "restart_daemon",
+        "stop_after_current",
+        "stop_now",
+        "cancel_job",
+    ]
     tool_names = [
+        "queue",
         "prime_queue_session",
         "enqueue_script",
         "daemon_status",
@@ -437,6 +455,141 @@ def create_mcp_server(queue: ExperimentQueue, daemon_command: list[str]) -> Fast
                 )
             ) or {}
         except Exception as exc:
+            raise ToolError(str(exc)) from exc
+
+    @mcp.tool(name="queue")
+    def queue_tool(
+        action: Literal[
+            "help",
+            "prime_queue_session",
+            "enqueue_script",
+            "daemon_status",
+            "queue_status",
+            "list_jobs",
+            "get_job",
+            "read_job_log",
+            "pause_queue",
+            "resume_queue",
+            "shutdown_daemon",
+            "restart_daemon",
+            "stop_after_current",
+            "stop_now",
+            "cancel_job",
+        ] = Field(..., description="Queue action to perform."),
+        debug: bool = Field(
+            default=False,
+            description="For queue_status, list_jobs, and get_job, return the full debug payload instead of the compact summary.",
+        ),
+        source_path: str | None = Field(default=None, description="Absolute or workspace-relative path to a bash script."),
+        script_args: list[str] = Field(default_factory=list, description="Optional positional arguments passed to an enqueued script."),
+        name: str | None = Field(default=None, description="Optional display name override for enqueue_script."),
+        cwd: str | None = Field(default=None, description="Optional working directory for enqueue_script."),
+        conda_env: str | None = Field(default=None, description="Optional conda env override for enqueue_script."),
+        owner_label: str | None = Field(default=None, description="Optional human-readable owner label for enqueue_script."),
+        owner_session_id: str | None = Field(default=None, description="Optional owning session identifier for enqueue_script."),
+        job_id: str | None = Field(default=None, description="Queue job ID for get_job, read_job_log, or cancel_job."),
+        status_filter: str | None = Field(default=None, description="Optional state filter for list_jobs."),
+        limit: int | None = Field(default=None, ge=1, description="Maximum number of jobs to return for list_jobs."),
+        stream: Literal["stdout", "stderr"] = Field(default="stdout", description="Log stream for read_job_log."),
+        lines: int = Field(default=100, ge=1, description="Number of trailing lines for read_job_log."),
+        requester_label: str | None = Field(default=None, description="Optional requester label for ownership checks."),
+        requester_session_id: str | None = Field(default=None, description="Optional requester session id for ownership checks."),
+        force: bool = Field(default=False, description="Override ownership checks for stop/cancel actions."),
+        list_limit: int = Field(default=5, ge=1, description="Number of recent jobs to include for prime_queue_session."),
+        exercise_control_tools: bool = Field(
+            default=True,
+            description="For prime_queue_session, whether to exercise reversible control operations.",
+        ),
+        exercise_enqueue_cancel: bool = Field(
+            default=False,
+            description="For prime_queue_session, whether to enqueue and cancel a temporary no-op job.",
+        ),
+    ) -> dict[str, Any]:
+        """Unified experiment queue tool. Use the `action` argument to select queue behavior."""
+        try:
+            if action == "help":
+                return {
+                    "tool_name": "queue",
+                    "available_actions": unified_actions,
+                    "debug_capable_actions": ["queue_status", "list_jobs", "get_job"],
+                    "preferred_for_autonomy": True,
+                    "note": (
+                        "For autonomous runs, prefer this unified `queue` tool so all queue operations "
+                        "stay under one MCP tool name. Legacy per-action tools remain available for compatibility."
+                    ),
+                }
+
+            if action == "prime_queue_session":
+                result = prime_queue_session(
+                    list_limit=list_limit,
+                    exercise_control_tools=exercise_control_tools,
+                    exercise_enqueue_cancel=exercise_enqueue_cancel,
+                )
+            elif action == "enqueue_script":
+                if source_path is None:
+                    raise ToolError("source_path is required for action=enqueue_script")
+                result = enqueue_script(
+                    source_path=source_path,
+                    args=script_args,
+                    name=name,
+                    cwd=cwd,
+                    conda_env=conda_env,
+                    owner_label=owner_label,
+                    owner_session_id=owner_session_id,
+                )
+            elif action == "daemon_status":
+                result = daemon_status()
+            elif action == "queue_status":
+                result = queue_debug_status() if debug else queue_status()
+            elif action == "list_jobs":
+                result = list_jobs_debug(status=status_filter, limit=limit) if debug else list_jobs(status=status_filter, limit=limit)
+            elif action == "get_job":
+                if job_id is None:
+                    raise ToolError("job_id is required for action=get_job")
+                result = get_job_debug(job_id=job_id) if debug else get_job(job_id=job_id)
+            elif action == "read_job_log":
+                if job_id is None:
+                    raise ToolError("job_id is required for action=read_job_log")
+                result = read_job_log(job_id=job_id, stream=stream, lines=lines)
+            elif action == "pause_queue":
+                result = pause_queue()
+            elif action == "resume_queue":
+                result = resume_queue()
+            elif action == "shutdown_daemon":
+                result = shutdown_daemon()
+            elif action == "restart_daemon":
+                result = restart_daemon()
+            elif action == "stop_after_current":
+                result = stop_after_current(
+                    requester_label=requester_label,
+                    requester_session_id=requester_session_id,
+                    force=force,
+                )
+            elif action == "stop_now":
+                result = stop_now(
+                    requester_label=requester_label,
+                    requester_session_id=requester_session_id,
+                    force=force,
+                )
+            elif action == "cancel_job":
+                if job_id is None:
+                    raise ToolError("job_id is required for action=cancel_job")
+                result = cancel_job(
+                    job_id=job_id,
+                    requester_label=requester_label,
+                    requester_session_id=requester_session_id,
+                    force=force,
+                )
+            else:  # pragma: no cover - Literal already constrains this
+                raise ToolError(f"Unsupported action: {action}")
+
+            return {
+                "action": action,
+                "result": result,
+            }
+        except Exception as exc:
+            if isinstance(exc, ToolError):
+                raise
             raise ToolError(str(exc)) from exc
 
     return mcp

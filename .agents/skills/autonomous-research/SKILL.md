@@ -24,49 +24,51 @@ The purpose of this skill is to let Codex autonomously run iterative research lo
 
 At the start of an autonomous-research session:
 
-1. Verify that the `experiment_queue` MCP is available and proactively touch the queue tools you are likely to need during the session.
+1. Verify that the `experiment_queue` MCP is available and proactively warm up the unified `queue` tool first.
 2. At minimum, request:
-   - `daemon_status`
-   - `queue_status`
-   - `list_jobs`
-   - `get_job`
-   - `read_job_log`
-   - `cancel_job`
-   - `stop_now`
-   - `stop_after_current`
-   - `pause_queue`
-   - `resume_queue`
-   - `shutdown_daemon`
-   - `restart_daemon`
-3. If you expect to enqueue and cancel experiments during the run, do a harmless placeholder queue cycle at startup so that this path has already been exercised before unattended work begins:
+   - `queue(action="help")`
+   - `queue(action="daemon_status")`
+   - `queue(action="queue_status")`
+   - `queue(action="list_jobs")`
+   - `queue(action="stop_now")`
+   - `queue(action="stop_after_current")`
+   - `queue(action="pause_queue")`
+   - `queue(action="resume_queue")`
+   - `queue(action="shutdown_daemon")`
+   - `queue(action="restart_daemon")`
+3. If you expect to use other MCP servers later in the run, warm those up too with the lightest harmless call that matches the later workflow.
+4. If you expect to enqueue and cancel experiments during the run, do a harmless placeholder queue cycle at startup so that this path has already been exercised before unattended work begins:
    - enqueue a tiny trusted no-op or smoke job
    - cancel it immediately if the point is only to warm up the tool path
    - or let it finish quickly if a successful queue smoke test is useful
-4. Treat that initial placeholder cycle as session preparation for autonomous work, not as a meaningful experiment result.
-5. Identify the current research question in one sentence.
-6. Identify the current best baseline or comparison target.
-7. Convert the user's request into an explicit research goal and a short list of likely levers to change.
-8. Decide what evidence would count as:
+5. Treat that initial placeholder cycle as session preparation for autonomous work, not as a meaningful experiment result.
+6. Treat warmup as best-effort only. It does not create a true session-wide approval bypass by itself.
+7. If a tool still prompts repeatedly after warmup, treat that as a config or client-behavior problem, not as a sign that the tool should keep being retried unattended.
+8. Identify the current research question in one sentence.
+9. Identify the current best baseline or comparison target.
+10. Convert the user's request into an explicit research goal and a short list of likely levers to change.
+11. Decide what evidence would count as:
    - obvious failure
    - enough evidence to stop early
    - enough evidence to justify the next experiment
-9. Prefer existing trusted launcher scripts under the active repo's `scripts/` directory.
-10. If no suitable launcher exists, create a small repo-tracked launcher first. Do not rely on a long ad hoc shell command for autonomous work.
-11. Choose a stable ownership identity for this session:
+12. Prefer existing trusted launcher scripts under the active repo's `scripts/` directory.
+13. If no suitable launcher exists, create a small repo-tracked launcher first. Do not rely on a long ad hoc shell command for autonomous work.
+14. Choose a stable ownership identity for this session:
    - a human-readable `owner_label`
    - a stable `owner_session_id`
-12. Pass that ownership metadata when enqueueing jobs, and reuse the matching requester fields when later stopping or cancelling them.
-13. In unattended mode, prefer the summary queue tools (`queue_status`, `list_jobs`, `get_job`) over the debug variants. The debug tools expose absolute paths and are more likely to trigger approval prompts in the Codex app.
+15. Pass that ownership metadata when enqueueing jobs, and reuse the matching requester fields when later stopping or cancelling them.
+16. In unattended mode, keep queue interactions on the unified `queue` tool so all experiment-queue activity stays under one MCP tool name.
+17. Within `queue`, prefer the summary actions (`queue_status`, `list_jobs`, `get_job`) over `debug=true`. Debug payloads expose absolute paths and are more likely to trigger approval prompts in the Codex app.
 
 ## Standard Operating Loop
 
 Use this loop repeatedly during autonomous research:
 
-1. Inspect queue state with `queue_status`.
+1. Inspect queue state with `queue(action="queue_status")`.
 2. If nothing useful is queued or running, enqueue the single best next experiment.
 3. For the active run, inspect:
-   - `get_job`
-   - `read_job_log`
+   - `queue(action="get_job", job_id=...)`
+   - `queue(action="read_job_log", job_id=...)`
    - the `wandb` MCP when the job logs WANDB metrics
 4. Decide whether the run should:
    - continue unchanged
@@ -98,7 +100,7 @@ Do not wait passively if the current evidence already supports a stop or branch 
 
 ## Stop Criteria
 
-Use `stop_now` or `stop_after_current` when any of these are true:
+Use `queue(action="stop_now")` or `queue(action="stop_after_current")` when any of these are true:
 
 - the job crashes, hangs, or repeatedly emits runtime errors
 - metrics indicate a broken run, such as NaNs, diverging losses, zero data collection, or clearly invalid rewards
@@ -106,8 +108,8 @@ Use `stop_now` or `stop_after_current` when any of these are true:
 - the run has already established the needed conclusion or provided the evidence that motivated running it
 - the user asked to halt or change direction
 
-Use `cancel_job` only for queued jobs that are no longer worth starting.
-For the active running job, use `stop_now` to terminate immediately or `stop_after_current` to let it finish cleanly and then pause further dequeueing.
+Use `queue(action="cancel_job", job_id=...)` only for queued jobs that are no longer worth starting.
+For the active running job, use `queue(action="stop_now")` to terminate immediately or `queue(action="stop_after_current")` to let it finish cleanly and then pause further dequeueing.
 
 ## Branching Rules
 
@@ -138,8 +140,8 @@ For autonomous research:
 - Keep changes local and inspectable. If a run needs a new condition, encode it in a repo-tracked launcher or config, not in an opaque inline shell fragment.
 - Before enqueueing a large sequence, define what evidence will cause early stopping or progression to the next job.
 - Multiple Codex sessions may attach to the same queue root. Inspecting shared jobs is fine, but do not stop or cancel another session's owned jobs unless the user explicitly wants that or you pass `force=true` intentionally.
-- The queue daemon auto-starts on mutating queue operations and stays alive until explicitly shut down. Use `daemon_status` if you need to verify worker health, and use `restart_daemon` or `shutdown_daemon` intentionally rather than treating daemon lifecycle as implicit.
-- The summary queue tools are the default unattended path. Only use `queue_debug_status`, `list_jobs_debug`, or `get_job_debug` when a human is present or explicit debugging requires the extra path-rich metadata.
+- The queue daemon auto-starts on mutating queue operations and stays alive until explicitly shut down. Use `queue(action="daemon_status")` if you need to verify worker health, and use `queue(action="restart_daemon")` or `queue(action="shutdown_daemon")` intentionally rather than treating daemon lifecycle as implicit.
+- The summary queue actions are the default unattended path. Only use `queue(..., debug=true)` when a human is present or explicit debugging requires the extra path-rich metadata.
 
 ## WANDB Use
 
@@ -148,7 +150,7 @@ For autonomous research:
 - If WANDB already provides enough evidence to reject or accept a condition, stop the run and move on.
 - If WANDB is unavailable, delayed, or incomplete, fall back to queue logs and job state rather than stalling.
 - Prefer decision-relevant metrics over dashboard tourism. Look only at the curves or summaries needed to decide continue, stop, or branch.
-- If the information you need is available from `wandb`, `queue_status`, `list_jobs`, `get_job`, and a short `read_job_log` tail, do not escalate to the debug queue tools.
+- If the information you need is available from `wandb`, `queue(action="queue_status")`, `queue(action="list_jobs")`, `queue(action="get_job")`, and a short `queue(action="read_job_log")` tail, do not escalate to debug payloads.
 
 ## When WANDB Is Not Enough
 
@@ -170,24 +172,28 @@ In those cases, use queue logs and job metadata as the primary source of truth.
 - If a run modifies code or launchers, verify the new launcher/config before queueing a long follow-up job.
 - Do not leave the queue running aimlessly after the current question has already been answered.
 - Do not abandon the research loop early if the current evidence is still insufficient. If the answer is not yet satisfying, decide what missing evidence matters most and queue the next experiment that resolves it.
-- Codex cannot reliably predict every future app approval prompt in `on-request` mode. Structure the workflow so the default path stays on summary tools and avoid path-heavy debug payloads unless a human is present.
+- Codex cannot reliably predict every future app approval prompt in `on-request` mode. Structure the workflow so the default path stays on the unified `queue` tool with summary actions and avoid path-heavy debug payloads unless a human is present.
+- Do not assume that one approved call unlocks an entire MCP forever. Warmup only helps when the active client config is already using `auto`-style approval behavior for the relevant tools.
+- If a long autonomous run would depend on a tool that still prompts every time, stop and surface that as a setup problem in the active Codex client instead of silently continuing.
 
 ## Expected Behavior In A Fresh Session
 
 A clean Codex session using only this skill plus the MCP server should be able to:
 
 1. detect that the queue server is available
-2. request the likely-needed queue tools early in the session
-3. perform a harmless placeholder queue cycle if unattended autonomy is expected
-4. understand that the MCP is control-only and the daemon auto-starts when mutation is needed
-5. choose a stable owner identity for this session
-6. choose or create a trusted launcher script
-7. enqueue a run with ownership metadata
-8. inspect queue status and logs
-9. inspect WANDB if present
-10. decide continue, stop, cancel, or branch
-11. enqueue the next best follow-up experiment
-12. repeat this loop until it has a satisfying answer, while keeping the queue intentional
+2. warm up the likely-needed queue actions early in the session through the unified `queue` tool
+3. warm up other MCPs it expects to rely on later
+4. perform a harmless placeholder queue cycle if unattended autonomy is expected
+5. detect when a tool is still configured or behaving as though it requires repeated approval and surface that as a setup problem
+6. understand that the MCP is control-only and the daemon auto-starts when mutation is needed
+7. choose a stable owner identity for this session
+8. choose or create a trusted launcher script
+9. enqueue a run with ownership metadata
+10. inspect queue status and logs through the unified `queue` tool
+11. inspect WANDB if present
+12. decide continue, stop, cancel, or branch
+13. enqueue the next best follow-up experiment
+14. repeat this loop until it has a satisfying answer, while keeping the queue intentional
 
 This skill is not meant to replace judgment. It is meant to provide a concrete operating procedure so Codex does not need prior conversational context to manage the queue sensibly.
 
@@ -198,4 +204,4 @@ This skill is not meant to replace judgment. It is meant to provide a concrete o
 - Queue runtime lives under the repo's `experiment_queue/` directory by default.
 - The default queued execution environment is the `fasttd3` conda env.
 - The current setup is intended for trusted launcher scripts in the thesis repo.
-- The MCP server is control-only; the actual queue worker is a daemon that is started on demand and remains alive until explicitly shut down.
+- The preferred autonomous interface is the single MCP tool `queue`, which dispatches by `action`. Legacy per-action tools remain for compatibility, but autonomous sessions should stay on `queue`.

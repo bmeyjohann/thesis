@@ -82,6 +82,7 @@ def test_mcp_queue_runs_script(tmp_path: Path) -> None:
 
         tools = _call(proc, 2, "tools/list")
         tool_names = {tool["name"] for tool in tools["result"]["tools"]}
+        assert "queue" in tool_names
         assert "prime_queue_session" in tool_names
         assert "enqueue_script" in tool_names
         assert "queue_status" in tool_names
@@ -90,17 +91,29 @@ def test_mcp_queue_runs_script(tmp_path: Path) -> None:
             proc,
             3,
             "tools/call",
-            {"name": "prime_queue_session", "arguments": {"exercise_control_tools": True}},
+            {
+                "name": "queue",
+                "arguments": {
+                    "action": "prime_queue_session",
+                    "exercise_control_tools": True,
+                },
+            },
         )
-        assert prime["result"]["structuredContent"]["server_name"] == "experiment-queue"
+        assert prime["result"]["structuredContent"]["result"]["server_name"] == "experiment-queue"
 
         queued = _call(
             proc,
             4,
             "tools/call",
-            {"name": "enqueue_script", "arguments": {"source_path": str(script_path)}},
+            {
+                "name": "queue",
+                "arguments": {
+                    "action": "enqueue_script",
+                    "source_path": str(script_path),
+                },
+            },
         )
-        job_id = queued["result"]["structuredContent"]["job_id"]
+        job_id = queued["result"]["structuredContent"]["result"]["job_id"]
         assert job_id
 
         deadline = time.time() + 10.0
@@ -110,9 +123,15 @@ def test_mcp_queue_runs_script(tmp_path: Path) -> None:
                 proc,
                 5,
                 "tools/call",
-                {"name": "get_job", "arguments": {"job_id": job_id}},
+                {
+                    "name": "queue",
+                    "arguments": {
+                        "action": "get_job",
+                        "job_id": job_id,
+                    },
+                },
             )
-            final_job = result["result"]["structuredContent"]
+            final_job = result["result"]["structuredContent"]["result"]
             if final_job["status"] == "finished":
                 break
             time.sleep(0.05)
@@ -124,11 +143,16 @@ def test_mcp_queue_runs_script(tmp_path: Path) -> None:
             6,
             "tools/call",
             {
-                "name": "read_job_log",
-                "arguments": {"job_id": job_id, "stream": "stdout", "lines": 20},
+                "name": "queue",
+                "arguments": {
+                    "action": "read_job_log",
+                    "job_id": job_id,
+                    "stream": "stdout",
+                    "lines": 20,
+                },
             },
         )
-        assert "queue-ok" in log_result["result"]["structuredContent"]["text"]
+        assert "queue-ok" in log_result["result"]["structuredContent"]["result"]["text"]
     finally:
         proc.kill()
         proc.wait(timeout=5)
@@ -186,9 +210,15 @@ def test_running_job_survives_server_restart(tmp_path: Path) -> None:
             proc,
             2,
             "tools/call",
-            {"name": "enqueue_script", "arguments": {"source_path": str(script_path)}},
+            {
+                "name": "queue",
+                "arguments": {
+                    "action": "enqueue_script",
+                    "source_path": str(script_path),
+                },
+            },
         )
-        job_id = queued["result"]["structuredContent"]["job_id"]
+        job_id = queued["result"]["structuredContent"]["result"]["job_id"]
 
         deadline = time.time() + 5.0
         while time.time() < deadline:
@@ -196,9 +226,15 @@ def test_running_job_survives_server_restart(tmp_path: Path) -> None:
                 proc,
                 3,
                 "tools/call",
-                {"name": "get_job", "arguments": {"job_id": job_id}},
+                {
+                    "name": "queue",
+                    "arguments": {
+                        "action": "get_job",
+                        "job_id": job_id,
+                    },
+                },
             )
-            if result["result"]["structuredContent"]["status"] == "running":
+            if result["result"]["structuredContent"]["result"]["status"] == "running":
                 break
             time.sleep(0.05)
         else:
@@ -226,9 +262,15 @@ def test_running_job_survives_server_restart(tmp_path: Path) -> None:
                 proc,
                 5,
                 "tools/call",
-                {"name": "get_job", "arguments": {"job_id": job_id}},
+                {
+                    "name": "queue",
+                    "arguments": {
+                        "action": "get_job",
+                        "job_id": job_id,
+                    },
+                },
             )
-            final_job = result["result"]["structuredContent"]
+            final_job = result["result"]["structuredContent"]["result"]
             if final_job["status"] == "finished":
                 break
             time.sleep(0.05)
@@ -240,11 +282,16 @@ def test_running_job_survives_server_restart(tmp_path: Path) -> None:
             6,
             "tools/call",
             {
-                "name": "read_job_log",
-                "arguments": {"job_id": job_id, "stream": "stdout", "lines": 20},
+                "name": "queue",
+                "arguments": {
+                    "action": "read_job_log",
+                    "job_id": job_id,
+                    "stream": "stdout",
+                    "lines": 20,
+                },
             },
         )
-        assert "survived" in log_result["result"]["structuredContent"]["text"]
+        assert "survived" in log_result["result"]["structuredContent"]["result"]["text"]
     finally:
         proc.kill()
         proc.wait(timeout=5)
@@ -448,22 +495,24 @@ def test_cancel_job_respects_owner_metadata(tmp_path: Path) -> None:
             2,
             "tools/call",
             {
-                "name": "enqueue_script",
+                "name": "queue",
                 "arguments": {
+                    "action": "enqueue_script",
                     "source_path": str(script_path),
                     "owner_label": "session-a",
                     "owner_session_id": "session-a-id",
                 },
             },
         )
-        job_id = queued["result"]["structuredContent"]["job_id"]
+        job_id = queued["result"]["structuredContent"]["result"]["job_id"]
         denied = _call(
             proc,
             3,
             "tools/call",
             {
-                "name": "cancel_job",
+                "name": "queue",
                 "arguments": {
+                    "action": "cancel_job",
                     "job_id": job_id,
                     "requester_label": "session-b",
                     "requester_session_id": "session-b-id",
@@ -478,15 +527,16 @@ def test_cancel_job_respects_owner_metadata(tmp_path: Path) -> None:
             4,
             "tools/call",
             {
-                "name": "cancel_job",
+                "name": "queue",
                 "arguments": {
+                    "action": "cancel_job",
                     "job_id": job_id,
                     "requester_label": "session-a",
                     "requester_session_id": "session-a-id",
                 },
             },
         )
-        allowed_status = allowed["result"]["structuredContent"]["status"]
+        allowed_status = allowed["result"]["structuredContent"]["result"]["status"]
         assert allowed_status in {"queued", "running", "cancelled"}
 
         deadline = time.time() + 5.0
@@ -496,9 +546,15 @@ def test_cancel_job_respects_owner_metadata(tmp_path: Path) -> None:
                 proc,
                 5,
                 "tools/call",
-                {"name": "get_job", "arguments": {"job_id": job_id}},
+                {
+                    "name": "queue",
+                    "arguments": {
+                        "action": "get_job",
+                        "job_id": job_id,
+                    },
+                },
             )
-            final_job = result["result"]["structuredContent"]
+            final_job = result["result"]["structuredContent"]["result"]
             if final_job["status"] == "cancelled":
                 break
             time.sleep(0.05)

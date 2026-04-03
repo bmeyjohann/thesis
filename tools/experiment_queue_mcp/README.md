@@ -14,7 +14,7 @@ The default queue root is [`experiment_queue/`](/home/benjamin/thesis/experiment
 - `logs/`
 - `state/`
 
-The server imports manually dropped scripts from `queued/`, but the preferred interface is the MCP `enqueue_script` tool.
+The server imports manually dropped scripts from `queued/`, but the preferred autonomous interface is the unified MCP `queue` tool with `action="enqueue_script"`.
 
 ## Start manually
 
@@ -59,6 +59,7 @@ Do not rely on a repo-local `.codex/config.toml` entry like `bash scripts/run_ex
 
 ## Tool surface
 
+- `queue`
 - `prime_queue_session`
 - `enqueue_script`
 - `daemon_status`
@@ -77,6 +78,30 @@ Do not rely on a repo-local `.codex/config.toml` entry like `bash scripts/run_ex
 - `stop_now`
 - `cancel_job`
 
+The legacy per-action tools remain for compatibility, but autonomous sessions should prefer `queue` so all queue activity stays under one MCP tool name.
+
+## Preferred Unified Tool
+
+Use the single MCP tool `queue` with an `action` argument:
+
+- `queue(action="help")`
+- `queue(action="prime_queue_session")`
+- `queue(action="enqueue_script", source_path="...")`
+- `queue(action="daemon_status")`
+- `queue(action="queue_status")`
+- `queue(action="list_jobs")`
+- `queue(action="get_job", job_id="...")`
+- `queue(action="read_job_log", job_id="...", stream="stdout")`
+- `queue(action="pause_queue")`
+- `queue(action="resume_queue")`
+- `queue(action="shutdown_daemon")`
+- `queue(action="restart_daemon")`
+- `queue(action="stop_after_current")`
+- `queue(action="stop_now")`
+- `queue(action="cancel_job", job_id="...")`
+
+For `queue_status`, `list_jobs`, and `get_job`, pass `debug=true` only when you explicitly need the full path-rich payload.
+
 ## Warmup Tool
 
 - `prime_queue_session` is a preflight helper for autonomous runs.
@@ -91,9 +116,9 @@ Do not rely on a repo-local `.codex/config.toml` entry like `bash scripts/run_ex
 - Jobs are bash scripts copied into the queue.
 - The daemon runs exactly one job at a time.
 - The MCP server is control-only. It does not own the long-lived worker loop.
-- Mutating queue tools (`enqueue_script`, `resume_queue`, `stop_after_current`, `stop_now`, `cancel_job`, and the optional probe path in `prime_queue_session`) check whether the daemon is running and start it if needed.
-- Read-only queue tools (`queue_status`, `list_jobs`, `get_job`, `read_job_log`, `pause_queue`) inspect persisted queue state without waking the daemon.
-- The default monitoring tools (`queue_status`, `list_jobs`, `get_job`) intentionally return compact summaries without absolute paths so unattended autonomous sessions are less likely to trip client-side approval heuristics.
+- Mutating queue actions, whether reached through the unified `queue` tool or the legacy per-action tools, check whether the daemon is running and start it if needed.
+- Read-only queue actions inspect persisted queue state without waking the daemon.
+- The default monitoring path (`queue(action="queue_status")`, `queue(action="list_jobs")`, `queue(action="get_job")`) intentionally returns compact summaries without absolute paths so unattended autonomous sessions are less likely to trip client-side approval heuristics.
 - The explicit debug tools (`queue_debug_status`, `list_jobs_debug`, `get_job_debug`) expose full path-rich metadata and are intended for manual diagnosis when a human is present.
 - The daemon stays alive once started until `shutdown_daemon` is called explicitly or the process is otherwise terminated.
 - Multiple MCP sessions can attach to the same queue root because they all talk to the same daemon-backed queue state.
@@ -116,7 +141,7 @@ Do not rely on a repo-local `.codex/config.toml` entry like `bash scripts/run_ex
 ## Approval guidance
 
 - Codex can auto-approve custom MCP tools via config, but app-side approval behavior is still heuristic and can be sensitive to path-heavy payloads.
-- If you want unattended autonomous work, prefer the summary tools plus `read_job_log` and `wandb` for normal monitoring.
+- If you want unattended autonomous work, prefer the unified `queue` tool with summary actions plus `wandb` for normal monitoring.
 - Treat the debug tools as manual-only. They are the ones most likely to trigger an extra approval because they expose absolute paths and richer execution metadata.
 - Put any per-tool MCP approval overrides in the active user config that your Codex app actually loads, not only in a repo-local config, if you need the app to honor them reliably.
 
