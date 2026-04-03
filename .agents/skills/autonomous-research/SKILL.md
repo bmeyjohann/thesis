@@ -25,7 +25,12 @@ The purpose of this skill is to let Codex autonomously run iterative research lo
 At the start of an autonomous-research session:
 
 1. Verify that the `experiment_queue` MCP is available and proactively warm up the unified `queue` tool first.
-2. At minimum, request:
+2. Do this immediately, before deep planning or long-running work, while the user is still present to approve the first MCP call if needed.
+3. The first queue warmup call should be a lightweight status read:
+   - `queue(action="queue_status")`
+4. If you expect to rely on the queue for a long unattended run, do that status warmup as one of the first actions in the session so the user can approve it and then leave the session alone.
+5. After the first status call, warm up the other queue actions you are likely to need during the session.
+6. At minimum, request:
    - `queue(action="help")`
    - `queue(action="daemon_status")`
    - `queue(action="queue_status")`
@@ -36,29 +41,29 @@ At the start of an autonomous-research session:
    - `queue(action="resume_queue")`
    - `queue(action="shutdown_daemon")`
    - `queue(action="restart_daemon")`
-3. If you expect to use other MCP servers later in the run, warm those up too with the lightest harmless call that matches the later workflow.
-4. If you expect to enqueue and cancel experiments during the run, do a harmless placeholder queue cycle at startup so that this path has already been exercised before unattended work begins:
+7. If you expect to use other MCP servers later in the run, warm those up too with the lightest harmless status or read-only call that matches the later workflow.
+8. If you expect to enqueue and cancel experiments during the run, do a harmless placeholder queue cycle at startup so that this path has already been exercised before unattended work begins:
    - enqueue a tiny trusted no-op or smoke job
    - cancel it immediately if the point is only to warm up the tool path
    - or let it finish quickly if a successful queue smoke test is useful
-5. Treat that initial placeholder cycle as session preparation for autonomous work, not as a meaningful experiment result.
-6. Treat warmup as best-effort only. It does not create a true session-wide approval bypass by itself.
-7. If a tool still prompts repeatedly after warmup, treat that as a config or client-behavior problem, not as a sign that the tool should keep being retried unattended.
-8. Identify the current research question in one sentence.
-9. Identify the current best baseline or comparison target.
-10. Convert the user's request into an explicit research goal and a short list of likely levers to change.
-11. Decide what evidence would count as:
+9. Treat that initial placeholder cycle as session preparation for autonomous work, not as a meaningful experiment result.
+10. Treat warmup as best-effort only. It does not create a true session-wide approval bypass by itself.
+11. If a tool still prompts repeatedly after warmup, treat that as a config or client-behavior problem, not as a sign that the tool should keep being retried unattended.
+12. Identify the current research question in one sentence.
+13. Identify the current best baseline or comparison target.
+14. Convert the user's request into an explicit research goal and a short list of likely levers to change.
+15. Decide what evidence would count as:
    - obvious failure
    - enough evidence to stop early
    - enough evidence to justify the next experiment
-12. Prefer existing trusted launcher scripts under the active repo's `scripts/` directory.
-13. If no suitable launcher exists, create a small repo-tracked launcher first. Do not rely on a long ad hoc shell command for autonomous work.
-14. Choose a stable ownership identity for this session:
+16. Prefer existing trusted launcher scripts under the active repo's `scripts/` directory.
+17. If no suitable launcher exists, create a small repo-tracked launcher first. Do not rely on a long ad hoc shell command for autonomous work.
+18. Choose a stable ownership identity for this session:
    - a human-readable `owner_label`
    - a stable `owner_session_id`
-15. Pass that ownership metadata when enqueueing jobs, and reuse the matching requester fields when later stopping or cancelling them.
-16. In unattended mode, keep queue interactions on the unified `queue` tool so all experiment-queue activity stays under one MCP tool name.
-17. Within `queue`, prefer the summary actions (`queue_status`, `list_jobs`, `get_job`) over `debug=true`. Debug payloads expose absolute paths and are more likely to trigger approval prompts in the Codex app.
+19. Pass that ownership metadata when enqueueing jobs, and reuse the matching requester fields when later stopping or cancelling them.
+20. In unattended mode, keep queue interactions on the unified `queue` tool so all experiment-queue activity stays under one MCP tool name.
+21. Within `queue`, prefer the summary actions (`queue_status`, `list_jobs`, `get_job`) over `debug=true`. Debug payloads expose absolute paths and are more likely to trigger approval prompts in the Codex app.
 
 ## Standard Operating Loop
 
@@ -181,19 +186,20 @@ In those cases, use queue logs and job metadata as the primary source of truth.
 A clean Codex session using only this skill plus the MCP server should be able to:
 
 1. detect that the queue server is available
-2. warm up the likely-needed queue actions early in the session through the unified `queue` tool
-3. warm up other MCPs it expects to rely on later
-4. perform a harmless placeholder queue cycle if unattended autonomy is expected
-5. detect when a tool is still configured or behaving as though it requires repeated approval and surface that as a setup problem
-6. understand that the MCP is control-only and the daemon auto-starts when mutation is needed
-7. choose a stable owner identity for this session
-8. choose or create a trusted launcher script
-9. enqueue a run with ownership metadata
-10. inspect queue status and logs through the unified `queue` tool
-11. inspect WANDB if present
-12. decide continue, stop, cancel, or branch
-13. enqueue the next best follow-up experiment
-14. repeat this loop until it has a satisfying answer, while keeping the queue intentional
+2. immediately issue a lightweight `queue(action="queue_status")` warmup call while the user is still present
+3. warm up the likely-needed queue actions early in the session through the unified `queue` tool
+4. warm up other MCPs it expects to rely on later
+5. perform a harmless placeholder queue cycle if unattended autonomy is expected
+6. detect when a tool is still configured or behaving as though it requires repeated approval and surface that as a setup problem
+7. understand that the MCP is control-only and the daemon auto-starts when mutation is needed
+8. choose a stable owner identity for this session
+9. choose or create a trusted launcher script
+10. enqueue a run with ownership metadata
+11. inspect queue status and logs through the unified `queue` tool
+12. inspect WANDB if present
+13. decide continue, stop, cancel, or branch
+14. enqueue the next best follow-up experiment
+15. repeat this loop until it has a satisfying answer, while keeping the queue intentional
 
 This skill is not meant to replace judgment. It is meant to provide a concrete operating procedure so Codex does not need prior conversational context to manage the queue sensibly.
 

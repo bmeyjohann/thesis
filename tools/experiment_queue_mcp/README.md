@@ -105,6 +105,7 @@ For `queue_status`, `list_jobs`, and `get_job`, pass `debug=true` only when you 
 ## Warmup Tool
 
 - `prime_queue_session` is a preflight helper for autonomous runs.
+- For unattended sessions, the first warmup should still be a lightweight status read such as `queue(action="queue_status")`, done immediately while the user is still present to approve the first MCP call if needed.
 - It can:
   - report queue state and recent jobs
   - exercise reversible control operations (`pause_queue`, `resume_queue`, `stop_after_current`)
