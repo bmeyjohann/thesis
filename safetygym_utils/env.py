@@ -176,6 +176,162 @@ def extract_goal_distance(env) -> float:
     return float("nan")
 
 
+def extract_goal_xy(env) -> Optional[np.ndarray]:
+    """Best-effort current goal xy position; returns None when unavailable."""
+    base = unwrap_env(env)
+    try:
+        task = getattr(base, "task", None)
+        goal = getattr(task, "goal", None)
+        pos = np.asarray(getattr(goal, "pos", None), dtype=np.float64).reshape(-1)
+        if pos.size >= 2 and np.isfinite(pos[:2]).all():
+            return pos[:2].astype(np.float64, copy=True)
+    except Exception:
+        pass
+    return None
+
+
+def extract_agent_xy(env) -> Optional[np.ndarray]:
+    """Best-effort agent xy position; returns None when unavailable."""
+    base = unwrap_env(env)
+    try:
+        task = getattr(base, "task", None)
+        agent = getattr(task, "agent", None)
+        pos = np.asarray(getattr(agent, "pos", None), dtype=np.float64).reshape(-1)
+        if pos.size >= 2 and np.isfinite(pos[:2]).all():
+            return pos[:2].astype(np.float64, copy=True)
+    except Exception:
+        pass
+    return None
+
+
+def extract_agent_velocity_xy(env) -> Optional[np.ndarray]:
+    """Best-effort agent xy velocity; returns None when unavailable."""
+    base = unwrap_env(env)
+    try:
+        task = getattr(base, "task", None)
+        agent = getattr(task, "agent", None)
+        vel = np.asarray(getattr(agent, "vel", None), dtype=np.float64).reshape(-1)
+        if vel.size >= 2 and np.isfinite(vel[:2]).all():
+            return vel[:2].astype(np.float64, copy=True)
+    except Exception:
+        pass
+    return None
+
+
+def extract_agent_forward_xy(env) -> Optional[np.ndarray]:
+    """Best-effort normalized forward xy direction from the agent body pose."""
+    base = unwrap_env(env)
+    try:
+        task = getattr(base, "task", None)
+        agent = getattr(task, "agent", None)
+        mat = np.asarray(getattr(agent, "mat", None), dtype=np.float64).reshape(3, 3)
+        if np.isfinite(mat).all():
+            # Matches the existing topdown renderer convention for SafetyCar.
+            forward = (-mat[:2, 1]).astype(np.float64, copy=False)
+            norm = float(np.linalg.norm(forward))
+            if norm > 1e-6:
+                return (forward / norm).astype(np.float64, copy=False)
+    except Exception:
+        pass
+    return None
+
+
+def _strip_numeric_suffix(name: str) -> str:
+    out = str(name)
+    while out and out[-1].isdigit():
+        out = out[:-1]
+    for suffix in ("obj", "mocap"):
+        if out.endswith(suffix):
+            out = out[: -len(suffix)]
+    return out or str(name)
+
+
+def _task_constrained_object_specs(task) -> list[dict]:
+    cached = getattr(task, "_codex_constrained_object_specs", None)
+    if isinstance(cached, list):
+        return cached
+
+    cfg = getattr(getattr(task, "world_info", None), "world_config_dict", None)
+    if not isinstance(cfg, dict):
+        setattr(task, "_codex_constrained_object_specs", [])
+        return []
+
+    plural_map = {
+        "hazard": "hazards",
+        "vase": "vases",
+        "pillar": "pillars",
+        "gremlin": "gremlins",
+        "button": "buttons",
+    }
+    specs: list[dict] = []
+    for section in ("geoms", "free_geoms", "mocaps"):
+        items = cfg.get(section, {})
+        if not isinstance(items, dict):
+            continue
+        for body_name, body_cfg in items.items():
+            if not isinstance(body_cfg, dict):
+                continue
+            geoms = body_cfg.get("geoms", [])
+            if not geoms:
+                continue
+            geom = geoms[0]
+            label = _strip_numeric_suffix(str(body_name)).lower()
+            task_attr = plural_map.get(label, f"{label}s")
+            obj = getattr(task, task_attr, None)
+            if obj is None or not bool(getattr(obj, "is_constrained", False)):
+                continue
+            size_arr = np.asarray(geom.get("size", [0.1, 0.1, 0.1]), dtype=np.float64).reshape(-1)
+            size = float(size_arr[0]) if size_arr.size else 0.1
+            keepout = float(getattr(obj, "keepout", size))
+            specs.append(
+                {
+                    "body_name": str(body_name),
+                    "label": str(label),
+                    "size": float(size),
+                    "keepout": float(keepout),
+                }
+            )
+
+    setattr(task, "_codex_constrained_object_specs", specs)
+    return specs
+
+
+def extract_min_constrained_clearance(env) -> float:
+    """Best-effort keepout-based clearance to the nearest constrained obstacle."""
+    base = unwrap_env(env)
+    task = getattr(base, "task", None)
+    if task is None:
+        return float("nan")
+
+    agent_xy = extract_agent_xy(env)
+    if agent_xy is None:
+        return float("nan")
+
+    agent = getattr(task, "agent", None)
+    agent_keepout = float(getattr(agent, "keepout", 0.0) or 0.0)
+    specs = _task_constrained_object_specs(task)
+    if not specs:
+        return float("nan")
+
+    min_clearance = float("inf")
+    for spec in specs:
+        try:
+            body = task.data.body(str(spec["body_name"]))
+            pos = np.asarray(body.xpos, dtype=np.float64).reshape(-1)
+        except Exception:
+            continue
+        if pos.size < 2 or not np.isfinite(pos[:2]).all():
+            continue
+        dist = float(np.linalg.norm(pos[:2] - agent_xy))
+        clearance = dist - (agent_keepout + float(spec["keepout"]))
+        if clearance < min_clearance:
+            min_clearance = clearance
+
+    if np.isfinite(min_clearance):
+        return float(min_clearance)
+    return float("nan")
+
+
 def extract_step_limit(env) -> int:
     """Return effective per-episode step limit."""
     values: list[int] = []
@@ -213,3 +369,17 @@ def clip_action_to_space(action: np.ndarray, action_space) -> np.ndarray:
         else:
             arr = arr[: low.shape[0]]
     return np.clip(arr, low, high).astype(np.float32, copy=False)
+
+
+def scale_action_np(action: np.ndarray, action_space) -> np.ndarray:
+    arr = np.asarray(action, dtype=np.float32).reshape(-1)
+    low = np.asarray(action_space.low, dtype=np.float32).reshape(-1)
+    high = np.asarray(action_space.high, dtype=np.float32).reshape(-1)
+    if arr.shape[0] != low.shape[0]:
+        if arr.shape[0] < low.shape[0]:
+            arr = np.pad(arr, (0, low.shape[0] - arr.shape[0]), mode="constant")
+        else:
+            arr = arr[: low.shape[0]]
+    center = 0.5 * (high + low)
+    half = 0.5 * (high - low)
+    return (center + arr * half).astype(np.float32, copy=False)

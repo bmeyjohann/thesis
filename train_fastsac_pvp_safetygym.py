@@ -34,10 +34,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--layer_norm_eps", type=float, default=1e-5)
     p.add_argument("--init_scale", type=float, default=0.01)
     p.add_argument("--max_grad_norm", type=float, default=10.0)
+    p.add_argument("--alpha_min", type=float, default=0.0,
+                   help="Minimum entropy temperature (alpha). Set to 0 to disable lower clamp.")
+    p.add_argument("--alpha_max", type=float, default=1.0,
+                   help="Maximum entropy temperature (alpha). Set to 0 to disable upper clamp.")
+    p.add_argument("--obs_normalization", action="store_true", default=True)
+    p.add_argument("--no_obs_normalization", dest="obs_normalization", action="store_false")
 
-    p.add_argument("--reward_mode", type=str, default="sparse", choices=["sparse", "dense", "dense_plus_sparse", "dual", "none"])
+    p.add_argument("--reward_mode", type=str, default="sparse", choices=["sparse", "dense", "dense_plus_sparse", "dual", "native", "none"])
     p.add_argument("--dense_reward_scale", type=float, default=1.0)
     p.add_argument("--step_penalty", type=float, default=0.0)
+    p.add_argument("--cost_penalty", type=float, default=0.0)
 
     p.add_argument("--render_mode", type=str, default="human", choices=["human", "rgb_array", "none", "pygame", "topdown"])
     p.add_argument("--viewer_fps", type=float, default=20.0)
@@ -123,6 +130,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--eval_interval", type=int, default=20_000)
     p.add_argument("--num_eval_episodes", type=int, default=10)
     p.add_argument("--save_interval", type=int, default=50_000)
+    p.add_argument("--viz_on_checkpoint", action="store_true", default=False)
+    p.add_argument("--viz_grid_resolution", type=int, default=48)
+    p.add_argument("--viz_quiver_stride", type=int, default=4)
+    p.add_argument("--viz_device", type=str, default="cpu")
+    p.add_argument("--viz_seed", type=int, default=0)
+    p.add_argument("--viz_first_step", type=int, default=0)
+    p.add_argument("--viz_headings_deg", type=str, default="0,90,180,270")
+    p.add_argument("--viz_num_rollouts", type=int, default=4)
+    p.add_argument("--eval_save_episode_plots", action="store_true", default=False)
+    p.add_argument("--eval_episode_plot_max_episodes", type=int, default=9)
     p.add_argument("--profile_timing", action="store_true", default=False)
     return p
 

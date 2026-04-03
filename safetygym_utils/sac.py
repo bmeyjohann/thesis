@@ -231,6 +231,17 @@ class SACUpdateMetrics:
     alpha_loss: float
     alpha: float
     target_q_mean: float
+    policy_entropy: float = 0.0
+    log_pi_mean: float = 0.0
+    action_l2: float = 0.0
+    q_min_pi_mean: float = 0.0
+    q_min_data_mean: float = 0.0
+    q_disagreement_data_mean: float = 0.0
+    q_disagreement_pi_mean: float = 0.0
+    replay_reward_mean: float = 0.0
+    replay_reward_abs_mean: float = 0.0
+    actor_updates: float = 1.0
+    alpha_updates: float = 1.0
     critic_loss_pref: float = 0.0
     critic_loss_pref_weighted: float = 0.0
     pref_q_delta: float = 0.0
@@ -253,6 +264,14 @@ class QDisagreementMetrics:
     q_max_mean: float
 
 
+def _as_q_list(q_out) -> list[torch.Tensor]:
+    if isinstance(q_out, list):
+        return q_out
+    if isinstance(q_out, tuple):
+        return list(q_out)
+    raise TypeError(f"Unsupported critic output type: {type(q_out)!r}")
+
+
 def build_sac(
     *,
     obs_dim: int,
@@ -268,6 +287,7 @@ def build_sac(
     weight_decay: float,
     num_envs: int,
     device: torch.device,
+    alpha_init: float = 1e-3,
 ) -> SACTensors:
     actor = SafetyActor(
         n_obs=obs_dim,
@@ -303,7 +323,7 @@ def build_sac(
     critic_optimizer = torch.optim.AdamW(critic.parameters(), lr=lr_critic, weight_decay=weight_decay)
 
     log_alpha = torch.ones(1, requires_grad=True, device=device)
-    log_alpha.data.copy_(torch.tensor([np.log(1e-3)], device=device))
+    log_alpha.data.copy_(torch.tensor([np.log(max(1e-6, float(alpha_init)))], device=device))
     alpha_optimizer = torch.optim.Adam([log_alpha], lr=lr_critic)
     target_entropy = -float(act_dim)
 
@@ -366,7 +386,7 @@ def compute_q_disagreement(
 ) -> QDisagreementMetrics:
     """Return scalar critic disagreement statistics for the given batch."""
     with torch.no_grad():
-        q_list = sac.critic(obs, actions)
+        q_list = _as_q_list(sac.critic(obs, actions))
         stacked = torch.stack(q_list, dim=0)
         q_min = torch.min(stacked, dim=0).values
         q_max = torch.max(stacked, dim=0).values
@@ -395,6 +415,7 @@ def sac_update_step(
     gamma: float,
     tau: float,
     max_grad_norm: float,
+    obs_preprocess=None,
     pref_batch=None,
     pref_rank_weight: float = 0.0,
     pref_rank_margin: float = 0.1,
@@ -406,24 +427,52 @@ def sac_update_step(
     pref_violation_clip: float = 10.0,
     pref_violation_target: float = 0.0,
     pref_lagrangian_violation_type: str = "hinge",
+    alpha_min: float = 0.0,
+    alpha_max: float = 1.0,
+    scale_actor_to_env_bounds: bool = False,
+    action_low: Optional[torch.Tensor] = None,
+    action_high: Optional[torch.Tensor] = None,
+    update_actor: bool = True,
+    critic_loss_reduction: str = "mean",
 ) -> SACUpdateMetrics:
     obs = batch["observations"]
     actions = batch["actions"]
     next_obs = batch["next"]["observations"]
+    if obs_preprocess is not None:
+        obs = obs_preprocess(obs)
+        next_obs = obs_preprocess(next_obs)
     rewards = batch["next"]["rewards"].unsqueeze(-1)
     dones = batch["next"]["dones"].bool().unsqueeze(-1)
     trunc = batch["next"]["truncations"].bool().unsqueeze(-1)
     discount = torch.as_tensor(gamma, device=obs.device, dtype=torch.float32)
     bootstrap = (trunc | ~dones).float()
 
+    def _scale_actions(actions: torch.Tensor) -> torch.Tensor:
+        if not bool(scale_actor_to_env_bounds):
+            return actions
+        if action_low is None or action_high is None:
+            raise ValueError("action bounds are required when scale_actor_to_env_bounds is enabled")
+        center = 0.5 * (action_high + action_low)
+        half = 0.5 * (action_high - action_low)
+        return center + actions * half
+
     with torch.no_grad():
-        next_actions, next_log_pi, _ = sac.actor(next_obs)
-        q_next_list = sac.critic_target(next_obs, next_actions)
+        next_actions_norm, next_log_pi, _ = sac.actor(next_obs)
+        next_actions = _scale_actions(next_actions_norm)
+        q_next_list = _as_q_list(sac.critic_target(next_obs, next_actions))
         min_q_next = torch.min(torch.stack(q_next_list, dim=0), dim=0).values - sac.log_alpha.exp() * next_log_pi
         target_q = rewards + bootstrap * discount * min_q_next
 
-    q_list = sac.critic(obs, actions)
-    critic_loss = torch.stack([F.mse_loss(q, target_q) for q in q_list], dim=0).mean()
+    q_list = _as_q_list(sac.critic(obs, actions))
+    q_stack_data = torch.stack(q_list, dim=0)
+    q_min_data = torch.min(q_stack_data, dim=0).values
+    q_max_data = torch.max(q_stack_data, dim=0).values
+    q_disagreement_data = q_max_data - q_min_data
+    q_losses = torch.stack([F.mse_loss(q, target_q) for q in q_list], dim=0)
+    if str(critic_loss_reduction).strip().lower() == "sum":
+        critic_loss = q_losses.sum()
+    else:
+        critic_loss = q_losses.mean()
     critic_loss_pref = torch.tensor(0.0, device=obs.device)
     critic_loss_pref_weighted = torch.tensor(0.0, device=obs.device)
     pref_q_delta = 0.0
@@ -489,20 +538,43 @@ def sac_update_step(
         torch.nn.utils.clip_grad_norm_(sac.critic.parameters(), max_grad_norm)
     sac.critic_optimizer.step()
 
-    pi_actions, log_pi, _ = sac.actor(obs)
-    q_pi = torch.min(torch.stack(sac.critic(obs, pi_actions), dim=0), dim=0).values
-    actor_loss = ((sac.log_alpha.exp().detach() * log_pi) - q_pi).mean()
+    pi_actions_norm, log_pi, _ = sac.actor(obs)
+    pi_actions = _scale_actions(pi_actions_norm)
+    q_pi_list = _as_q_list(sac.critic(obs, pi_actions))
+    q_stack_pi = torch.stack(q_pi_list, dim=0)
+    q_pi = torch.min(q_stack_pi, dim=0).values
+    q_disagreement_pi = torch.max(q_stack_pi, dim=0).values - torch.min(q_stack_pi, dim=0).values
 
-    sac.actor_optimizer.zero_grad(set_to_none=True)
-    actor_loss.backward()
-    if max_grad_norm > 0:
-        torch.nn.utils.clip_grad_norm_(sac.actor.parameters(), max_grad_norm)
-    sac.actor_optimizer.step()
+    actor_loss = torch.tensor(0.0, device=obs.device)
+    alpha_loss = torch.tensor(0.0, device=obs.device)
+    actor_updates = 0.0
+    alpha_updates = 0.0
 
-    alpha_loss = -sac.log_alpha.exp() * (log_pi.detach() + sac.target_entropy).mean()
-    sac.alpha_optimizer.zero_grad(set_to_none=True)
-    alpha_loss.backward()
-    sac.alpha_optimizer.step()
+    if bool(update_actor):
+        actor_loss = ((sac.log_alpha.exp().detach() * log_pi) - q_pi).mean()
+
+        sac.actor_optimizer.zero_grad(set_to_none=True)
+        actor_loss.backward()
+        if max_grad_norm > 0:
+            torch.nn.utils.clip_grad_norm_(sac.actor.parameters(), max_grad_norm)
+        sac.actor_optimizer.step()
+
+        alpha_loss = -sac.log_alpha.exp() * (log_pi.detach() + sac.target_entropy).mean()
+        sac.alpha_optimizer.zero_grad(set_to_none=True)
+        alpha_loss.backward()
+        sac.alpha_optimizer.step()
+        with torch.no_grad():
+            min_log_alpha = None
+            if float(alpha_min) > 0.0:
+                min_log_alpha = float(np.log(max(1e-6, float(alpha_min))))
+            max_log_alpha = None
+            if float(alpha_max) > 0.0:
+                max_log_alpha = float(np.log(float(alpha_max)))
+            lower = min_log_alpha if min_log_alpha is not None else -torch.inf
+            upper = max_log_alpha if max_log_alpha is not None else torch.inf
+            sac.log_alpha.clamp_(min=lower, max=upper)
+        actor_updates = 1.0
+        alpha_updates = 1.0
 
     soft_update(sac.critic, sac.critic_target, tau)
 
@@ -512,6 +584,17 @@ def sac_update_step(
         alpha_loss=float(alpha_loss.detach().cpu().item()),
         alpha=float(sac.log_alpha.exp().detach().cpu().item()),
         target_q_mean=float(target_q.detach().mean().cpu().item()),
+        policy_entropy=float((-log_pi).detach().mean().cpu().item()),
+        log_pi_mean=float(log_pi.detach().mean().cpu().item()),
+        action_l2=float(pi_actions.detach().norm(dim=-1).mean().cpu().item()),
+        q_min_pi_mean=float(q_pi.detach().mean().cpu().item()),
+        q_min_data_mean=float(q_min_data.detach().mean().cpu().item()),
+        q_disagreement_data_mean=float(q_disagreement_data.detach().mean().cpu().item()),
+        q_disagreement_pi_mean=float(q_disagreement_pi.detach().mean().cpu().item()),
+        replay_reward_mean=float(rewards.detach().mean().cpu().item()),
+        replay_reward_abs_mean=float(rewards.detach().abs().mean().cpu().item()),
+        actor_updates=float(actor_updates),
+        alpha_updates=float(alpha_updates),
         critic_loss_pref=float(critic_loss_pref.detach().cpu().item()),
         critic_loss_pref_weighted=float(critic_loss_pref_weighted.detach().cpu().item()),
         pref_q_delta=float(pref_q_delta),

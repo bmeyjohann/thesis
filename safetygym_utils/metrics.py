@@ -16,6 +16,14 @@ MANDATORY_EPISODE_KEYS = {
     "intervention_num_bursts",
     "intervention_avg_burst_len",
     "goal_met",
+    "goal_met_count",
+    "first_goal_success",
+    "first_goal_hit_step",
+    "first_goal_hit_step_success_only",
+    "first_goal_within_100",
+    "first_goal_within_200",
+    "first_goal_reward_sum",
+    "first_goal_dense_reward_sum",
     "final_distance_to_goal",
     "outcome_success",
     "outcome_timeout",
@@ -74,18 +82,51 @@ def augment_rollout_summary(summary: Dict[str, float], prefix: str) -> Dict[str,
     episodes = float(out.get(f"{prefix}/episodes", 0.0))
     goal_rate = float(out.get(f"{prefix}/goal_met_mean", out.get(f"{prefix}/outcome_success_mean", 0.0)))
     out[f"{prefix}/goal_success_rate"] = goal_rate
-    out[f"{prefix}/goals_solved"] = float(goal_rate * episodes)
+    goals_per_episode = float(out.get(f"{prefix}/goal_met_count_mean", goal_rate))
+    out[f"{prefix}/goals_per_episode"] = goals_per_episode
+    out[f"{prefix}/goals_solved"] = float(goals_per_episode * episodes)
+    out[f"{prefix}/goals_reached"] = float(out[f"{prefix}/goals_solved"])
     out[f"{prefix}/goals_attempted"] = float(episodes)
     out[f"{prefix}/teacher_fraction_steps"] = float(out.get(f"{prefix}/intervention_fraction_mean", 0.0))
     out[f"{prefix}/teacher_intervention_steps"] = float(out.get(f"{prefix}/intervention_steps_mean", 0.0))
-    if f"{prefix}/reward_shaped_sum_mean" in out:
-        out[f"{prefix}/reward_shaped_return_mean"] = float(out[f"{prefix}/reward_shaped_sum_mean"])
+    if f"{prefix}/episode_return_mean" in out:
+        out[f"{prefix}/mean_reward"] = float(out[f"{prefix}/episode_return_mean"])
+    if f"{prefix}/episode_length_mean" in out:
+        out[f"{prefix}/mean_episode_length"] = float(out[f"{prefix}/episode_length_mean"])
     if f"{prefix}/reward_raw_env_sum_mean" in out:
-        out[f"{prefix}/reward_raw_env_return_mean"] = float(out[f"{prefix}/reward_raw_env_sum_mean"])
+        out[f"{prefix}/mean_env_reward"] = float(out[f"{prefix}/reward_raw_env_sum_mean"])
     if f"{prefix}/reward_dense_sum_mean" in out:
-        out[f"{prefix}/reward_dense_return_mean"] = float(out[f"{prefix}/reward_dense_sum_mean"])
+        out[f"{prefix}/mean_dense_reward"] = float(out[f"{prefix}/reward_dense_sum_mean"])
     if f"{prefix}/reward_sparse_sum_mean" in out:
-        out[f"{prefix}/reward_sparse_return_mean"] = float(out[f"{prefix}/reward_sparse_sum_mean"])
+        out[f"{prefix}/mean_sparse_reward"] = float(out[f"{prefix}/reward_sparse_sum_mean"])
     if f"{prefix}/reward_step_penalty_sum_mean" in out:
-        out[f"{prefix}/reward_step_penalty_return_mean"] = float(out[f"{prefix}/reward_step_penalty_sum_mean"])
+        out[f"{prefix}/mean_step_penalty_reward"] = float(out[f"{prefix}/reward_step_penalty_sum_mean"])
+    if f"{prefix}/reward_cost_penalty_sum_mean" in out:
+        out[f"{prefix}/mean_cost_penalty_reward"] = float(out[f"{prefix}/reward_cost_penalty_sum_mean"])
+    if f"{prefix}/reward_clearance_penalty_sum_mean" in out:
+        out[f"{prefix}/mean_clearance_penalty_reward"] = float(out[f"{prefix}/reward_clearance_penalty_sum_mean"])
+    if f"{prefix}/reward_forward_sum_mean" in out:
+        out[f"{prefix}/mean_forward_reward"] = float(out[f"{prefix}/reward_forward_sum_mean"])
+    if f"{prefix}/reward_backward_penalty_sum_mean" in out:
+        out[f"{prefix}/mean_backward_penalty_reward"] = float(out[f"{prefix}/reward_backward_penalty_sum_mean"])
+    if f"{prefix}/reward_heading_sum_mean" in out:
+        out[f"{prefix}/mean_heading_reward"] = float(out[f"{prefix}/reward_heading_sum_mean"])
+    if f"{prefix}/episode_cost_sum_mean" in out:
+        out[f"{prefix}/mean_episode_cost"] = float(out[f"{prefix}/episode_cost_sum_mean"])
+        out[f"{prefix}/collision_cost_sum"] = float(out[f"{prefix}/episode_cost_sum_mean"])
+    if f"{prefix}/episode_cost_rate_mean" in out:
+        out[f"{prefix}/mean_episode_cost_rate"] = float(out[f"{prefix}/episode_cost_rate_mean"])
+        out[f"{prefix}/collision_cost_rate"] = float(out[f"{prefix}/episode_cost_rate_mean"])
+    if f"{prefix}/mean_constrained_clearance_mean" in out:
+        out[f"{prefix}/mean_constrained_clearance"] = float(out[f"{prefix}/mean_constrained_clearance_mean"])
+    if f"{prefix}/min_constrained_clearance_mean" in out:
+        out[f"{prefix}/min_constrained_clearance"] = float(out[f"{prefix}/min_constrained_clearance_mean"])
+    if f"{prefix}/first_goal_success_mean" in out:
+        out[f"{prefix}/first_goal_success_rate"] = float(out[f"{prefix}/first_goal_success_mean"])
+    if f"{prefix}/first_goal_hit_step_mean" in out:
+        out[f"{prefix}/mean_first_goal_hit_step"] = float(out[f"{prefix}/first_goal_hit_step_mean"])
+    if f"{prefix}/first_goal_reward_sum_mean" in out:
+        out[f"{prefix}/mean_reward_to_first_goal"] = float(out[f"{prefix}/first_goal_reward_sum_mean"])
+    if f"{prefix}/first_goal_dense_reward_sum_mean" in out:
+        out[f"{prefix}/mean_dense_reward_to_first_goal"] = float(out[f"{prefix}/first_goal_dense_reward_sum_mean"])
     return out

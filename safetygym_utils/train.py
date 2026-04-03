@@ -19,7 +19,7 @@ if _FAST_SAC_PATH.exists():
     if _fast_sac_path_str not in sys.path:
         sys.path.insert(0, _fast_sac_path_str)
 
-from fast_sac_utils import SimpleReplayBuffer
+from fast_sac_utils import EmpiricalNormalization, SimpleReplayBuffer
 
 from .controllers import build_human_controller
 from .dataset_io import (
@@ -31,9 +31,10 @@ from .dataset_io import (
     save_buffer_as_transition_dataset,
 )
 from .gamepad import DEFAULT_SAFETY_GAMEPAD_CACHE_PATH, DEFAULT_SAFETY_GAMEPAD_CONFIG_PATH, DEFAULT_SAFETY_GAMEPAD_PORT
-from .env import clip_action_to_space, extract_goal_distance, extract_step_limit, make_safety_env
+from .env import clip_action_to_space, extract_goal_distance, extract_step_limit, make_safety_env, scale_action_np
 from .io import save_args_json
 from .metrics import EpisodeWindow, augment_rollout_summary, classify_outcome
+from .policy_viz import _extract_bounds, _extract_overlay_specs, plot_episode_contact_sheet, plot_eval_episode_trajectory
 from .rendering import build_external_viewer, resolve_env_render_mode, wants_external_viewer
 from .sac import (
     SACTensors,
@@ -122,6 +123,52 @@ class TimingWindow:
         self.total_s = 0.0
 
 
+def _maybe_render_policy_map(
+    *,
+    args,
+    checkpoint_path: Path,
+    step_value: int,
+    run_paths: RunPaths,
+    wandb_run,
+) -> None:
+    if not bool(getattr(args, "viz_on_checkpoint", False)):
+        return
+    first_step = int(max(0, getattr(args, "viz_first_step", 0)))
+    if step_value < first_step:
+        return
+    try:
+        from .policy_viz import generate_safety_policy_maps
+
+        result = generate_safety_policy_maps(
+            model_path=checkpoint_path,
+            output_dir=run_paths.log_dir / "policy_maps",
+            tag=str(step_value),
+            env_name=str(args.env_name),
+            device=str(getattr(args, "viz_device", "cpu")),
+            grid_resolution=int(getattr(args, "viz_grid_resolution", 48)),
+            quiver_stride=int(getattr(args, "viz_quiver_stride", 4)),
+            seed=int(getattr(args, "viz_seed", 0)),
+            headings_deg=str(getattr(args, "viz_headings_deg", "0,90,180,270")),
+            num_rollouts=int(getattr(args, "viz_num_rollouts", 4)),
+        )
+        print(f"[Viz] generated {result['map_png']}", flush=True)
+        if wandb_run is not None:
+            try:
+                import wandb  # type: ignore
+
+                wandb_run.log(
+                    {
+                        "viz/policy_map": wandb.Image(str(result["map_png"]), caption=f"step={step_value}"),
+                        "viz/policy_rollouts": wandb.Image(str(result["rollout_png"]), caption=f"step={step_value}"),
+                    },
+                    step=int(step_value),
+                )
+            except Exception:
+                pass
+    except Exception as exc:
+        print(f"[Viz] failed at step {step_value}: {exc}", flush=True)
+
+
 def _summary_stats(values: list[float], prefix: str) -> Dict[str, float]:
     if not values:
         return {
@@ -141,14 +188,28 @@ def _summary_stats(values: list[float], prefix: str) -> Dict[str, float]:
     }
 
 
+def _window_mean(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    return float(np.mean(np.asarray(values, dtype=np.float64)))
+
+
 def _compute_uncertainty_signal(
     *,
     sac: SACTensors,
     obs: np.ndarray,
     action: np.ndarray,
     device: torch.device,
+    obs_preprocess=None,
 ) -> Dict[str, float]:
     obs_t = torch.as_tensor(obs[None, :], device=device, dtype=torch.float32)
+    if obs_preprocess is not None:
+        was_training = bool(getattr(obs_preprocess, "training", False))
+        if hasattr(obs_preprocess, "eval"):
+            obs_preprocess.eval()
+        obs_t = obs_preprocess(obs_t)
+        if was_training and hasattr(obs_preprocess, "train"):
+            obs_preprocess.train()
     act_t = torch.as_tensor(action[None, :], device=device, dtype=torch.float32)
     qd = compute_q_disagreement(sac=sac, obs=obs_t, actions=act_t)
     return {
@@ -242,9 +303,9 @@ def _console_metrics_line(payload: Dict[str, float]) -> str:
         return (
             "[Eval] "
             f"step={int(payload.get('eval/step', 0.0))} "
-            f"return={_fmt_metric(payload, 'eval/episode_return_mean')} "
-            f"dense={_fmt_metric(payload, 'eval/reward_dense_return_mean')} "
-            f"sparse={_fmt_metric(payload, 'eval/reward_sparse_return_mean')} "
+            f"reward={_fmt_metric(payload, 'eval/mean_reward')} "
+            f"dense={_fmt_metric(payload, 'eval/mean_dense_reward')} "
+            f"sparse={_fmt_metric(payload, 'eval/mean_sparse_reward')} "
             f"cost={_fmt_metric(payload, 'eval/episode_cost_sum_mean')} "
             f"success={_fmt_metric(payload, 'eval/outcome_success_mean')} "
             f"goals={goals_solved}/{goals_attempted} "
@@ -278,9 +339,9 @@ def _console_metrics_line(payload: Dict[str, float]) -> str:
             "[Train] "
             f"step={int(payload.get('train/step', 0.0))} "
             f"fps={_fmt_metric(payload, 'train/fps', digits=1)} "
-            f"return={_fmt_metric(payload, 'train/episode_return_mean')} "
-            f"dense={_fmt_metric(payload, 'train/reward_dense_return_mean')} "
-            f"sparse={_fmt_metric(payload, 'train/reward_sparse_return_mean')} "
+            f"reward={_fmt_metric(payload, 'train/mean_reward')} "
+            f"dense={_fmt_metric(payload, 'train/mean_dense_reward')} "
+            f"sparse={_fmt_metric(payload, 'train/mean_sparse_reward')} "
             f"cost={_fmt_metric(payload, 'train/episode_cost_sum_mean')} "
             f"success={_fmt_metric(payload, 'train/outcome_success_mean')} "
             f"goals={goals_solved}/{goals_attempted} "
@@ -314,6 +375,7 @@ def _make_env_with_wrappers(
         reward_mode=args.reward_mode,
         dense_reward_scale=args.dense_reward_scale,
         step_penalty=args.step_penalty,
+        cost_penalty=float(getattr(args, "cost_penalty", 0.0)),
     )
     if with_intervention:
         if controller is None:
@@ -420,14 +482,21 @@ def _episode_metrics_from_info(
     ep_reward_dense: float,
     ep_reward_sparse: float,
     ep_reward_step_penalty: float,
+    ep_reward_cost_penalty: float,
     ep_len: int,
     max_episode_steps: int,
     terminated: bool,
     truncated: bool,
     final_distance_to_goal: float,
+    goal_met_any: bool,
+    goal_met_count: int,
+    first_goal_hit_step: int | None,
+    first_goal_reward_sum: float,
+    first_goal_dense_reward_sum: float,
 ) -> Dict[str, float]:
-    goal_met = bool(info.get("goal_met", False))
+    goal_met = bool(goal_met_any)
     outcome = classify_outcome(goal_met=goal_met, episode_steps=ep_len, max_episode_steps=max_episode_steps)
+    first_hit = int(first_goal_hit_step) if first_goal_hit_step is not None else int(max_episode_steps)
     return {
         "episode_return": float(ep_return),
         "episode_cost_sum": float(ep_cost),
@@ -438,11 +507,20 @@ def _episode_metrics_from_info(
         "reward_dense_sum": float(ep_reward_dense),
         "reward_sparse_sum": float(ep_reward_sparse),
         "reward_step_penalty_sum": float(ep_reward_step_penalty),
+        "reward_cost_penalty_sum": float(ep_reward_cost_penalty),
         "intervention_steps": float(info.get("teacher_intervention_steps", 0.0)),
         "intervention_fraction": float(info.get("teacher_fraction_steps", 0.0)),
         "intervention_num_bursts": float(info.get("teacher_num_bursts", 0.0)),
         "intervention_avg_burst_len": float(info.get("teacher_avg_burst_len", 0.0)),
         "goal_met": 1.0 if goal_met else 0.0,
+        "goal_met_count": float(max(0, int(goal_met_count))),
+        "first_goal_success": 1.0 if first_goal_hit_step is not None else 0.0,
+        "first_goal_hit_step": float(first_hit),
+        "first_goal_hit_step_success_only": float(first_hit if first_goal_hit_step is not None else 0.0),
+        "first_goal_within_100": 1.0 if first_goal_hit_step is not None and first_hit <= 100 else 0.0,
+        "first_goal_within_200": 1.0 if first_goal_hit_step is not None and first_hit <= 200 else 0.0,
+        "first_goal_reward_sum": float(first_goal_reward_sum),
+        "first_goal_dense_reward_sum": float(first_goal_dense_reward_sum),
         "final_distance_to_goal": float(final_distance_to_goal),
         "outcome_success": 1.0 if outcome == "success" else 0.0,
         "outcome_timeout": 1.0 if outcome == "timeout" else 0.0,
@@ -460,6 +538,8 @@ def _select_prefill_action(
     env,
     sac: SACTensors,
     device: torch.device,
+    obs_preprocess=None,
+    scale_actor_to_env_bounds: bool = False,
 ) -> np.ndarray:
     mode = str(policy).lower()
     if mode == "random":
@@ -469,8 +549,13 @@ def _select_prefill_action(
     if mode == "student":
         with torch.no_grad():
             obs_t = torch.as_tensor(obs[None, :], device=device, dtype=torch.float32)
+            if obs_preprocess is not None:
+                obs_t = obs_preprocess(obs_t)
             act_t, _, _ = sac.actor(obs_t)
-            return act_t[0].detach().cpu().numpy().astype(np.float32)
+            action = act_t[0].detach().cpu().numpy().astype(np.float32)
+        if scale_actor_to_env_bounds:
+            action = scale_action_np(action, env.action_space)
+        return action
     raise ValueError(f"Unsupported --prefill_policy: {policy}")
 
 
@@ -485,6 +570,7 @@ def _run_demo_prefill(
     novice_rb: Optional[SimpleReplayBuffer],
     human_rb: Optional[SimpleReplayBuffer],
     variant: str,
+    obs_preprocess=None,
     viewer: PygameRGBArrayViewer | None = None,
 ) -> Dict[str, float]:
     if int(getattr(args, "prefill_demo_episodes", 0)) <= 0:
@@ -506,7 +592,15 @@ def _run_demo_prefill(
             viewer.draw_env(env)
         ep_steps = 0
         while True:
-            student_action = _select_prefill_action(policy=prefill_policy, obs=obs, env=env, sac=sac, device=device)
+            student_action = _select_prefill_action(
+                policy=prefill_policy,
+                obs=obs,
+                env=env,
+                sac=sac,
+                device=device,
+                obs_preprocess=obs_preprocess,
+                scale_actor_to_env_bounds=bool(getattr(args, "scale_actor_to_env_bounds", False)),
+            )
             student_action = clip_action_to_space(student_action, env.action_space)
             next_obs, reward, _cost, terminated, truncated, info = env.step(student_action)
             next_obs = np.asarray(next_obs, dtype=np.float32).reshape(-1)
@@ -536,6 +630,9 @@ def _run_demo_prefill(
             )
 
             main_rb.extend(transition)
+            if bool(getattr(args, "obs_normalization", True)) and hasattr(obs_preprocess, "update"):
+                obs_preprocess.update(torch.as_tensor(obs[None, :], device=device, dtype=torch.float32))
+                obs_preprocess.update(torch.as_tensor(next_obs[None, :], device=device, dtype=torch.float32))
             if teacher_intervened and demo_rb is not None:
                 demo_rb.extend(transition)
             if variant == "pvp":
@@ -562,6 +659,7 @@ def _run_demo_pretrain(
     args,
     sac: SACTensors,
     demo_rb: Optional[SimpleReplayBuffer],
+    obs_preprocess=None,
 ) -> tuple[Optional[SACUpdateMetrics], Dict[str, float]]:
     updates = int(max(0, getattr(args, "demo_pretrain_updates", 0)))
     if updates <= 0 or demo_rb is None:
@@ -590,6 +688,7 @@ def _run_demo_pretrain(
             gamma=float(args.gamma),
             tau=float(args.tau),
             max_grad_norm=float(args.max_grad_norm),
+            obs_preprocess=obs_preprocess,
             pref_batch=None,
             pref_rank_weight=0.0,
             pref_rank_margin=float(getattr(args, "pref_rank_margin", 0.1)),
@@ -601,6 +700,8 @@ def _run_demo_pretrain(
             pref_violation_clip=float(getattr(args, "pref_violation_clip", 10.0)),
             pref_violation_target=float(getattr(args, "pref_violation_target", 0.0)),
             pref_lagrangian_violation_type=str(getattr(args, "pref_lagrangian_violation_type", "hinge")),
+            alpha_min=float(getattr(args, "alpha_min", 0.0)),
+            alpha_max=float(getattr(args, "alpha_max", 1.0)),
         )
         critic_losses.append(float(last_update.critic_loss))
         actor_losses.append(float(last_update.actor_loss))
@@ -624,6 +725,7 @@ def _maybe_load_sac_checkpoint(
     args,
     sac: SACTensors,
     device: torch.device,
+    obs_preprocess=None,
 ) -> Dict[str, float]:
     checkpoint_path = str(getattr(args, "init_checkpoint_path", "") or "").strip()
     if not checkpoint_path:
@@ -635,6 +737,7 @@ def _maybe_load_sac_checkpoint(
     loaded_target = 0.0
     loaded_alpha = 0.0
     loaded_optim = 0.0
+    loaded_obs_normalizer = 0.0
 
     if bool(getattr(args, "load_actor_from_checkpoint", True)) and "actor_state_dict" in checkpoint:
         sac.actor.load_state_dict(checkpoint["actor_state_dict"])
@@ -652,6 +755,14 @@ def _maybe_load_sac_checkpoint(
         log_alpha = torch.as_tensor(checkpoint["log_alpha"], device=device, dtype=torch.float32).reshape_as(sac.log_alpha)
         sac.log_alpha.data.copy_(log_alpha)
         loaded_alpha = 1.0
+    if (
+        bool(getattr(args, "obs_normalization", True))
+        and obs_preprocess is not None
+        and hasattr(obs_preprocess, "load_state_dict")
+        and "obs_normalizer_state_dict" in checkpoint
+    ):
+        obs_preprocess.load_state_dict(checkpoint["obs_normalizer_state_dict"], strict=False)
+        loaded_obs_normalizer = 1.0
 
     if bool(getattr(args, "load_optimizer_state_from_checkpoint", False)):
         if loaded_actor > 0.0 and "actor_optimizer_state_dict" in checkpoint:
@@ -671,6 +782,7 @@ def _maybe_load_sac_checkpoint(
         "train/init_checkpoint_loaded_critic": loaded_critic,
         "train/init_checkpoint_loaded_critic_target": loaded_target,
         "train/init_checkpoint_loaded_alpha": loaded_alpha,
+        "train/init_checkpoint_loaded_obs_normalizer": loaded_obs_normalizer,
         "train/init_checkpoint_loaded_optimizer_state": loaded_optim,
     }
 
@@ -723,10 +835,29 @@ def _maybe_export_final_buffer_dataset(
     }
 
 
-def _run_eval(actor, args, device: torch.device, eval_seed: int) -> Dict[str, float]:
+def _run_eval(
+    actor,
+    args,
+    device: torch.device,
+    eval_seed: int,
+    *,
+    obs_preprocess=None,
+    run_paths: RunPaths | None = None,
+    step_value: int | None = None,
+) -> Dict[str, float]:
     env = _make_env_with_wrappers(args=args, seed=eval_seed, with_intervention=False, controller=None)
+    scale_actor_to_env_bounds = bool(getattr(args, "scale_actor_to_env_bounds", False))
     max_steps = extract_step_limit(env)
     win = EpisodeWindow(size=max(10, args.num_eval_episodes))
+    task = env.unwrapped.task
+    overlay_specs = _extract_overlay_specs(task)
+    bounds = _extract_bounds(task, x_range=None, y_range=None)
+    save_episode_plots = bool(getattr(args, "eval_save_episode_plots", False))
+    episode_plot_max = int(max(0, getattr(args, "eval_episode_plot_max_episodes", 9)))
+    saved_episode_plot_paths: list[Path] = []
+    plot_dir: Path | None = None
+    if save_episode_plots and run_paths is not None and step_value is not None:
+        plot_dir = run_paths.log_dir / "eval_episode_plots" / f"step_{int(step_value)}"
 
     episodes = 0
     obs, _ = env.reset(seed=eval_seed)
@@ -737,13 +868,30 @@ def _run_eval(actor, args, device: torch.device, eval_seed: int) -> Dict[str, fl
     ep_reward_dense = 0.0
     ep_reward_sparse = 0.0
     ep_reward_step_penalty = 0.0
+    ep_reward_cost_penalty = 0.0
     ep_len = 0
+    ep_goal_met_any = False
+    ep_goal_met_count = 0
+    ep_first_goal_hit_step: int | None = None
+    ep_first_goal_reward_sum = 0.0
+    ep_first_goal_dense_reward_sum = 0.0
+    ep_path = [np.asarray(task.agent.pos[:2], dtype=np.float64).copy()]
+    ep_goal_positions = [np.asarray(task.goal.pos[:2], dtype=np.float64).copy()]
+    ep_goal_hit_points: list[np.ndarray] = []
+
+    obs_preprocess_was_training = bool(getattr(obs_preprocess, "training", False)) if obs_preprocess is not None else False
+    if obs_preprocess is not None and hasattr(obs_preprocess, "eval"):
+        obs_preprocess.eval()
 
     while episodes < args.num_eval_episodes:
         with torch.no_grad():
             obs_t = torch.as_tensor(obs[None, :], device=device, dtype=torch.float32)
+            if obs_preprocess is not None:
+                obs_t = obs_preprocess(obs_t)
             _, _, mean = actor(obs_t)
             action = mean[0].detach().cpu().numpy().astype(np.float32)
+        if scale_actor_to_env_bounds:
+            action = scale_action_np(action, env.action_space)
         action = clip_action_to_space(action, env.action_space)
         next_obs, reward, cost, terminated, truncated, info = env.step(action)
         next_obs = np.asarray(next_obs, dtype=np.float32).reshape(-1)
@@ -754,7 +902,20 @@ def _run_eval(actor, args, device: torch.device, eval_seed: int) -> Dict[str, fl
         ep_reward_dense += float(info.get("reward_dense_component", 0.0))
         ep_reward_sparse += float(info.get("reward_sparse_component", 0.0))
         ep_reward_step_penalty += float(info.get("reward_step_penalty_component", 0.0))
+        ep_reward_cost_penalty += float(info.get("reward_cost_penalty_component", 0.0))
         ep_len += 1
+        ep_path.append(np.asarray(task.agent.pos[:2], dtype=np.float64).copy())
+        if bool(info.get("goal_met", False)):
+            ep_goal_met_any = True
+            ep_goal_met_count += 1
+            if ep_first_goal_hit_step is None:
+                ep_first_goal_hit_step = int(ep_len)
+                ep_first_goal_reward_sum = float(ep_ret)
+                ep_first_goal_dense_reward_sum = float(ep_reward_dense)
+            ep_goal_hit_points.append(np.asarray(task.agent.pos[:2], dtype=np.float64).copy())
+        current_goal_xy = np.asarray(task.goal.pos[:2], dtype=np.float64).copy()
+        if np.linalg.norm(current_goal_xy - np.asarray(ep_goal_positions[-1], dtype=np.float64)) > 1e-6:
+            ep_goal_positions.append(current_goal_xy)
 
         if terminated or truncated:
             final_dist = extract_goal_distance(env)
@@ -766,13 +927,43 @@ def _run_eval(actor, args, device: torch.device, eval_seed: int) -> Dict[str, fl
                 ep_reward_dense=ep_reward_dense,
                 ep_reward_sparse=ep_reward_sparse,
                 ep_reward_step_penalty=ep_reward_step_penalty,
+                ep_reward_cost_penalty=ep_reward_cost_penalty,
                 ep_len=ep_len,
                 max_episode_steps=max_steps,
                 terminated=bool(terminated),
                 truncated=bool(truncated),
                 final_distance_to_goal=final_dist,
+                goal_met_any=ep_goal_met_any,
+                goal_met_count=ep_goal_met_count,
+                first_goal_hit_step=ep_first_goal_hit_step,
+                first_goal_reward_sum=(
+                    ep_first_goal_reward_sum if ep_first_goal_hit_step is not None else float(ep_ret)
+                ),
+                first_goal_dense_reward_sum=(
+                    ep_first_goal_dense_reward_sum if ep_first_goal_hit_step is not None else float(ep_reward_dense)
+                ),
             )
             win.add(epm)
+            if save_episode_plots and plot_dir is not None and len(saved_episode_plot_paths) < episode_plot_max:
+                plot_path = plot_eval_episode_trajectory(
+                    output_path=plot_dir / f"episode_{episodes + 1:03d}.png",
+                    task=task,
+                    overlay_specs=overlay_specs,
+                    bounds=bounds,
+                    path=np.asarray(ep_path, dtype=np.float64),
+                    goal_positions=np.asarray(ep_goal_positions, dtype=np.float64),
+                    goal_hit_points=(
+                        np.asarray(ep_goal_hit_points, dtype=np.float64)
+                        if ep_goal_hit_points
+                        else np.zeros((0, 2), dtype=np.float64)
+                    ),
+                    episode_idx=episodes + 1,
+                    total_episodes=int(args.num_eval_episodes),
+                    episode_reward=float(ep_ret),
+                    goals_reached=int(ep_goal_met_count),
+                    final_distance=float(final_dist),
+                )
+                saved_episode_plot_paths.append(Path(plot_path))
             episodes += 1
             obs, _ = env.reset(seed=eval_seed + episodes)
             obs = np.asarray(obs, dtype=np.float32).reshape(-1)
@@ -782,10 +973,30 @@ def _run_eval(actor, args, device: torch.device, eval_seed: int) -> Dict[str, fl
             ep_reward_dense = 0.0
             ep_reward_sparse = 0.0
             ep_reward_step_penalty = 0.0
+            ep_reward_cost_penalty = 0.0
             ep_len = 0
+            ep_goal_met_any = False
+            ep_goal_met_count = 0
+            ep_first_goal_hit_step = None
+            ep_first_goal_reward_sum = 0.0
+            ep_first_goal_dense_reward_sum = 0.0
+            ep_path = [np.asarray(task.agent.pos[:2], dtype=np.float64).copy()]
+            ep_goal_positions = [np.asarray(task.goal.pos[:2], dtype=np.float64).copy()]
+            ep_goal_hit_points = []
         else:
             obs = next_obs
 
+    if save_episode_plots and plot_dir is not None and saved_episode_plot_paths:
+        sheet_path = plot_episode_contact_sheet(
+            image_paths=saved_episode_plot_paths,
+            output_path=plot_dir / "episode_contact_sheet.png",
+            title=f"SafetyGym train eval step {int(step_value or 0)}",
+            max_cols=3,
+        )
+        if sheet_path is not None:
+            print(f"[EvalPlots] saved {sheet_path}", flush=True)
+    if obs_preprocess is not None and obs_preprocess_was_training and hasattr(obs_preprocess, "train"):
+        obs_preprocess.train()
     env.close()
     return augment_rollout_summary(win.summary("eval"), "eval")
 
@@ -888,6 +1099,10 @@ def run_training(args, *, variant: str) -> None:
             viewer.draw_env(env)
 
     max_steps = extract_step_limit(env)
+    if bool(getattr(args, "obs_normalization", True)):
+        obs_preprocess = EmpiricalNormalization(shape=obs_dim, device=device)
+    else:
+        obs_preprocess = torch.nn.Identity()
 
     sac: SACTensors = build_sac(
         obs_dim=obs_dim,
@@ -903,10 +1118,11 @@ def run_training(args, *, variant: str) -> None:
         weight_decay=args.weight_decay,
         num_envs=1,
         device=device,
+        alpha_init=float(getattr(args, "alpha_init", 1e-3)),
     )
     sac.pref_lambda = float(getattr(args, "pref_lambda_init", 0.0))
     sac.pref_violation_ema = 0.0
-    init_logs = _maybe_load_sac_checkpoint(args=args, sac=sac, device=device)
+    init_logs = _maybe_load_sac_checkpoint(args=args, sac=sac, device=device, obs_preprocess=obs_preprocess)
     if init_logs:
         _emit_metrics(payload=init_logs, log_path=log_path, wandb_run=wandb_run, step=0)
 
@@ -923,6 +1139,8 @@ def run_training(args, *, variant: str) -> None:
         device=device,
         pixel_shape=None,
     )
+    action_low_t = torch.as_tensor(env.action_space.low.reshape(1, -1), device=device, dtype=torch.float32)
+    action_high_t = torch.as_tensor(env.action_space.high.reshape(1, -1), device=device, dtype=torch.float32)
 
     novice_rb = None
     human_rb = None
@@ -1093,13 +1311,32 @@ def run_training(args, *, variant: str) -> None:
         novice_rb=novice_rb,
         human_rb=human_rb,
         variant=variant,
+        obs_preprocess=obs_preprocess,
         viewer=viewer,
     )
     if prefill_logs:
         _emit_metrics(payload=prefill_logs, log_path=log_path, wandb_run=wandb_run, step=0)
 
     last_update: Optional[SACUpdateMetrics] = None
-    pretrain_update, pretrain_logs = _run_demo_pretrain(args=args, sac=sac, demo_rb=demo_rb)
+    update_window_count = 0
+    update_window_actor_updates = 0.0
+    update_window_alpha_updates = 0.0
+    update_window_policy_entropy = 0.0
+    update_window_log_pi_mean = 0.0
+    update_window_action_l2 = 0.0
+    update_window_q_min_pi_mean = 0.0
+    update_window_q_min_data_mean = 0.0
+    update_window_q_disagreement_data_mean = 0.0
+    update_window_q_disagreement_pi_mean = 0.0
+    update_window_replay_reward_mean = 0.0
+    update_window_replay_reward_abs_mean = 0.0
+    total_update_steps = 0
+    pretrain_update, pretrain_logs = _run_demo_pretrain(
+        args=args,
+        sac=sac,
+        demo_rb=demo_rb,
+        obs_preprocess=obs_preprocess,
+    )
     if pretrain_update is not None:
         last_update = pretrain_update
     if pretrain_logs:
@@ -1146,7 +1383,13 @@ def run_training(args, *, variant: str) -> None:
     ep_reward_dense = 0.0
     ep_reward_sparse = 0.0
     ep_reward_step_penalty = 0.0
+    ep_reward_cost_penalty = 0.0
     ep_len = 0
+    ep_goal_met_any = False
+    ep_goal_met_count = 0
+    ep_first_goal_hit_step: int | None = None
+    ep_first_goal_reward_sum = 0.0
+    ep_first_goal_dense_reward_sum = 0.0
 
     next_log = int(args.log_interval)
     next_eval = int(args.eval_interval) if args.eval_interval > 0 else -1
@@ -1165,6 +1408,7 @@ def run_training(args, *, variant: str) -> None:
     live_window_reward_dense: list[float] = []
     live_window_reward_sparse: list[float] = []
     live_window_reward_step_penalty: list[float] = []
+    live_window_reward_cost_penalty: list[float] = []
     prev_teacher_intervened = False
     oversight_mode = str(getattr(args, "uncertainty_oversight_mode", "signal_only")).lower()
     oversight_threshold = float(getattr(args, "uncertainty_oversight_threshold", 0.0))
@@ -1192,8 +1436,11 @@ def run_training(args, *, variant: str) -> None:
         else:
             with torch.no_grad():
                 obs_t = torch.as_tensor(obs[None, :], device=device, dtype=torch.float32)
+                obs_t = obs_preprocess(obs_t)
                 action_t, _, _ = sac.actor(obs_t)
                 student_action = action_t[0].detach().cpu().numpy().astype(np.float32)
+            if bool(getattr(args, "scale_actor_to_env_bounds", False)):
+                student_action = scale_action_np(student_action, env.action_space)
         student_action = clip_action_to_space(student_action, env.action_space)
         t_action += time.perf_counter() - t0
 
@@ -1227,6 +1474,9 @@ def run_training(args, *, variant: str) -> None:
         )
 
         main_rb.extend(transition)
+        if bool(getattr(args, "obs_normalization", True)) and hasattr(obs_preprocess, "update"):
+            obs_preprocess.update(torch.as_tensor(obs[None, :], device=device, dtype=torch.float32))
+            obs_preprocess.update(torch.as_tensor(next_obs[None, :], device=device, dtype=torch.float32))
         if variant == "pvp":
             if teacher_intervened and human_rb is not None:
                 human_rb.extend(transition)
@@ -1257,6 +1507,7 @@ def run_training(args, *, variant: str) -> None:
                 obs=obs,
                 action=applied_action,
                 device=device,
+                obs_preprocess=obs_preprocess,
             )
             unc_val = float(unc["abs_diff"])
             live_window_uncertainty_all.append(unc_val)
@@ -1283,12 +1534,21 @@ def run_training(args, *, variant: str) -> None:
         ep_reward_dense += float(info.get("reward_dense_component", 0.0))
         ep_reward_sparse += float(info.get("reward_sparse_component", 0.0))
         ep_reward_step_penalty += float(info.get("reward_step_penalty_component", 0.0))
+        ep_reward_cost_penalty += float(info.get("reward_cost_penalty_component", 0.0))
         live_window_reward_raw_env.append(float(info.get("reward_raw_env", 0.0)))
         live_window_reward_shaped.append(float(reward))
         live_window_reward_dense.append(float(info.get("reward_dense_component", 0.0)))
         live_window_reward_sparse.append(float(info.get("reward_sparse_component", 0.0)))
         live_window_reward_step_penalty.append(float(info.get("reward_step_penalty_component", 0.0)))
+        live_window_reward_cost_penalty.append(float(info.get("reward_cost_penalty_component", 0.0)))
         ep_len += 1
+        if bool(info.get("goal_met", False)):
+            ep_goal_met_any = True
+            ep_goal_met_count += 1
+            if ep_first_goal_hit_step is None:
+                ep_first_goal_hit_step = int(ep_len)
+                ep_first_goal_reward_sum = float(ep_ret)
+                ep_first_goal_dense_reward_sum = float(ep_reward_dense)
 
         rb_ready = main_rb.size >= int(args.batch_size)
         if variant == "pvp" and novice_rb is not None:
@@ -1299,6 +1559,7 @@ def run_training(args, *, variant: str) -> None:
         if step > int(effective_learning_starts) and rb_ready and (step % update_every == 0):
             t0 = time.perf_counter()
             for _ in range(updates_per_cycle):
+                total_update_steps += 1
                 if variant == "pvp" and novice_rb is not None and human_rb is not None:
                     half = max(1, int(args.batch_size // 2))
                     if human_rb.size >= half:
@@ -1343,6 +1604,7 @@ def run_training(args, *, variant: str) -> None:
                     gamma=float(args.gamma),
                     tau=float(args.tau),
                     max_grad_norm=float(args.max_grad_norm),
+                    obs_preprocess=obs_preprocess,
                     pref_batch=pref_batch,
                     pref_rank_weight=float(getattr(args, "pref_rank_weight", 0.0)),
                     pref_rank_margin=float(getattr(args, "pref_rank_margin", 0.1)),
@@ -1354,7 +1616,30 @@ def run_training(args, *, variant: str) -> None:
                     pref_violation_clip=float(getattr(args, "pref_violation_clip", 10.0)),
                     pref_violation_target=float(getattr(args, "pref_violation_target", 0.0)),
                     pref_lagrangian_violation_type=str(getattr(args, "pref_lagrangian_violation_type", "hinge")),
+                    alpha_min=float(getattr(args, "alpha_min", 0.0)),
+                    alpha_max=float(getattr(args, "alpha_max", 1.0)),
+                    scale_actor_to_env_bounds=bool(getattr(args, "scale_actor_to_env_bounds", False)),
+                    action_low=action_low_t,
+                    action_high=action_high_t,
+                    update_actor=(total_update_steps % max(1, int(getattr(args, "policy_frequency", 1))) == 0),
+                    critic_loss_reduction=str(getattr(args, "critic_loss_reduction", "mean")),
                 )
+                update_window_count += 1
+                update_window_actor_updates += float(getattr(last_update, "actor_updates", 0.0))
+                update_window_alpha_updates += float(getattr(last_update, "alpha_updates", 0.0))
+                update_window_policy_entropy += float(getattr(last_update, "policy_entropy", 0.0))
+                update_window_log_pi_mean += float(getattr(last_update, "log_pi_mean", 0.0))
+                update_window_action_l2 += float(getattr(last_update, "action_l2", 0.0))
+                update_window_q_min_pi_mean += float(getattr(last_update, "q_min_pi_mean", 0.0))
+                update_window_q_min_data_mean += float(getattr(last_update, "q_min_data_mean", 0.0))
+                update_window_q_disagreement_data_mean += float(
+                    getattr(last_update, "q_disagreement_data_mean", 0.0)
+                )
+                update_window_q_disagreement_pi_mean += float(
+                    getattr(last_update, "q_disagreement_pi_mean", 0.0)
+                )
+                update_window_replay_reward_mean += float(getattr(last_update, "replay_reward_mean", 0.0))
+                update_window_replay_reward_abs_mean += float(getattr(last_update, "replay_reward_abs_mean", 0.0))
             t_update += time.perf_counter() - t0
 
         if terminated or truncated:
@@ -1368,15 +1653,28 @@ def run_training(args, *, variant: str) -> None:
                 ep_reward_dense=ep_reward_dense,
                 ep_reward_sparse=ep_reward_sparse,
                 ep_reward_step_penalty=ep_reward_step_penalty,
+                ep_reward_cost_penalty=ep_reward_cost_penalty,
                 ep_len=ep_len,
                 max_episode_steps=max_steps,
                 terminated=bool(terminated),
                 truncated=bool(truncated),
                 final_distance_to_goal=final_dist,
+                goal_met_any=ep_goal_met_any,
+                goal_met_count=ep_goal_met_count,
+                first_goal_hit_step=ep_first_goal_hit_step,
+                first_goal_reward_sum=(
+                    ep_first_goal_reward_sum if ep_first_goal_hit_step is not None else float(ep_ret)
+                ),
+                first_goal_dense_reward_sum=(
+                    ep_first_goal_dense_reward_sum if ep_first_goal_hit_step is not None else float(ep_reward_dense)
+                ),
             )
             train_win.add(epm)
 
-            obs, _ = env.reset(seed=args.seed + step)
+            if bool(getattr(args, "reseed_on_episode_reset", True)):
+                obs, _ = env.reset(seed=args.seed + step)
+            else:
+                obs, _ = env.reset()
             obs = np.asarray(obs, dtype=np.float32).reshape(-1)
             if viewer is not None:
                 viewer.draw_env(env)
@@ -1387,6 +1685,11 @@ def run_training(args, *, variant: str) -> None:
             ep_reward_sparse = 0.0
             ep_reward_step_penalty = 0.0
             ep_len = 0
+            ep_goal_met_any = False
+            ep_goal_met_count = 0
+            ep_first_goal_hit_step = None
+            ep_first_goal_reward_sum = 0.0
+            ep_first_goal_dense_reward_sum = 0.0
             prev_teacher_intervened = False
             t_episode_end += time.perf_counter() - t0
 
@@ -1464,12 +1767,15 @@ def run_training(args, *, variant: str) -> None:
                 logs["train/oversight_ema"] = float(oversight_ema if oversight_ema is not None else 0.0)
             if timing_enabled:
                 logs.update(timing_window.summary("train_timing"))
-            logs.update(_summary_stats(live_window_reward_raw_env, "train/live_reward_raw_env"))
-            logs.update(_summary_stats(live_window_reward_shaped, "train/live_reward_shaped"))
-            logs.update(_summary_stats(live_window_reward_dense, "train/live_reward_dense"))
-            logs.update(_summary_stats(live_window_reward_sparse, "train/live_reward_sparse"))
-            logs.update(_summary_stats(live_window_reward_step_penalty, "train/live_reward_step_penalty"))
+            logs["train/mean_step_reward"] = _window_mean(live_window_reward_shaped)
+            logs["train/mean_step_env_reward"] = _window_mean(live_window_reward_raw_env)
+            logs["train/mean_step_dense_reward"] = _window_mean(live_window_reward_dense)
+            logs["train/mean_step_sparse_reward"] = _window_mean(live_window_reward_sparse)
+            logs["train/mean_step_step_penalty_reward"] = _window_mean(live_window_reward_step_penalty)
+            logs["train/mean_step_cost_penalty_reward"] = _window_mean(live_window_reward_cost_penalty)
             logs.update(augment_rollout_summary(train_win.summary("train"), "train"))
+            if "train/mean_reward" not in logs and "train/episode_return_mean" in logs:
+                logs["train/mean_reward"] = float(logs["train/episode_return_mean"])
             if variant == "pvp" and novice_rb is not None and human_rb is not None:
                 logs["train/novice_replay_size"] = float(novice_rb.size)
                 logs["train/human_replay_size"] = float(human_rb.size)
@@ -1494,6 +1800,26 @@ def run_training(args, *, variant: str) -> None:
                         "train/pref_lagrangian_loss": last_update.pref_lagrangian_loss,
                     }
                 )
+                update_denom = float(max(1, update_window_count))
+                actor_update_denom = float(max(1.0, update_window_actor_updates))
+                alpha_update_denom = float(max(1.0, update_window_alpha_updates))
+                logs["train/policy_entropy"] = float(update_window_policy_entropy / actor_update_denom)
+                logs["train/log_pi_mean"] = float(update_window_log_pi_mean / actor_update_denom)
+                logs["train/action_l2"] = float(update_window_action_l2 / actor_update_denom)
+                logs["train/q_min_pi_mean"] = float(update_window_q_min_pi_mean / actor_update_denom)
+                logs["train/q_min_data_mean"] = float(update_window_q_min_data_mean / update_denom)
+                logs["train/q_disagreement_data_mean"] = float(
+                    update_window_q_disagreement_data_mean / update_denom
+                )
+                logs["train/q_disagreement_pi_mean"] = float(
+                    update_window_q_disagreement_pi_mean / actor_update_denom
+                )
+                logs["train/replay_reward_mean"] = float(update_window_replay_reward_mean / update_denom)
+                logs["train/replay_reward_abs_mean"] = float(
+                    update_window_replay_reward_abs_mean / update_denom
+                )
+                logs["train/actor_updates_per_iter"] = float(update_window_actor_updates)
+                logs["train/alpha_updates_per_iter"] = float(update_window_alpha_updates)
                 pref_loss_type = str(getattr(args, "pref_loss_type", "margin")).strip().lower()
                 pref_lagrangian_violation_type = str(
                     getattr(args, "pref_lagrangian_violation_type", "hinge")
@@ -1523,12 +1849,33 @@ def run_training(args, *, variant: str) -> None:
             live_window_reward_dense = []
             live_window_reward_sparse = []
             live_window_reward_step_penalty = []
+            live_window_reward_cost_penalty = []
+            update_window_count = 0
+            update_window_actor_updates = 0.0
+            update_window_alpha_updates = 0.0
+            update_window_policy_entropy = 0.0
+            update_window_log_pi_mean = 0.0
+            update_window_action_l2 = 0.0
+            update_window_q_min_pi_mean = 0.0
+            update_window_q_min_data_mean = 0.0
+            update_window_q_disagreement_data_mean = 0.0
+            update_window_q_disagreement_pi_mean = 0.0
+            update_window_replay_reward_mean = 0.0
+            update_window_replay_reward_abs_mean = 0.0
             if timing_enabled:
                 timing_window.reset()
 
         if next_eval > 0 and step >= next_eval:
             next_eval += int(args.eval_interval)
-            eval_metrics = _run_eval(sac.actor, args, device, eval_seed=args.seed + 100000 + step)
+            eval_metrics = _run_eval(
+                sac.actor,
+                args,
+                device,
+                eval_seed=args.seed + 100000 + step,
+                obs_preprocess=obs_preprocess,
+                run_paths=run_paths,
+                step_value=int(step),
+            )
             eval_metrics["eval/step"] = float(step)
             _emit_metrics(payload=eval_metrics, log_path=log_path, wandb_run=wandb_run, step=step)
 
@@ -1544,11 +1891,21 @@ def run_training(args, *, variant: str) -> None:
                     "critic_optimizer_state_dict": sac.critic_optimizer.state_dict(),
                     "alpha_optimizer_state_dict": sac.alpha_optimizer.state_dict(),
                     "log_alpha": sac.log_alpha.detach().cpu(),
+                    "obs_normalizer_state_dict": (
+                        obs_preprocess.state_dict() if hasattr(obs_preprocess, "state_dict") else {}
+                    ),
                     "args": vars(args),
                     "global_step": int(step),
                     "variant": str(variant),
                 },
                 ckpt_path,
+            )
+            _maybe_render_policy_map(
+                args=args,
+                checkpoint_path=ckpt_path,
+                step_value=int(step),
+                run_paths=run_paths,
+                wandb_run=wandb_run,
             )
 
     final_ckpt = run_paths.model_dir / "final.pt"
@@ -1561,11 +1918,21 @@ def run_training(args, *, variant: str) -> None:
             "critic_optimizer_state_dict": sac.critic_optimizer.state_dict(),
             "alpha_optimizer_state_dict": sac.alpha_optimizer.state_dict(),
             "log_alpha": sac.log_alpha.detach().cpu(),
+            "obs_normalizer_state_dict": (
+                obs_preprocess.state_dict() if hasattr(obs_preprocess, "state_dict") else {}
+            ),
             "args": vars(args),
             "global_step": int(args.total_timesteps),
             "variant": str(variant),
         },
         final_ckpt,
+    )
+    _maybe_render_policy_map(
+        args=args,
+        checkpoint_path=final_ckpt,
+        step_value=int(args.total_timesteps),
+        run_paths=run_paths,
+        wandb_run=wandb_run,
     )
     final_export_logs: Dict[str, float] = {}
     final_export_logs.update(

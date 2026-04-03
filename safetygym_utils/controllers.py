@@ -9,6 +9,7 @@ from typing import Optional
 
 import numpy as np
 
+from .env import extract_min_constrained_clearance
 from .gamepad import (
     DEFAULT_SAFETY_GAMEPAD_CACHE_PATH,
     DEFAULT_SAFETY_GAMEPAD_CONFIG_PATH,
@@ -419,10 +420,173 @@ class TkKeyboardController:
         self._closed = True
 
 
+class ExpertPolicyController:
+    """Checkpoint-backed policy controller for expert-as-human intervention tests."""
+
+    always_active = True
+
+    def __init__(
+        self,
+        *,
+        checkpoint_path: str | Path,
+        obs_dim: int,
+        action_low: np.ndarray,
+        action_high: np.ndarray,
+        device: str = "cpu",
+    ):
+        self.checkpoint_path = Path(checkpoint_path).expanduser().resolve()
+        if not self.checkpoint_path.is_file():
+            raise FileNotFoundError(f"Expert checkpoint not found: {self.checkpoint_path}")
+        self.obs_dim = int(obs_dim)
+        self.action_low = np.asarray(action_low, dtype=np.float32).reshape(-1)
+        self.action_high = np.asarray(action_high, dtype=np.float32).reshape(-1)
+        self.device = device
+        self._load_model()
+
+    @staticmethod
+    def _resolve_args_path(checkpoint_path: Path) -> Path | None:
+        for candidate in (checkpoint_path.parent / "args.json", checkpoint_path.parent.parent / "args.json"):
+            if candidate.is_file():
+                return candidate
+        return None
+
+    def _load_model(self) -> None:
+        import json
+        import torch
+        import sys
+
+        repo_root = Path(__file__).resolve().parent.parent
+        fast_sac_path = repo_root / "fasttd3" / "fast_sac"
+        fast_sac_path_str = str(fast_sac_path)
+        if fast_sac_path.exists() and fast_sac_path_str not in sys.path:
+            sys.path.insert(0, fast_sac_path_str)
+
+        from fast_sac import Actor
+        from fast_sac_utils import EmpiricalNormalization
+
+        from .sac import SafetyActor
+
+        args_path = self._resolve_args_path(self.checkpoint_path)
+        ckpt_args = {}
+        if args_path is not None:
+            try:
+                ckpt_args = json.loads(args_path.read_text())
+            except Exception:
+                ckpt_args = {}
+
+        module_impl = str(ckpt_args.get("module_impl", "fastsac")).strip().lower()
+        actor_hidden_dim = int(ckpt_args.get("actor_hidden_dim", 256))
+        init_scale = float(ckpt_args.get("init_scale", 0.01))
+        use_layer_norm = bool(ckpt_args.get("use_layer_norm", False))
+        layer_norm_eps = float(ckpt_args.get("layer_norm_eps", 1e-5))
+        self.scale_to_env_bounds = bool(ckpt_args.get("scale_actor_to_env_bounds", False))
+
+        checkpoint = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
+        action_dim = int(self.action_low.shape[0])
+        device = torch.device(self.device)
+        if module_impl == "custom":
+            actor = SafetyActor(
+                n_obs=self.obs_dim,
+                n_act=action_dim,
+                num_envs=1,
+                init_scale=init_scale,
+                hidden_dim=actor_hidden_dim,
+                use_layer_norm=use_layer_norm,
+                layer_norm_eps=layer_norm_eps,
+                device=device,
+            )
+        else:
+            actor = Actor(
+                n_obs=self.obs_dim,
+                n_act=action_dim,
+                num_envs=1,
+                init_scale=init_scale,
+                hidden_dim=actor_hidden_dim,
+                device=device,
+            )
+        actor.load_state_dict(checkpoint["actor_state_dict"])
+        actor.eval()
+        self.actor = actor
+        self._torch = torch
+
+        state = checkpoint.get("obs_normalizer_state_dict") or {}
+        if state:
+            normalizer = EmpiricalNormalization(shape=self.obs_dim, device=device)
+            normalizer.load_state_dict(state, strict=False)
+            self.obs_normalizer = normalizer
+        else:
+            self.obs_normalizer = torch.nn.Identity()
+
+    def get_action(self, obs: np.ndarray | None = None, env=None) -> np.ndarray | None:
+        if obs is None:
+            return None
+        torch = self._torch
+        device = next(self.actor.parameters()).device
+        with torch.no_grad():
+            obs_t = torch.as_tensor(np.asarray(obs, dtype=np.float32).reshape(1, -1), device=device)
+            obs_t = self.obs_normalizer(obs_t)
+            _, _, mean_t = self.actor(obs_t)
+            action = mean_t[0].detach().cpu().numpy().astype(np.float32)
+        if self.scale_to_env_bounds:
+            center = 0.5 * (self.action_high + self.action_low)
+            half = 0.5 * (self.action_high - self.action_low)
+            action = center + action * half
+        return np.clip(action, self.action_low, self.action_high).astype(np.float32, copy=False)
+
+    def close(self) -> None:
+        return None
+
+
+class SwitchingExpertPolicyController:
+    """Route between a goal-reaching expert and a safe expert using live clearance."""
+
+    always_active = True
+
+    def __init__(
+        self,
+        *,
+        goal_checkpoint_path: str | Path,
+        safe_checkpoint_path: str | Path,
+        obs_dim: int,
+        action_low: np.ndarray,
+        action_high: np.ndarray,
+        clearance_threshold: float,
+        device: str = "cpu",
+    ):
+        self.clearance_threshold = float(clearance_threshold)
+        self.goal_controller = ExpertPolicyController(
+            checkpoint_path=goal_checkpoint_path,
+            obs_dim=obs_dim,
+            action_low=action_low,
+            action_high=action_high,
+            device=device,
+        )
+        self.safe_controller = ExpertPolicyController(
+            checkpoint_path=safe_checkpoint_path,
+            obs_dim=obs_dim,
+            action_low=action_low,
+            action_high=action_high,
+            device=device,
+        )
+
+    def get_action(self, obs: np.ndarray | None = None, env=None) -> np.ndarray | None:
+        if obs is None:
+            return None
+        clearance = extract_min_constrained_clearance(env) if env is not None else None
+        if clearance is not None and clearance <= self.clearance_threshold:
+            return self.safe_controller.get_action(obs=obs)
+        return self.goal_controller.get_action(obs=obs)
+
+    def close(self) -> None:
+        self.goal_controller.close()
+        self.safe_controller.close()
+
+
 def build_human_controller(
     *,
     input_device: str,
     action_dim: int,
+    obs_dim: int | None = None,
     env_name: str,
     action_scale: float,
     wheel_command_limit: float,
@@ -436,11 +600,48 @@ def build_human_controller(
     gamepad_config_path: Path | str = DEFAULT_SAFETY_GAMEPAD_CONFIG_PATH,
     gamepad_use_saved_config: bool = True,
     gamepad_device_index: int = 0,
+    action_low: np.ndarray | None = None,
+    action_high: np.ndarray | None = None,
+    expert_checkpoint_path: str = "",
+    expert_safe_checkpoint_path: str = "",
+    expert_switch_clearance_threshold: float = 0.08,
+    expert_device: str = "cpu",
     show_overlay: bool = True,
     prefer_separate_keyboard_window: bool = False,
 ):
     input_device = str(input_device).lower()
     control_scheme = infer_control_scheme(env_name)
+    if input_device == "expert":
+        if obs_dim is None or action_low is None or action_high is None:
+            raise ValueError("Expert controller requires obs_dim plus action_low/action_high.")
+        checkpoint_path = str(expert_checkpoint_path).strip()
+        if not checkpoint_path:
+            raise ValueError("input_device=expert requires expert_checkpoint_path.")
+        return ExpertPolicyController(
+            checkpoint_path=checkpoint_path,
+            obs_dim=int(obs_dim),
+            action_low=np.asarray(action_low, dtype=np.float32),
+            action_high=np.asarray(action_high, dtype=np.float32),
+            device=str(expert_device),
+        )
+    if input_device == "expert_switch":
+        if obs_dim is None or action_low is None or action_high is None:
+            raise ValueError("Expert switch controller requires obs_dim plus action_low/action_high.")
+        goal_checkpoint_path = str(expert_checkpoint_path).strip()
+        safe_checkpoint_path = str(expert_safe_checkpoint_path).strip()
+        if not goal_checkpoint_path:
+            raise ValueError("input_device=expert_switch requires expert_checkpoint_path for the goal expert.")
+        if not safe_checkpoint_path:
+            raise ValueError("input_device=expert_switch requires expert_safe_checkpoint_path for the safe expert.")
+        return SwitchingExpertPolicyController(
+            goal_checkpoint_path=goal_checkpoint_path,
+            safe_checkpoint_path=safe_checkpoint_path,
+            obs_dim=int(obs_dim),
+            action_low=np.asarray(action_low, dtype=np.float32),
+            action_high=np.asarray(action_high, dtype=np.float32),
+            clearance_threshold=float(expert_switch_clearance_threshold),
+            device=str(expert_device),
+        )
     if input_device == "gamepad":
         config = GamepadMappingConfig(
             device_index=int(gamepad_device_index),

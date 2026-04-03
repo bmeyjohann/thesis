@@ -36,7 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--car_wheel_command_limit", type=float, default=2.0)
     p.add_argument("--car_force_scale", type=float, default=2.0)
     p.add_argument("--max_episode_steps", type=int, default=0)
-    p.add_argument("--reward_mode", type=str, default="none", choices=["sparse", "dense", "dense_plus_sparse", "none"])
+    p.add_argument("--reward_mode", type=str, default="none", choices=["sparse", "dense", "dense_plus_sparse", "native", "none"])
     p.add_argument("--dense_reward_scale", type=float, default=1.0)
     p.add_argument("--step_penalty", type=float, default=0.0)
     p.add_argument("--human_action_scale", type=float, default=1.0)

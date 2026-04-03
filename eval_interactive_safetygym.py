@@ -5,6 +5,7 @@ import argparse
 import os
 import json
 import time
+import sys
 from pathlib import Path
 from typing import Any, Dict
 from collections import deque
@@ -18,12 +19,29 @@ from safetygym_utils.gamepad import (
     DEFAULT_SAFETY_GAMEPAD_CONFIG_PATH,
     DEFAULT_SAFETY_GAMEPAD_PORT,
 )
-from safetygym_utils.env import clip_action_to_space, extract_goal_distance, extract_step_limit, make_safety_env
+from safetygym_utils.env import clip_action_to_space, extract_goal_distance, extract_step_limit, make_safety_env, scale_action_np
 from safetygym_utils.io import load_args_json, maybe_find_args_json_from_model
 from safetygym_utils.metrics import EpisodeWindow, augment_rollout_summary, classify_outcome
+from safetygym_utils.policy_viz import (
+    _extract_bounds,
+    _extract_overlay_specs,
+    plot_episode_contact_sheet,
+    plot_eval_episode_trajectory,
+)
 from safetygym_utils.rendering import build_external_viewer, resolve_env_render_mode, wants_external_viewer
 from safetygym_utils.sac import SafetyActor
 from safetygym_utils.wrappers import HumanInterventionWrapper, RewardModeWrapper
+
+_FAST_SAC_PATH = Path(__file__).resolve().parent / "fasttd3" / "fast_sac"
+if _FAST_SAC_PATH.exists():
+    _fast_sac_path_str = str(_FAST_SAC_PATH)
+    if _fast_sac_path_str not in sys.path:
+        sys.path.insert(0, _fast_sac_path_str)
+
+try:
+    from fast_sac_utils import EmpiricalNormalization  # type: ignore
+except Exception:  # pragma: no cover - optional dependency for minimal checkpoints only
+    EmpiricalNormalization = None
 
 
 class EvalTelemetryPanel:
@@ -222,6 +240,159 @@ class EvalTelemetryPanel:
         self._clock = None
 
 
+class EvalEpisodeControlPanel:
+    def __init__(self, *, width: int = 420, height: int = 220, title: str = "SafetyGym Eval Controls"):
+        self.width = int(width)
+        self.height = int(height)
+        self.title = str(title)
+        self._initialized = False
+        self._warned_no_display = False
+        self._closed = False
+        self._root = None
+        self._label = None
+        self._requests = {
+            "prev": False,
+            "next": False,
+            "reset": False,
+            "quit": False,
+        }
+        self._fps_delta = 0.0
+        self._current_episode = 1
+        self._num_episodes = 1
+        self._fps = 30.0
+
+    @staticmethod
+    def _has_graphical_display() -> bool:
+        if os.name == "nt":
+            return True
+        if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+            return True
+        return False
+
+    def _on_key(self, event) -> None:
+        key = str(getattr(event, "keysym", "")).strip().lower()
+        if key in {"escape", "q"}:
+            self._requests["quit"] = True
+        elif key == "left":
+            self._requests["prev"] = True
+        elif key == "right":
+            self._requests["next"] = True
+        elif key in {"r", "backspace"}:
+            self._requests["reset"] = True
+        elif key == "up":
+            self._fps_delta += 2.0
+        elif key == "down":
+            self._fps_delta -= 2.0
+        self._render_text()
+
+    def _on_close(self) -> None:
+        self._closed = True
+        root = self._root
+        if root is not None:
+            try:
+                root.destroy()
+            except Exception:
+                pass
+        self._root = None
+        self._label = None
+
+    def _ensure(self) -> bool:
+        if self._initialized:
+            return self._root is not None
+        if not self._has_graphical_display():
+            if not self._warned_no_display:
+                print("eval controls disabled: no graphical display detected", flush=True)
+                self._warned_no_display = True
+            self._initialized = True
+            return False
+        try:
+            import tkinter as tk
+        except Exception as exc:
+            print(f"eval controls disabled: tkinter unavailable ({exc})", flush=True)
+            self._initialized = True
+            return False
+
+        root = tk.Tk()
+        root.title(self.title)
+        root.geometry(f"{self.width}x{self.height}")
+        root.resizable(False, False)
+        root.configure(bg="#141418")
+        root.bind("<KeyPress>", self._on_key)
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
+        label = tk.Label(
+            root,
+            text="",
+            justify="left",
+            anchor="nw",
+            bg="#141418",
+            fg="#e0e0e0",
+            font=("TkDefaultFont", 11),
+        )
+        label.pack(fill="both", expand=True, padx=12, pady=12)
+        self._root = root
+        self._label = label
+        try:
+            root.focus_force()
+        except Exception:
+            pass
+        self._initialized = True
+        self._render_text()
+        return True
+
+    def _render_text(self) -> None:
+        label = self._label
+        if label is None:
+            return
+        lines = [
+            "Eval episode controls",
+            "",
+            f"Episode: {int(self._current_episode)}/{int(max(1, self._num_episodes))}",
+            f"FPS: {float(self._fps):.1f}",
+            "",
+            "Right: next episode",
+            "Left: previous episode",
+            "R / Backspace: reset current episode",
+            "Up / Down: FPS +/- 2",
+            "Esc / Q: quit",
+        ]
+        try:
+            label.config(text="\n".join(lines))
+        except Exception:
+            pass
+
+    def set_status(self, *, episode_idx: int, num_episodes: int, fps: float) -> None:
+        self._current_episode = int(max(1, episode_idx))
+        self._num_episodes = int(max(1, num_episodes))
+        self._fps = float(fps)
+        self._render_text()
+
+    def poll(self) -> tuple[bool, bool, bool, bool, float]:
+        if not self._ensure():
+            return False, False, False, False, 0.0
+        root = self._root
+        if root is None or self._closed:
+            return False, False, False, False, 0.0
+        try:
+            root.update_idletasks()
+            root.update()
+        except Exception:
+            self._closed = True
+            self._root = None
+            self._label = None
+            return False, False, True, False, 0.0
+        prev_requested = bool(self._requests["prev"])
+        next_requested = bool(self._requests["next"])
+        reset_requested = bool(self._requests["reset"])
+        quit_requested = bool(self._requests["quit"])
+        fps_delta = float(self._fps_delta)
+        self._requests = {k: False for k in self._requests}
+        self._fps_delta = 0.0
+        return prev_requested, next_requested, quit_requested, reset_requested, fps_delta
+
+    def close(self) -> None:
+        self._on_close()
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Interactive evaluation for Safety-Gymnasium FastSAC checkpoints")
     p.add_argument("--model_path", type=str, default="")
@@ -244,10 +415,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--reward_mode",
         type=str,
         default="sparse",
-        choices=["sparse", "dense", "dense_plus_sparse", "dual", "none"],
+        choices=["sparse", "dense", "dense_plus_sparse", "dual", "native", "none"],
     )
     p.add_argument("--dense_reward_scale", type=float, default=1.0)
     p.add_argument("--step_penalty", type=float, default=0.0)
+    p.add_argument("--cost_penalty", type=float, default=0.0)
 
     p.add_argument("--intervention_threshold", type=float, default=0.1)
     p.add_argument("--intervention_hold_seconds", type=float, default=0.25)
@@ -269,10 +441,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--use_layer_norm", action="store_true", default=False)
     p.add_argument("--layer_norm_eps", type=float, default=1e-5)
     p.add_argument("--init_scale", type=float, default=0.01)
+    p.add_argument("--scale_actor_to_env_bounds", action="store_true", default=False)
+    p.add_argument("--no_scale_actor_to_env_bounds", dest="scale_actor_to_env_bounds", action="store_false")
     p.add_argument("--load_checkpoint_args", action="store_true", default=True)
     p.add_argument("--no_load_checkpoint_args", dest="load_checkpoint_args", action="store_false")
     p.add_argument("--show_telemetry_overlay", action="store_true", default=False)
     p.add_argument("--telemetry_overlay_hz", type=float, default=20.0)
+    p.add_argument("--show_episode_controls", action="store_true", default=True)
+    p.add_argument("--no_show_episode_controls", dest="show_episode_controls", action="store_false")
+    p.add_argument("--save_episode_plots", action="store_true", default=False)
+    p.add_argument("--episode_plot_dir", type=str, default="")
+    p.add_argument("--episode_plot_max_episodes", type=int, default=9)
     return p
 
 
@@ -292,6 +471,7 @@ def _apply_ckpt_defaults(args: argparse.Namespace) -> None:
     _set_if_default("reward_mode", "sparse")
     _set_if_default("dense_reward_scale", 1.0)
     _set_if_default("step_penalty", 0.0)
+    _set_if_default("cost_penalty", 0.0)
     _set_if_default("surface_mode", "default")
     _set_if_default("car_wheel_command_limit", 2.0)
     _set_if_default("car_force_scale", 2.0)
@@ -299,6 +479,7 @@ def _apply_ckpt_defaults(args: argparse.Namespace) -> None:
     _set_if_default("use_layer_norm", False)
     _set_if_default("layer_norm_eps", 1e-5)
     _set_if_default("init_scale", 0.01)
+    _set_if_default("scale_actor_to_env_bounds", False)
 
 
 def _build_env(args: argparse.Namespace, controller):
@@ -316,6 +497,7 @@ def _build_env(args: argparse.Namespace, controller):
         reward_mode=args.reward_mode,
         dense_reward_scale=args.dense_reward_scale,
         step_penalty=args.step_penalty,
+        cost_penalty=args.cost_penalty,
     )
     if args.intervention_mode == "human":
         if controller is None:
@@ -337,14 +519,21 @@ def _episode_metrics(
     ep_reward_dense: float,
     ep_reward_sparse: float,
     ep_reward_step_penalty: float,
+    ep_reward_cost_penalty: float,
     ep_len: int,
     max_steps: int,
     terminated: bool,
     truncated: bool,
     final_distance: float,
+    goal_met_any: bool,
+    goal_met_count: int,
+    first_goal_hit_step: int | None,
+    first_goal_reward_sum: float,
+    first_goal_dense_reward_sum: float,
 ) -> Dict[str, float]:
-    goal_met = bool(info.get("goal_met", False))
+    goal_met = bool(goal_met_any)
     outcome = classify_outcome(goal_met=goal_met, episode_steps=ep_len, max_episode_steps=max_steps)
+    first_hit = int(first_goal_hit_step) if first_goal_hit_step is not None else int(max_steps)
     return {
         "episode_return": float(ep_return),
         "episode_cost_sum": float(ep_cost),
@@ -355,11 +544,20 @@ def _episode_metrics(
         "reward_dense_sum": float(ep_reward_dense),
         "reward_sparse_sum": float(ep_reward_sparse),
         "reward_step_penalty_sum": float(ep_reward_step_penalty),
+        "reward_cost_penalty_sum": float(ep_reward_cost_penalty),
         "intervention_steps": float(info.get("teacher_intervention_steps", 0.0)),
         "intervention_fraction": float(info.get("teacher_fraction_steps", 0.0)),
         "intervention_num_bursts": float(info.get("teacher_num_bursts", 0.0)),
         "intervention_avg_burst_len": float(info.get("teacher_avg_burst_len", 0.0)),
         "goal_met": 1.0 if goal_met else 0.0,
+        "goal_met_count": float(max(0, int(goal_met_count))),
+        "first_goal_success": 1.0 if first_goal_hit_step is not None else 0.0,
+        "first_goal_hit_step": float(first_hit),
+        "first_goal_hit_step_success_only": float(first_hit if first_goal_hit_step is not None else 0.0),
+        "first_goal_within_100": 1.0 if first_goal_hit_step is not None and first_hit <= 100 else 0.0,
+        "first_goal_within_200": 1.0 if first_goal_hit_step is not None and first_hit <= 200 else 0.0,
+        "first_goal_reward_sum": float(first_goal_reward_sum),
+        "first_goal_dense_reward_sum": float(first_goal_dense_reward_sum),
         "final_distance_to_goal": float(final_distance),
         "outcome_success": 1.0 if outcome == "success" else 0.0,
         "outcome_timeout": 1.0 if outcome == "timeout" else 0.0,
@@ -437,15 +635,20 @@ def main() -> int:
     ) if wants_external_viewer(args.render_mode) else None
     max_steps = extract_step_limit(env)
     telemetry_panel = EvalTelemetryPanel(draw_hz=float(args.telemetry_overlay_hz)) if bool(args.show_telemetry_overlay) else None
+    control_panel = EvalEpisodeControlPanel() if bool(getattr(args, "show_episode_controls", True)) else None
 
     obs, _ = env.reset(seed=args.seed)
     obs = np.asarray(obs, dtype=np.float32).reshape(-1)
     if viewer is not None:
         viewer.draw_env(env)
+    task = env.unwrapped.task
+    overlay_specs = _extract_overlay_specs(task)
+    bounds = _extract_bounds(task, x_range=None, y_range=None)
     obs_dim = int(obs.shape[0])
     act_dim = int(np.prod(env.action_space.shape))
 
     actor = None
+    obs_preprocess = None
     if args.controller == "policy":
         if not args.model_path:
             raise ValueError("--model_path is required for --controller policy")
@@ -462,6 +665,13 @@ def main() -> int:
         checkpoint = torch.load(args.model_path, map_location=device, weights_only=False)
         actor.load_state_dict(checkpoint["actor_state_dict"])
         actor.eval()
+        obs_norm_state = checkpoint.get("obs_normalizer_state_dict", None)
+        if obs_norm_state and EmpiricalNormalization is not None:
+            obs_preprocess = EmpiricalNormalization(shape=obs_dim, device=device)
+            obs_preprocess.load_state_dict(obs_norm_state, strict=False)
+            obs_preprocess.eval()
+        else:
+            obs_preprocess = torch.nn.Identity()
 
     win = EpisodeWindow(size=max(10, args.num_episodes))
 
@@ -471,15 +681,107 @@ def main() -> int:
     ep_reward_dense = 0.0
     ep_reward_sparse = 0.0
     ep_reward_step_penalty = 0.0
+    ep_reward_cost_penalty = 0.0
     ep_len = 0
+    ep_goal_met_any = False
+    ep_goal_met_count = 0
+    ep_first_goal_hit_step: int | None = None
+    ep_first_goal_reward_sum = 0.0
+    ep_first_goal_dense_reward_sum = 0.0
+    ep_path = [np.asarray(task.agent.pos[:2], dtype=np.float64).copy()]
+    ep_goal_positions = [np.asarray(task.goal.pos[:2], dtype=np.float64).copy()]
+    ep_goal_hit_points: list[np.ndarray] = []
     episodes = 0
+    episode_idx = 0
+    eval_fps = float(args.fps)
+    saved_episode_plot_paths: list[Path] = []
 
     while episodes < args.num_episodes:
+        if control_panel is not None:
+            control_panel.set_status(episode_idx=episode_idx + 1, num_episodes=args.num_episodes, fps=eval_fps)
+            prev_requested, next_requested, quit_requested, reset_requested, fps_delta = control_panel.poll()
+            if abs(float(fps_delta)) > 0.0:
+                eval_fps = max(0.0, float(eval_fps + fps_delta))
+            if quit_requested:
+                break
+            if prev_requested:
+                episode_idx = max(0, int(episode_idx - 1))
+                obs, _ = env.reset(seed=args.seed + episode_idx)
+                obs = np.asarray(obs, dtype=np.float32).reshape(-1)
+                if viewer is not None:
+                    viewer.draw_env(env)
+                ep_ret = 0.0
+                ep_cost = 0.0
+                ep_reward_raw_env = 0.0
+                ep_reward_dense = 0.0
+                ep_reward_sparse = 0.0
+                ep_reward_step_penalty = 0.0
+                ep_reward_cost_penalty = 0.0
+                ep_len = 0
+                ep_goal_met_any = False
+                ep_goal_met_count = 0
+                ep_first_goal_hit_step = None
+                ep_first_goal_reward_sum = 0.0
+                ep_first_goal_dense_reward_sum = 0.0
+                ep_path = [np.asarray(task.agent.pos[:2], dtype=np.float64).copy()]
+                ep_goal_positions = [np.asarray(task.goal.pos[:2], dtype=np.float64).copy()]
+                ep_goal_hit_points = []
+                continue
+            if next_requested:
+                episode_idx = min(max(0, int(args.num_episodes) - 1), int(episode_idx + 1))
+                obs, _ = env.reset(seed=args.seed + episode_idx)
+                obs = np.asarray(obs, dtype=np.float32).reshape(-1)
+                if viewer is not None:
+                    viewer.draw_env(env)
+                ep_ret = 0.0
+                ep_cost = 0.0
+                ep_reward_raw_env = 0.0
+                ep_reward_dense = 0.0
+                ep_reward_sparse = 0.0
+                ep_reward_step_penalty = 0.0
+                ep_reward_cost_penalty = 0.0
+                ep_len = 0
+                ep_goal_met_any = False
+                ep_goal_met_count = 0
+                ep_first_goal_hit_step = None
+                ep_first_goal_reward_sum = 0.0
+                ep_first_goal_dense_reward_sum = 0.0
+                ep_path = [np.asarray(task.agent.pos[:2], dtype=np.float64).copy()]
+                ep_goal_positions = [np.asarray(task.goal.pos[:2], dtype=np.float64).copy()]
+                ep_goal_hit_points = []
+                continue
+            if reset_requested:
+                obs, _ = env.reset(seed=args.seed + episode_idx)
+                obs = np.asarray(obs, dtype=np.float32).reshape(-1)
+                if viewer is not None:
+                    viewer.draw_env(env)
+                ep_ret = 0.0
+                ep_cost = 0.0
+                ep_reward_raw_env = 0.0
+                ep_reward_dense = 0.0
+                ep_reward_sparse = 0.0
+                ep_reward_step_penalty = 0.0
+                ep_reward_cost_penalty = 0.0
+                ep_len = 0
+                ep_goal_met_any = False
+                ep_goal_met_count = 0
+                ep_first_goal_hit_step = None
+                ep_first_goal_reward_sum = 0.0
+                ep_first_goal_dense_reward_sum = 0.0
+                ep_path = [np.asarray(task.agent.pos[:2], dtype=np.float64).copy()]
+                ep_goal_positions = [np.asarray(task.goal.pos[:2], dtype=np.float64).copy()]
+                ep_goal_hit_points = []
+                continue
+
         if args.controller == "policy":
             with torch.no_grad():
                 obs_t = torch.as_tensor(obs[None, :], device=device, dtype=torch.float32)
+                if obs_preprocess is not None:
+                    obs_t = obs_preprocess(obs_t)
                 _, _, mean = actor(obs_t)
                 action = mean[0].detach().cpu().numpy().astype(np.float32)
+            if bool(getattr(args, "scale_actor_to_env_bounds", False)):
+                action = scale_action_np(action, env.action_space)
         elif args.controller == "random":
             action = env.action_space.sample().astype(np.float32)
         else:
@@ -507,7 +809,20 @@ def main() -> int:
         ep_reward_dense += float(info.get("reward_dense_component", 0.0))
         ep_reward_sparse += float(info.get("reward_sparse_component", 0.0))
         ep_reward_step_penalty += float(info.get("reward_step_penalty_component", 0.0))
+        ep_reward_cost_penalty += float(info.get("reward_cost_penalty_component", 0.0))
         ep_len += 1
+        ep_path.append(np.asarray(task.agent.pos[:2], dtype=np.float64).copy())
+        if bool(info.get("goal_met", False)):
+            ep_goal_met_any = True
+            ep_goal_met_count += 1
+            ep_goal_hit_points.append(np.asarray(task.agent.pos[:2], dtype=np.float64).copy())
+            if ep_first_goal_hit_step is None:
+                ep_first_goal_hit_step = int(ep_len)
+                ep_first_goal_reward_sum = float(ep_ret)
+                ep_first_goal_dense_reward_sum = float(ep_reward_dense)
+        current_goal_xy = np.asarray(task.goal.pos[:2], dtype=np.float64).copy()
+        if np.linalg.norm(current_goal_xy - np.asarray(ep_goal_positions[-1], dtype=np.float64)) > 1e-6:
+            ep_goal_positions.append(current_goal_xy)
 
         if terminated or truncated:
             final_dist = extract_goal_distance(env)
@@ -519,13 +834,49 @@ def main() -> int:
                 ep_reward_dense=ep_reward_dense,
                 ep_reward_sparse=ep_reward_sparse,
                 ep_reward_step_penalty=ep_reward_step_penalty,
+                ep_reward_cost_penalty=ep_reward_cost_penalty,
                 ep_len=ep_len,
                 max_steps=max_steps,
                 terminated=bool(terminated),
                 truncated=bool(truncated),
                 final_distance=final_dist,
+                goal_met_any=ep_goal_met_any,
+                goal_met_count=ep_goal_met_count,
+                first_goal_hit_step=ep_first_goal_hit_step,
+                first_goal_reward_sum=(
+                    ep_first_goal_reward_sum if ep_first_goal_hit_step is not None else float(ep_ret)
+                ),
+                first_goal_dense_reward_sum=(
+                    ep_first_goal_dense_reward_sum if ep_first_goal_hit_step is not None else float(ep_reward_dense)
+                ),
             )
             win.add(ep)
+            if bool(getattr(args, "save_episode_plots", False)):
+                plot_dir = (
+                    Path(str(args.episode_plot_dir)).expanduser()
+                    if str(getattr(args, "episode_plot_dir", "")).strip()
+                    else Path("logs") / "safetygym_eval_plots" / Path(str(args.model_path or "policy")).stem
+                )
+                if len(saved_episode_plot_paths) < int(max(0, getattr(args, "episode_plot_max_episodes", 9))):
+                    plot_path = plot_eval_episode_trajectory(
+                        output_path=plot_dir / f"episode_{episodes + 1:03d}.png",
+                        task=task,
+                        overlay_specs=overlay_specs,
+                        bounds=bounds,
+                        path=np.asarray(ep_path, dtype=np.float64),
+                        goal_positions=np.asarray(ep_goal_positions, dtype=np.float64),
+                        goal_hit_points=(
+                            np.asarray(ep_goal_hit_points, dtype=np.float64)
+                            if ep_goal_hit_points
+                            else np.zeros((0, 2), dtype=np.float64)
+                        ),
+                        episode_idx=episodes + 1,
+                        total_episodes=int(args.num_episodes),
+                        episode_reward=float(ep_ret),
+                        goals_reached=int(ep_goal_met_count),
+                        final_distance=float(final_dist),
+                    )
+                    saved_episode_plot_paths.append(Path(plot_path))
             outcome = "success" if ep["outcome_success"] > 0.5 else ("timeout" if ep["outcome_timeout"] > 0.5 else "kill")
             print(
                 f"episode={episodes+1} outcome={outcome} return={ep_ret:.3f} cost={ep_cost:.3f} "
@@ -534,6 +885,7 @@ def main() -> int:
                 flush=True,
             )
             episodes += 1
+            episode_idx = min(int(episodes), max(0, int(args.num_episodes) - 1))
             obs, _ = env.reset(seed=args.seed + episodes)
             obs = np.asarray(obs, dtype=np.float32).reshape(-1)
             if viewer is not None:
@@ -544,14 +896,39 @@ def main() -> int:
             ep_reward_dense = 0.0
             ep_reward_sparse = 0.0
             ep_reward_step_penalty = 0.0
+            ep_reward_cost_penalty = 0.0
             ep_len = 0
+            ep_goal_met_any = False
+            ep_goal_met_count = 0
+            ep_first_goal_hit_step = None
+            ep_first_goal_reward_sum = 0.0
+            ep_first_goal_dense_reward_sum = 0.0
+            ep_path = [np.asarray(task.agent.pos[:2], dtype=np.float64).copy()]
+            ep_goal_positions = [np.asarray(task.goal.pos[:2], dtype=np.float64).copy()]
+            ep_goal_hit_points = []
         else:
             obs = next_obs
 
-        if args.fps > 0:
-            time.sleep(1.0 / float(args.fps))
+        if eval_fps > 0:
+            time.sleep(1.0 / float(eval_fps))
 
     summary = augment_rollout_summary(win.summary("eval"), "eval")
+    if "eval/mean_reward" not in summary and "eval/episode_return_mean" in summary:
+        summary["eval/mean_reward"] = float(summary["eval/episode_return_mean"])
+    if bool(getattr(args, "save_episode_plots", False)) and saved_episode_plot_paths:
+        plot_dir = (
+            Path(str(args.episode_plot_dir)).expanduser()
+            if str(getattr(args, "episode_plot_dir", "")).strip()
+            else Path("logs") / "safetygym_eval_plots" / Path(str(args.model_path or "policy")).stem
+        )
+        sheet_path = plot_episode_contact_sheet(
+            image_paths=saved_episode_plot_paths,
+            output_path=plot_dir / "episode_contact_sheet.png",
+            title=f"SafetyGym eval episodes: {Path(str(args.model_path or 'policy')).stem}",
+            max_cols=3,
+        )
+        if sheet_path is not None:
+            print(f"saved episode contact sheet to {sheet_path}", flush=True)
     print(json.dumps(summary, sort_keys=True), flush=True)
 
     env.close()
@@ -561,6 +938,8 @@ def main() -> int:
         telemetry_panel.close()
     if viewer is not None:
         viewer.close()
+    if control_panel is not None:
+        control_panel.close()
     return 0
 
 
