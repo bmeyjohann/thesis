@@ -143,6 +143,7 @@ For `queue_status`, `list_jobs`, and `get_job`, pass `debug=true` only when you 
 
 - Codex can auto-approve custom MCP tools via config, but app-side approval behavior is still heuristic and can be sensitive to path-heavy payloads.
 - If you want unattended autonomous work, prefer the unified `queue` tool with summary actions plus `wandb` for normal monitoring.
+- In autonomous research, a successful enqueue or a healthy running job is not completion by itself; the agent should remain in a monitor-and-decide loop until the research objective is answered or clearly blocked.
 - Treat the debug tools as manual-only. They are the ones most likely to trigger an extra approval because they expose absolute paths and richer execution metadata.
 - Put any per-tool MCP approval overrides in the active user config that your Codex app actually loads, not only in a repo-local config, if you need the app to honor them reliably.
 

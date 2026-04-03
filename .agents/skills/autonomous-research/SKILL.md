@@ -17,6 +17,7 @@ The purpose of this skill is to let Codex autonomously run iterative research lo
 - checking logs and WANDB periodically
 - stopping broken or no-longer-useful runs early
 - enqueueing the next most informative experiment
+- maintaining an explicit objective ledger and live task list
 - keeping the queue small, intentional, and interpretable
 - continuing this loop until Codex has a satisfying answer to the original research question, the user-imposed stopping condition is reached, or the remaining uncertainty is clearly blocked by missing data/tooling
 
@@ -65,28 +66,79 @@ At the start of an autonomous-research session:
 20. In unattended mode, keep queue interactions on the unified `queue` tool so all experiment-queue activity stays under one MCP tool name.
 21. Within `queue`, prefer the summary actions (`queue_status`, `list_jobs`, `get_job`) over `debug=true`. Debug payloads expose absolute paths and are more likely to trigger approval prompts in the Codex app.
 
+## Objective Ledger
+
+At the start of the session, create and maintain an explicit research ledger in your working memory:
+
+- `question`: the user-facing question to answer
+- `success_criteria`: what would count as a satisfying answer
+- `stop_conditions`: what would make further work clearly pointless or blocked
+- `active_hypotheses`: the current best explanations or levers to test
+- `todo`: a short ordered task list with statuses such as `open`, `running`, `blocked`, `done`, or `dropped`
+- `evidence`: the key facts already established
+
+Keep this ledger live. Update it whenever new evidence changes what the most informative next step is.
+
+Do not let the queue become a substitute for this ledger. A queued or running job is only one piece of evidence, not completion of the research task.
+
 ## Standard Operating Loop
 
 Use this loop repeatedly during autonomous research:
 
-1. Inspect queue state with `queue(action="queue_status")`.
-2. If nothing useful is queued or running, enqueue the single best next experiment.
-3. For the active run, inspect:
+1. Re-state the current objective ledger to yourself:
+   - what question is still unanswered
+   - which task is currently `running`
+   - which task should happen next if the current one fails or finishes
+2. Inspect queue state with `queue(action="queue_status")`.
+3. If nothing useful is queued or running, enqueue the single best next experiment.
+4. For the active run, inspect:
    - `queue(action="get_job", job_id=...)`
    - `queue(action="read_job_log", job_id=...)`
    - the `wandb` MCP when the job logs WANDB metrics
-4. Decide whether the run should:
+5. Decide whether the run should:
    - continue unchanged
    - be stopped because it is broken
    - be stopped because it has already answered the question
    - be followed by a new variant with adjusted parameters
-5. If the evidence is sufficient, enqueue the next best follow-up experiment before idling.
-6. Keep the queue short. Prefer sequential decision-making over a long blind backlog.
-7. Record a concise summary of:
+6. Update the ledger immediately after each inspection:
+   - mark completed tasks `done`
+   - mark invalidated tasks `dropped`
+   - add new follow-ups if the evidence opens a better branch
+   - reorder the todo list so the next action reflects the current best information
+7. If the evidence is sufficient, enqueue the next best follow-up experiment before idling.
+8. Keep the queue short. Prefer sequential decision-making over a long blind backlog.
+9. Record a concise summary of:
    - what was learned
    - what is still uncertain
    - what the next queued run is meant to resolve
-8. Keep iterating until you can answer the user's starting question satisfactorily. Do not stop merely because one run finished or because the queue is temporarily empty.
+10. Keep iterating until you can answer the user's starting question satisfactorily. Do not stop merely because one run finished or because the queue is temporarily empty.
+
+## Persistence Rule
+
+- Enqueuing jobs is not completion.
+- Seeing a run start successfully is not completion.
+- Handing off a list of currently running experiments is not completion.
+- If experiments are still relevant to the user question, stay in the monitoring-and-decision loop.
+- If the current run needs time before the next decision point, wait and then inspect again. Do not end the turn just because the next useful action is a future inspection.
+- If all active work is still healthy but the answer is not yet known, remain responsible for the session and continue polling until a decision can be made.
+
+The only acceptable reasons to stop are:
+
+- the user's question has a satisfying answer
+- the user explicitly asked to stop
+- the work is clearly blocked by missing permissions, missing tooling, irrecoverable runtime failure, or insufficient available time/budget
+
+If blocked, say exactly what is blocking progress and why further unattended waiting would not change that.
+
+## Dynamic Task Management
+
+Treat the todo list as adaptive, not fixed.
+
+- If new evidence shows a planned branch is a bad idea, mark it `dropped` and say why.
+- If one branch becomes clearly dominant, move it to the front of the queue and cancel stale queued jobs that no longer help answer the question.
+- If an infrastructure problem appears, insert the necessary repair or verification task before queueing more science experiments.
+- If a run already answers part of the question, split the remaining uncertainty into a smaller follow-up task instead of continuing with the old broad plan.
+- Always keep exactly one current best next step visible in the ledger.
 
 ## Inspection Cadence
 
@@ -102,6 +154,14 @@ Use a tighter loop early and a looser loop later:
   - a queued job becomes the new active job
 
 Do not wait passively if the current evidence already supports a stop or branch decision.
+
+When a run is still in progress and more evidence is expected soon:
+
+- set an explicit next check objective in your ledger
+- wait for that interval or event
+- re-enter the loop instead of treating the session as handed off
+
+Autonomous research means staying in control of the loop, not just launching it.
 
 ## Stop Criteria
 
@@ -177,6 +237,7 @@ In those cases, use queue logs and job metadata as the primary source of truth.
 - If a run modifies code or launchers, verify the new launcher/config before queueing a long follow-up job.
 - Do not leave the queue running aimlessly after the current question has already been answered.
 - Do not abandon the research loop early if the current evidence is still insufficient. If the answer is not yet satisfying, decide what missing evidence matters most and queue the next experiment that resolves it.
+- Do not convert "jobs are running" into a handoff summary when the user explicitly asked for unattended or overnight iteration. Continue monitoring, updating the ledger, and iterating until the objective is satisfied or clearly blocked.
 - Codex cannot reliably predict every future app approval prompt in `on-request` mode. Structure the workflow so the default path stays on the unified `queue` tool with summary actions and avoid path-heavy debug payloads unless a human is present.
 - Do not assume that one approved call unlocks an entire MCP forever. Warmup only helps when the active client config is already using `auto`-style approval behavior for the relevant tools.
 - If a long autonomous run would depend on a tool that still prompts every time, stop and surface that as a setup problem in the active Codex client instead of silently continuing.
@@ -199,7 +260,9 @@ A clean Codex session using only this skill plus the MCP server should be able t
 12. inspect WANDB if present
 13. decide continue, stop, cancel, or branch
 14. enqueue the next best follow-up experiment
-15. repeat this loop until it has a satisfying answer, while keeping the queue intentional
+15. maintain an explicit objective ledger and dynamic todo list throughout the run
+16. keep monitoring active experiments instead of handing off just because work is in flight
+17. repeat this loop until it has a satisfying answer, while keeping the queue intentional
 
 This skill is not meant to replace judgment. It is meant to provide a concrete operating procedure so Codex does not need prior conversational context to manage the queue sensibly.
 
