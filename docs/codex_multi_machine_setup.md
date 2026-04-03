@@ -59,37 +59,46 @@ args = [
 startup_timeout_sec = 30.0
 
 [mcp_servers.experiment_queue.tools.prime_queue_session]
-approval_mode = "approve"
+approval_mode = "auto"
+
+[mcp_servers.experiment_queue.tools.daemon_status]
+approval_mode = "auto"
 
 [mcp_servers.experiment_queue.tools.queue_status]
-approval_mode = "approve"
+approval_mode = "auto"
 
 [mcp_servers.experiment_queue.tools.list_jobs]
-approval_mode = "approve"
+approval_mode = "auto"
 
 [mcp_servers.experiment_queue.tools.enqueue_script]
-approval_mode = "approve"
+approval_mode = "auto"
 
 [mcp_servers.experiment_queue.tools.get_job]
-approval_mode = "approve"
+approval_mode = "auto"
 
 [mcp_servers.experiment_queue.tools.read_job_log]
-approval_mode = "approve"
+approval_mode = "auto"
 
 [mcp_servers.experiment_queue.tools.pause_queue]
-approval_mode = "approve"
+approval_mode = "auto"
+
+[mcp_servers.experiment_queue.tools.shutdown_daemon]
+approval_mode = "auto"
+
+[mcp_servers.experiment_queue.tools.restart_daemon]
+approval_mode = "auto"
 
 [mcp_servers.experiment_queue.tools.stop_after_current]
-approval_mode = "approve"
+approval_mode = "auto"
 
 [mcp_servers.experiment_queue.tools.stop_now]
-approval_mode = "approve"
+approval_mode = "auto"
 
 [mcp_servers.experiment_queue.tools.cancel_job]
-approval_mode = "approve"
+approval_mode = "auto"
 
 [mcp_servers.experiment_queue.tools.resume_queue]
-approval_mode = "approve"
+approval_mode = "auto"
 
 [mcp_servers.linear]
 url = "https://mcp.linear.app/mcp"
@@ -208,6 +217,7 @@ Then start a fresh session and verify:
 
 - `wandb` MCP is available
 - `experiment_queue` MCP is available
+- `daemon_status`, `shutdown_daemon`, and `restart_daemon` are visible on `experiment_queue`
 - `linear` MCP is available
 - `zotero` MCP is available
 - the repo-local `autonomous-research` skill is visible

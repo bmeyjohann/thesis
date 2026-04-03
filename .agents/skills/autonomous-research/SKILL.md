@@ -26,6 +26,7 @@ At the start of an autonomous-research session:
 
 1. Verify that the `experiment_queue` MCP is available and proactively touch the queue tools you are likely to need during the session.
 2. At minimum, request:
+   - `daemon_status`
    - `queue_status`
    - `list_jobs`
    - `get_job`
@@ -35,6 +36,8 @@ At the start of an autonomous-research session:
    - `stop_after_current`
    - `pause_queue`
    - `resume_queue`
+   - `shutdown_daemon`
+   - `restart_daemon`
 3. If you expect to enqueue and cancel experiments during the run, do a harmless placeholder queue cycle at startup so that this path has already been exercised before unattended work begins:
    - enqueue a tiny trusted no-op or smoke job
    - cancel it immediately if the point is only to warm up the tool path
@@ -135,7 +138,7 @@ For autonomous research:
 - Keep changes local and inspectable. If a run needs a new condition, encode it in a repo-tracked launcher or config, not in an opaque inline shell fragment.
 - Before enqueueing a large sequence, define what evidence will cause early stopping or progression to the next job.
 - Multiple Codex sessions may attach to the same queue root. Inspecting shared jobs is fine, but do not stop or cancel another session's owned jobs unless the user explicitly wants that or you pass `force=true` intentionally.
-- The queue daemon auto-starts on mutating queue operations and exits after the queue stays idle. Do not treat an idle daemon exit as a failure; the next enqueue or resume call will wake it again.
+- The queue daemon auto-starts on mutating queue operations and stays alive until explicitly shut down. Use `daemon_status` if you need to verify worker health, and use `restart_daemon` or `shutdown_daemon` intentionally rather than treating daemon lifecycle as implicit.
 - The summary queue tools are the default unattended path. Only use `queue_debug_status`, `list_jobs_debug`, or `get_job_debug` when a human is present or explicit debugging requires the extra path-rich metadata.
 
 ## WANDB Use
@@ -195,4 +198,4 @@ This skill is not meant to replace judgment. It is meant to provide a concrete o
 - Queue runtime lives under the repo's `experiment_queue/` directory by default.
 - The default queued execution environment is the `fasttd3` conda env.
 - The current setup is intended for trusted launcher scripts in the thesis repo.
-- The MCP server is control-only; the actual queue worker is a daemon that is started on demand and exits automatically once the queue stays idle.
+- The MCP server is control-only; the actual queue worker is a daemon that is started on demand and remains alive until explicitly shut down.

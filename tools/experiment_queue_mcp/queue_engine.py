@@ -103,6 +103,7 @@ class ExperimentQueue:
         self.results_dir = self.state_dir / "results"
         self.control_path = self.state_dir / "control.json"
         self.worker_lock_path = self.state_dir / "worker.lock"
+        self.worker_heartbeat_path = self.state_dir / "worker_heartbeat.json"
         self.daemon_log_path = self.logs_dir / "daemon.log"
 
         self._lock = threading.RLock()
@@ -175,6 +176,7 @@ class ExperimentQueue:
     def _tick(self) -> None:
         with self._lock:
             self._reconcile_jobs_locked()
+            self._write_worker_heartbeat_locked()
             control = self._read_control_locked()
             running_job = self._get_running_job_locked()
 
@@ -357,9 +359,60 @@ class ExperimentQueue:
         status["started_now"] = False
         raise RuntimeError(f"Experiment queue daemon did not start for {self.queue_root}")
 
+    def shutdown_daemon(
+        self,
+        *,
+        wait_s: float = 5.0,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        with self._lock:
+            status = self._daemon_status_locked()
+            pid = self._read_worker_pid_locked()
+            if not status["worker_lock_held"] and not pid:
+                status["stopped_now"] = False
+                return status
+            if pid is None or not self._pid_is_running(pid):
+                status["stopped_now"] = False
+                status["note"] = "Daemon pid missing or already dead; no signal sent."
+                return status
+            try:
+                os.kill(pid, signal.SIGKILL if force else signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+        deadline = time.time() + wait_s
+        last_status: dict[str, Any] | None = None
+        while time.time() < deadline:
+            last_status = self.daemon_status()
+            last_pid = self._read_worker_pid_locked()
+            if not last_status["worker_lock_held"] and (last_pid is None or not self._pid_is_running(last_pid)):
+                last_status["stopped_now"] = True
+                return last_status
+            time.sleep(0.1)
+
+        if not force and pid is not None and self._pid_is_running(pid):
+            return self.shutdown_daemon(wait_s=wait_s, force=True)
+
+        status = last_status or self.daemon_status()
+        status["stopped_now"] = False
+        raise RuntimeError(f"Experiment queue daemon did not stop for {self.queue_root}")
+
+    def restart_daemon(
+        self,
+        daemon_command: list[str],
+        *,
+        shutdown_wait_s: float = 5.0,
+        startup_wait_s: float = 3.0,
+    ) -> dict[str, Any]:
+        self.shutdown_daemon(wait_s=shutdown_wait_s)
+        status = self.ensure_daemon_running(daemon_command, startup_wait_s=startup_wait_s)
+        status["restarted_now"] = True
+        return status
+
     def list_jobs(self, status: str | None = None, limit: int | None = None) -> list[JobRecord]:
         with self._lock:
             self._reconcile_jobs_locked()
+            self._reconcile_orphaned_running_job_locked()
             jobs = [self._read_job_file(path) for path in sorted(self.jobs_dir.glob("*.json"))]
             jobs.sort(key=lambda item: item.submitted_at, reverse=True)
             if status:
@@ -370,12 +423,17 @@ class ExperimentQueue:
 
     def get_job(self, job_id: str) -> JobRecord:
         with self._lock:
+            self._reconcile_jobs_locked()
+            self._reconcile_orphaned_running_job_locked()
             path = self.jobs_dir / f"{job_id}.json"
             if not path.exists():
                 raise KeyError(f"Unknown job: {job_id}")
             return self._read_job_file(path)
 
     def read_log(self, job_id: str, stream: str = "stdout", lines: int = 100) -> str:
+        with self._lock:
+            self._reconcile_jobs_locked()
+            self._reconcile_orphaned_running_job_locked()
         job = self.get_job(job_id)
         if stream not in {"stdout", "stderr"}:
             raise ValueError("stream must be 'stdout' or 'stderr'")
@@ -470,6 +528,7 @@ class ExperimentQueue:
     def queue_status(self) -> dict[str, Any]:
         with self._lock:
             self._reconcile_jobs_locked()
+            self._reconcile_orphaned_running_job_locked()
             control = self._read_control_locked()
             jobs = self.list_jobs(limit=None)
             counts: dict[str, int] = {}
@@ -685,6 +744,7 @@ class ExperimentQueue:
         handle.write(f"{os.getpid()}\n")
         handle.flush()
         self._worker_lock_handle = handle
+        self._write_worker_heartbeat_locked()
 
     def _release_worker_lock_locked(self) -> None:
         handle = self._worker_lock_handle
@@ -695,15 +755,34 @@ class ExperimentQueue:
         finally:
             handle.close()
             self._worker_lock_handle = None
+            try:
+                self.worker_lock_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            try:
+                self.worker_heartbeat_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def _daemon_status_locked(self) -> dict[str, Any]:
-        pid = self._read_worker_pid_locked()
-        running = self._worker_lock_is_held_locked()
+        heartbeat = self._read_worker_heartbeat_locked()
+        lock_held = self._worker_lock_is_held_locked()
+        heartbeat_fresh = self._worker_heartbeat_is_fresh_locked(heartbeat)
+        running = lock_held and heartbeat_fresh
+        heartbeat_age_s = None
+        if heartbeat and isinstance(heartbeat.get("updated_at"), (int, float)):
+            heartbeat_age_s = max(0.0, time.time() - float(heartbeat["updated_at"]))
+        pid = heartbeat.get("pid") if heartbeat else self._read_worker_pid_locked()
         return {
             "daemon_running": running,
-            "daemon_pid": pid if running else None,
+            "daemon_pid": int(pid) if running and pid is not None else None,
             "daemon_log_path": str(self.daemon_log_path),
             "worker_lock_path": str(self.worker_lock_path),
+            "worker_heartbeat_path": str(self.worker_heartbeat_path),
+            "worker_lock_held": lock_held,
+            "worker_heartbeat_fresh": heartbeat_fresh,
+            "worker_heartbeat_age_s": heartbeat_age_s,
+            "worker_lock_stale": lock_held and not heartbeat_fresh,
         }
 
     def _read_worker_pid_locked(self) -> int | None:
@@ -724,6 +803,8 @@ class ExperimentQueue:
     def _worker_lock_is_held_locked(self) -> bool:
         if self._worker_lock_handle is not None:
             return True
+        if not self.worker_lock_path.exists():
+            return False
         handle = self.worker_lock_path.open("a+", encoding="utf-8")
         acquired = False
         try:
@@ -740,6 +821,66 @@ class ExperimentQueue:
                 except OSError:
                     pass
             handle.close()
+
+    def _read_worker_heartbeat_locked(self) -> dict[str, Any] | None:
+        if not self.worker_heartbeat_path.exists():
+            return None
+        try:
+            data = self._read_json(self.worker_heartbeat_path)
+        except (OSError, json.JSONDecodeError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _worker_heartbeat_is_fresh_locked(self, heartbeat: dict[str, Any] | None) -> bool:
+        if not heartbeat:
+            return False
+        updated_at = heartbeat.get("updated_at")
+        if not isinstance(updated_at, (int, float)):
+            return False
+        return (time.time() - float(updated_at)) <= max(5.0, self.poll_interval_s * 4.0)
+
+    def _write_worker_heartbeat_locked(self) -> None:
+        if self._worker_lock_handle is None:
+            return
+        running_job = self._get_running_job_locked()
+        payload: dict[str, Any] = {
+            "pid": os.getpid(),
+            "updated_at": time.time(),
+        }
+        if running_job is not None:
+            payload["current_job_id"] = running_job.job_id
+        self._write_json(self.worker_heartbeat_path, payload)
+
+    def _reconcile_orphaned_running_job_locked(self) -> None:
+        status = self._daemon_status_locked()
+        if status["daemon_running"]:
+            return
+        job = self._get_running_job_locked()
+        if job is None:
+            return
+        recorded_exit = self._read_recorded_exit_code_locked(job)
+        if recorded_exit is not None:
+            final_status = STATUS_FINISHED if recorded_exit == 0 else STATUS_FAILED
+            self._finish_job_locked(
+                job,
+                status=final_status,
+                exit_code=recorded_exit,
+                note="Recovered completed job after daemon heartbeat stopped.",
+            )
+            return
+        if job.pid and self._pid_is_running(job.pid):
+            return
+        if self._should_wait_for_exit_sidecar_locked(job):
+            return
+        note = "Recovered stale running job after daemon heartbeat stopped."
+        if status.get("worker_lock_stale"):
+            note += " Worker lock remained held without a fresh heartbeat."
+        self._finish_job_locked(
+            job,
+            status=STATUS_FAILED,
+            exit_code=None,
+            note=note,
+        )
 
     def _assert_job_control_allowed(
         self,

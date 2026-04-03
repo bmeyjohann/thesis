@@ -61,6 +61,7 @@ Do not rely on a repo-local `.codex/config.toml` entry like `bash scripts/run_ex
 
 - `prime_queue_session`
 - `enqueue_script`
+- `daemon_status`
 - `queue_status`
 - `queue_debug_status`
 - `list_jobs`
@@ -70,6 +71,8 @@ Do not rely on a repo-local `.codex/config.toml` entry like `bash scripts/run_ex
 - `read_job_log`
 - `pause_queue`
 - `resume_queue`
+- `shutdown_daemon`
+- `restart_daemon`
 - `stop_after_current`
 - `stop_now`
 - `cancel_job`
@@ -92,10 +95,12 @@ Do not rely on a repo-local `.codex/config.toml` entry like `bash scripts/run_ex
 - Read-only queue tools (`queue_status`, `list_jobs`, `get_job`, `read_job_log`, `pause_queue`) inspect persisted queue state without waking the daemon.
 - The default monitoring tools (`queue_status`, `list_jobs`, `get_job`) intentionally return compact summaries without absolute paths so unattended autonomous sessions are less likely to trip client-side approval heuristics.
 - The explicit debug tools (`queue_debug_status`, `list_jobs_debug`, `get_job_debug`) expose full path-rich metadata and are intended for manual diagnosis when a human is present.
-- The daemon exits automatically once the queue is empty and no job is active for a short idle grace period.
+- The daemon stays alive once started until `shutdown_daemon` is called explicitly or the process is otherwise terminated.
 - Multiple MCP sessions can attach to the same queue root because they all talk to the same daemon-backed queue state.
 - Running jobs can survive an MCP control-server restart because the daemon is independent of MCP client lifetime.
-- Daemon liveness is inferred from the actual queue worker file lock, not only from a stored PID, so cross-namespace PID mismatches do not prevent auto-start from waking the worker.
+- Daemon liveness is inferred from both the worker lock and a fresh worker heartbeat, not only from a stored PID, so stale pid text or an unrelated lock holder does not get reported as a healthy daemon.
+- The daemon removes stale lock metadata on clean exit, and the control plane can reconcile orphaned `running` jobs if the worker disappears after the child process has already exited or written its exit sidecar.
+- Use `daemon_status` for lightweight daemon health checks, `restart_daemon` to recover the worker explicitly, and `shutdown_daemon` when you intentionally want the service stopped.
 - Removing the current script from `running/` requests cancellation.
 - `stop_now` sends `SIGTERM` to the job process group and escalates to `SIGKILL` after the configured grace period.
 - `stop_after_current` lets the active job finish, then stops dequeuing new jobs until resumed.

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import signal
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -33,12 +35,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shell-path", default="/bin/bash", help="Shell used to run scripts.")
     parser.add_argument("--poll-interval", type=float, default=1.0, help="Worker poll interval in seconds.")
     parser.add_argument("--terminate-grace", type=float, default=10.0, help="Seconds to wait after SIGTERM before SIGKILL.")
-    parser.add_argument(
-        "--idle-exit-delay",
-        type=float,
-        default=2.0,
-        help="Seconds to remain alive after the queue becomes idle before exiting.",
-    )
     return parser
 
 
@@ -55,15 +51,19 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     LOGGER.info("Experiment queue daemon started for %s", queue.queue_root)
-    last_busy_at = time.time()
+    stop_event = threading.Event()
+
+    def _handle_signal(signum, _frame) -> None:
+        LOGGER.info("Experiment queue daemon received signal %s; shutting down.", signum)
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
     try:
-        while True:
-            if queue.has_pending_work():
-                last_busy_at = time.time()
-            elif time.time() - last_busy_at >= args.idle_exit_delay:
-                LOGGER.info("Experiment queue idle for %.2fs; exiting daemon.", args.idle_exit_delay)
-                return 0
+        while not stop_event.is_set():
             time.sleep(max(0.1, args.poll_interval))
+        return 0
     finally:
         queue.stop(kill_running=False)
 

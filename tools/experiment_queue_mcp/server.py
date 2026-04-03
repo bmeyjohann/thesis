@@ -72,6 +72,22 @@ def _queue_status_summary(status: Any) -> dict[str, Any]:
     }
 
 
+def _daemon_status_summary(status: Any) -> dict[str, Any]:
+    data = _serialize(status)
+    summary = {
+        "daemon_running": data["daemon_running"],
+        "daemon_pid": data.get("daemon_pid"),
+        "worker_lock_held": data.get("worker_lock_held"),
+        "worker_heartbeat_fresh": data.get("worker_heartbeat_fresh"),
+        "worker_heartbeat_age_s": data.get("worker_heartbeat_age_s"),
+        "worker_lock_stale": data.get("worker_lock_stale"),
+    }
+    for key in ("started_now", "stopped_now", "restarted_now", "note"):
+        if key in data:
+            summary[key] = data[key]
+    return summary
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Queue-backed MCP server for experiment scripts.")
     parser.add_argument("--queue-root", required=True, help="Path to the queue root directory.")
@@ -144,6 +160,7 @@ def create_mcp_server(queue: ExperimentQueue, daemon_command: list[str]) -> Fast
     tool_names = [
         "prime_queue_session",
         "enqueue_script",
+        "daemon_status",
         "queue_status",
         "queue_debug_status",
         "list_jobs",
@@ -153,6 +170,8 @@ def create_mcp_server(queue: ExperimentQueue, daemon_command: list[str]) -> Fast
         "read_job_log",
         "pause_queue",
         "resume_queue",
+        "shutdown_daemon",
+        "restart_daemon",
         "stop_after_current",
         "stop_now",
         "cancel_job",
@@ -254,6 +273,14 @@ def create_mcp_server(queue: ExperimentQueue, daemon_command: list[str]) -> Fast
             raise ToolError(str(exc)) from exc
 
     @mcp.tool()
+    def daemon_status() -> dict[str, Any]:
+        """Return daemon health and stale-lock indicators without full path metadata."""
+        try:
+            return _daemon_status_summary(queue.daemon_status())
+        except Exception as exc:
+            raise ToolError(str(exc)) from exc
+
+    @mcp.tool()
     def queue_status() -> dict[str, Any]:
         """Return a compact queue summary for unattended monitoring."""
         try:
@@ -337,6 +364,22 @@ def create_mcp_server(queue: ExperimentQueue, daemon_command: list[str]) -> Fast
         try:
             queue.ensure_daemon_running(daemon_command)
             return _serialize(queue.resume_queue())
+        except Exception as exc:
+            raise ToolError(str(exc)) from exc
+
+    @mcp.tool()
+    def shutdown_daemon() -> dict[str, Any]:
+        """Stop the background daemon explicitly and leave queued jobs untouched."""
+        try:
+            return _daemon_status_summary(queue.shutdown_daemon())
+        except Exception as exc:
+            raise ToolError(str(exc)) from exc
+
+    @mcp.tool()
+    def restart_daemon() -> dict[str, Any]:
+        """Restart the background daemon explicitly."""
+        try:
+            return _daemon_status_summary(queue.restart_daemon(daemon_command))
         except Exception as exc:
             raise ToolError(str(exc)) from exc
 

@@ -6,6 +6,9 @@ import time
 from pathlib import Path
 
 from tools.experiment_queue_mcp.queue_engine import ExperimentQueue
+from tools.experiment_queue_mcp.queue_engine import JobRecord
+from tools.experiment_queue_mcp.queue_engine import STATUS_FAILED
+from tools.experiment_queue_mcp.queue_engine import STATUS_RUNNING
 
 
 SERVER_PYTHON = "/usr/bin/python3"
@@ -334,6 +337,68 @@ def test_two_servers_share_one_auto_started_daemon(tmp_path: Path) -> None:
             proc_b.wait(timeout=5)
 
 
+def test_daemon_persists_until_explicit_shutdown_via_mcp(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    scripts_dir = workspace / "scripts"
+    queue_root = workspace / "experiment_queue"
+    scripts_dir.mkdir(parents=True)
+
+    server_path = Path(__file__).resolve().parents[1] / "tools" / "experiment_queue_mcp" / "server.py"
+    proc = subprocess.Popen(
+        [
+            SERVER_PYTHON,
+            str(server_path),
+            "--queue-root",
+            str(queue_root),
+            "--workspace-root",
+            str(workspace),
+            "--default-cwd",
+            str(workspace),
+            "--script-root",
+            str(scripts_dir),
+            "--poll-interval",
+            "0.05",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    try:
+        _call(
+            proc,
+            1,
+            "initialize",
+            {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "pytest", "version": "0"},
+            },
+        )
+
+        before = _call(proc, 2, "tools/call", {"name": "daemon_status", "arguments": {}})
+        assert before["result"]["structuredContent"]["daemon_running"] is False
+
+        started = _call(proc, 3, "tools/call", {"name": "restart_daemon", "arguments": {}})
+        assert started["result"]["structuredContent"]["daemon_running"] is True
+        assert started["result"]["structuredContent"]["restarted_now"] is True
+
+        time.sleep(0.35)
+        still_running = _call(proc, 4, "tools/call", {"name": "daemon_status", "arguments": {}})
+        assert still_running["result"]["structuredContent"]["daemon_running"] is True
+        assert still_running["result"]["structuredContent"]["worker_heartbeat_fresh"] is True
+
+        stopped = _call(proc, 5, "tools/call", {"name": "shutdown_daemon", "arguments": {}})
+        assert stopped["result"]["structuredContent"]["daemon_running"] is False
+        assert stopped["result"]["structuredContent"]["stopped_now"] is True
+
+        after = _call(proc, 6, "tools/call", {"name": "daemon_status", "arguments": {}})
+        assert after["result"]["structuredContent"]["daemon_running"] is False
+    finally:
+        proc.kill()
+        proc.wait(timeout=5)
+
+
 def test_cancel_job_respects_owner_metadata(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     scripts_dir = workspace / "scripts"
@@ -544,3 +609,91 @@ def test_daemon_status_ignores_stale_pid_text_when_lock_is_free(tmp_path: Path) 
     status = queue.daemon_status()
     assert status["daemon_running"] is False
     assert status["daemon_pid"] is None
+
+
+def test_daemon_status_ignores_lock_without_fresh_heartbeat(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    scripts_dir = workspace / "scripts"
+    queue_root = workspace / "experiment_queue"
+    scripts_dir.mkdir(parents=True)
+
+    queue = ExperimentQueue(
+        queue_root=queue_root,
+        workspace_root=workspace,
+        script_roots=[scripts_dir],
+        default_cwd=workspace,
+        poll_interval_s=0.05,
+    )
+
+    holder = subprocess.Popen(
+        [
+            SERVER_PYTHON,
+            "-c",
+            (
+                "import fcntl, sys, time; "
+                "path, pid_text = sys.argv[1], sys.argv[2]; "
+                "handle = open(path, 'a+', encoding='utf-8'); "
+                "fcntl.flock(handle.fileno(), fcntl.LOCK_EX); "
+                "handle.seek(0); "
+                "handle.truncate(); "
+                "handle.write(pid_text + '\\n'); "
+                "handle.flush(); "
+                "time.sleep(5)"
+            ),
+            str(queue.worker_lock_path),
+            "999999",
+        ],
+    )
+    try:
+        time.sleep(0.2)
+        status = queue.daemon_status()
+        assert status["worker_lock_held"] is True
+        assert status["worker_heartbeat_fresh"] is False
+        assert status["worker_lock_stale"] is True
+        assert status["daemon_running"] is False
+        assert status["daemon_pid"] is None
+    finally:
+        holder.terminate()
+        holder.wait(timeout=5)
+
+
+def test_queue_status_recovers_orphaned_running_job_when_worker_is_unhealthy(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    scripts_dir = workspace / "scripts"
+    queue_root = workspace / "experiment_queue"
+    scripts_dir.mkdir(parents=True)
+
+    queue = ExperimentQueue(
+        queue_root=queue_root,
+        workspace_root=workspace,
+        script_roots=[scripts_dir],
+        default_cwd=workspace,
+        poll_interval_s=0.05,
+    )
+
+    running_script = queue.running_dir / "20260403-000000-deadbeef__orphan.sh"
+    running_script.write_text("#!/usr/bin/env bash\nset -euo pipefail\necho orphan\n", encoding="utf-8")
+    running_script.chmod(0o755)
+
+    job = JobRecord(
+        job_id="20260403-000000-deadbeef",
+        name="orphan",
+        status=STATUS_RUNNING,
+        script_path=str(running_script),
+        submitted_at=time.time() - 30.0,
+        started_at=time.time() - 30.0,
+        cwd=str(workspace),
+        pid=999999,
+        stdout_log=str(queue.logs_dir / "20260403-000000-deadbeef.out"),
+        stderr_log=str(queue.logs_dir / "20260403-000000-deadbeef.err"),
+        exit_code_path=str(queue.results_dir / "20260403-000000-deadbeef.exitcode"),
+    )
+    queue._write_job_locked(job)
+
+    status = queue.queue_status()
+    recovered = queue.get_job(job.job_id)
+    assert recovered.status == STATUS_FAILED
+    assert Path(recovered.script_path).parent == queue.failed_dir
+    assert "Recovered stale running job" in (recovered.note or "")
+    assert status["current_job"] is None
+    assert status["counts"].get(STATUS_FAILED) == 1
