@@ -33,6 +33,10 @@ import gymnasium as gym
 import numpy as np
 import pygame
 import torch
+try:
+    import mujoco
+except Exception:
+    mujoco = None
 
 if "fasttd3/fast_sac" not in sys.path:
     sys.path.append("fasttd3/fast_sac")
@@ -654,8 +658,14 @@ class EpisodeControlPanel:
 class NativeViewer:
     """MuJoCo passive viewer wrapper for manip environments."""
 
-    def __init__(self):
+    def __init__(self, *, enable_intervention_visuals: bool = False):
         self.enabled = False
+        self._enable_intervention_visuals = bool(enable_intervention_visuals)
+        self._cached_model_ptr: Optional[int] = None
+        self._arm_material_ids: list[int] = []
+        self._gripper_material_ids: list[int] = []
+        self._original_rgba: dict[int, np.ndarray] = {}
+        self._last_visual_state: Optional[str] = None
 
     def maybe_launch(self, env: gym.Env) -> None:
         base = env.unwrapped
@@ -670,7 +680,7 @@ class NativeViewer:
             self.enabled = False
             print(f"native viewer warning: launch failed: {exc}")
 
-    def sync(self, env: gym.Env) -> None:
+    def sync(self, env: gym.Env, info: Optional[dict[str, Any]] = None) -> None:
         if not self.enabled:
             return
         base = env.unwrapped
@@ -678,8 +688,11 @@ class NativeViewer:
         if not callable(sync_fn):
             return
         try:
+            if self._enable_intervention_visuals:
+                self._apply_intervention_visuals(env, info)
             sync_fn()
         except Exception as exc:
+            self.close(env)
             self.enabled = False
             print(f"native viewer warning: sync failed, disabling viewer: {exc}")
 
@@ -688,9 +701,205 @@ class NativeViewer:
         close_fn = getattr(base, "close_passive_viewer", None)
         if callable(close_fn):
             try:
+                self._restore_original_materials(env)
                 close_fn()
             except Exception:
                 pass
+        self.enabled = False
+        self._last_visual_state = None
+
+    def _apply_intervention_visuals(self, env: gym.Env, info: Optional[dict[str, Any]]) -> None:
+        if mujoco is None:
+            return
+        self._ensure_material_cache(env)
+        if not self._original_rgba:
+            return
+        visual_state = self._visual_state_from_info(info)
+        if visual_state == self._last_visual_state:
+            return
+        if visual_state == "none":
+            self._restore_original_materials(env)
+            self._last_visual_state = visual_state
+            return
+
+        base = env.unwrapped
+        model = getattr(base, "_model", None)
+        if model is None:
+            return
+        handle = getattr(base, "_passive_viewer_handle", None)
+        lock_ctx = handle.lock() if handle is not None else None
+        if lock_ctx is not None:
+            lock_ctx.__enter__()
+        try:
+            self._restore_original_rgba_in_place(model)
+            if visual_state == "gripper_only":
+                self._tint_materials(
+                    model,
+                    self._gripper_material_ids,
+                    rgba=np.array([1.00, 0.72, 0.18, 1.0], dtype=np.float32),
+                )
+            elif visual_state == "full":
+                self._tint_materials(
+                    model,
+                    self._arm_material_ids,
+                    rgba=np.array([0.95, 0.18, 0.18, 1.0], dtype=np.float32),
+                )
+                self._tint_materials(
+                    model,
+                    self._gripper_material_ids,
+                    rgba=np.array([1.00, 0.30, 0.30, 1.0], dtype=np.float32),
+                )
+        finally:
+            if lock_ctx is not None:
+                lock_ctx.__exit__(None, None, None)
+        self._last_visual_state = visual_state
+
+    def _ensure_material_cache(self, env: gym.Env) -> None:
+        if mujoco is None:
+            return
+        base = env.unwrapped
+        model = getattr(base, "_model", None)
+        if model is None:
+            return
+        model_ptr = self._model_cache_key(model)
+        if self._cached_model_ptr == model_ptr and self._original_rgba:
+            return
+
+        self._cached_model_ptr = model_ptr
+        self._arm_material_ids = []
+        self._gripper_material_ids = []
+        self._original_rgba = {}
+        nmat = int(getattr(model, "nmat", 0))
+        for mat_id in range(nmat):
+            name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_MATERIAL, mat_id) or ""
+            self._original_rgba[mat_id] = np.asarray(model.mat_rgba[mat_id], dtype=np.float32).copy()
+            if name.startswith("ur5e/robotiq/") or "/robotiq/" in name:
+                self._gripper_material_ids.append(mat_id)
+            elif name.startswith("ur5e/"):
+                self._arm_material_ids.append(mat_id)
+        self._last_visual_state = None
+
+    @staticmethod
+    def _model_cache_key(model: Any) -> int:
+        ptr = getattr(model, "ptr", None)
+        if ptr is not None:
+            try:
+                return int(ptr)
+            except Exception:
+                pass
+        return id(model)
+
+    def _restore_original_rgba_in_place(self, model: Any) -> None:
+        for mat_id, rgba in self._original_rgba.items():
+            model.mat_rgba[mat_id] = rgba
+
+    def _restore_original_materials(self, env: gym.Env) -> None:
+        if mujoco is None or not self._original_rgba:
+            return
+        base = env.unwrapped
+        model = getattr(base, "_model", None)
+        if model is None:
+            return
+        handle = getattr(base, "_passive_viewer_handle", None)
+        lock_ctx = handle.lock() if handle is not None else None
+        if lock_ctx is not None:
+            lock_ctx.__enter__()
+        try:
+            self._restore_original_rgba_in_place(model)
+        finally:
+            if lock_ctx is not None:
+                lock_ctx.__exit__(None, None, None)
+        self._last_visual_state = "none"
+
+    def _tint_materials(self, model: Any, material_ids: list[int], rgba: np.ndarray) -> None:
+        for mat_id in material_ids:
+            orig = self._original_rgba.get(mat_id, None)
+            if orig is None:
+                continue
+            blended = 0.25 * np.asarray(orig, dtype=np.float32) + 0.75 * rgba
+            blended[3] = float(orig[3])
+            model.mat_rgba[mat_id] = blended
+
+    @staticmethod
+    def _visual_state_from_info(info: Optional[dict[str, Any]]) -> str:
+        if not isinstance(info, dict):
+            return "none"
+        if not bool(info.get("teacher_intervened", False)):
+            return "none"
+        reason = str(info.get("teacher_reason", "") or "")
+        component = str(info.get("teacher_reason_component", "") or "")
+        if reason in {"gripper", "gripper_lock", "gripper_sync"} or component == "gripper":
+            return "gripper_only"
+        return "full"
+
+
+class RGBArrayViewer:
+    """Pygame window that mirrors env.render() frames for WSL/GLFW fallback."""
+
+    def __init__(self, title: str = "Manip Eval Viewer"):
+        self.enabled = False
+        self._title = str(title)
+        self._screen = None
+        self._size: Optional[tuple[int, int]] = None
+
+    def maybe_launch(self, env: gym.Env) -> None:
+        if self.enabled:
+            return
+        try:
+            frame = env.render()
+        except Exception as exc:
+            self.enabled = False
+            print(f"rgb viewer warning: initial render failed: {exc}")
+            return
+        if frame is None:
+            return
+        arr = np.asarray(frame)
+        if arr.ndim != 3 or arr.shape[-1] < 3:
+            return
+        h, w = int(arr.shape[0]), int(arr.shape[1])
+        self._screen = pygame.display.set_mode((w, h))
+        pygame.display.set_caption(self._title)
+        self._size = (w, h)
+        self.enabled = True
+        print(f"rgb viewer: launched ({w}x{h})")
+        self._draw_frame(arr)
+
+    def sync(self, env: gym.Env, info: Optional[dict[str, Any]] = None) -> None:
+        if not self.enabled:
+            return
+        try:
+            frame = env.render()
+        except Exception as exc:
+            self.enabled = False
+            print(f"rgb viewer warning: render failed, disabling viewer: {exc}")
+            return
+        if frame is None:
+            return
+        self._draw_frame(np.asarray(frame))
+
+    def close(self, env: gym.Env) -> None:
+        if self._screen is not None:
+            try:
+                pygame.display.quit()
+            except Exception:
+                pass
+        self._screen = None
+        self._size = None
+        self.enabled = False
+
+    def _draw_frame(self, frame: np.ndarray) -> None:
+        if self._screen is None:
+            return
+        arr = np.asarray(frame, dtype=np.uint8)
+        if arr.ndim != 3 or arr.shape[-1] < 3:
+            return
+        h, w = int(arr.shape[0]), int(arr.shape[1])
+        if self._size != (w, h):
+            self._screen = pygame.display.set_mode((w, h))
+            self._size = (w, h)
+        surface = pygame.surfarray.make_surface(np.transpose(arr[..., :3], (1, 0, 2)))
+        self._screen.blit(surface, (0, 0))
+        pygame.display.flip()
 
 
 def _pump_pygame_events() -> None:
@@ -1011,6 +1220,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max_episode_steps", type=int, default=500)
     p.add_argument("--controller", type=str, default="random", choices=["policy", "random", "keyboard", "human", "idle", "vr"])
     p.add_argument("--render_mode", type=str, default="human", choices=["human", "rgb_array"])
+    p.add_argument(
+        "--viewer_backend",
+        type=str,
+        default="native",
+        choices=["native", "rgb_array"],
+        help="Viewer path for interactive eval. Use rgb_array as a fallback when the native MuJoCo passive viewer stays visually stale under WSL/GLFW.",
+    )
     p.add_argument("--mujoco_gl", type=str, default="auto", choices=["auto", "glfw", "egl"])
     p.add_argument("--fps", type=int, default=20)
     p.add_argument("--headless", action="store_true", default=False)
@@ -1257,6 +1473,12 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Disable control panel window for policy/random/idle controllers.",
     )
+    p.add_argument(
+        "--visualize_intervention_colors",
+        action="store_true",
+        default=False,
+        help="Tint the robot in the native viewer: full intervention colors arm+gripper red, gripper-only colors the gripper amber.",
+    )
     return p.parse_args()
 
 
@@ -1470,7 +1692,7 @@ def _compact_step_line(
 
 
 def create_env(args: argparse.Namespace) -> gym.Env:
-    if not args.headless and args.render_mode == "human":
+    if not args.headless and args.viewer_backend == "native" and args.render_mode == "human":
         if args.mujoco_gl == "auto":
             os.environ["MUJOCO_GL"] = "glfw"
         else:
@@ -1483,7 +1705,12 @@ def create_env(args: argparse.Namespace) -> gym.Env:
 
     # Manip env ignores render_mode and always returns rgb arrays from render().
     # Use None for interactive mode and native passive viewer instead.
-    render_mode = "rgb_array" if args.headless else (None if args.render_mode == "human" else args.render_mode)
+    if args.headless:
+        render_mode = "rgb_array"
+    elif args.viewer_backend == "native" and args.render_mode == "human":
+        render_mode = None
+    else:
+        render_mode = args.render_mode
     make_kwargs = {
         "render_mode": render_mode,
         "hold_targets_on_zero_action": bool(args.hold_targets_on_zero_action),
@@ -1700,9 +1927,12 @@ def _print_obs_breakdown(
 
 
 def run(args: argparse.Namespace) -> None:
-    if not args.headless and args.render_mode != "human":
+    if not args.headless and args.viewer_backend == "native" and args.render_mode != "human":
         print("For interactive manipulation debugging, forcing native render_mode=human (avoids flicker).")
         args.render_mode = "human"
+    if not args.headless and args.viewer_backend == "rgb_array" and args.render_mode != "rgb_array":
+        print("viewer_backend=rgb_array: forcing render_mode=rgb_array.")
+        args.render_mode = "rgb_array"
     if args.step_through and args.headless:
         raise ValueError("--step_through requires a control window; run without --headless.")
     if args.step_through and args.print_every > 1:
@@ -1732,10 +1962,15 @@ def run(args: argparse.Namespace) -> None:
     else:
         # "human" is an alias for keyboard teleop.
         controller = KeyboardController(action_dim, magnitude=float(args.keyboard_scale))
-    native_viewer = NativeViewer()
+    native_viewer = (
+        RGBArrayViewer()
+        if args.viewer_backend == "rgb_array"
+        else NativeViewer(enable_intervention_visuals=bool(args.visualize_intervention_colors))
+    )
     control_panel = None
     use_panel = (
         (not args.headless)
+        and (args.viewer_backend != "rgb_array")
         and (args.controller not in ("keyboard", "human", "vr"))
         and ((not args.disable_control_panel) or args.step_through)
     )
@@ -1784,8 +2019,10 @@ def run(args: argparse.Namespace) -> None:
         )
     print(f"target_mode={args.teacher_target_mode}, cube_success_tol={args.cube_success_tolerance}")
     print(f"action_dim={int(np.prod(action_space.shape))}")
+    print(f"viewer_backend={args.viewer_backend}")
     print(f"MUJOCO_GL={os.environ.get('MUJOCO_GL', '<unset>')}")
     print(f"DISPLAY={os.environ.get('DISPLAY', '<unset>')}")
+    print(f"visualize_intervention_colors={int(bool(args.visualize_intervention_colors))}")
     if args.intervention_mode != "none":
         print("note: teacher interventions are enabled; agent movement may occur without keyboard input.")
     reward_tracker = _build_cube_reward_tracker(args)
@@ -1858,7 +2095,7 @@ def run(args: argparse.Namespace) -> None:
             if not args.headless and args.render_mode == "human":
                 if not native_viewer.enabled:
                     native_viewer.maybe_launch(env)
-                native_viewer.sync(env)
+                native_viewer.sync(env, info if bool(args.visualize_intervention_colors) else None)
             episode_visits += 1
             ep_reward = 0.0
             ep_len = 0
@@ -1900,7 +2137,7 @@ def run(args: argparse.Namespace) -> None:
                         step_advance = bool(panel_advance)
                     if not step_advance:
                         if not args.headless and args.render_mode == "human":
-                            native_viewer.sync(env)
+                            native_viewer.sync(env, info if bool(args.visualize_intervention_colors) else None)
                         if frame_dt > 0:
                             elapsed = time.perf_counter() - t0
                             if elapsed < frame_dt:
@@ -1914,7 +2151,7 @@ def run(args: argparse.Namespace) -> None:
                         step_advance = bool(panel_advance)
                     if not step_advance:
                         if not args.headless and args.render_mode == "human":
-                            native_viewer.sync(env)
+                            native_viewer.sync(env, info if bool(args.visualize_intervention_colors) else None)
                         if frame_dt > 0:
                             elapsed = time.perf_counter() - t0
                             if elapsed < frame_dt:
@@ -1933,7 +2170,7 @@ def run(args: argparse.Namespace) -> None:
                         step_advance = bool(kb_advance or panel_advance)
                     if not step_advance:
                         if not args.headless and args.render_mode == "human":
-                            native_viewer.sync(env)
+                            native_viewer.sync(env, info if bool(args.visualize_intervention_colors) else None)
                         if frame_dt > 0:
                             elapsed = time.perf_counter() - t0
                             if elapsed < frame_dt:
@@ -1967,7 +2204,7 @@ def run(args: argparse.Namespace) -> None:
                     and float(np.linalg.norm(action)) <= 1e-8
                 ):
                     if not args.headless and args.render_mode == "human":
-                        native_viewer.sync(env)
+                        native_viewer.sync(env, info if bool(args.visualize_intervention_colors) else None)
                     if frame_dt > 0:
                         elapsed = time.perf_counter() - t0
                         if elapsed < frame_dt:
@@ -1995,7 +2232,7 @@ def run(args: argparse.Namespace) -> None:
                 )
 
                 if not args.headless and args.render_mode == "human":
-                    native_viewer.sync(env)
+                    native_viewer.sync(env, info if bool(args.visualize_intervention_colors) else None)
 
                 ep_reward += float(reward)
                 ep_len += 1
