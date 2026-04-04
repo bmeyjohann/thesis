@@ -264,6 +264,43 @@ class InterventionWrapper(gym.Wrapper):
             delta = delta * self.tolerance_channel_weights
         return float(np.linalg.norm(delta))
 
+    @staticmethod
+    def _project_5d_to_4d(action: np.ndarray) -> np.ndarray:
+        arr = np.asarray(action, dtype=np.float32).reshape(-1)
+        if arr.size != 5:
+            return arr
+        return np.concatenate([arr[:3], arr[4:5]], axis=0).astype(np.float32, copy=False)
+
+    @staticmethod
+    def _expand_4d_to_5d(action: np.ndarray) -> np.ndarray:
+        arr = np.asarray(action, dtype=np.float32).reshape(-1)
+        if arr.size != 4:
+            return arr
+        out = np.zeros((5,), dtype=np.float32)
+        out[:3] = arr[:3]
+        out[4] = arr[3]
+        return out
+
+    def _coerce_action_dim(self, action: Optional[np.ndarray], target_dim: int) -> Optional[np.ndarray]:
+        if action is None:
+            return None
+        arr = np.asarray(action, dtype=np.float32).reshape(-1)
+        if target_dim <= 0 or arr.size == target_dim:
+            return arr
+        if arr.size == 5 and target_dim == 4:
+            return self._project_5d_to_4d(arr)
+        if arr.size == 4 and target_dim == 5:
+            return self._expand_4d_to_5d(arr)
+        return arr
+
+    @staticmethod
+    def _gripper_index_for_size(size: int) -> Optional[int]:
+        return (size - 1) if size >= 4 else None
+
+    @staticmethod
+    def _yaw_index_for_size(size: int) -> Optional[int]:
+        return 3 if size >= 5 else None
+
     def _apply_gripper_binary(self, action: Optional[np.ndarray]) -> Optional[np.ndarray]:
         if action is None:
             return None
@@ -296,7 +333,7 @@ class InterventionWrapper(gym.Wrapper):
             return None, diag
         p = np.asarray(policy_action, dtype=np.float32).reshape(-1)
         t = np.asarray(teacher_action, dtype=np.float32).reshape(-1)
-        if p.size < 5 or t.size < 5:
+        if p.size < 4 or t.size != p.size:
             return None, diag
         policy_sign = self._gripper_sign(p)
         teacher_sign = self._gripper_sign(t)
@@ -305,7 +342,10 @@ class InterventionWrapper(gym.Wrapper):
         if teacher_sign == 0 or policy_sign == teacher_sign:
             return None, diag
         forced = p.copy()
-        forced[4] = 1.0 if teacher_sign > 0 else -1.0
+        gripper_idx = self._gripper_index_for_size(forced.size)
+        if gripper_idx is None:
+            return None, diag
+        forced[gripper_idx] = 1.0 if teacher_sign > 0 else -1.0
         forced = self._apply_gripper_binary(forced)
         diag["teacher_gripper_sync_applied"] = 1.0
         return forced, diag
@@ -324,16 +364,19 @@ class InterventionWrapper(gym.Wrapper):
             return None, diag
         p = np.asarray(policy_action, dtype=np.float32).reshape(-1)
         t = np.asarray(teacher_action, dtype=np.float32).reshape(-1)
-        if p.size < 5 or t.size < 5:
+        if p.size < 4 or t.size != p.size:
             return None, diag
         policy_sign = self._gripper_sign(p)
         teacher_sign = self._gripper_sign(t)
         diag["teacher_gripper_sync_policy_sign"] = float(policy_sign)
         diag["teacher_gripper_sync_teacher_sign"] = float(teacher_sign)
         forced = p.copy()
-        forced[4] = t[4]
+        gripper_idx = self._gripper_index_for_size(forced.size)
+        if gripper_idx is None:
+            return None, diag
+        forced[gripper_idx] = t[gripper_idx]
         forced = self._apply_gripper_binary(forced)
-        if abs(float(forced[4]) - float(p[4])) <= 1e-6:
+        if abs(float(forced[gripper_idx]) - float(p[gripper_idx])) <= 1e-6:
             return None, diag
         diag["teacher_gripper_sync_applied"] = 1.0
         return forced, diag
@@ -397,10 +440,12 @@ class InterventionWrapper(gym.Wrapper):
         if policy_action is None:
             return None
         out = np.asarray(policy_action, dtype=np.float32).copy()
-        if out.reshape(-1).size < 5:
+        out_flat = out.reshape(-1)
+        gripper_idx = self._gripper_index_for_size(out_flat.size)
+        if gripper_idx is None:
             return None
         # Keep agent movement/yaw, only force gripper close.
-        out.reshape(-1)[4] = 1.0
+        out_flat[gripper_idx] = 1.0
         return self._apply_gripper_binary(out)
 
     def _gripper_lock_violation(self, info: Optional[dict], policy_action: Optional[np.ndarray]):
@@ -496,12 +541,14 @@ class InterventionWrapper(gym.Wrapper):
         d = np.abs(p[:n] - t[:n]).astype(np.float32)
 
         xyz_l2 = float(np.linalg.norm(d[:3])) if n >= 3 else 0.0
-        yaw_abs = float(d[3]) if n >= 4 else 0.0
-        gripper_abs = float(d[4]) if n >= 5 else 0.0
+        yaw_idx = self._yaw_index_for_size(n)
+        gripper_idx = self._gripper_index_for_size(n)
+        yaw_abs = float(d[yaw_idx]) if yaw_idx is not None else 0.0
+        gripper_abs = float(d[gripper_idx]) if gripper_idx is not None else 0.0
         eps = 1e-6
         has_xyz = xyz_l2 > eps
-        has_yaw = yaw_abs > eps
-        has_gripper = gripper_abs > eps
+        has_yaw = yaw_idx is not None and yaw_abs > eps
+        has_gripper = gripper_idx is not None and gripper_abs > eps
 
         # If hard gripper branch decided intervention, keep label stable.
         if reason in {"gripper", "gripper_lock", "gripper_sync"}:
@@ -588,13 +635,15 @@ class InterventionWrapper(gym.Wrapper):
             return False, diag
         d = np.abs(p[:n] - t[:n]).astype(np.float32)
         xyz_l2 = float(np.linalg.norm(d[:3])) if n >= 3 else 0.0
-        yaw_abs = float(d[3]) if n >= 4 else 0.0
-        gripper_abs = float(d[4]) if n >= 5 else 0.0
+        yaw_idx = self._yaw_index_for_size(n)
+        gripper_idx = self._gripper_index_for_size(n)
+        yaw_abs = float(d[yaw_idx]) if yaw_idx is not None else 0.0
+        gripper_abs = float(d[gripper_idx]) if gripper_idx is not None else 0.0
 
         thr_xyz, thr_yaw, thr_grip, scale = self._component_thresholds(info)
         div_xyz = bool(xyz_l2 > thr_xyz) if n >= 3 else False
-        div_yaw = bool(yaw_abs > thr_yaw) if n >= 4 else False
-        div_grip = bool(gripper_abs > thr_grip) if n >= 5 else False
+        div_yaw = bool(yaw_abs > thr_yaw) if yaw_idx is not None else False
+        div_grip = bool(gripper_abs > thr_grip) if gripper_idx is not None else False
         diverged = bool(div_xyz or div_yaw or div_grip)
 
         diag["teacher_component_threshold_xyz"] = float(thr_xyz)
@@ -1000,6 +1049,7 @@ class InterventionWrapper(gym.Wrapper):
     def step(self, policy_action: np.ndarray):
         step_start = time.perf_counter()
         # Decide override
+        policy_action = self._coerce_action_dim(policy_action, self._action_dim)
         policy_action = self._apply_gripper_binary(policy_action)
         teacher_action = None
         teacher_candidate_action = None
@@ -1061,6 +1111,7 @@ class InterventionWrapper(gym.Wrapper):
                     teacher_action = None
                 else:
                     teacher_action = self._teacher_action(self._last_obs, self._last_info or {})
+                    teacher_action = self._coerce_action_dim(teacher_action, self._action_dim)
                     teacher_action = self._apply_gripper_binary(teacher_action)
                 manual_gate_active = self._manual_gate_active()
                 teacher_candidate_action = teacher_action

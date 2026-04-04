@@ -268,14 +268,22 @@ class TrainingLogger:
         if self.wandb_run is None:
             import wandb
 
-            self.wandb_run = wandb.init(
-                project=self.args.project,
-                name=self.args.exp_name,
-                id=self.args.exp_name,
-                config=vars(self.args),
-                reinit=True,
-                resume="allow",
-            )
+            try:
+                self.wandb_run = wandb.init(
+                    project=self.args.project,
+                    name=self.args.exp_name,
+                    id=self.args.exp_name,
+                    config=vars(self.args),
+                    reinit=True,
+                    resume="allow",
+                )
+            except Exception as exc:
+                msg = f"[WandB] init failed; continuing without wandb logging: {exc}"
+                print(msg, flush=True)
+                self.record_progress(msg)
+                self.args.use_wandb = False
+                self.wandb_run = None
+                return None
         return self.wandb_run
 
     def should_log(self, total_env_steps: int, force: bool = False) -> bool:
@@ -448,6 +456,16 @@ class TrainingLogger:
             log_line_parts.append(f"success {logs['/Episode/goal_success_rate']:.2f}")
         if "/Teacher/teacher_fraction_steps" in logs:
             log_line_parts.append(f"teacher_frac {logs['/Teacher/teacher_fraction_steps']:.2f}")
+        if "Train/critic_loss_total" in logs:
+            log_line_parts.append(f"qloss {logs['Train/critic_loss_total']:.3f}")
+        if "Train/critic_loss_pref_weighted" in logs:
+            pref_loss = float(logs["Train/critic_loss_pref_weighted"])
+            if abs(pref_loss) > 1e-8:
+                log_line_parts.append(f"ploss {pref_loss:.3f}")
+        if "Train/pref_lambda" in logs:
+            pref_lambda = float(logs["Train/pref_lambda"])
+            if pref_lambda > 1e-8:
+                log_line_parts.append(f"lambda {pref_lambda:.2f}")
         if self.args.store_denied_actions and last_denied_samples > 0:
             log_line_parts.append(f"denied {last_denied_samples}")
         if timing_summary:

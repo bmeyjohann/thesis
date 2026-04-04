@@ -73,6 +73,26 @@ def make_wrappers(args, env_family: str):
         wrapper_kwargs["relative_only_obs"] = bool(
             getattr(args, "relative_only_obs", False)
         )
+        wrapper_kwargs["disable_rotation"] = bool(getattr(args, "disable_rotation", False))
+        wrapper_kwargs["tolerance_xyz_value"] = getattr(args, "tolerance_xyz_value", -1.0)
+        wrapper_kwargs["tolerance_yaw_value"] = getattr(args, "tolerance_yaw_value", -1.0)
+        wrapper_kwargs["tolerance_gripper_value"] = getattr(args, "tolerance_gripper_value", -1.0)
+        wrapper_kwargs["tolerance_adaptive_enable"] = bool(
+            getattr(args, "tolerance_adaptive_enable", True)
+        )
+        wrapper_kwargs["tolerance_adaptive_near_distance"] = getattr(
+            args, "tolerance_adaptive_near_distance", 0.08
+        )
+        wrapper_kwargs["tolerance_adaptive_far_distance"] = getattr(
+            args, "tolerance_adaptive_far_distance", 0.30
+        )
+        wrapper_kwargs["tolerance_adaptive_near_scale"] = getattr(
+            args, "tolerance_adaptive_near_scale", 0.35
+        )
+        wrapper_kwargs["intervention_agent_mode"] = getattr(args, "intervention_agent_mode", "divergence")
+        wrapper_kwargs["human_intervention_threshold"] = getattr(args, "human_intervention_threshold", 0.1)
+        wrapper_kwargs["human_intervention_hold_time"] = getattr(args, "human_intervention_hold_time", 0.5)
+        wrapper_kwargs["static_reset_seed"] = getattr(args, "static_reset_seed", None)
     wrapper = build_wrapper(**wrapper_kwargs)
     return [wrapper]
 
@@ -125,6 +145,26 @@ def make_eval_wrappers(args, env_family: str):
         wrapper_kwargs["relative_only_obs"] = bool(
             getattr(args, "relative_only_obs", False)
         )
+        wrapper_kwargs["disable_rotation"] = bool(getattr(args, "disable_rotation", False))
+        wrapper_kwargs["tolerance_xyz_value"] = getattr(args, "tolerance_xyz_value", -1.0)
+        wrapper_kwargs["tolerance_yaw_value"] = getattr(args, "tolerance_yaw_value", -1.0)
+        wrapper_kwargs["tolerance_gripper_value"] = getattr(args, "tolerance_gripper_value", -1.0)
+        wrapper_kwargs["tolerance_adaptive_enable"] = bool(
+            getattr(args, "tolerance_adaptive_enable", True)
+        )
+        wrapper_kwargs["tolerance_adaptive_near_distance"] = getattr(
+            args, "tolerance_adaptive_near_distance", 0.08
+        )
+        wrapper_kwargs["tolerance_adaptive_far_distance"] = getattr(
+            args, "tolerance_adaptive_far_distance", 0.30
+        )
+        wrapper_kwargs["tolerance_adaptive_near_scale"] = getattr(
+            args, "tolerance_adaptive_near_scale", 0.35
+        )
+        wrapper_kwargs["intervention_agent_mode"] = getattr(args, "intervention_agent_mode", "divergence")
+        wrapper_kwargs["human_intervention_threshold"] = getattr(args, "human_intervention_threshold", 0.1)
+        wrapper_kwargs["human_intervention_hold_time"] = getattr(args, "human_intervention_hold_time", 0.5)
+        wrapper_kwargs["static_reset_seed"] = getattr(args, "static_reset_seed", None)
     wrapper = build_wrapper(**wrapper_kwargs)
     return [wrapper]
 
