@@ -63,8 +63,13 @@ At the start of an autonomous-research session:
    - a human-readable `owner_label`
    - a stable `owner_session_id`
 19. Pass that ownership metadata when enqueueing jobs, and reuse the matching requester fields when later stopping or cancelling them.
-20. In unattended mode, keep queue interactions on the unified `queue` tool so all experiment-queue activity stays under one MCP tool name.
-21. Within `queue`, prefer the summary actions (`queue_status`, `list_jobs`, `get_job`) over `debug=true`. Debug payloads expose absolute paths and are more likely to trigger approval prompts in the Codex app.
+20. Decide early whether this session should share the default queue root or use a dedicated alternate queue root.
+21. If hard isolation from other autonomous sessions is needed, switch immediately with:
+   - `queue(action="set_queue_root", queue_root="...")`
+22. If the user wants parallel throughput, set the queue-wide concurrency explicitly at startup instead of assuming the current value:
+   - `queue(action="set_max_concurrent_jobs", max_concurrent_jobs=2)`
+23. In unattended mode, keep queue interactions on the unified `queue` tool so all experiment-queue activity stays under one MCP tool name.
+24. Within `queue`, prefer the summary actions (`queue_status`, `list_jobs`, `get_job`) over `debug=true`. Debug payloads expose absolute paths and are more likely to trigger approval prompts in the Codex app.
 
 ## Objective Ledger
 
@@ -205,6 +210,10 @@ For autonomous research:
 - Keep changes local and inspectable. If a run needs a new condition, encode it in a repo-tracked launcher or config, not in an opaque inline shell fragment.
 - Before enqueueing a large sequence, define what evidence will cause early stopping or progression to the next job.
 - Multiple Codex sessions may attach to the same queue root. Inspecting shared jobs is fine, but do not stop or cancel another session's owned jobs unless the user explicitly wants that or you pass `force=true` intentionally.
+- Shared queues may run multiple jobs at once. Treat `max_concurrent_jobs` as shared GPU/CPU bandwidth, not as private capacity for this session.
+- Do not try to jump ahead of other sessions by repeatedly requeueing or using queue-wide controls. The queue uses owner-aware round-robin scheduling; let it choose the next owner fairly.
+- In shared use, prefer targeted `queue(action="cancel_job", job_id=...)` for your own jobs and avoid queue-wide controls unless the user explicitly wants a whole-queue intervention.
+- If the queue needs hard isolation for a separate research thread, switch to a different queue root before launching long jobs rather than competing inside the same root.
 - The queue daemon auto-starts on mutating queue operations and stays alive until explicitly shut down. Use `queue(action="daemon_status")` if you need to verify worker health, and use `queue(action="restart_daemon")` or `queue(action="shutdown_daemon")` intentionally rather than treating daemon lifecycle as implicit.
 - The summary queue actions are the default unattended path. Only use `queue(..., debug=true)` when a human is present or explicit debugging requires the extra path-rich metadata.
 
@@ -273,4 +282,4 @@ This skill is not meant to replace judgment. It is meant to provide a concrete o
 - Queue runtime lives under the repo's `experiment_queue/` directory by default.
 - The default queued execution environment is the `fasttd3` conda env.
 - The current setup is intended for trusted launcher scripts in the thesis repo.
-- The preferred autonomous interface is the single MCP tool `queue`, which dispatches by `action`. Legacy per-action tools remain for compatibility, but autonomous sessions should stay on `queue`.
+- The experiment queue MCP publishes only the single tool `queue`, which dispatches by `action`. Do not assume any separate per-action queue tools exist.

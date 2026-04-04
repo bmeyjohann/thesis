@@ -35,6 +35,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shell-path", default="/bin/bash", help="Shell used to run scripts.")
     parser.add_argument("--poll-interval", type=float, default=1.0, help="Worker poll interval in seconds.")
     parser.add_argument("--terminate-grace", type=float, default=10.0, help="Seconds to wait after SIGTERM before SIGKILL.")
+    parser.add_argument("--max-concurrent-jobs", type=int, default=2, help="Maximum number of jobs the daemon may run at once.")
     return parser
 
 

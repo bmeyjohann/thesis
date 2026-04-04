@@ -61,6 +61,7 @@ args = [
   "--conda-sh-path", "/home/benjamin/miniconda3/etc/profile.d/conda.sh",
   "--poll-interval", "1.0",
   "--terminate-grace", "10.0",
+  "--max-concurrent-jobs", "2",
 ]
 startup_timeout_sec = 30.0
 
@@ -99,6 +100,7 @@ Notes on adapting that snippet on another machine:
 - if the GPU device/cache layout differs, adjust `writable_roots` accordingly
 - keep `WANDB_API_KEY` out of this shared file; put it in the machine-local `~/.codex/config.toml` or shell env
 - if you want unattended autonomy, do not accidentally leave these MCP tools on `approval_mode = "approve"` in the live `~/.codex/config.toml`; that forces repeated prompts and defeats the queue warmup workflow
+- the configured queue root above is just the default root for that Codex session; the unified queue MCP tool can switch to another workspace-local queue root later with `queue(action="set_queue_root", queue_root="...")`
 
 ## Other Computer Bootstrap
 

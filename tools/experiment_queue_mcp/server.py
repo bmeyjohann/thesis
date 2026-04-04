@@ -61,13 +61,20 @@ def _job_summary(job: Any) -> dict[str, Any] | None:
 
 def _queue_status_summary(status: Any) -> dict[str, Any]:
     data = _serialize(status)
+    running_jobs = [_job_summary(job) for job in data.get("running_jobs", [])]
     return {
+        "queue_root_name": Path(str(data.get("queue_root", ""))).name if data.get("queue_root") else None,
         "daemon_running": data["daemon_running"],
         "daemon_pid": data.get("daemon_pid"),
         "paused": data["paused"],
         "stop_after_current": data["stop_after_current"],
         "stop_now": data["stop_now"],
+        "max_concurrent_jobs": data.get("max_concurrent_jobs", 1),
+        "scheduler_mode": data.get("scheduler_mode"),
+        "last_scheduled_owner": data.get("last_scheduled_owner"),
         "counts": data["counts"],
+        "running_jobs": running_jobs,
+        "running_count": len(running_jobs),
         "current_job": _job_summary(data.get("current_job")),
     }
 
@@ -81,6 +88,9 @@ def _daemon_status_summary(status: Any) -> dict[str, Any]:
         "worker_heartbeat_fresh": data.get("worker_heartbeat_fresh"),
         "worker_heartbeat_age_s": data.get("worker_heartbeat_age_s"),
         "worker_lock_stale": data.get("worker_lock_stale"),
+        "max_concurrent_jobs": data.get("max_concurrent_jobs"),
+        "scheduler_mode": data.get("scheduler_mode"),
+        "last_scheduled_owner": data.get("last_scheduled_owner"),
     }
     for key in ("started_now", "stopped_now", "restarted_now", "note"):
         if key in data:
@@ -105,6 +115,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shell-path", default="/bin/bash", help="Shell used to run scripts.")
     parser.add_argument("--poll-interval", type=float, default=1.0, help="Worker poll interval in seconds.")
     parser.add_argument("--terminate-grace", type=float, default=10.0, help="Seconds to wait after SIGTERM before SIGKILL.")
+    parser.add_argument("--max-concurrent-jobs", type=int, default=2, help="Maximum number of jobs the daemon may run at once.")
     return parser
 
 
@@ -120,6 +131,7 @@ def build_queue(args: argparse.Namespace) -> ExperimentQueue:
         shell_path=args.shell_path,
         poll_interval_s=args.poll_interval,
         terminate_grace_s=args.terminate_grace,
+        max_concurrent_jobs=args.max_concurrent_jobs,
     )
 
 
@@ -147,6 +159,8 @@ def build_daemon_command(args: argparse.Namespace) -> list[str]:
         str(args.poll_interval),
         "--terminate-grace",
         str(args.terminate_grace),
+        "--max-concurrent-jobs",
+        str(args.max_concurrent_jobs),
         *(
             ["--conda-sh-path", str(Path(args.conda_sh_path).expanduser().resolve())]
             if args.conda_sh_path
@@ -157,10 +171,22 @@ def build_daemon_command(args: argparse.Namespace) -> list[str]:
 
 def create_mcp_server(queue: ExperimentQueue, daemon_command: list[str]) -> FastMCP:
     mcp = FastMCP("experiment-queue", json_response=True, log_level="INFO")
+    runtime: dict[str, Any] = {
+        "queue": queue,
+        "daemon_command": daemon_command,
+    }
+
+    def current_queue() -> ExperimentQueue:
+        return runtime["queue"]
+
+    def current_daemon_command() -> list[str]:
+        return runtime["daemon_command"]
+
     unified_actions = [
         "help",
         "prime_queue_session",
         "enqueue_script",
+        "set_queue_root",
         "daemon_status",
         "queue_status",
         "list_jobs",
@@ -170,32 +196,13 @@ def create_mcp_server(queue: ExperimentQueue, daemon_command: list[str]) -> Fast
         "resume_queue",
         "shutdown_daemon",
         "restart_daemon",
+        "set_max_concurrent_jobs",
         "stop_after_current",
         "stop_now",
         "cancel_job",
     ]
-    tool_names = [
-        "queue",
-        "prime_queue_session",
-        "enqueue_script",
-        "daemon_status",
-        "queue_status",
-        "queue_debug_status",
-        "list_jobs",
-        "list_jobs_debug",
-        "get_job",
-        "get_job_debug",
-        "read_job_log",
-        "pause_queue",
-        "resume_queue",
-        "shutdown_daemon",
-        "restart_daemon",
-        "stop_after_current",
-        "stop_now",
-        "cancel_job",
-    ]
+    tool_names = ["queue"]
 
-    @mcp.tool()
     def prime_queue_session(
         list_limit: int = Field(default=5, ge=1, description="Number of recent jobs to include in the summary."),
         exercise_control_tools: bool = Field(
@@ -209,27 +216,28 @@ def create_mcp_server(queue: ExperimentQueue, daemon_command: list[str]) -> Fast
     ) -> dict[str, Any]:
         """Warm up the queue MCP and optionally exercise safe control paths before an autonomous run."""
         try:
-            queue.ensure_daemon_running(daemon_command)
-            initial_status = queue.queue_status()
+            q = current_queue()
+            q.ensure_daemon_running(current_daemon_command())
+            initial_status = q.queue_status()
             actions: list[str] = []
             probe_job: dict[str, Any] | None = None
 
             if exercise_control_tools:
-                queue.pause_queue()
+                q.pause_queue()
                 actions.append("pause_queue")
-                queue.resume_queue()
+                q.resume_queue()
                 actions.append("resume_queue")
-                queue.stop_after_current()
+                q.stop_after_current()
                 actions.append("stop_after_current")
                 if initial_status["paused"]:
-                    queue.pause_queue()
+                    q.pause_queue()
                 else:
-                    queue.resume_queue()
+                    q.resume_queue()
                 if initial_status["stop_after_current"]:
-                    queue.stop_after_current()
+                    q.stop_after_current()
 
             if exercise_enqueue_cancel:
-                probe_dir = queue.workspace_root / ".experiment_queue_mcp"
+                probe_dir = q.workspace_root / ".experiment_queue_mcp"
                 probe_dir.mkdir(parents=True, exist_ok=True)
                 probe_script = probe_dir / "prime_queue_session_noop.sh"
                 probe_script.write_text(
@@ -237,14 +245,14 @@ def create_mcp_server(queue: ExperimentQueue, daemon_command: list[str]) -> Fast
                     encoding="utf-8",
                 )
                 probe_script.chmod(0o700)
-                queued_probe = queue.enqueue_script(
+                queued_probe = q.enqueue_script(
                     source_path=str(probe_script),
                     name="prime-queue-session-noop",
-                    cwd=str(queue.default_cwd),
-                    conda_env=queue.default_conda_env,
+                    cwd=str(q.default_cwd),
+                    conda_env=q.default_conda_env,
                 )
                 actions.append("enqueue_script")
-                cancelled_probe = queue.cancel_job(queued_probe.job_id)
+                cancelled_probe = q.cancel_job(queued_probe.job_id)
                 actions.append("cancel_job")
                 probe_job = _job_summary(cancelled_probe)
 
@@ -252,8 +260,8 @@ def create_mcp_server(queue: ExperimentQueue, daemon_command: list[str]) -> Fast
                 "server_name": "experiment-queue",
                 "available_tools": tool_names,
                 "queue_status_before": _queue_status_summary(initial_status),
-                "queue_status_after": _queue_status_summary(queue.queue_status()),
-                "recent_jobs": [_job_summary(job) for job in queue.list_jobs(limit=list_limit)],
+                "queue_status_after": _queue_status_summary(q.queue_status()),
+                "recent_jobs": [_job_summary(job) for job in q.list_jobs(limit=list_limit)],
                 "actions_exercised": actions,
                 "probe_job": probe_job,
                 "note": (
@@ -264,7 +272,6 @@ def create_mcp_server(queue: ExperimentQueue, daemon_command: list[str]) -> Fast
         except Exception as exc:
             raise ToolError(str(exc)) from exc
 
-    @mcp.tool()
     def enqueue_script(
         source_path: str = Field(..., description="Absolute or workspace-relative path to a bash script."),
         args: list[str] = Field(default_factory=list, description="Optional positional arguments passed to the script."),
@@ -276,87 +283,120 @@ def create_mcp_server(queue: ExperimentQueue, daemon_command: list[str]) -> Fast
     ) -> dict[str, Any]:
         """Copy a bash script into the queue and schedule it for execution."""
         try:
-            result = queue.enqueue_script(
-                source_path=str(_resolve_path(queue, source_path)),
+            q = current_queue()
+            result = q.enqueue_script(
+                source_path=str(_resolve_path(q, source_path)),
                 args=list(args),
                 name=name,
-                cwd=str(_resolve_path(queue, cwd)) if cwd else None,
+                cwd=str(_resolve_path(q, cwd)) if cwd else None,
                 conda_env=conda_env,
                 owner_label=owner_label,
                 owner_session_id=owner_session_id,
             )
-            queue.ensure_daemon_running(daemon_command)
+            q.ensure_daemon_running(current_daemon_command())
             return _job_summary(result) or {}
         except Exception as exc:
             raise ToolError(str(exc)) from exc
 
-    @mcp.tool()
+    def set_queue_root(
+        queue_root: str = Field(..., description="Absolute or workspace-relative path to the queue root directory to use for this MCP server."),
+    ) -> dict[str, Any]:
+        """Switch this MCP server to a different queue root under the current workspace."""
+        try:
+            q = current_queue()
+            resolved_root = _resolve_path(q, queue_root)
+            workspace_root = q.workspace_root
+            try:
+                resolved_root.relative_to(workspace_root)
+            except ValueError as exc:
+                raise ToolError(f"queue_root must stay under workspace_root: {workspace_root}") from exc
+
+            old_status = q.queue_status()
+            args = argparse.Namespace(
+                queue_root=str(resolved_root),
+                workspace_root=str(workspace_root),
+                default_cwd=str(q.default_cwd),
+                script_roots=[str(path) for path in q.script_roots],
+                default_conda_env=q.default_conda_env,
+                conda_sh_path=str(q.conda_sh_path) if q.conda_sh_path else None,
+                shell_path=q.shell_path,
+                poll_interval=q.poll_interval_s,
+                terminate_grace=q.terminate_grace_s,
+                max_concurrent_jobs=old_status.get("max_concurrent_jobs", 2),
+            )
+            runtime["queue"] = build_queue(args)
+            runtime["daemon_command"] = build_daemon_command(args)
+            new_status = current_queue().queue_status()
+            return {
+                "queue_root": str(resolved_root),
+                "queue_root_name": resolved_root.name,
+                "workspace_root": str(workspace_root),
+                "max_concurrent_jobs": new_status.get("max_concurrent_jobs", 2),
+                "counts": new_status.get("counts", {}),
+                "note": "This switches only the active MCP server session. Other sessions keep their own queue root.",
+            }
+        except Exception as exc:
+            raise ToolError(str(exc)) from exc
+
     def daemon_status() -> dict[str, Any]:
         """Return daemon health and stale-lock indicators without full path metadata."""
         try:
-            return _daemon_status_summary(queue.daemon_status())
+            return _daemon_status_summary(current_queue().daemon_status())
         except Exception as exc:
             raise ToolError(str(exc)) from exc
 
-    @mcp.tool()
     def queue_status() -> dict[str, Any]:
         """Return a compact queue summary for unattended monitoring."""
         try:
-            return _queue_status_summary(queue.queue_status())
+            return _queue_status_summary(current_queue().queue_status())
         except Exception as exc:
             raise ToolError(str(exc)) from exc
 
-    @mcp.tool()
     def queue_debug_status() -> dict[str, Any]:
         """Return the full queue status, including absolute paths, for manual debugging."""
         try:
-            return _serialize(queue.queue_status())
+            return _serialize(current_queue().queue_status())
         except Exception as exc:
             raise ToolError(str(exc)) from exc
 
-    @mcp.tool()
     def list_jobs(
         status: str | None = Field(default=None, description="Optional state filter."),
         limit: int | None = Field(default=None, ge=1, description="Maximum number of jobs to return."),
     ) -> list[dict[str, Any]]:
         """List compact job summaries, optionally filtered by state."""
         try:
-            return [_job_summary(job) or {} for job in queue.list_jobs(status=status, limit=limit)]
+            return [_job_summary(job) or {} for job in current_queue().list_jobs(status=status, limit=limit)]
         except Exception as exc:
             raise ToolError(str(exc)) from exc
 
-    @mcp.tool()
     def list_jobs_debug(
         status: str | None = Field(default=None, description="Optional state filter."),
         limit: int | None = Field(default=None, ge=1, description="Maximum number of jobs to return."),
     ) -> list[dict[str, Any]]:
         """List full job metadata, including absolute paths, for manual debugging."""
         try:
-            return _serialize(queue.list_jobs(status=status, limit=limit))
+            return _serialize(current_queue().list_jobs(status=status, limit=limit))
         except Exception as exc:
             raise ToolError(str(exc)) from exc
 
-    @mcp.tool()
     def get_job(
         job_id: str = Field(..., description="Queue job ID."),
     ) -> dict[str, Any]:
         """Get a compact summary for one job."""
         try:
-            return _job_summary(queue.get_job(job_id)) or {}
+            return _job_summary(current_queue().get_job(job_id)) or {}
         except Exception as exc:
             raise ToolError(str(exc)) from exc
 
-    @mcp.tool()
     def get_job_debug(
         job_id: str = Field(..., description="Queue job ID."),
     ) -> dict[str, Any]:
         """Get full job metadata, including absolute paths, for manual debugging."""
         try:
-            return _serialize(queue.get_job(job_id))
+            return _serialize(current_queue().get_job(job_id))
         except Exception as exc:
             raise ToolError(str(exc)) from exc
 
-    @mcp.tool()
     def read_job_log(
         job_id: str = Field(..., description="Queue job ID."),
         stream: Literal["stdout", "stderr"] = Field(default="stdout", description="Log stream to read."),
@@ -364,44 +404,52 @@ def create_mcp_server(queue: ExperimentQueue, daemon_command: list[str]) -> Fast
     ) -> dict[str, str]:
         """Tail stdout or stderr for a queued or completed job."""
         try:
-            return {"text": queue.read_log(job_id, stream=stream, lines=lines)}
+            return {"text": current_queue().read_log(job_id, stream=stream, lines=lines)}
         except Exception as exc:
             raise ToolError(str(exc)) from exc
 
-    @mcp.tool()
     def pause_queue() -> dict[str, Any]:
         """Pause dequeuing new jobs without stopping the current job."""
         try:
-            return _serialize(queue.pause_queue())
+            return _serialize(current_queue().pause_queue())
         except Exception as exc:
             raise ToolError(str(exc)) from exc
 
-    @mcp.tool()
     def resume_queue() -> dict[str, Any]:
         """Resume dequeuing jobs and clear stop-after-current."""
         try:
-            queue.ensure_daemon_running(daemon_command)
-            return _serialize(queue.resume_queue())
+            q = current_queue()
+            q.ensure_daemon_running(current_daemon_command())
+            return _serialize(q.resume_queue())
         except Exception as exc:
             raise ToolError(str(exc)) from exc
 
-    @mcp.tool()
+    def set_max_concurrent_jobs(
+        max_concurrent_jobs: int = Field(..., ge=1, description="Maximum number of queued jobs allowed to run simultaneously."),
+    ) -> dict[str, Any]:
+        """Set the queue-wide concurrency limit for simultaneously running jobs."""
+        try:
+            q = current_queue()
+            q.ensure_daemon_running(current_daemon_command())
+            return _serialize(q.set_max_concurrent_jobs(max_concurrent_jobs))
+        except Exception as exc:
+            raise ToolError(str(exc)) from exc
+
     def shutdown_daemon() -> dict[str, Any]:
         """Stop the background daemon explicitly and leave queued jobs untouched."""
         try:
-            return _daemon_status_summary(queue.shutdown_daemon())
+            return _daemon_status_summary(current_queue().shutdown_daemon())
         except Exception as exc:
             raise ToolError(str(exc)) from exc
 
-    @mcp.tool()
     def restart_daemon() -> dict[str, Any]:
         """Restart the background daemon explicitly."""
         try:
-            return _daemon_status_summary(queue.restart_daemon(daemon_command))
+            q = current_queue()
+            return _daemon_status_summary(q.restart_daemon(current_daemon_command()))
         except Exception as exc:
             raise ToolError(str(exc)) from exc
 
-    @mcp.tool()
     def stop_after_current(
         requester_label: str | None = Field(default=None, description="Optional requester label for ownership checks."),
         requester_session_id: str | None = Field(default=None, description="Optional requester session id for ownership checks."),
@@ -409,17 +457,17 @@ def create_mcp_server(queue: ExperimentQueue, daemon_command: list[str]) -> Fast
     ) -> dict[str, Any]:
         """Finish the active job and then stop starting new jobs."""
         try:
-            queue.assert_current_job_control_allowed(
+            q = current_queue()
+            q.assert_running_jobs_control_allowed(
                 requester_label=requester_label,
                 requester_session_id=requester_session_id,
                 force=force,
             )
-            queue.ensure_daemon_running(daemon_command)
-            return _serialize(queue.stop_after_current())
+            q.ensure_daemon_running(current_daemon_command())
+            return _serialize(q.stop_after_current())
         except Exception as exc:
             raise ToolError(str(exc)) from exc
 
-    @mcp.tool()
     def stop_now(
         requester_label: str | None = Field(default=None, description="Optional requester label for ownership checks."),
         requester_session_id: str | None = Field(default=None, description="Optional requester session id for ownership checks."),
@@ -427,17 +475,17 @@ def create_mcp_server(queue: ExperimentQueue, daemon_command: list[str]) -> Fast
     ) -> dict[str, Any]:
         """Terminate the active job and stop starting new jobs until resumed."""
         try:
-            queue.assert_current_job_control_allowed(
+            q = current_queue()
+            q.assert_running_jobs_control_allowed(
                 requester_label=requester_label,
                 requester_session_id=requester_session_id,
                 force=force,
             )
-            queue.ensure_daemon_running(daemon_command)
-            return _serialize(queue.stop_now())
+            q.ensure_daemon_running(current_daemon_command())
+            return _serialize(q.stop_now())
         except Exception as exc:
             raise ToolError(str(exc)) from exc
 
-    @mcp.tool()
     def cancel_job(
         job_id: str = Field(..., description="Queue job ID."),
         requester_label: str | None = Field(default=None, description="Optional requester label for ownership checks."),
@@ -447,7 +495,7 @@ def create_mcp_server(queue: ExperimentQueue, daemon_command: list[str]) -> Fast
         """Cancel a queued job immediately or request stop for a running job."""
         try:
             return _job_summary(
-                queue.cancel_job(
+                current_queue().cancel_job(
                     job_id,
                     requester_label=requester_label,
                     requester_session_id=requester_session_id,
@@ -463,6 +511,7 @@ def create_mcp_server(queue: ExperimentQueue, daemon_command: list[str]) -> Fast
             "help",
             "prime_queue_session",
             "enqueue_script",
+            "set_queue_root",
             "daemon_status",
             "queue_status",
             "list_jobs",
@@ -472,6 +521,7 @@ def create_mcp_server(queue: ExperimentQueue, daemon_command: list[str]) -> Fast
             "resume_queue",
             "shutdown_daemon",
             "restart_daemon",
+            "set_max_concurrent_jobs",
             "stop_after_current",
             "stop_now",
             "cancel_job",
@@ -481,6 +531,7 @@ def create_mcp_server(queue: ExperimentQueue, daemon_command: list[str]) -> Fast
             description="For queue_status, list_jobs, and get_job, return the full debug payload instead of the compact summary.",
         ),
         source_path: str | None = Field(default=None, description="Absolute or workspace-relative path to a bash script."),
+        queue_root: str | None = Field(default=None, description="Workspace-relative or absolute queue root for action=set_queue_root."),
         script_args: list[str] = Field(default_factory=list, description="Optional positional arguments passed to an enqueued script."),
         name: str | None = Field(default=None, description="Optional display name override for enqueue_script."),
         cwd: str | None = Field(default=None, description="Optional working directory for enqueue_script."),
@@ -492,6 +543,7 @@ def create_mcp_server(queue: ExperimentQueue, daemon_command: list[str]) -> Fast
         limit: int | None = Field(default=None, ge=1, description="Maximum number of jobs to return for list_jobs."),
         stream: Literal["stdout", "stderr"] = Field(default="stdout", description="Log stream for read_job_log."),
         lines: int = Field(default=100, ge=1, description="Number of trailing lines for read_job_log."),
+        max_concurrent_jobs: int | None = Field(default=None, ge=1, description="Concurrency limit for set_max_concurrent_jobs."),
         requester_label: str | None = Field(default=None, description="Optional requester label for ownership checks."),
         requester_session_id: str | None = Field(default=None, description="Optional requester session id for ownership checks."),
         force: bool = Field(default=False, description="Override ownership checks for stop/cancel actions."),
@@ -514,8 +566,7 @@ def create_mcp_server(queue: ExperimentQueue, daemon_command: list[str]) -> Fast
                     "debug_capable_actions": ["queue_status", "list_jobs", "get_job"],
                     "preferred_for_autonomy": True,
                     "note": (
-                        "For autonomous runs, prefer this unified `queue` tool so all queue operations "
-                        "stay under one MCP tool name. Legacy per-action tools remain available for compatibility."
+                        "For autonomous runs, use this unified `queue` tool for all experiment-queue operations."
                     ),
                 }
 
@@ -537,6 +588,10 @@ def create_mcp_server(queue: ExperimentQueue, daemon_command: list[str]) -> Fast
                     owner_label=owner_label,
                     owner_session_id=owner_session_id,
                 )
+            elif action == "set_queue_root":
+                if queue_root is None:
+                    raise ToolError("queue_root is required for action=set_queue_root")
+                result = set_queue_root(queue_root=queue_root)
             elif action == "daemon_status":
                 result = daemon_status()
             elif action == "queue_status":
@@ -559,6 +614,10 @@ def create_mcp_server(queue: ExperimentQueue, daemon_command: list[str]) -> Fast
                 result = shutdown_daemon()
             elif action == "restart_daemon":
                 result = restart_daemon()
+            elif action == "set_max_concurrent_jobs":
+                if max_concurrent_jobs is None:
+                    raise ToolError("max_concurrent_jobs is required for action=set_max_concurrent_jobs")
+                result = set_max_concurrent_jobs(max_concurrent_jobs=max_concurrent_jobs)
             elif action == "stop_after_current":
                 result = stop_after_current(
                     requester_label=requester_label,

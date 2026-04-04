@@ -60,25 +60,8 @@ Do not rely on a repo-local `.codex/config.toml` entry like `bash scripts/run_ex
 ## Tool surface
 
 - `queue`
-- `prime_queue_session`
-- `enqueue_script`
-- `daemon_status`
-- `queue_status`
-- `queue_debug_status`
-- `list_jobs`
-- `list_jobs_debug`
-- `get_job`
-- `get_job_debug`
-- `read_job_log`
-- `pause_queue`
-- `resume_queue`
-- `shutdown_daemon`
-- `restart_daemon`
-- `stop_after_current`
-- `stop_now`
-- `cancel_job`
 
-The legacy per-action tools remain for compatibility, but autonomous sessions should prefer `queue` so all queue activity stays under one MCP tool name.
+The MCP publishes only the unified `queue` tool. All experiment-queue functionality is selected through its `action` argument.
 
 ## Preferred Unified Tool
 
@@ -87,6 +70,7 @@ Use the single MCP tool `queue` with an `action` argument:
 - `queue(action="help")`
 - `queue(action="prime_queue_session")`
 - `queue(action="enqueue_script", source_path="...")`
+- `queue(action="set_queue_root", queue_root="experiment_queue_alt")`
 - `queue(action="daemon_status")`
 - `queue(action="queue_status")`
 - `queue(action="list_jobs")`
@@ -96,6 +80,7 @@ Use the single MCP tool `queue` with an `action` argument:
 - `queue(action="resume_queue")`
 - `queue(action="shutdown_daemon")`
 - `queue(action="restart_daemon")`
+- `queue(action="set_max_concurrent_jobs", max_concurrent_jobs=2)`
 - `queue(action="stop_after_current")`
 - `queue(action="stop_now")`
 - `queue(action="cancel_job", job_id="...")`
@@ -115,14 +100,17 @@ For `queue_status`, `list_jobs`, and `get_job`, pass `debug=true` only when you 
 ## Execution model
 
 - Jobs are bash scripts copied into the queue.
-- The daemon runs exactly one job at a time.
+- The daemon can run multiple jobs in parallel up to the configured queue-wide concurrency limit.
 - The MCP server is control-only. It does not own the long-lived worker loop.
 - Mutating queue actions, whether reached through the unified `queue` tool or the legacy per-action tools, check whether the daemon is running and start it if needed.
 - Read-only queue actions inspect persisted queue state without waking the daemon.
+- `set_queue_root` lets the current MCP session switch to another queue root under the same workspace without restarting Codex. This changes only the active MCP session; other sessions keep their own queue root.
 - The default monitoring path (`queue(action="queue_status")`, `queue(action="list_jobs")`, `queue(action="get_job")`) intentionally returns compact summaries without absolute paths so unattended autonomous sessions are less likely to trip client-side approval heuristics.
 - The explicit debug tools (`queue_debug_status`, `list_jobs_debug`, `get_job_debug`) expose full path-rich metadata and are intended for manual diagnosis when a human is present.
 - The daemon stays alive once started until `shutdown_daemon` is called explicitly or the process is otherwise terminated.
+- The queue supports configurable parallel execution through `set_max_concurrent_jobs`. The default is `2`.
 - Multiple MCP sessions can attach to the same queue root because they all talk to the same daemon-backed queue state.
+- When multiple owner sessions share one queue root, dequeueing is round-robin by owner identity (`owner_session_id`, then `owner_label`) so one session cannot monopolize all launch slots just by queueing more jobs.
 - Running jobs can survive an MCP control-server restart because the daemon is independent of MCP client lifetime.
 - Daemon liveness is inferred from both the worker lock and a fresh worker heartbeat, not only from a stored PID, so stale pid text or an unrelated lock holder does not get reported as a healthy daemon.
 - The daemon removes stale lock metadata on clean exit, and the control plane can reconcile orphaned `running` jobs if the worker disappears after the child process has already exited or written its exit sidecar.
@@ -138,6 +126,8 @@ For `queue_status`, `list_jobs`, and `get_job`, pass `debug=true` only when you 
 - If a job has ownership metadata, matching owners may mutate it normally.
 - A different session can still inspect the job, but it must pass `force=true` to cancel or stop it.
 - Jobs without ownership metadata remain mutable by any session, which is useful for ad hoc manual runs.
+- In shared multi-session use, prefer targeted `cancel_job(job_id)` for owned jobs. Global queue controls such as `stop_now`, `stop_after_current`, `pause_queue`, and `resume_queue` affect the whole queue and should be treated as administrative actions.
+- If you need hard isolation between autonomous loops, first switch one loop to another queue root with `queue(action="set_queue_root", queue_root="...")` instead of competing in the same queue.
 
 ## Approval guidance
 

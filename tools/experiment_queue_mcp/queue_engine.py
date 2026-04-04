@@ -51,6 +51,8 @@ class JobRecord:
     stderr_log: str | None = None
     exit_code_path: str | None = None
     note: str | None = None
+    stop_requested: bool = False
+    terminate_requested_at: float | None = None
 
 
 @dataclass
@@ -58,6 +60,7 @@ class ControlState:
     paused: bool = False
     stop_after_current: bool = False
     stop_now: bool = False
+    max_concurrent_jobs: int = 2
 
 
 @dataclass
@@ -81,6 +84,7 @@ class ExperimentQueue:
         shell_path: str = "/bin/bash",
         poll_interval_s: float = 1.0,
         terminate_grace_s: float = 10.0,
+        max_concurrent_jobs: int = 2,
     ) -> None:
         self.queue_root = queue_root.resolve()
         self.workspace_root = workspace_root.resolve()
@@ -91,6 +95,7 @@ class ExperimentQueue:
         self.shell_path = shell_path
         self.poll_interval_s = poll_interval_s
         self.terminate_grace_s = terminate_grace_s
+        self.max_concurrent_jobs = max(1, int(max_concurrent_jobs))
 
         self.queued_dir = self.queue_root / "queued"
         self.running_dir = self.queue_root / "running"
@@ -104,17 +109,18 @@ class ExperimentQueue:
         self.control_path = self.state_dir / "control.json"
         self.worker_lock_path = self.state_dir / "worker.lock"
         self.worker_heartbeat_path = self.state_dir / "worker_heartbeat.json"
+        self.scheduler_state_path = self.state_dir / "scheduler_state.json"
         self.daemon_log_path = self.logs_dir / "daemon.log"
 
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
         self._worker_thread: threading.Thread | None = None
-        self._current_process: subprocess.Popen[bytes] | RecoveredProcessHandle | None = None
-        self._terminate_requested_at: float | None = None
+        self._current_processes: dict[str, subprocess.Popen[bytes] | RecoveredProcessHandle] = {}
         self._worker_lock_handle: Any | None = None
 
         self._ensure_layout()
         self._ensure_control_state()
+        self._ensure_scheduler_state()
         self._reconcile_jobs_locked()
 
     def _ensure_layout(self) -> None:
@@ -135,7 +141,15 @@ class ExperimentQueue:
     def _ensure_control_state(self) -> None:
         if self.control_path.exists():
             return
-        self._write_json(self.control_path, asdict(ControlState()))
+        self._write_json(
+            self.control_path,
+            asdict(ControlState(max_concurrent_jobs=self.max_concurrent_jobs)),
+        )
+
+    def _ensure_scheduler_state(self) -> None:
+        if self.scheduler_state_path.exists():
+            return
+        self._write_json(self.scheduler_state_path, {"last_owner_key": None, "updated_at": None})
 
     def start(self) -> bool:
         with self._lock:
@@ -157,8 +171,9 @@ class ExperimentQueue:
     def stop(self, *, kill_running: bool = False) -> None:
         self._stop_event.set()
         with self._lock:
-            if kill_running and self._current_process:
-                self._kill_current_process_locked(force=True)
+            if kill_running:
+                for job in self._get_running_jobs_locked():
+                    self._kill_process_locked(job.job_id, force=True)
         thread = self._worker_thread
         if thread:
             thread.join(timeout=5.0)
@@ -176,31 +191,38 @@ class ExperimentQueue:
     def _tick(self) -> None:
         with self._lock:
             self._reconcile_jobs_locked()
-            self._write_worker_heartbeat_locked()
+            self._reconcile_orphaned_running_jobs_locked()
             control = self._read_control_locked()
-            running_job = self._get_running_job_locked()
+            running_jobs = self._get_running_jobs_locked()
+            self._write_worker_heartbeat_locked(running_jobs)
 
-            if running_job:
-                self._poll_running_job_locked(running_job, control)
-            else:
-                if control.stop_now:
-                    control.stop_now = False
-                    self._write_control_locked(control)
-                if control.stop_after_current:
-                    return
-                if control.paused:
-                    return
-                next_job = self._dequeue_next_job_locked()
-                if next_job:
+            if control.stop_now:
+                for job in running_jobs:
+                    self._request_stop_locked(job, reason="stop_now")
+                control.stop_now = False
+                control.paused = True
+                self._write_control_locked(control)
+
+            for job in list(self._get_running_jobs_locked()):
+                self._poll_running_job_locked(job)
+
+            running_jobs = self._get_running_jobs_locked()
+            if control.stop_after_current and running_jobs:
+                pass
+            elif not control.paused and not control.stop_after_current:
+                while len(running_jobs) < max(1, int(control.max_concurrent_jobs)):
+                    next_job = self._dequeue_next_job_locked()
+                    if not next_job:
+                        break
                     self._start_job_locked(next_job)
+                    running_jobs = self._get_running_jobs_locked()
         time.sleep(self.poll_interval_s)
 
     def _poll_running_job_locked(
         self,
         job: JobRecord,
-        control: ControlState,
     ) -> None:
-        process = self._current_process
+        process = self._current_processes.get(job.job_id)
         if not process:
             process = self._recover_process_handle_locked(job)
             if not process:
@@ -220,17 +242,16 @@ class ExperimentQueue:
                 return
 
         script_path = Path(job.script_path)
-        if control.stop_now or not script_path.exists():
-            self._request_stop_locked(job, reason="stop_now" if control.stop_now else "running script removed")
-            control.stop_now = False
-            self._write_control_locked(control)
+        if not script_path.exists():
+            self._request_stop_locked(job, reason="running script removed")
 
         return_code = process.poll()
         if return_code is None:
-            if self._terminate_requested_at is not None:
-                elapsed = time.time() - self._terminate_requested_at
+            if job.terminate_requested_at is not None:
+                self._kill_process_locked(job.job_id, force=False)
+                elapsed = time.time() - job.terminate_requested_at
                 if elapsed >= self.terminate_grace_s:
-                    self._kill_current_process_locked(force=True)
+                    self._kill_process_locked(job.job_id, force=True)
             return
 
         recorded_exit = self._read_recorded_exit_code_locked(job)
@@ -238,7 +259,7 @@ class ExperimentQueue:
             return_code = recorded_exit
 
         status = STATUS_FINISHED if return_code == 0 else STATUS_FAILED
-        if self._terminate_requested_at is not None and return_code != 0:
+        if job.stop_requested:
             status = STATUS_CANCELLED
         self._finish_job_locked(job, status=status, exit_code=return_code)
 
@@ -248,19 +269,20 @@ class ExperimentQueue:
         handle = RecoveredProcessHandle(pid=job.pid)
         if handle.poll() is not None:
             return None
-        self._current_process = handle
+        self._current_processes[job.job_id] = handle
         return handle
 
     def _request_stop_locked(self, job: JobRecord, reason: str) -> None:
-        if self._terminate_requested_at is not None:
+        if job.stop_requested:
             return
-        self._terminate_requested_at = time.time()
+        job.stop_requested = True
+        job.terminate_requested_at = time.time()
         job.note = reason
         self._write_job_locked(job)
-        self._kill_current_process_locked(force=False)
+        self._kill_process_locked(job.job_id, force=False)
 
-    def _kill_current_process_locked(self, force: bool) -> None:
-        process = self._current_process
+    def _kill_process_locked(self, job_id: str, force: bool) -> None:
+        process = self._current_processes.get(job_id)
         if not process:
             return
         try:
@@ -412,7 +434,7 @@ class ExperimentQueue:
     def list_jobs(self, status: str | None = None, limit: int | None = None) -> list[JobRecord]:
         with self._lock:
             self._reconcile_jobs_locked()
-            self._reconcile_orphaned_running_job_locked()
+            self._reconcile_orphaned_running_jobs_locked()
             jobs = [self._read_job_file(path) for path in sorted(self.jobs_dir.glob("*.json"))]
             jobs.sort(key=lambda item: item.submitted_at, reverse=True)
             if status:
@@ -424,7 +446,7 @@ class ExperimentQueue:
     def get_job(self, job_id: str) -> JobRecord:
         with self._lock:
             self._reconcile_jobs_locked()
-            self._reconcile_orphaned_running_job_locked()
+            self._reconcile_orphaned_running_jobs_locked()
             path = self.jobs_dir / f"{job_id}.json"
             if not path.exists():
                 raise KeyError(f"Unknown job: {job_id}")
@@ -433,7 +455,7 @@ class ExperimentQueue:
     def read_log(self, job_id: str, stream: str = "stdout", lines: int = 100) -> str:
         with self._lock:
             self._reconcile_jobs_locked()
-            self._reconcile_orphaned_running_job_locked()
+            self._reconcile_orphaned_running_jobs_locked()
         job = self.get_job(job_id)
         if stream not in {"stdout", "stderr"}:
             raise ValueError("stream must be 'stdout' or 'stderr'")
@@ -458,6 +480,13 @@ class ExperimentQueue:
             self._write_control_locked(control)
             return control
 
+    def set_max_concurrent_jobs(self, max_concurrent_jobs: int) -> ControlState:
+        with self._lock:
+            control = self._read_control_locked()
+            control.max_concurrent_jobs = max(1, int(max_concurrent_jobs))
+            self._write_control_locked(control)
+            return control
+
     def stop_after_current(self) -> ControlState:
         with self._lock:
             control = self._read_control_locked()
@@ -469,6 +498,7 @@ class ExperimentQueue:
         with self._lock:
             control = self._read_control_locked()
             control.stop_now = True
+            control.paused = True
             self._write_control_locked(control)
             return control
 
@@ -500,9 +530,7 @@ class ExperimentQueue:
                 self._write_job_locked(job)
                 return job
             if job.status == STATUS_RUNNING:
-                control = self._read_control_locked()
-                control.stop_now = True
-                self._write_control_locked(control)
+                self._request_stop_locked(job, reason="cancel_job")
                 return job
             return job
 
@@ -525,16 +553,35 @@ class ExperimentQueue:
             )
             return job
 
+    def assert_running_jobs_control_allowed(
+        self,
+        *,
+        requester_label: str | None = None,
+        requester_session_id: str | None = None,
+        force: bool = False,
+    ) -> list[JobRecord]:
+        with self._lock:
+            jobs = self._get_running_jobs_locked()
+            for job in jobs:
+                self._assert_job_control_allowed(
+                    job,
+                    requester_label=requester_label,
+                    requester_session_id=requester_session_id,
+                    force=force,
+                )
+            return jobs
+
     def queue_status(self) -> dict[str, Any]:
         with self._lock:
             self._reconcile_jobs_locked()
-            self._reconcile_orphaned_running_job_locked()
+            self._reconcile_orphaned_running_jobs_locked()
             control = self._read_control_locked()
             jobs = self.list_jobs(limit=None)
             counts: dict[str, int] = {}
             for job in jobs:
                 counts[job.status] = counts.get(job.status, 0) + 1
-            current = self._get_running_job_locked()
+            running_jobs = self._get_running_jobs_locked()
+            current = running_jobs[0] if running_jobs else None
             return {
                 "queue_root": str(self.queue_root),
                 "workspace_root": str(self.workspace_root),
@@ -542,15 +589,17 @@ class ExperimentQueue:
                 "paused": control.paused,
                 "stop_after_current": control.stop_after_current,
                 "stop_now": control.stop_now,
+                "max_concurrent_jobs": control.max_concurrent_jobs,
                 "counts": counts,
+                "running_jobs": [asdict(job) for job in running_jobs],
                 "current_job": asdict(current) if current else None,
             }
 
     def has_pending_work(self) -> bool:
         with self._lock:
             self._reconcile_jobs_locked()
-            current = self._get_running_job_locked()
-            if current is not None:
+            current = self._get_running_jobs_locked()
+            if current:
                 return True
             queued_jobs = [job for job in self.list_jobs_from_disk_locked() if job.status == STATUS_QUEUED]
             return bool(queued_jobs)
@@ -565,7 +614,23 @@ class ExperimentQueue:
                 item.submitted_at,
             )
         )
-        return queued_jobs[0]
+        owner_buckets: dict[str, list[JobRecord]] = {}
+        owner_order: list[str] = []
+        for job in queued_jobs:
+            owner_key = self._owner_key(job)
+            if owner_key not in owner_buckets:
+                owner_buckets[owner_key] = []
+                owner_order.append(owner_key)
+            owner_buckets[owner_key].append(job)
+
+        scheduler_state = self._read_scheduler_state_locked()
+        last_owner_key = scheduler_state.get("last_owner_key")
+        chosen_index = 0
+        if last_owner_key in owner_order and len(owner_order) > 1:
+            chosen_index = (owner_order.index(last_owner_key) + 1) % len(owner_order)
+        chosen_owner = owner_order[chosen_index]
+        self._write_scheduler_state_locked(last_owner_key=chosen_owner)
+        return owner_buckets[chosen_owner][0]
 
     def _start_job_locked(self, job: JobRecord) -> None:
         src = Path(job.script_path)
@@ -578,6 +643,8 @@ class ExperimentQueue:
         job.finished_at = None
         job.exit_code = None
         job.note = None
+        job.stop_requested = False
+        job.terminate_requested_at = None
 
         stdout_path = Path(job.stdout_log or self.logs_dir / f"{job.job_id}.out")
         stderr_path = Path(job.stderr_log or self.logs_dir / f"{job.job_id}.err")
@@ -605,8 +672,7 @@ class ExperimentQueue:
         stderr_handle.close()
         job.pid = process.pid
         job.pgid = os.getpgid(process.pid)
-        self._current_process = process
-        self._terminate_requested_at = None
+        self._current_processes[job.job_id] = process
         self._write_job_locked(job)
 
     def _build_job_command(self, job: JobRecord) -> list[str]:
@@ -653,11 +719,12 @@ class ExperimentQueue:
         job.status = status
         job.exit_code = exit_code
         job.finished_at = time.time()
+        job.stop_requested = False
+        job.terminate_requested_at = None
         if note:
             job.note = note
         self._write_job_locked(job)
-        self._current_process = None
-        self._terminate_requested_at = None
+        self._current_processes.pop(job.job_id, None)
 
     def _reconcile_jobs_locked(self) -> None:
         known_jobs = self._dedupe_jobs_locked()
@@ -727,7 +794,10 @@ class ExperimentQueue:
     def list_jobs_from_disk_locked(self) -> list[JobRecord]:
         jobs = []
         for path in sorted(self.jobs_dir.glob("*.json")):
-            jobs.append(self._read_job_file(path))
+            try:
+                jobs.append(self._read_job_file(path))
+            except FileNotFoundError:
+                continue
         return jobs
 
     def _acquire_worker_lock_locked(self) -> None:
@@ -744,7 +814,7 @@ class ExperimentQueue:
         handle.write(f"{os.getpid()}\n")
         handle.flush()
         self._worker_lock_handle = handle
-        self._write_worker_heartbeat_locked()
+        self._write_worker_heartbeat_locked([])
 
     def _release_worker_lock_locked(self) -> None:
         handle = self._worker_lock_handle
@@ -773,6 +843,7 @@ class ExperimentQueue:
         if heartbeat and isinstance(heartbeat.get("updated_at"), (int, float)):
             heartbeat_age_s = max(0.0, time.time() - float(heartbeat["updated_at"]))
         pid = heartbeat.get("pid") if heartbeat else self._read_worker_pid_locked()
+        scheduler_state = self._read_scheduler_state_locked()
         return {
             "daemon_running": running,
             "daemon_pid": int(pid) if running and pid is not None else None,
@@ -783,6 +854,9 @@ class ExperimentQueue:
             "worker_heartbeat_fresh": heartbeat_fresh,
             "worker_heartbeat_age_s": heartbeat_age_s,
             "worker_lock_stale": lock_held and not heartbeat_fresh,
+            "max_concurrent_jobs": int(heartbeat.get("max_concurrent_jobs")) if running and heartbeat and heartbeat.get("max_concurrent_jobs") is not None else self._read_control_locked().max_concurrent_jobs,
+            "scheduler_mode": "round_robin_by_owner",
+            "last_scheduled_owner": scheduler_state.get("last_owner_key"),
         }
 
     def _read_worker_pid_locked(self) -> int | None:
@@ -831,6 +905,24 @@ class ExperimentQueue:
             return None
         return data if isinstance(data, dict) else None
 
+    def _read_scheduler_state_locked(self) -> dict[str, Any]:
+        if not self.scheduler_state_path.exists():
+            return {"last_owner_key": None, "updated_at": None}
+        try:
+            data = self._read_json(self.scheduler_state_path)
+        except (OSError, json.JSONDecodeError):
+            return {"last_owner_key": None, "updated_at": None}
+        return data if isinstance(data, dict) else {"last_owner_key": None, "updated_at": None}
+
+    def _write_scheduler_state_locked(self, *, last_owner_key: str | None) -> None:
+        self._write_json(
+            self.scheduler_state_path,
+            {
+                "last_owner_key": last_owner_key,
+                "updated_at": time.time(),
+            },
+        )
+
     def _worker_heartbeat_is_fresh_locked(self, heartbeat: dict[str, Any] | None) -> bool:
         if not heartbeat:
             return False
@@ -839,48 +931,50 @@ class ExperimentQueue:
             return False
         return (time.time() - float(updated_at)) <= max(5.0, self.poll_interval_s * 4.0)
 
-    def _write_worker_heartbeat_locked(self) -> None:
+    def _write_worker_heartbeat_locked(self, running_jobs: list[JobRecord] | None = None) -> None:
         if self._worker_lock_handle is None:
             return
-        running_job = self._get_running_job_locked()
+        if running_jobs is None:
+            running_jobs = self._get_running_jobs_locked()
+        control = self._read_control_locked()
         payload: dict[str, Any] = {
             "pid": os.getpid(),
             "updated_at": time.time(),
+            "max_concurrent_jobs": int(control.max_concurrent_jobs),
+            "running_job_ids": [job.job_id for job in running_jobs],
         }
-        if running_job is not None:
-            payload["current_job_id"] = running_job.job_id
+        if running_jobs:
+            payload["current_job_id"] = running_jobs[0].job_id
         self._write_json(self.worker_heartbeat_path, payload)
 
-    def _reconcile_orphaned_running_job_locked(self) -> None:
+    def _reconcile_orphaned_running_jobs_locked(self) -> None:
         status = self._daemon_status_locked()
         if status["daemon_running"]:
             return
-        job = self._get_running_job_locked()
-        if job is None:
-            return
-        recorded_exit = self._read_recorded_exit_code_locked(job)
-        if recorded_exit is not None:
-            final_status = STATUS_FINISHED if recorded_exit == 0 else STATUS_FAILED
+        for job in self._get_running_jobs_locked():
+            recorded_exit = self._read_recorded_exit_code_locked(job)
+            if recorded_exit is not None:
+                final_status = STATUS_FINISHED if recorded_exit == 0 else STATUS_FAILED
+                self._finish_job_locked(
+                    job,
+                    status=final_status,
+                    exit_code=recorded_exit,
+                    note="Recovered completed job after daemon heartbeat stopped.",
+                )
+                continue
+            if job.pid and self._pid_is_running(job.pid):
+                continue
+            if self._should_wait_for_exit_sidecar_locked(job):
+                continue
+            note = "Recovered stale running job after daemon heartbeat stopped."
+            if status.get("worker_lock_stale"):
+                note += " Worker lock remained held without a fresh heartbeat."
             self._finish_job_locked(
                 job,
-                status=final_status,
-                exit_code=recorded_exit,
-                note="Recovered completed job after daemon heartbeat stopped.",
+                status=STATUS_FAILED,
+                exit_code=None,
+                note=note,
             )
-            return
-        if job.pid and self._pid_is_running(job.pid):
-            return
-        if self._should_wait_for_exit_sidecar_locked(job):
-            return
-        note = "Recovered stale running job after daemon heartbeat stopped."
-        if status.get("worker_lock_stale"):
-            note += " Worker lock remained held without a fresh heartbeat."
-        self._finish_job_locked(
-            job,
-            status=STATUS_FAILED,
-            exit_code=None,
-            note=note,
-        )
 
     def _assert_job_control_allowed(
         self,
@@ -917,14 +1011,27 @@ class ExperimentQueue:
             "Pass force=true to override."
         )
 
-    def _get_running_job_locked(self) -> JobRecord | None:
+    def _owner_key(self, job: JobRecord) -> str:
+        if job.owner_session_id:
+            return f"session:{job.owner_session_id}"
+        if job.owner_label:
+            return f"label:{job.owner_label}"
+        return "unowned"
+
+    def _get_running_jobs_locked(self) -> list[JobRecord]:
         running_jobs = [job for job in self.list_jobs_from_disk_locked() if job.status == STATUS_RUNNING]
-        running_jobs.sort(key=lambda item: item.started_at or item.submitted_at, reverse=True)
+        running_jobs.sort(key=lambda item: item.started_at or item.submitted_at)
+        return running_jobs
+
+    def _get_running_job_locked(self) -> JobRecord | None:
+        running_jobs = self._get_running_jobs_locked()
         return running_jobs[0] if running_jobs else None
 
     def _read_control_locked(self) -> ControlState:
         data = self._read_json(self.control_path)
-        return ControlState(**data)
+        control = ControlState(**data)
+        control.max_concurrent_jobs = max(1, int(control.max_concurrent_jobs))
+        return control
 
     def _write_control_locked(self, control: ControlState) -> None:
         self._write_json(self.control_path, asdict(control))

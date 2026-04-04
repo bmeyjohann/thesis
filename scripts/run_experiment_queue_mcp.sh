@@ -9,6 +9,7 @@ default_conda_env="${EXPERIMENT_QUEUE_CONDA_ENV:-fasttd3}"
 conda_sh_path="${EXPERIMENT_QUEUE_CONDA_SH:-/home/benjamin/miniconda3/etc/profile.d/conda.sh}"
 poll_interval="${EXPERIMENT_QUEUE_POLL_INTERVAL:-1.0}"
 terminate_grace="${EXPERIMENT_QUEUE_TERMINATE_GRACE:-10.0}"
+max_concurrent_jobs="${EXPERIMENT_QUEUE_MAX_CONCURRENT_JOBS:-2}"
 
 exec python3 "$repo_root/tools/experiment_queue_mcp/server.py" \
   --queue-root "$queue_root" \
@@ -19,5 +20,5 @@ exec python3 "$repo_root/tools/experiment_queue_mcp/server.py" \
   --default-conda-env "$default_conda_env" \
   --conda-sh-path "$conda_sh_path" \
   --poll-interval "$poll_interval" \
-  --terminate-grace "$terminate_grace"
-
+  --terminate-grace "$terminate_grace" \
+  --max-concurrent-jobs "$max_concurrent_jobs"

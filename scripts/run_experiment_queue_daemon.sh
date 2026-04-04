@@ -13,4 +13,5 @@ exec /usr/bin/python3 "${REPO_ROOT}/tools/experiment_queue_mcp/daemon.py" \
   --default-conda-env fasttd3 \
   --conda-sh-path "/home/benjamin/miniconda3/etc/profile.d/conda.sh" \
   --poll-interval 1.0 \
-  --terminate-grace 10.0
+  --terminate-grace 10.0 \
+  --max-concurrent-jobs 2
