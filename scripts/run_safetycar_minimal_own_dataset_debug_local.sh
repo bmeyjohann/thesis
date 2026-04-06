@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="/home/benjamin/thesis"
+cd "$ROOT"
+
+for arg in "$@"; do
+  case "$arg" in
+    *=*)
+      export "$arg"
+      ;;
+    *)
+      echo "Unsupported argument: $arg" >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ -z "${DEMO_DATASET_PATH:-}" ]]; then
+  echo "DEMO_DATASET_PATH is required." >&2
+  exit 2
+fi
+
+TIMESTAMP="${TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
+
+export EXP_PREFIX="${EXP_PREFIX:-safetycar_min_own_dataset_debug}"
+export VARIANT="${VARIANT:-own}"
+export TOTAL_TIMESTEPS="${TOTAL_TIMESTEPS:-10000}"
+export CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-5000}"
+export MODULE_IMPL="${MODULE_IMPL:-custom}"
+export REWARD_MODE="${REWARD_MODE:-dense}"
+export GAMMA="${GAMMA:-0.99}"
+export STEP_PENALTY="${STEP_PENALTY:--0.001}"
+export COST_PENALTY="${COST_PENALTY:-0.0}"
+export OBS_NORMALIZATION="${OBS_NORMALIZATION:-1}"
+export SCALE_ACTOR_TO_ENV_BOUNDS="${SCALE_ACTOR_TO_ENV_BOUNDS:-1}"
+export CAR_WHEEL_COMMAND_LIMIT="${CAR_WHEEL_COMMAND_LIMIT:-2.0}"
+export CAR_FORCE_SCALE="${CAR_FORCE_SCALE:-2.0}"
+export CAR_ACTION_MODE="${CAR_ACTION_MODE:-raw_wheels}"
+export ACTOR_HIDDEN_DIM="${ACTOR_HIDDEN_DIM:-512}"
+export CRITIC_HIDDEN_DIM="${CRITIC_HIDDEN_DIM:-1024}"
+export SEED="${SEED:-1}"
+export RENDER_MODE="${RENDER_MODE:-none}"
+export LEARNING_STARTS="${LEARNING_STARTS:-0}"
+export NUM_UPDATES="${NUM_UPDATES:-2}"
+export POLICY_FREQUENCY="${POLICY_FREQUENCY:-2}"
+export PREF_CAPACITY="${PREF_CAPACITY:-100000}"
+export PREF_SAMPLING_MODE="${PREF_SAMPLING_MODE:-linked}"
+export PREF_SAMPLE_RATIO="${PREF_SAMPLE_RATIO:-0.5}"
+export PREF_RANK_WEIGHT="${PREF_RANK_WEIGHT:-1.0}"
+export PREF_LOSS_TYPE="${PREF_LOSS_TYPE:-lagrangian}"
+export PREF_STOPGRAD_POSITIVE="${PREF_STOPGRAD_POSITIVE:-1}"
+export PREF_LAMBDA_INIT="${PREF_LAMBDA_INIT:-1.0}"
+export PREF_LAMBDA_LR="${PREF_LAMBDA_LR:-1e-3}"
+export PREF_LAMBDA_MAX="${PREF_LAMBDA_MAX:-10.0}"
+export PREF_LAMBDA_EMA="${PREF_LAMBDA_EMA:-0.9}"
+export PREF_VIOLATION_CLIP="${PREF_VIOLATION_CLIP:-10.0}"
+export PREF_VIOLATION_TARGET="${PREF_VIOLATION_TARGET:-0.0}"
+export PREF_LAGRANGIAN_VIOLATION_TYPE="${PREF_LAGRANGIAN_VIOLATION_TYPE:-hinge}"
+export DEMO_SAMPLE_RATIO="${DEMO_SAMPLE_RATIO:-0.0}"
+export DEMO_DATASET_TARGET="${DEMO_DATASET_TARGET:-replay}"
+export DEMO_DATASET_MAX_ROWS="${DEMO_DATASET_MAX_ROWS:-0}"
+export OFFLINE_ONLY="${OFFLINE_ONLY:-1}"
+export SAVE_OPTIMIZER_STATE_IN_CHECKPOINTS="${SAVE_OPTIMIZER_STATE_IN_CHECKPOINTS:-0}"
+export VIZ_ON_CHECKPOINT="${VIZ_ON_CHECKPOINT:-0}"
+export EVAL_SAVE_EPISODE_PLOTS="${EVAL_SAVE_EPISODE_PLOTS:-0}"
+export WANDB_MODE="${WANDB_MODE:-online}"
+export PROJECT="${PROJECT:-thesis-safetygym}"
+
+"$ROOT/scripts/run_safetycar_minimal_human_ready_local.sh" "TIMESTAMP=$TIMESTAMP"

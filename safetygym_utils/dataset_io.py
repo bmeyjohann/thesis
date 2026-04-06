@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -65,8 +67,34 @@ def save_transition_dataset(
         payload["student_actions"] = np.asarray(student_actions, dtype=np.float32)
     if teacher_intervened is not None:
         payload["teacher_intervened"] = np.asarray(teacher_intervened, dtype=np.bool_).reshape(-1)
-    np.savez_compressed(target, **payload)
-    target.with_suffix(".json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    with tempfile.NamedTemporaryFile(
+        dir=target.parent,
+        prefix=f".{target.stem}_",
+        suffix=target.suffix,
+        delete=False,
+    ) as tmp_npz:
+        tmp_npz_path = Path(tmp_npz.name)
+    try:
+        np.savez_compressed(tmp_npz_path, **payload)
+        os.replace(tmp_npz_path, target)
+    finally:
+        tmp_npz_path.unlink(missing_ok=True)
+
+    sidecar = target.with_suffix(".json")
+    with tempfile.NamedTemporaryFile(
+        dir=sidecar.parent,
+        prefix=f".{sidecar.stem}_",
+        suffix=sidecar.suffix,
+        delete=False,
+        mode="w",
+        encoding="utf-8",
+    ) as tmp_json:
+        tmp_json.write(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+        tmp_json_path = Path(tmp_json.name)
+    try:
+        os.replace(tmp_json_path, sidecar)
+    finally:
+        tmp_json_path.unlink(missing_ok=True)
     return target
 
 

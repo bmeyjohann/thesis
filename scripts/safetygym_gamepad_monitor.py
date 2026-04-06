@@ -12,6 +12,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from safetygym_utils.controllers import build_human_controller
+from safetygym_utils.env import resolve_control_scheme
 from safetygym_utils.gamepad import (
     DEFAULT_SAFETY_GAMEPAD_CACHE_PATH,
     DEFAULT_SAFETY_GAMEPAD_CONFIG_PATH,
@@ -24,6 +25,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Monitor SafetyGym gamepad input and edit mapping in a browser")
     p.add_argument("--env_name", type=str, default="SafetyCarGoal2-v0")
     p.add_argument("--action_dim", type=int, default=2)
+    p.add_argument("--car_action_mode", type=str, default="raw_wheels", choices=["raw_wheels", "throttle_turn", "cardinal"])
     p.add_argument("--gamepad_mode", type=str, default="local", choices=["local", "connect"])
     p.add_argument("--gamepad_host", type=str, default="")
     p.add_argument("--gamepad_port", type=int, default=0)
@@ -56,6 +58,7 @@ def main() -> int:
         gamepad_config_path=args.gamepad_config_path,
         gamepad_use_saved_config=bool(args.gamepad_use_saved_config),
         gamepad_device_index=int(args.gamepad_device_index),
+        control_scheme_override=resolve_control_scheme(args.env_name, car_action_mode=args.car_action_mode),
     )
     web = GamepadWebServer(controller=controller, config_path=args.gamepad_config_path, port=int(args.web_port))
     web.start()

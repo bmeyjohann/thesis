@@ -22,6 +22,7 @@ CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-5000}"
 WANDB_MODE="${WANDB_MODE:-online}"
 PROJECT="${PROJECT:-thesis-safetygym}"
 SEED="${SEED:-1}"
+ENV_NAME="${ENV_NAME:-SafetyCarGoal2-v0}"
 
 EXP_PREFIX="${EXP_PREFIX:-safetycar_min_human_ready}"
 EXP_NAME="${EXP_NAME:-${EXP_PREFIX}_${TIMESTAMP}}"
@@ -54,6 +55,8 @@ ACTOR_HIDDEN_DIM="${ACTOR_HIDDEN_DIM:-512}"
 CRITIC_HIDDEN_DIM="${CRITIC_HIDDEN_DIM:-1024}"
 CAR_WHEEL_COMMAND_LIMIT="${CAR_WHEEL_COMMAND_LIMIT:-2.0}"
 CAR_FORCE_SCALE="${CAR_FORCE_SCALE:-2.0}"
+CAR_ACTION_MODE="${CAR_ACTION_MODE:-raw_wheels}"
+OBS_MASK_MODE="${OBS_MASK_MODE:-none}"
 MODULE_IMPL="${MODULE_IMPL:-custom}"
 RENDER_MODE="${RENDER_MODE:-none}"
 LOG_INTERVAL="${LOG_INTERVAL:-2000}"
@@ -154,6 +157,11 @@ if [[ "${EXPORT_FINAL_DEMO_DATASET:-0}" == "1" ]]; then
   EXPORT_DEMO_FLAG="--export_final_demo_dataset"
 fi
 
+OFFLINE_ONLY_FLAG=""
+if [[ "${OFFLINE_ONLY:-0}" == "1" ]]; then
+  OFFLINE_ONLY_FLAG="--offline_only"
+fi
+
 PREF_STOPGRAD_FLAG=""
 if [[ "${PREF_STOPGRAD_POSITIVE:-0}" == "1" ]]; then
   PREF_STOPGRAD_FLAG="--pref_stopgrad_positive"
@@ -165,7 +173,7 @@ if [[ "${HEADING_POSITIVE_ONLY:-1}" == "0" ]]; then
 fi
 
 /home/benjamin/miniconda3/envs/fasttd3/bin/python /home/benjamin/thesis/train_fast_sac_safetygym_minimal.py \
-  --env_name SafetyCarGoal2-v0 \
+  --env_name "$ENV_NAME" \
   --exp_name "$EXP_NAME" \
   --variant "$VARIANT" \
   --seed "$SEED" \
@@ -206,6 +214,8 @@ fi
   "$HEADING_POSITIVE_ONLY_FLAG" \
   --car_wheel_command_limit "$CAR_WHEEL_COMMAND_LIMIT" \
   --car_force_scale "$CAR_FORCE_SCALE" \
+  --car_action_mode "$CAR_ACTION_MODE" \
+  --obs_mask_mode "$OBS_MASK_MODE" \
   --max_episode_steps "${MAX_EPISODE_STEPS:-0}" \
   $TERMINATE_ON_GOAL_FLAG \
   "$SCALE_FLAG" \
@@ -265,6 +275,12 @@ fi
   "$SAVE_OPT_FLAG" \
   --export_dataset_dir "${EXPORT_DATASET_DIR:-}" \
   --export_dataset_max_rows "${EXPORT_DATASET_MAX_ROWS:-0}" \
+  $OFFLINE_ONLY_FLAG \
+  --export_replay_dataset_interval "${EXPORT_REPLAY_DATASET_INTERVAL:-0}" \
+  --export_replay_dataset_path "${EXPORT_REPLAY_DATASET_PATH:-}" \
+  --export_replay_dataset_dir "${EXPORT_REPLAY_DATASET_DIR:-}" \
+  --export_replay_dataset_label "${EXPORT_REPLAY_DATASET_LABEL:-online_replay}" \
+  --export_replay_dataset_max_rows "${EXPORT_REPLAY_DATASET_MAX_ROWS:-0}" \
   $EXPORT_REPLAY_FLAG \
   --export_final_replay_dataset_path "${EXPORT_FINAL_REPLAY_DATASET_PATH:-}" \
   $EXPORT_DEMO_FLAG \

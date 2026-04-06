@@ -24,7 +24,7 @@ from safetygym_utils.gamepad import (
     DEFAULT_SAFETY_GAMEPAD_CONFIG_PATH,
     DEFAULT_SAFETY_GAMEPAD_PORT,
 )
-from safetygym_utils.env import clip_action_to_space, make_safety_env
+from safetygym_utils.env import clip_action_to_space, make_safety_env, resolve_control_scheme
 from safetygym_utils.rendering import build_external_viewer, resolve_env_render_mode, wants_external_viewer
 from safetygym_utils.wrappers import RewardModeWrapper
 
@@ -39,6 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--surface_mode", type=str, default="default", choices=["default", "grippy"])
     p.add_argument("--car_wheel_command_limit", type=float, default=2.0)
     p.add_argument("--car_force_scale", type=float, default=2.0)
+    p.add_argument("--car_action_mode", type=str, default="raw_wheels", choices=["raw_wheels", "throttle_turn", "cardinal"])
     p.add_argument("--max_episode_steps", type=int, default=0)
     p.add_argument("--reward_mode", type=str, default="sparse", choices=["sparse", "dense", "dense_plus_sparse", "native", "none"])
     p.add_argument("--dense_reward_scale", type=float, default=1.0)
@@ -73,6 +74,7 @@ def main() -> int:
         surface_mode=args.surface_mode,
         car_wheel_command_limit=args.car_wheel_command_limit,
         car_force_scale=args.car_force_scale,
+        car_action_mode=args.car_action_mode,
         seed=args.seed,
     )
     env = RewardModeWrapper(
@@ -99,6 +101,7 @@ def main() -> int:
         gamepad_use_saved_config=bool(args.gamepad_use_saved_config),
         gamepad_device_index=int(args.gamepad_device_index),
         prefer_separate_keyboard_window=wants_external_viewer(args.render_mode),
+        control_scheme_override=resolve_control_scheme(args.env_name, car_action_mode=args.car_action_mode),
     )
 
     obs_rows = []

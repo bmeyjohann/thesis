@@ -447,6 +447,8 @@ def _run_rollout_eval(
         surface_mode=str(train_args.get("surface_mode", "default")),
         car_wheel_command_limit=float(train_args.get("car_wheel_command_limit", 2.0)),
         car_force_scale=float(train_args.get("car_force_scale", 2.0)),
+        car_action_mode=str(train_args.get("car_action_mode", "raw_wheels")),
+        obs_mask_mode=str(train_args.get("obs_mask_mode", "none")),
         seed=seed,
     )
     task = env.unwrapped.task
@@ -704,6 +706,8 @@ def generate_safety_policy_maps(
         surface_mode=str(train_args.get("surface_mode", "default")),
         car_wheel_command_limit=float(train_args.get("car_wheel_command_limit", 2.0)),
         car_force_scale=float(train_args.get("car_force_scale", 2.0)),
+        car_action_mode=str(train_args.get("car_action_mode", "raw_wheels")),
+        obs_mask_mode=str(train_args.get("obs_mask_mode", "none")),
         seed=int(seed),
     )
     obs, _ = env.reset(seed=int(seed))

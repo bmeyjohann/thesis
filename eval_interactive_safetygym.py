@@ -19,7 +19,7 @@ from safetygym_utils.gamepad import (
     DEFAULT_SAFETY_GAMEPAD_CONFIG_PATH,
     DEFAULT_SAFETY_GAMEPAD_PORT,
 )
-from safetygym_utils.env import clip_action_to_space, extract_goal_distance, extract_step_limit, make_safety_env, scale_action_np
+from safetygym_utils.env import clip_action_to_space, extract_goal_distance, extract_step_limit, make_safety_env, resolve_control_scheme, scale_action_np
 from safetygym_utils.io import load_args_json, maybe_find_args_json_from_model
 from safetygym_utils.metrics import EpisodeWindow, augment_rollout_summary, classify_outcome
 from safetygym_utils.policy_viz import (
@@ -30,7 +30,7 @@ from safetygym_utils.policy_viz import (
 )
 from safetygym_utils.rendering import build_external_viewer, resolve_env_render_mode, wants_external_viewer
 from safetygym_utils.sac import SafetyActor
-from safetygym_utils.wrappers import HumanInterventionWrapper, RewardModeWrapper
+from safetygym_utils.wrappers import HumanInterventionWrapper, RewardModeWrapper, TerminateOnGoalWrapper
 
 _FAST_SAC_PATH = Path(__file__).resolve().parent / "fasttd3" / "fast_sac"
 if _FAST_SAC_PATH.exists():
@@ -407,6 +407,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--surface_mode", type=str, default="default", choices=["default", "grippy"])
     p.add_argument("--car_wheel_command_limit", type=float, default=2.0)
     p.add_argument("--car_force_scale", type=float, default=2.0)
+    p.add_argument("--car_action_mode", type=str, default="raw_wheels", choices=["raw_wheels", "throttle_turn", "cardinal"])
+    p.add_argument("--obs_mask_mode", type=str, default="none", choices=["none", "goal_only_lidar"])
     p.add_argument("--max_episode_steps", type=int, default=0)
     p.add_argument("--num_episodes", type=int, default=10)
     p.add_argument("--fps", type=int, default=30)
@@ -420,6 +422,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dense_reward_scale", type=float, default=1.0)
     p.add_argument("--step_penalty", type=float, default=0.0)
     p.add_argument("--cost_penalty", type=float, default=0.0)
+    p.add_argument("--cost_penalty_warmup_steps", type=int, default=0)
+    p.add_argument("--cost_penalty_ramp_steps", type=int, default=0)
+    p.add_argument("--clearance_penalty_scale", type=float, default=0.0)
+    p.add_argument("--clearance_margin", type=float, default=0.0)
+    p.add_argument("--clearance_penalty_power", type=float, default=1.0)
+    p.add_argument("--clearance_penalty_warmup_steps", type=int, default=0)
+    p.add_argument("--clearance_penalty_ramp_steps", type=int, default=0)
+    p.add_argument("--forward_reward_scale", type=float, default=0.0)
+    p.add_argument("--backward_penalty_scale", type=float, default=0.0)
+    p.add_argument("--heading_reward_scale", type=float, default=0.0)
+    p.add_argument("--heading_positive_only", action="store_true", default=True)
+    p.add_argument("--no_heading_positive_only", dest="heading_positive_only", action="store_false")
+    p.add_argument("--terminate_on_goal", action="store_true", default=False)
+    p.add_argument("--no_terminate_on_goal", dest="terminate_on_goal", action="store_false")
 
     p.add_argument("--intervention_threshold", type=float, default=0.1)
     p.add_argument("--intervention_hold_seconds", type=float, default=0.25)
@@ -462,24 +478,45 @@ def _apply_ckpt_defaults(args: argparse.Namespace) -> None:
     if args_path is None or not args_path.exists():
         return
     cfg = load_args_json(args_path)
+    cli_args = set(sys.argv[1:])
 
     def _set_if_default(name: str, default_val):
         if getattr(args, name) == default_val and name in cfg:
             setattr(args, name, cfg[name])
+
+    def _bool_flag_explicit(*flags: str) -> bool:
+        return any(flag in cli_args for flag in flags)
 
     _set_if_default("env_name", "SafetyCarGoal2-v0")
     _set_if_default("reward_mode", "sparse")
     _set_if_default("dense_reward_scale", 1.0)
     _set_if_default("step_penalty", 0.0)
     _set_if_default("cost_penalty", 0.0)
+    _set_if_default("cost_penalty_warmup_steps", 0)
+    _set_if_default("cost_penalty_ramp_steps", 0)
+    _set_if_default("clearance_penalty_scale", 0.0)
+    _set_if_default("clearance_margin", 0.0)
+    _set_if_default("clearance_penalty_power", 1.0)
+    _set_if_default("clearance_penalty_warmup_steps", 0)
+    _set_if_default("clearance_penalty_ramp_steps", 0)
+    _set_if_default("forward_reward_scale", 0.0)
+    _set_if_default("backward_penalty_scale", 0.0)
+    _set_if_default("heading_reward_scale", 0.0)
+    if not _bool_flag_explicit("--heading_positive_only", "--no_heading_positive_only"):
+        _set_if_default("heading_positive_only", True)
+    if not _bool_flag_explicit("--terminate_on_goal", "--no_terminate_on_goal"):
+        _set_if_default("terminate_on_goal", False)
     _set_if_default("surface_mode", "default")
     _set_if_default("car_wheel_command_limit", 2.0)
     _set_if_default("car_force_scale", 2.0)
+    _set_if_default("car_action_mode", "raw_wheels")
+    _set_if_default("obs_mask_mode", "none")
     _set_if_default("actor_hidden_dim", 256)
     _set_if_default("use_layer_norm", False)
     _set_if_default("layer_norm_eps", 1e-5)
     _set_if_default("init_scale", 0.01)
-    _set_if_default("scale_actor_to_env_bounds", False)
+    if not _bool_flag_explicit("--scale_actor_to_env_bounds", "--no_scale_actor_to_env_bounds"):
+        _set_if_default("scale_actor_to_env_bounds", False)
 
 
 def _build_env(args: argparse.Namespace, controller):
@@ -490,6 +527,8 @@ def _build_env(args: argparse.Namespace, controller):
         surface_mode=args.surface_mode,
         car_wheel_command_limit=args.car_wheel_command_limit,
         car_force_scale=args.car_force_scale,
+        car_action_mode=args.car_action_mode,
+        obs_mask_mode=str(getattr(args, "obs_mask_mode", "none")),
         seed=args.seed,
     )
     env = RewardModeWrapper(
@@ -498,7 +537,20 @@ def _build_env(args: argparse.Namespace, controller):
         dense_reward_scale=args.dense_reward_scale,
         step_penalty=args.step_penalty,
         cost_penalty=args.cost_penalty,
+        cost_penalty_warmup_steps=int(getattr(args, "cost_penalty_warmup_steps", 0)),
+        cost_penalty_ramp_steps=int(getattr(args, "cost_penalty_ramp_steps", 0)),
+        clearance_penalty_scale=float(getattr(args, "clearance_penalty_scale", 0.0)),
+        clearance_margin=float(getattr(args, "clearance_margin", 0.0)),
+        clearance_penalty_power=float(getattr(args, "clearance_penalty_power", 1.0)),
+        clearance_penalty_warmup_steps=int(getattr(args, "clearance_penalty_warmup_steps", 0)),
+        clearance_penalty_ramp_steps=int(getattr(args, "clearance_penalty_ramp_steps", 0)),
+        forward_reward_scale=float(getattr(args, "forward_reward_scale", 0.0)),
+        backward_penalty_scale=float(getattr(args, "backward_penalty_scale", 0.0)),
+        heading_reward_scale=float(getattr(args, "heading_reward_scale", 0.0)),
+        heading_positive_only=bool(getattr(args, "heading_positive_only", True)),
     )
+    if bool(getattr(args, "terminate_on_goal", False)):
+        env = TerminateOnGoalWrapper(env)
     if args.intervention_mode == "human":
         if controller is None:
             raise ValueError("controller is required for intervention_mode=human")
@@ -596,6 +648,8 @@ def main() -> int:
             surface_mode=args.surface_mode,
             car_wheel_command_limit=args.car_wheel_command_limit,
             car_force_scale=args.car_force_scale,
+            car_action_mode=args.car_action_mode,
+            obs_mask_mode=str(getattr(args, "obs_mask_mode", "none")),
             seed=args.seed,
         )
         act_dim = int(np.prod(tmp_env.action_space.shape))
@@ -618,6 +672,10 @@ def main() -> int:
             gamepad_device_index=int(getattr(args, "gamepad_device_index", 0)),
             show_overlay=not bool(args.show_telemetry_overlay),
             prefer_separate_keyboard_window=wants_external_viewer(getattr(args, "render_mode", "human")),
+            control_scheme_override=resolve_control_scheme(
+                str(args.env_name),
+                car_action_mode=str(getattr(args, "car_action_mode", "raw_wheels")),
+            ),
         )
         if str(getattr(args, "human_input_device", "keyboard")).lower() == "keyboard":
             control_help = [

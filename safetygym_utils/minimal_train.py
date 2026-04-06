@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 import json
 import random
 import time
@@ -29,7 +30,7 @@ from .dataset_io import (
     load_transition_dataset,
     save_buffer_as_transition_dataset,
 )
-from .env import clip_action_to_space, extract_goal_distance, extract_step_limit, make_safety_env
+from .env import clip_action_to_space, extract_goal_distance, extract_step_limit, make_safety_env, resolve_control_scheme
 from .io import save_args_json
 from .metrics import EpisodeWindow, augment_rollout_summary, classify_outcome
 from .policy_viz import _extract_bounds, _extract_overlay_specs, plot_episode_contact_sheet, plot_eval_episode_trajectory
@@ -113,6 +114,8 @@ def _make_env_with_wrappers(
         surface_mode=args.surface_mode,
         car_wheel_command_limit=float(args.car_wheel_command_limit),
         car_force_scale=float(args.car_force_scale),
+        car_action_mode=str(getattr(args, "car_action_mode", "raw_wheels")),
+        obs_mask_mode=str(getattr(args, "obs_mask_mode", "none")),
         seed=seed,
     )
     env = RewardModeWrapper(
@@ -266,6 +269,187 @@ def _maybe_export_final_buffer_dataset(
         f"{metric_prefix}_rows": float(stats["rows_saved"]),
         f"{metric_prefix}_saved": 1.0,
     }
+
+
+def _export_replay_snapshot(
+    *,
+    args,
+    replay_buffer,
+    dataset_path: str,
+    env_name: str,
+    step_value: int,
+    tag: str,
+    context: str,
+) -> dict[str, float]:
+    metadata = {
+        "env_name": str(env_name),
+        "exp_name": str(getattr(args, "exp_name", "") or ""),
+        "variant": str(getattr(args, "variant", "plain") or "plain"),
+        "reward_mode": str(getattr(args, "reward_mode", "dense") or "dense"),
+        "source_buffer": "replay",
+        "context": str(context),
+        "export_tag": str(tag),
+        "global_step": int(step_value),
+        "gamma": float(getattr(args, "gamma", 0.0)),
+        "num_updates": int(getattr(args, "num_updates", 1)),
+        "policy_frequency": int(getattr(args, "policy_frequency", 1)),
+        "pref_sampling_mode": str(getattr(args, "pref_sampling_mode", "linked") or "linked"),
+        "pref_sample_ratio": float(getattr(args, "pref_sample_ratio", 0.0)),
+        "pref_rank_weight": float(getattr(args, "pref_rank_weight", 0.0)),
+        "demo_sample_ratio": float(getattr(args, "demo_sample_ratio", 0.0)),
+        "offline_only": bool(getattr(args, "offline_only", False)),
+        "init_checkpoint_path": str(getattr(args, "init_checkpoint_path", "") or ""),
+    }
+    stats = save_buffer_as_transition_dataset(
+        buffer=replay_buffer,
+        path=dataset_path,
+        metadata=metadata,
+        max_rows=int(getattr(args, "export_replay_dataset_max_rows", 0)),
+        filter_mode="all",
+    )
+    return {
+        "train/export_replay_rows": float(stats["rows_saved"]),
+        "train/export_replay_saved": 1.0,
+    }
+
+
+def _update_obs_normalizer_from_dataset(
+    *,
+    obs_normalizer,
+    dataset: dict[str, Any] | None,
+    device: torch.device,
+    chunk_size: int = 8192,
+) -> int:
+    if dataset is None or not hasattr(obs_normalizer, "update"):
+        return 0
+    rows_updated = 0
+    for key in ("observations", "next_observations"):
+        arr = np.asarray(dataset.get(key), dtype=np.float32) if dataset.get(key) is not None else None
+        if arr is None or arr.ndim != 2 or arr.shape[0] <= 0:
+            continue
+        for start in range(0, int(arr.shape[0]), int(max(1, chunk_size))):
+            stop = min(int(arr.shape[0]), start + int(max(1, chunk_size)))
+            obs_normalizer.update(torch.as_tensor(arr[start:stop], device=device, dtype=torch.float32))
+        rows_updated += int(arr.shape[0])
+    return rows_updated
+
+
+def _accumulate_update_metrics(update_window: dict[str, float], last_update: SACUpdateMetrics) -> None:
+    update_window["count"] += 1.0
+    update_window["actor_updates"] += float(last_update.actor_updates)
+    update_window["alpha_updates"] += float(last_update.alpha_updates)
+    update_window["critic_loss"] += float(last_update.critic_loss)
+    update_window["critic_loss_replay"] += float(last_update.critic_loss_replay)
+    update_window["critic_loss_total"] += float(last_update.critic_loss_total)
+    update_window["critic_loss_pref"] += float(last_update.critic_loss_pref)
+    update_window["critic_loss_pref_weighted"] += float(last_update.critic_loss_pref_weighted)
+    update_window["actor_loss"] += float(last_update.actor_loss)
+    update_window["actor_loss_sac"] += float(last_update.actor_loss_sac)
+    update_window["alpha_loss"] += float(last_update.alpha_loss)
+    update_window["alpha"] += float(last_update.alpha)
+    update_window["target_q_mean"] += float(last_update.target_q_mean)
+    update_window["policy_entropy"] += float(last_update.policy_entropy)
+    update_window["log_pi_mean"] += float(last_update.log_pi_mean)
+    update_window["action_l2"] += float(last_update.action_l2)
+    update_window["q_min_pi_mean"] += float(last_update.q_min_pi_mean)
+    update_window["q_min_data_mean"] += float(last_update.q_min_data_mean)
+    update_window["q_disagreement_data_mean"] += float(last_update.q_disagreement_data_mean)
+    update_window["q_disagreement_pi_mean"] += float(last_update.q_disagreement_pi_mean)
+    update_window["replay_reward_mean"] += float(last_update.replay_reward_mean)
+    update_window["replay_reward_abs_mean"] += float(last_update.replay_reward_abs_mean)
+    update_window["batch_teacher_fraction"] += float(last_update.batch_teacher_fraction)
+    update_window["q_min_teacher_action_sum"] += float(last_update.q_min_teacher_action_mean) * float(
+        last_update.q_min_teacher_action_count
+    )
+    update_window["q_min_teacher_action_count"] += float(last_update.q_min_teacher_action_count)
+    update_window["q_min_non_teacher_action_sum"] += float(last_update.q_min_non_teacher_action_mean) * float(
+        last_update.q_min_non_teacher_action_count
+    )
+    update_window["q_min_non_teacher_action_count"] += float(last_update.q_min_non_teacher_action_count)
+    update_window["pref_rows"] += float(last_update.pref_linked_rows)
+    update_window["pref_q_delta_sum"] += float(last_update.pref_q_delta) * float(last_update.pref_linked_rows)
+    update_window["pref_q_teacher_sum"] += float(last_update.pref_q_teacher_mean) * float(last_update.pref_linked_rows)
+    update_window["pref_q_student_sum"] += float(last_update.pref_q_student_mean) * float(last_update.pref_linked_rows)
+    update_window["pref_action_delta_l2_sum"] += float(last_update.pref_action_delta_l2) * float(
+        last_update.pref_linked_rows
+    )
+    update_window["pref_lambda"] += float(last_update.pref_lambda)
+    update_window["pref_lambda_delta"] += float(last_update.pref_lambda_delta)
+    update_window["pref_dual_violation"] += float(last_update.pref_dual_violation)
+    update_window["pref_dual_signal"] += float(last_update.pref_dual_signal)
+    update_window["pref_violation"] += float(last_update.pref_violation)
+    update_window["pref_violation_ema"] += float(last_update.pref_violation_ema)
+    update_window["pref_lagrangian_loss"] += float(last_update.pref_lagrangian_loss)
+
+
+def _append_update_window_logs(*, logs: Dict[str, float], update_window: dict[str, float], variant: str, args) -> None:
+    if update_window.get("count", 0.0) <= 0.0:
+        return
+    denom = float(max(1.0, update_window["count"]))
+    actor_denom = float(max(1.0, update_window["actor_updates"]))
+    alpha_denom = float(max(1.0, update_window["alpha_updates"]))
+    logs.update(
+        {
+            "train/critic_loss": float(update_window["critic_loss"] / denom),
+            "train/critic_loss_replay": float(update_window["critic_loss_replay"] / denom),
+            "train/critic_loss_total": float(update_window["critic_loss_total"] / denom),
+            "train/actor_loss": float(update_window["actor_loss"] / actor_denom),
+            "train/actor_loss_sac": float(update_window["actor_loss_sac"] / actor_denom),
+            "train/alpha_loss": float(update_window["alpha_loss"] / alpha_denom),
+            "train/alpha": float(update_window["alpha"] / denom),
+            "train/target_q_mean": float(update_window["target_q_mean"] / denom),
+            "train/policy_entropy": float(update_window["policy_entropy"] / actor_denom),
+            "train/log_pi_mean": float(update_window["log_pi_mean"] / actor_denom),
+            "train/action_l2": float(update_window["action_l2"] / actor_denom),
+            "train/q_min_pi_mean": float(update_window["q_min_pi_mean"] / actor_denom),
+            "train/q_min_data_mean": float(update_window["q_min_data_mean"] / denom),
+            "train/q_gap_mean": float(update_window["q_disagreement_data_mean"] / denom),
+            "train/q_disagreement_data_mean": float(update_window["q_disagreement_data_mean"] / denom),
+            "train/q_disagreement_pi_mean": float(update_window["q_disagreement_pi_mean"] / actor_denom),
+            "train/replay_reward_mean": float(update_window["replay_reward_mean"] / denom),
+            "train/replay_reward_abs_mean": float(update_window["replay_reward_abs_mean"] / denom),
+            "train/actor_updates_per_iter": float(update_window["actor_updates"] / denom),
+            "train/alpha_updates_per_iter": float(update_window["alpha_updates"] / denom),
+            "train/batch_teacher_fraction": float(update_window["batch_teacher_fraction"] / denom),
+        }
+    )
+    teacher_q_count = float(update_window.get("q_min_teacher_action_count", 0.0))
+    if teacher_q_count > 0.0:
+        logs["train/q_min_teacher_action_mean"] = float(update_window["q_min_teacher_action_sum"] / teacher_q_count)
+    non_teacher_q_count = float(update_window.get("q_min_non_teacher_action_count", 0.0))
+    if non_teacher_q_count > 0.0:
+        logs["train/q_min_non_teacher_action_mean"] = float(
+            update_window["q_min_non_teacher_action_sum"] / non_teacher_q_count
+        )
+    if variant == "own":
+        pref_rows = float(update_window.get("pref_rows", 0.0))
+        logs.update(
+            {
+                "train/critic_loss_pref": float(update_window["critic_loss_pref"] / denom),
+                "train/critic_loss_pref_weighted": float(update_window["critic_loss_pref_weighted"] / denom),
+                "train/pref_lambda": float(update_window["pref_lambda"] / denom),
+                "train/pref_lambda_delta": float(update_window["pref_lambda_delta"] / denom),
+                "train/pref_dual_violation": float(update_window["pref_dual_violation"] / denom),
+                "train/pref_dual_signal": float(update_window["pref_dual_signal"] / denom),
+                "train/pref_violation": float(update_window["pref_violation"] / denom),
+                "train/pref_violation_ema": float(update_window["pref_violation_ema"] / denom),
+                "train/pref_lagrangian_loss": float(update_window["pref_lagrangian_loss"] / denom),
+                "train/pref_lagrangian_enabled": (
+                    1.0 if str(getattr(args, "pref_loss_type", "margin")).strip().lower() == "lagrangian" else 0.0
+                ),
+                "train/pref_lambda_lr": float(getattr(args, "pref_lambda_lr", 0.0)),
+                "train/pref_lambda_max": float(getattr(args, "pref_lambda_max", 0.0)),
+                "train/pref_lambda_ema_cfg": float(getattr(args, "pref_lambda_ema", 0.0)),
+                "train/pref_violation_clip": float(getattr(args, "pref_violation_clip", 0.0)),
+                "train/pref_violation_target": float(getattr(args, "pref_violation_target", 0.0)),
+            }
+        )
+        if pref_rows > 0.0:
+            logs["train/pref_linked_rows"] = float(pref_rows / denom)
+            logs["train/pref_q_delta_mean"] = float(update_window["pref_q_delta_sum"] / pref_rows)
+            logs["train/pref_q_teacher_mean"] = float(update_window["pref_q_teacher_sum"] / pref_rows)
+            logs["train/pref_q_student_mean"] = float(update_window["pref_q_student_sum"] / pref_rows)
+            logs["train/pref_action_delta_l2"] = float(update_window["pref_action_delta_l2_sum"] / pref_rows)
 
 
 def _build_transition(
@@ -799,7 +983,7 @@ def run_minimal_training(args) -> None:
     high_np = np.asarray(env.action_space.high, dtype=np.float32).reshape(-1)
     low_t = torch.as_tensor(low_np, device=device, dtype=torch.float32).view(1, -1)
     high_t = torch.as_tensor(high_np, device=device, dtype=torch.float32).view(1, -1)
-    if bool(getattr(args, "use_intervention", False)):
+    if bool(getattr(args, "use_intervention", False)) and not bool(getattr(args, "offline_only", False)):
         env.close()
         controller = build_human_controller(
             input_device=str(getattr(args, "human_input_device", "keyboard")),
@@ -825,10 +1009,16 @@ def run_minimal_training(args) -> None:
             expert_switch_clearance_threshold=float(getattr(args, "expert_switch_clearance_threshold", 0.08)),
             expert_device=str(getattr(args, "expert_device", "cpu")),
             prefer_separate_keyboard_window=str(getattr(args, "render_mode", "none")).lower() == "human",
+            control_scheme_override=resolve_control_scheme(
+                str(args.env_name),
+                car_action_mode=str(getattr(args, "car_action_mode", "raw_wheels")),
+            ),
         )
         env = _make_env_with_wrappers(args=args, seed=int(args.seed), with_intervention=True, controller=controller)
         obs, _ = env.reset(seed=int(args.seed))
         obs = np.asarray(obs, dtype=np.float32).reshape(-1)
+    elif bool(getattr(args, "use_intervention", False)) and bool(getattr(args, "offline_only", False)):
+        print("[Offline] ignoring live human intervention inputs during offline-only training.", flush=True)
 
     module_impl = str(getattr(args, "module_impl", "fastsac")).strip().lower()
     if module_impl == "custom":
@@ -968,6 +1158,14 @@ def run_minimal_training(args) -> None:
         if found is not None:
             demo_dataset_path = str(found)
             print(f"[Dataset] auto-selected SafetyGym dataset {demo_dataset_path}", flush=True)
+    loaded_dataset_for_normalizer = None
+    if (
+        demo_dataset_path
+        and bool(getattr(args, "offline_only", False))
+        and bool(args.obs_normalization)
+        and not str(getattr(args, "init_checkpoint_path", "") or "").strip()
+    ):
+        loaded_dataset_for_normalizer = load_transition_dataset(demo_dataset_path)
     if demo_dataset_path:
         max_rows = int(getattr(args, "demo_dataset_max_rows", 0))
         if dataset_target == "replay":
@@ -1058,6 +1256,41 @@ def run_minimal_training(args) -> None:
                 if len(pref_pairs) > pref_capacity:
                     pref_pairs = pref_pairs[-pref_capacity:]
                 print(f"[Dataset] loaded {len(pref_pairs)} preference pairs from intervened dataset rows", flush=True)
+    if loaded_dataset_for_normalizer is not None:
+        norm_rows = _update_obs_normalizer_from_dataset(
+            obs_normalizer=obs_normalizer,
+            dataset=loaded_dataset_for_normalizer,
+            device=device,
+        )
+        if norm_rows > 0:
+            print(f"[Dataset] fit observation normalizer from {norm_rows} offline dataset rows", flush=True)
+
+    export_replay_interval = int(max(0, getattr(args, "export_replay_dataset_interval", 0)))
+    export_replay_dataset_path: str | None = None
+    next_export_replay_step: int | None = None
+    last_export_replay_step: int | None = None
+    if export_replay_interval > 0 and not bool(getattr(args, "offline_only", False)):
+        configured_path = str(getattr(args, "export_replay_dataset_path", "") or "").strip()
+        if configured_path:
+            export_replay_dataset_path = configured_path
+        else:
+            dataset_root = (
+                str(getattr(args, "export_replay_dataset_dir", "") or "").strip() or str(DEFAULT_SAFETYGYM_DATASET_DIR)
+            )
+            dataset_label = str(getattr(args, "export_replay_dataset_label", "") or "").strip() or "online_replay"
+            export_replay_dataset_path = str(
+                build_dataset_path(
+                    env_name=str(args.env_name),
+                    dataset_dir=dataset_root,
+                    label=dataset_label,
+                )
+            )
+        next_export_replay_step = export_replay_interval
+        print(
+            "[Dataset] SafetyGym replay snapshots enabled "
+            f"path={export_replay_dataset_path} interval={export_replay_interval}",
+            flush=True,
+        )
 
     def _reset_obs(reset_seed: int | None):
         if reset_seed is None:
@@ -1208,13 +1441,224 @@ def run_minimal_training(args) -> None:
                 if wandb_run is not None:
                     wandb_run.log(pretrain_logs, step=0)
 
+    def _sample_training_batch() -> TensorDict:
+        if variant == "pvp" and novice_rb is not None and human_rb is not None:
+            half = max(1, int(args.batch_size // 2))
+            if human_rb.size >= half and novice_rb.size >= max(1, int(args.batch_size - half)):
+                batch_n = novice_rb.sample(max(1, int(args.batch_size - half)))
+                batch_h = human_rb.sample(half)
+                return TensorDict.cat([batch_n, batch_h], dim=0)
+            if novice_rb.size >= int(args.batch_size):
+                return novice_rb.sample(int(args.batch_size))
+            return main_rb.sample(int(args.batch_size))
+        if (
+            variant in {"own", "hilserl"}
+            and demo_rb is not None
+            and demo_rb.size > 0
+            and float(getattr(args, "demo_sample_ratio", 0.0)) > 0.0
+        ):
+            demo_n = int(max(1, args.batch_size * float(getattr(args, "demo_sample_ratio", 0.0))))
+            base_n = max(1, int(args.batch_size - demo_n))
+            if main_rb.size >= base_n and demo_rb.size >= demo_n:
+                return TensorDict.cat([main_rb.sample(base_n), demo_rb.sample(demo_n)], dim=0)
+        return main_rb.sample(int(args.batch_size))
+
+    def _sample_pref_batch_for_update():
+        if variant != "own" or float(getattr(args, "pref_sample_ratio", 0.0)) <= 0.0:
+            return None
+        pref_n = max(1, int(args.batch_size * float(getattr(args, "pref_sample_ratio", 0.0))))
+        if pref_sampling_mode == "linked":
+            return _sample_linked_pref_batch(main_rb, pref_n, device)
+        return _sample_pref_batch(pref_pairs, pref_n, device)
+
+    def _run_update_step(update_index: int) -> SACUpdateMetrics:
+        return sac_update_step(
+            sac=sac,
+            batch=_sample_training_batch(),
+            gamma=float(args.gamma),
+            tau=float(args.tau),
+            max_grad_norm=float(args.max_grad_norm),
+            obs_preprocess=obs_normalizer,
+            pref_batch=_sample_pref_batch_for_update(),
+            pref_rank_weight=float(getattr(args, "pref_rank_weight", 0.0)) if variant == "own" else 0.0,
+            pref_rank_margin=float(getattr(args, "pref_rank_margin", 0.1)),
+            pref_loss_type=str(getattr(args, "pref_loss_type", "margin")),
+            pref_stopgrad_positive=bool(getattr(args, "pref_stopgrad_positive", False)),
+            pref_lambda_lr=float(getattr(args, "pref_lambda_lr", 1e-3)),
+            pref_lambda_max=float(getattr(args, "pref_lambda_max", 10.0)),
+            pref_lambda_ema=float(getattr(args, "pref_lambda_ema", 0.9)),
+            pref_violation_clip=float(getattr(args, "pref_violation_clip", 10.0)),
+            pref_violation_target=float(getattr(args, "pref_violation_target", 0.0)),
+            pref_lagrangian_violation_type=str(getattr(args, "pref_lagrangian_violation_type", "hinge")),
+            alpha_min=float(args.alpha_min),
+            alpha_max=float(args.alpha_max),
+            scale_actor_to_env_bounds=bool(args.scale_actor_to_env_bounds),
+            action_low=low_t,
+            action_high=high_t,
+            update_actor=(update_index % int(max(1, args.policy_frequency)) == 0),
+            critic_loss_reduction=str(args.critic_loss_reduction),
+        )
+
+    if bool(getattr(args, "offline_only", False)):
+        if main_rb.size < int(args.batch_size):
+            raise ValueError(
+                f"Offline-only training requires at least batch_size={int(args.batch_size)} replay rows, got {int(main_rb.size)}."
+            )
+        start_time = time.time()
+        next_log = int(args.log_interval) if int(args.log_interval) > 0 else None
+        next_eval = int(args.eval_interval)
+        next_save = int(args.save_interval)
+        total_updates = 0
+        update_window: dict[str, float] = defaultdict(float)
+
+        for update_step in range(1, int(args.total_timesteps) + 1):
+            total_updates += 1
+            last_update = _run_update_step(total_updates)
+            _accumulate_update_metrics(update_window, last_update)
+            step = update_step
+
+            if next_log is not None and step >= next_log:
+                next_log += int(args.log_interval)
+                elapsed = max(1e-6, time.time() - start_time)
+                logs: Dict[str, float] = {
+                    "train/step": float(step),
+                    "train/update_step": float(step),
+                    "train/offline_only": 1.0,
+                    "train/fps": float(step / elapsed),
+                    "train/replay_size": float(main_rb.size),
+                    "train/buffer_main_size": float(main_rb.size),
+                }
+                if demo_rb is not None:
+                    logs["train/buffer_demo_size"] = float(demo_rb.size)
+                if novice_rb is not None:
+                    logs["train/buffer_novice_size"] = float(novice_rb.size)
+                if human_rb is not None:
+                    logs["train/buffer_human_size"] = float(human_rb.size)
+                if variant == "own":
+                    if pref_sampling_mode == "linked":
+                        logs["train/buffer_pref_size"] = float(main_rb.linked_pref_pair_count())
+                    else:
+                        logs["train/buffer_pref_size"] = float(len(pref_pairs))
+                _append_update_window_logs(logs=logs, update_window=update_window, variant=variant, args=args)
+                update_window.clear()
+                print(json.dumps(logs, sort_keys=True), flush=True)
+                if wandb_run is not None:
+                    wandb_run.log(logs, step=step)
+
+            if int(args.eval_interval) > 0 and step >= next_eval:
+                next_eval += int(args.eval_interval)
+                eval_logs = _run_eval(
+                    sac.actor,
+                    args,
+                    device,
+                    obs_normalizer=obs_normalizer,
+                    log_dir=log_dir,
+                    step_value=step,
+                )
+                eval_logs["eval/step"] = float(step)
+                print(json.dumps(eval_logs, sort_keys=True), flush=True)
+                if wandb_run is not None:
+                    wandb_run.log(eval_logs, step=step)
+
+            if int(args.save_interval) > 0 and step >= next_save:
+                next_save += int(args.save_interval)
+                checkpoint_path = model_dir / f"step_{step}.pt"
+                _save_checkpoint(
+                    path=checkpoint_path,
+                    actor=sac.actor,
+                    critic=sac.critic,
+                    critic_target=sac.critic_target,
+                    actor_optimizer=sac.actor_optimizer,
+                    critic_optimizer=sac.critic_optimizer,
+                    alpha_optimizer=sac.alpha_optimizer,
+                    log_alpha=sac.log_alpha,
+                    obs_normalizer=obs_normalizer,
+                    step=step,
+                    save_optimizer_state=bool(getattr(args, "save_optimizer_state_in_checkpoints", True)),
+                )
+                _maybe_render_policy_map(
+                    args=args,
+                    checkpoint_path=checkpoint_path,
+                    step_value=int(step),
+                    log_dir=log_dir,
+                    wandb_run=wandb_run,
+                )
+
+        final_checkpoint = model_dir / "final.pt"
+        _save_checkpoint(
+            path=final_checkpoint,
+            actor=sac.actor,
+            critic=sac.critic,
+            critic_target=sac.critic_target,
+            actor_optimizer=sac.actor_optimizer,
+            critic_optimizer=sac.critic_optimizer,
+            alpha_optimizer=sac.alpha_optimizer,
+            log_alpha=sac.log_alpha,
+            obs_normalizer=obs_normalizer,
+            step=int(args.total_timesteps),
+            save_optimizer_state=bool(getattr(args, "save_optimizer_state_in_checkpoints", True)),
+        )
+        _maybe_render_policy_map(
+            args=args,
+            checkpoint_path=final_checkpoint,
+            step_value=int(args.total_timesteps),
+            log_dir=log_dir,
+            wandb_run=wandb_run,
+        )
+
+        final_eval = _run_eval(
+            sac.actor,
+            args,
+            device,
+            obs_normalizer=obs_normalizer,
+            log_dir=log_dir,
+            step_value=int(args.total_timesteps),
+        )
+        final_eval["eval/step"] = float(args.total_timesteps)
+        print(json.dumps(final_eval, sort_keys=True), flush=True)
+        export_logs: Dict[str, float] = {}
+        export_logs.update(
+            _maybe_export_final_buffer_dataset(
+                args=args,
+                buffer=main_rb,
+                env_name=str(args.env_name),
+                variant=variant,
+                reward_mode=str(args.reward_mode),
+                label_suffix="replay",
+                explicit_path=str(getattr(args, "export_final_replay_dataset_path", "") or ""),
+                enabled=bool(getattr(args, "export_final_replay_dataset", False)),
+            )
+        )
+        export_logs.update(
+            _maybe_export_final_buffer_dataset(
+                args=args,
+                buffer=demo_rb,
+                env_name=str(args.env_name),
+                variant=variant,
+                reward_mode=str(args.reward_mode),
+                label_suffix="demo",
+                explicit_path=str(getattr(args, "export_final_demo_dataset_path", "") or ""),
+                enabled=bool(getattr(args, "export_final_demo_dataset", False)),
+                filter_mode="all",
+            )
+        )
+        if wandb_run is not None:
+            wandb_run.log(final_eval, step=int(args.total_timesteps))
+            if export_logs:
+                wandb_run.log(export_logs, step=int(args.total_timesteps))
+            wandb_run.finish()
+        env.close()
+        if controller is not None and hasattr(controller, "close"):
+            controller.close()
+        return
+
     if prefill_steps > 0:
         obs = _reset_obs(int(args.seed) + 20_000)
 
     win = EpisodeWindow(size=100)
     max_steps = extract_step_limit(env)
     start_time = time.time()
-    next_log = int(args.log_interval)
+    next_log = int(args.log_interval) if int(args.log_interval) > 0 else None
     next_eval = int(args.eval_interval)
     next_save = int(args.save_interval)
     effective_learning_starts = max(0, int(args.learning_starts) - prefill_steps)
@@ -1241,6 +1685,7 @@ def run_minimal_training(args) -> None:
     total_updates = 0
     episode_idx = 0
     last_update: SACUpdateMetrics | None = None
+    update_window: dict[str, float] = defaultdict(float)
 
     for step in range(1, int(args.total_timesteps) + 1):
         if step <= int(effective_learning_starts):
@@ -1332,65 +1777,8 @@ def run_minimal_training(args) -> None:
         if step > int(effective_learning_starts) and rb_ready:
             for _ in range(int(args.num_updates)):
                 total_updates += 1
-                if variant == "pvp" and novice_rb is not None and human_rb is not None:
-                    half = max(1, int(args.batch_size // 2))
-                    if human_rb.size >= half and novice_rb.size >= max(1, int(args.batch_size - half)):
-                        batch_n = novice_rb.sample(max(1, int(args.batch_size - half)))
-                        batch_h = human_rb.sample(half)
-                        batch = TensorDict.cat([batch_n, batch_h], dim=0)
-                    elif novice_rb.size >= int(args.batch_size):
-                        batch = novice_rb.sample(int(args.batch_size))
-                    else:
-                        batch = main_rb.sample(int(args.batch_size))
-                elif (
-                    variant in {"own", "hilserl"}
-                    and demo_rb is not None
-                    and demo_rb.size > 0
-                    and float(getattr(args, "demo_sample_ratio", 0.0)) > 0.0
-                ):
-                    demo_n = int(max(1, args.batch_size * float(getattr(args, "demo_sample_ratio", 0.0))))
-                    base_n = max(1, int(args.batch_size - demo_n))
-                    if main_rb.size >= base_n and demo_rb.size >= demo_n:
-                        batch = TensorDict.cat([main_rb.sample(base_n), demo_rb.sample(demo_n)], dim=0)
-                    else:
-                        batch = main_rb.sample(int(args.batch_size))
-                else:
-                    batch = main_rb.sample(int(args.batch_size))
-
-                pref_batch = None
-                if variant == "own" and float(getattr(args, "pref_sample_ratio", 0.0)) > 0.0:
-                    pref_n = max(1, int(args.batch_size * float(getattr(args, "pref_sample_ratio", 0.0))))
-                    if pref_sampling_mode == "linked":
-                        pref_batch = _sample_linked_pref_batch(main_rb, pref_n, device)
-                    else:
-                        pref_batch = _sample_pref_batch(pref_pairs, pref_n, device)
-
-                last_update = sac_update_step(
-                    sac=sac,
-                    batch=batch,
-                    gamma=float(args.gamma),
-                    tau=float(args.tau),
-                    max_grad_norm=float(args.max_grad_norm),
-                    obs_preprocess=obs_normalizer,
-                    pref_batch=pref_batch,
-                    pref_rank_weight=float(getattr(args, "pref_rank_weight", 0.0)) if variant == "own" else 0.0,
-                    pref_rank_margin=float(getattr(args, "pref_rank_margin", 0.1)),
-                    pref_loss_type=str(getattr(args, "pref_loss_type", "margin")),
-                    pref_stopgrad_positive=bool(getattr(args, "pref_stopgrad_positive", False)),
-                    pref_lambda_lr=float(getattr(args, "pref_lambda_lr", 1e-3)),
-                    pref_lambda_max=float(getattr(args, "pref_lambda_max", 10.0)),
-                    pref_lambda_ema=float(getattr(args, "pref_lambda_ema", 0.9)),
-                    pref_violation_clip=float(getattr(args, "pref_violation_clip", 10.0)),
-                    pref_violation_target=float(getattr(args, "pref_violation_target", 0.0)),
-                    pref_lagrangian_violation_type=str(getattr(args, "pref_lagrangian_violation_type", "hinge")),
-                    alpha_min=float(args.alpha_min),
-                    alpha_max=float(args.alpha_max),
-                    scale_actor_to_env_bounds=bool(args.scale_actor_to_env_bounds),
-                    action_low=low_t,
-                    action_high=high_t,
-                    update_actor=(total_updates % int(max(1, args.policy_frequency)) == 0),
-                    critic_loss_reduction=str(args.critic_loss_reduction),
-                )
+                last_update = _run_update_step(total_updates)
+                _accumulate_update_metrics(update_window, last_update)
 
         if terminated or truncated:
             final_dist = extract_goal_distance(env)
@@ -1453,7 +1841,7 @@ def run_minimal_training(args) -> None:
             ep_first_goal_reward_sum = 0.0
             ep_first_goal_dense_reward_sum = 0.0
 
-        if step >= next_log:
+        if next_log is not None and step >= next_log:
             next_log += int(args.log_interval)
             elapsed = max(1e-6, time.time() - start_time)
             logs: Dict[str, float] = {
@@ -1474,33 +1862,8 @@ def run_minimal_training(args) -> None:
                 else:
                     logs["train/buffer_pref_size"] = float(len(pref_pairs))
             logs.update(augment_rollout_summary(win.summary("train"), "train"))
-            if last_update is not None:
-                logs.update(
-                    {
-                        "train/critic_loss": float(last_update.critic_loss),
-                        "train/actor_loss": float(last_update.actor_loss),
-                        "train/alpha_loss": float(last_update.alpha_loss),
-                        "train/alpha": float(last_update.alpha),
-                        "train/target_q_mean": float(last_update.target_q_mean),
-                        "train/q_min_pi_mean": float(last_update.q_min_pi_mean),
-                        "train/q_min_data_mean": float(last_update.q_min_data_mean),
-                        "train/q_gap_mean": float(last_update.q_disagreement_data_mean),
-                        "train/replay_reward_mean": float(last_update.replay_reward_mean),
-                        "train/actor_updates_per_iter": float(last_update.actor_updates),
-                        "train/alpha_updates_per_iter": float(last_update.alpha_updates),
-                    }
-                )
-                if variant == "own":
-                    logs.update(
-                        {
-                            "train/critic_loss_pref": float(last_update.critic_loss_pref),
-                            "train/critic_loss_pref_weighted": float(last_update.critic_loss_pref_weighted),
-                            "train/pref_q_delta": float(last_update.pref_q_delta),
-                            "train/pref_lambda": float(last_update.pref_lambda),
-                            "train/pref_violation": float(last_update.pref_violation),
-                            "train/pref_violation_ema": float(last_update.pref_violation_ema),
-                        }
-                    )
+            _append_update_window_logs(logs=logs, update_window=update_window, variant=variant, args=args)
+            update_window.clear()
             print(json.dumps(logs, sort_keys=True), flush=True)
             if wandb_run is not None:
                 wandb_run.log(logs, step=step)
@@ -1544,6 +1907,30 @@ def run_minimal_training(args) -> None:
                 wandb_run=wandb_run,
             )
 
+        while next_export_replay_step is not None and step >= next_export_replay_step:
+            if main_rb.size > 0 and export_replay_dataset_path is not None:
+                try:
+                    export_logs = _export_replay_snapshot(
+                        args=args,
+                        replay_buffer=main_rb,
+                        dataset_path=export_replay_dataset_path,
+                        env_name=str(args.env_name),
+                        step_value=int(step),
+                        tag="periodic",
+                        context="online_training",
+                    )
+                    last_export_replay_step = int(step)
+                    print(
+                        "[Dataset] saved SafetyGym replay snapshot "
+                        f"step={step} path={export_replay_dataset_path}",
+                        flush=True,
+                    )
+                    if wandb_run is not None:
+                        wandb_run.log(export_logs, step=step)
+                except Exception as exc:
+                    print(f"[Dataset] failed to save periodic SafetyGym replay snapshot: {exc}", flush=True)
+            next_export_replay_step += export_replay_interval
+
     final_checkpoint = model_dir / "final.pt"
     _save_checkpoint(
         path=final_checkpoint,
@@ -1577,6 +1964,27 @@ def run_minimal_training(args) -> None:
     final_eval["eval/step"] = float(args.total_timesteps)
     print(json.dumps(final_eval, sort_keys=True), flush=True)
     export_logs: Dict[str, float] = {}
+    if export_replay_dataset_path is not None and main_rb.size > 0:
+        try:
+            export_logs.update(
+                _export_replay_snapshot(
+                    args=args,
+                    replay_buffer=main_rb,
+                    dataset_path=export_replay_dataset_path,
+                    env_name=str(args.env_name),
+                    step_value=int(args.total_timesteps),
+                    tag="final",
+                    context="online_training",
+                )
+            )
+            last_export_replay_step = int(args.total_timesteps)
+            print(
+                "[Dataset] saved final SafetyGym replay snapshot "
+                f"step={int(args.total_timesteps)} path={export_replay_dataset_path}",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"[Dataset] failed to save final SafetyGym replay snapshot: {exc}", flush=True)
     export_logs.update(
         _maybe_export_final_buffer_dataset(
             args=args,

@@ -31,7 +31,7 @@ from .dataset_io import (
     save_buffer_as_transition_dataset,
 )
 from .gamepad import DEFAULT_SAFETY_GAMEPAD_CACHE_PATH, DEFAULT_SAFETY_GAMEPAD_CONFIG_PATH, DEFAULT_SAFETY_GAMEPAD_PORT
-from .env import clip_action_to_space, extract_goal_distance, extract_step_limit, make_safety_env, scale_action_np
+from .env import clip_action_to_space, extract_goal_distance, extract_step_limit, make_safety_env, resolve_control_scheme, scale_action_np
 from .io import save_args_json
 from .metrics import EpisodeWindow, augment_rollout_summary, classify_outcome
 from .policy_viz import _extract_bounds, _extract_overlay_specs, plot_episode_contact_sheet, plot_eval_episode_trajectory
@@ -368,6 +368,7 @@ def _make_env_with_wrappers(
         surface_mode=getattr(args, "surface_mode", "default"),
         car_wheel_command_limit=float(getattr(args, "car_wheel_command_limit", 2.0)),
         car_force_scale=float(getattr(args, "car_force_scale", 2.0)),
+        car_action_mode=str(getattr(args, "car_action_mode", "raw_wheels")),
         seed=seed,
     )
     env = RewardModeWrapper(
@@ -1055,6 +1056,10 @@ def run_training(args, *, variant: str) -> None:
             gamepad_use_saved_config=bool(getattr(args, "gamepad_use_saved_config", True)),
             gamepad_device_index=int(getattr(args, "gamepad_device_index", 0)),
             prefer_separate_keyboard_window=wants_external_viewer(getattr(args, "render_mode", "human")),
+            control_scheme_override=resolve_control_scheme(
+                str(args.env_name),
+                car_action_mode=str(getattr(args, "car_action_mode", "raw_wheels")),
+            ),
         )
 
     env = _make_env_with_wrappers(
@@ -1090,6 +1095,10 @@ def run_training(args, *, variant: str) -> None:
             gamepad_use_saved_config=bool(getattr(args, "gamepad_use_saved_config", True)),
             gamepad_device_index=int(getattr(args, "gamepad_device_index", 0)),
             prefer_separate_keyboard_window=wants_external_viewer(getattr(args, "render_mode", "human")),
+            control_scheme_override=resolve_control_scheme(
+                str(args.env_name),
+                car_action_mode=str(getattr(args, "car_action_mode", "raw_wheels")),
+            ),
         )
         env.close()
         env = _make_env_with_wrappers(args=args, seed=args.seed, with_intervention=True, controller=controller)

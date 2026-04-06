@@ -53,6 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--surface_mode", type=str, default="default", choices=["default", "grippy"])
     p.add_argument("--car_wheel_command_limit", type=float, default=2.0)
     p.add_argument("--car_force_scale", type=float, default=2.0)
+    p.add_argument("--car_action_mode", type=str, default="raw_wheels", choices=["raw_wheels", "throttle_turn", "cardinal"])
     p.add_argument("--max_episode_steps", type=int, default=0)
     p.add_argument("--use_intervention", action="store_true", default=False)
     p.add_argument("--intervention_threshold", type=float, default=0.1)

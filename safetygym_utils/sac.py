@@ -226,11 +226,14 @@ class SACTensors:
 
 @dataclass
 class SACUpdateMetrics:
-    critic_loss: float
-    actor_loss: float
-    alpha_loss: float
-    alpha: float
-    target_q_mean: float
+    critic_loss: float = 0.0
+    critic_loss_replay: float = 0.0
+    critic_loss_total: float = 0.0
+    actor_loss: float = 0.0
+    actor_loss_sac: float = 0.0
+    alpha_loss: float = 0.0
+    alpha: float = 0.0
+    target_q_mean: float = 0.0
     policy_entropy: float = 0.0
     log_pi_mean: float = 0.0
     action_l2: float = 0.0
@@ -245,6 +248,10 @@ class SACUpdateMetrics:
     critic_loss_pref: float = 0.0
     critic_loss_pref_weighted: float = 0.0
     pref_q_delta: float = 0.0
+    pref_q_teacher_mean: float = 0.0
+    pref_q_student_mean: float = 0.0
+    pref_action_delta_l2: float = 0.0
+    pref_linked_rows: float = 0.0
     pref_lambda: float = 0.0
     pref_lambda_delta: float = 0.0
     pref_dual_violation: float = 0.0
@@ -252,6 +259,11 @@ class SACUpdateMetrics:
     pref_violation: float = 0.0
     pref_violation_ema: float = 0.0
     pref_lagrangian_loss: float = 0.0
+    q_min_teacher_action_mean: float = 0.0
+    q_min_teacher_action_count: float = 0.0
+    q_min_non_teacher_action_mean: float = 0.0
+    q_min_non_teacher_action_count: float = 0.0
+    batch_teacher_fraction: float = 0.0
 
 
 @dataclass
@@ -469,6 +481,7 @@ def sac_update_step(
     q_max_data = torch.max(q_stack_data, dim=0).values
     q_disagreement_data = q_max_data - q_min_data
     q_losses = torch.stack([F.mse_loss(q, target_q) for q in q_list], dim=0)
+    critic_loss_replay_value = float(q_losses.detach().mean().cpu().item())
     if str(critic_loss_reduction).strip().lower() == "sum":
         critic_loss = q_losses.sum()
     else:
@@ -476,6 +489,10 @@ def sac_update_step(
     critic_loss_pref = torch.tensor(0.0, device=obs.device)
     critic_loss_pref_weighted = torch.tensor(0.0, device=obs.device)
     pref_q_delta = 0.0
+    pref_q_teacher_mean = 0.0
+    pref_q_student_mean = 0.0
+    pref_action_delta_l2 = 0.0
+    pref_linked_rows = 0.0
     pref_lambda_value = float(sac.pref_lambda)
     pref_lambda_delta = 0.0
     pref_dual_violation = float(sac.pref_violation_ema)
@@ -483,6 +500,31 @@ def sac_update_step(
     pref_violation = 0.0
     pref_violation_ema_value = float(sac.pref_violation_ema)
     pref_lagrangian_loss = 0.0
+    q_min_teacher_action_mean = 0.0
+    q_min_teacher_action_count = 0.0
+    q_min_non_teacher_action_mean = 0.0
+    q_min_non_teacher_action_count = 0.0
+    batch_teacher_fraction = 0.0
+
+    teacher_mask = None
+    has_teacher_intervened = False
+    try:
+        has_teacher_intervened = "teacher_intervened" in batch.keys(include_nested=False)
+    except TypeError:
+        has_teacher_intervened = "teacher_intervened" in batch.keys()
+    except Exception:
+        has_teacher_intervened = "teacher_intervened" in batch
+    if has_teacher_intervened:
+        teacher_mask = batch["teacher_intervened"].to(torch.bool).reshape(-1)
+        batch_teacher_fraction = float(teacher_mask.float().mean().detach().cpu().item())
+        q_min_data_flat = q_min_data.reshape(-1)
+        if bool(teacher_mask.any().item()):
+            q_min_teacher_action_mean = float(q_min_data_flat[teacher_mask].detach().mean().cpu().item())
+            q_min_teacher_action_count = float(int(teacher_mask.sum().item()))
+        non_teacher_mask = ~teacher_mask
+        if bool(non_teacher_mask.any().item()):
+            q_min_non_teacher_action_mean = float(q_min_data_flat[non_teacher_mask].detach().mean().cpu().item())
+            q_min_non_teacher_action_count = float(int(non_teacher_mask.sum().item()))
 
     if pref_batch is not None and float(pref_rank_weight) > 0.0:
         pref_obs = pref_batch["obs"]
@@ -490,6 +532,10 @@ def sac_update_step(
         pref_student = pref_batch["student_actions"]
         q_teacher = torch.stack(sac.critic(pref_obs, pref_teacher), dim=0)
         q_student = torch.stack(sac.critic(pref_obs, pref_student), dim=0)
+        pref_q_teacher_mean = float(q_teacher.detach().mean().cpu().item())
+        pref_q_student_mean = float(q_student.detach().mean().cpu().item())
+        pref_action_delta_l2 = float((pref_teacher - pref_student).detach().norm(dim=-1).mean().cpu().item())
+        pref_linked_rows = float(pref_obs.shape[0])
         q_teacher_term = q_teacher.detach() if bool(pref_stopgrad_positive) else q_teacher
         delta = q_teacher_term - q_student
         pref_q_delta = float(delta.detach().mean().cpu().item())
@@ -577,10 +623,14 @@ def sac_update_step(
         alpha_updates = 1.0
 
     soft_update(sac.critic, sac.critic_target, tau)
+    actor_loss_sac_value = float(actor_loss.detach().cpu().item())
 
     return SACUpdateMetrics(
         critic_loss=float(critic_loss.detach().cpu().item()),
+        critic_loss_replay=float(critic_loss_replay_value),
+        critic_loss_total=float(critic_loss_replay_value + float(critic_loss_pref_weighted.detach().cpu().item())),
         actor_loss=float(actor_loss.detach().cpu().item()),
+        actor_loss_sac=float(actor_loss_sac_value),
         alpha_loss=float(alpha_loss.detach().cpu().item()),
         alpha=float(sac.log_alpha.exp().detach().cpu().item()),
         target_q_mean=float(target_q.detach().mean().cpu().item()),
@@ -598,6 +648,10 @@ def sac_update_step(
         critic_loss_pref=float(critic_loss_pref.detach().cpu().item()),
         critic_loss_pref_weighted=float(critic_loss_pref_weighted.detach().cpu().item()),
         pref_q_delta=float(pref_q_delta),
+        pref_q_teacher_mean=float(pref_q_teacher_mean),
+        pref_q_student_mean=float(pref_q_student_mean),
+        pref_action_delta_l2=float(pref_action_delta_l2),
+        pref_linked_rows=float(pref_linked_rows),
         pref_lambda=float(pref_lambda_value),
         pref_lambda_delta=float(pref_lambda_delta),
         pref_dual_violation=float(pref_dual_violation),
@@ -605,4 +659,9 @@ def sac_update_step(
         pref_violation=float(pref_violation),
         pref_violation_ema=float(pref_violation_ema_value),
         pref_lagrangian_loss=float(pref_lagrangian_loss),
+        q_min_teacher_action_mean=float(q_min_teacher_action_mean),
+        q_min_teacher_action_count=float(q_min_teacher_action_count),
+        q_min_non_teacher_action_mean=float(q_min_non_teacher_action_mean),
+        q_min_non_teacher_action_count=float(q_min_non_teacher_action_count),
+        batch_teacher_fraction=float(batch_teacher_fraction),
     )

@@ -114,6 +114,161 @@ class CarActuationWrapper(gym.Wrapper):
         return obs, info
 
 
+class CarThrottleTurnActionWrapper(gym.ActionWrapper):
+    """Expose SafetyCar actions as [throttle, turn] instead of raw wheel commands."""
+
+    def __init__(self, env: gym.Env):
+        super().__init__(env)
+        base_space = getattr(env, "action_space", None)
+        if not isinstance(base_space, gym.spaces.Box):
+            raise TypeError("CarThrottleTurnActionWrapper expects a Box action space.")
+        low = np.asarray(base_space.low, dtype=np.float32).reshape(-1)
+        high = np.asarray(base_space.high, dtype=np.float32).reshape(-1)
+        if low.shape[0] < 2:
+            raise ValueError("CarThrottleTurnActionWrapper expects at least 2 action dims.")
+        self._base_low = low.copy()
+        self._base_high = high.copy()
+        self._wheel_limit = float(max(np.max(np.abs(low[:2])), np.max(np.abs(high[:2])), 1.0))
+        self.action_mode = "throttle_turn"
+        self.action_space = gym.spaces.Box(
+            low=np.full((2,), -1.0, dtype=np.float32),
+            high=np.full((2,), 1.0, dtype=np.float32),
+            dtype=np.float32,
+        )
+
+    def action(self, action):
+        arr = np.asarray(action, dtype=np.float32).reshape(-1)
+        if arr.shape[0] < 2:
+            arr = np.pad(arr, (0, 2 - arr.shape[0]), mode="constant")
+        throttle = float(np.clip(arr[0], -1.0, 1.0))
+        turn = float(np.clip(arr[1], -1.0, 1.0))
+        # Preserve the same max wheel authority as the raw-wheel policy:
+        # throttle=1 -> [wheel_limit, wheel_limit], turn=1 -> [-wheel_limit, wheel_limit].
+        left = self._wheel_limit * np.clip(throttle - turn, -1.0, 1.0)
+        right = self._wheel_limit * np.clip(throttle + turn, -1.0, 1.0)
+        wheel_action = np.asarray([left, right], dtype=np.float32)
+        return np.clip(wheel_action, self._base_low[:2], self._base_high[:2]).astype(np.float32, copy=False)
+
+    def reverse_action(self, action):
+        arr = np.asarray(action, dtype=np.float32).reshape(-1)
+        if arr.shape[0] < 2:
+            arr = np.pad(arr, (0, 2 - arr.shape[0]), mode="constant")
+        wheel_scale = max(1e-6, float(self._wheel_limit))
+        throttle = 0.5 * (float(arr[0]) + float(arr[1])) / wheel_scale
+        turn = 0.5 * (float(arr[1]) - float(arr[0])) / wheel_scale
+        return np.clip(np.asarray([throttle, turn], dtype=np.float32), -1.0, 1.0)
+
+
+class CarCardinalActionWrapper(gym.ActionWrapper):
+    """Expose SafetyCar actions as 2D inputs snapped to 4 cardinal motion primitives."""
+
+    def __init__(self, env: gym.Env, *, deadzone: float = 0.05):
+        super().__init__(env)
+        base_space = getattr(env, "action_space", None)
+        if not isinstance(base_space, gym.spaces.Box):
+            raise TypeError("CarCardinalActionWrapper expects a Box action space.")
+        low = np.asarray(base_space.low, dtype=np.float32).reshape(-1)
+        high = np.asarray(base_space.high, dtype=np.float32).reshape(-1)
+        if low.shape[0] < 2:
+            raise ValueError("CarCardinalActionWrapper expects at least 2 action dims.")
+        self._base_low = low.copy()
+        self._base_high = high.copy()
+        self._wheel_limit = float(max(np.max(np.abs(low[:2])), np.max(np.abs(high[:2])), 1.0))
+        self._deadzone = float(max(0.0, deadzone))
+        self.action_mode = "cardinal"
+        self.action_space = gym.spaces.Box(
+            low=np.full((2,), -1.0, dtype=np.float32),
+            high=np.full((2,), 1.0, dtype=np.float32),
+            dtype=np.float32,
+        )
+
+    def action(self, action):
+        arr = np.asarray(action, dtype=np.float32).reshape(-1)
+        if arr.shape[0] < 2:
+            arr = np.pad(arr, (0, 2 - arr.shape[0]), mode="constant")
+        throttle = float(np.clip(arr[0], -1.0, 1.0))
+        turn = float(np.clip(arr[1], -1.0, 1.0))
+        mag = max(abs(throttle), abs(turn))
+        if mag <= self._deadzone:
+            wheel_action = np.zeros((2,), dtype=np.float32)
+        elif abs(throttle) >= abs(turn):
+            sign = 1.0 if throttle >= 0.0 else -1.0
+            wheel_action = np.asarray([sign * self._wheel_limit, sign * self._wheel_limit], dtype=np.float32)
+        else:
+            sign = 1.0 if turn >= 0.0 else -1.0
+            wheel_action = np.asarray([-sign * self._wheel_limit, sign * self._wheel_limit], dtype=np.float32)
+        return np.clip(wheel_action, self._base_low[:2], self._base_high[:2]).astype(np.float32, copy=False)
+
+    def reverse_action(self, action):
+        arr = np.asarray(action, dtype=np.float32).reshape(-1)
+        if arr.shape[0] < 2:
+            arr = np.pad(arr, (0, 2 - arr.shape[0]), mode="constant")
+        wheel_scale = max(1e-6, float(self._wheel_limit))
+        throttle = 0.5 * (float(arr[0]) + float(arr[1])) / wheel_scale
+        turn = 0.5 * (float(arr[1]) - float(arr[0])) / wheel_scale
+        mag = max(abs(throttle), abs(turn))
+        if mag <= self._deadzone:
+            return np.zeros((2,), dtype=np.float32)
+        if abs(throttle) >= abs(turn):
+            return np.asarray([1.0 if throttle >= 0.0 else -1.0, 0.0], dtype=np.float32)
+        return np.asarray([0.0, 1.0 if turn >= 0.0 else -1.0], dtype=np.float32)
+
+
+class GoalOnlyLidarObservationWrapper(gym.Wrapper):
+    """Zero all non-goal lidar channels while preserving agent proprio and goal lidar."""
+
+    def __init__(self, env: gym.Env):
+        super().__init__(env)
+        base = unwrap_env(env)
+        task = getattr(base, "task", None)
+        obs_space_dict = getattr(getattr(task, "obs_info", None), "obs_space_dict", None)
+        if not isinstance(obs_space_dict, gym.spaces.Dict):
+            raise TypeError("GoalOnlyLidarObservationWrapper requires a Dict-backed Safety-Gym observation space.")
+        self._masked_keys = tuple(
+            key
+            for key in obs_space_dict.spaces.keys()
+            if key.endswith("_lidar") and key != "goal_lidar"
+        )
+        self._flattened = bool(getattr(task, "observation_flatten", True))
+        self._flat_slices: dict[str, slice] = {}
+        offset = 0
+        for key, space in obs_space_dict.spaces.items():
+            width = int(gym.spaces.utils.flatdim(space))
+            self._flat_slices[key] = slice(offset, offset + width)
+            offset += width
+        self.observation_space = env.observation_space
+
+    def _mask_observation(self, observation):
+        if not self._masked_keys:
+            return observation
+        if self._flattened:
+            arr = np.asarray(observation).copy()
+            for key in self._masked_keys:
+                sl = self._flat_slices.get(key)
+                if sl is not None:
+                    arr[sl] = 0
+            return arr
+        masked = dict(observation)
+        for key in self._masked_keys:
+            if key in masked:
+                masked[key] = np.zeros_like(masked[key])
+        return masked
+
+    def reset(self, **kwargs):
+        observation, info = self.env.reset(**kwargs)
+        return self._mask_observation(observation), info
+
+    def step(self, action):
+        out = self.env.step(action)
+        if len(out) == 6:
+            observation, reward, cost, terminated, truncated, info = out
+            return self._mask_observation(observation), reward, cost, terminated, truncated, info
+        if len(out) == 5:
+            observation, reward, terminated, truncated, info = out
+            return self._mask_observation(observation), reward, terminated, truncated, info
+        raise ValueError(f"Unexpected env.step() output length for GoalOnlyLidarObservationWrapper: {len(out)}")
+
+
 def ensure_safety_gymnasium_importable() -> None:
     """Add the local safety-gymnasium checkout to sys.path when present."""
     repo_root = Path(__file__).resolve().parent.parent
@@ -132,6 +287,8 @@ def make_safety_env(
     surface_mode: str = "default",
     car_wheel_command_limit: float = 2.0,
     car_force_scale: float = 2.0,
+    car_action_mode: str = "raw_wheels",
+    obs_mask_mode: str = "none",
     seed: Optional[int] = None,
 ):
     ensure_safety_gymnasium_importable()
@@ -149,10 +306,33 @@ def make_safety_env(
             wheel_command_limit=car_wheel_command_limit,
             force_scale=car_force_scale,
         )
+        action_mode = str(car_action_mode).strip().lower()
+        if action_mode not in {"raw_wheels", "throttle_turn", "cardinal"}:
+            raise ValueError(f"Unsupported car_action_mode: {car_action_mode}")
+        if action_mode == "throttle_turn":
+            env = CarThrottleTurnActionWrapper(env)
+        elif action_mode == "cardinal":
+            env = CarCardinalActionWrapper(env)
+    obs_mask_mode_l = str(obs_mask_mode).strip().lower()
+    if obs_mask_mode_l not in {"none", "goal_only_lidar"}:
+        raise ValueError(f"Unsupported obs_mask_mode: {obs_mask_mode}")
+    if obs_mask_mode_l == "goal_only_lidar":
+        env = GoalOnlyLidarObservationWrapper(env)
     env = SurfaceConfigWrapper(env, mode=surface_mode)
     if seed is not None:
         env.reset(seed=int(seed))
     return env
+
+
+def resolve_control_scheme(env_name: str, *, car_action_mode: str = "raw_wheels") -> str:
+    name = str(env_name).lower()
+    if "car" in name:
+        return (
+            "planar_velocity"
+            if str(car_action_mode).strip().lower() in {"throttle_turn", "cardinal"}
+            else "differential_wheels"
+        )
+    return "planar_velocity"
 
 
 def unwrap_env(env):

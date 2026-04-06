@@ -608,9 +608,10 @@ def build_human_controller(
     expert_device: str = "cpu",
     show_overlay: bool = True,
     prefer_separate_keyboard_window: bool = False,
+    control_scheme_override: str | None = None,
 ):
     input_device = str(input_device).lower()
-    control_scheme = infer_control_scheme(env_name)
+    control_scheme = str(control_scheme_override).strip() if control_scheme_override else infer_control_scheme(env_name)
     if input_device == "expert":
         if obs_dim is None or action_low is None or action_high is None:
             raise ValueError("Expert controller requires obs_dim plus action_low/action_high.")
