@@ -411,39 +411,6 @@ def _sample_pref_batch(pref_pairs: list[Dict[str, np.ndarray]], batch_size: int,
     }
 
 
-def _sample_linked_pref_batch(
-    replay_buffer: SimpleReplayBuffer,
-    batch_size: int,
-    device: torch.device,
-):
-    if int(getattr(replay_buffer, "n_env", 1)) != 1:
-        raise ValueError("SafetyGym linked preference sampling currently expects a single-env replay buffer.")
-    cap = int(replay_buffer.env_capacities[0])
-    if cap <= 1 or int(replay_buffer.filled[0].item()) <= 0:
-        return None
-    valid_mask = (
-        replay_buffer.transition_ready[0, :cap]
-        & replay_buffer.valid_next_mask[0, :cap]
-        & replay_buffer.teacher_intervened[0, :cap]
-    )
-    valid_indices = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1)
-    if valid_indices.numel() <= 0:
-        return None
-    n = min(int(batch_size), int(valid_indices.numel()))
-    if n <= 0:
-        return None
-    sample_ids = torch.randperm(valid_indices.numel(), device=replay_buffer.storage_device)[:n]
-    idx = valid_indices.index_select(0, sample_ids)
-    obs = replay_buffer._gather_observations(0, idx).to(device=device, dtype=torch.float32, non_blocking=True)
-    teacher = replay_buffer.actions[0, idx].to(device=device, dtype=torch.float32, non_blocking=True)
-    student = replay_buffer.student_actions[0, idx].to(device=device, dtype=torch.float32, non_blocking=True)
-    return {
-        "obs": obs,
-        "teacher_actions": teacher,
-        "student_actions": student,
-    }
-
-
 def _build_transition(
     *,
     obs: np.ndarray,
@@ -1601,8 +1568,7 @@ def run_training(args, *, variant: str) -> None:
                     and float(args.pref_sample_ratio) > 0.0
                     and pref_sampling_mode == "linked"
                 ):
-                    pref_n = max(1, int(args.batch_size * float(args.pref_sample_ratio)))
-                    pref_batch = _sample_linked_pref_batch(main_rb, pref_n, device)
+                    pref_batch = None
                 elif variant == "own" and float(args.pref_sample_ratio) > 0.0 and pref_pairs:
                     pref_n = max(1, int(args.batch_size * float(args.pref_sample_ratio)))
                     pref_batch = _sample_pref_batch(pref_pairs, pref_n, device)
@@ -1615,6 +1581,7 @@ def run_training(args, *, variant: str) -> None:
                     max_grad_norm=float(args.max_grad_norm),
                     obs_preprocess=obs_preprocess,
                     pref_batch=pref_batch,
+                    pref_sampling_mode=pref_sampling_mode if variant == "own" else "separate",
                     pref_rank_weight=float(getattr(args, "pref_rank_weight", 0.0)),
                     pref_rank_margin=float(getattr(args, "pref_rank_margin", 0.1)),
                     pref_loss_type=str(getattr(args, "pref_loss_type", "margin")),

@@ -845,35 +845,6 @@ def _sample_pref_batch(pref_pairs: list[Dict[str, np.ndarray]], batch_size: int,
     }
 
 
-def _sample_linked_pref_batch(replay_buffer: SimpleReplayBuffer, batch_size: int, device: torch.device):
-    if int(getattr(replay_buffer, "n_env", 1)) != 1:
-        raise ValueError("Linked preference sampling expects a single-env replay buffer.")
-    cap = int(replay_buffer.env_capacities[0])
-    if cap <= 1 or int(replay_buffer.filled[0].item()) <= 0:
-        return None
-    valid_mask = (
-        replay_buffer.transition_ready[0, :cap]
-        & replay_buffer.valid_next_mask[0, :cap]
-        & replay_buffer.teacher_intervened[0, :cap]
-    )
-    valid_indices = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1)
-    if valid_indices.numel() <= 0:
-        return None
-    n = min(int(batch_size), int(valid_indices.numel()))
-    if n <= 0:
-        return None
-    sample_ids = torch.randint(0, valid_indices.numel(), (n,), device=replay_buffer.storage_device)
-    idx = valid_indices.index_select(0, sample_ids)
-    obs = replay_buffer._gather_observations(0, idx).to(device, non_blocking=True)
-    teacher = replay_buffer.actions[0, idx].to(device=device, dtype=torch.float32, non_blocking=True)
-    student = replay_buffer.student_actions[0, idx].to(device=device, dtype=torch.float32, non_blocking=True)
-    return {
-        "obs": obs,
-        "teacher_actions": teacher,
-        "student_actions": student,
-    }
-
-
 def _maybe_load_checkpoint(*, args, sac: SACTensors, obs_normalizer, device: torch.device) -> None:
     checkpoint_path = str(getattr(args, "init_checkpoint_path", "") or "").strip()
     if not checkpoint_path:
@@ -1466,9 +1437,9 @@ def run_minimal_training(args) -> None:
     def _sample_pref_batch_for_update():
         if variant != "own" or float(getattr(args, "pref_sample_ratio", 0.0)) <= 0.0:
             return None
-        pref_n = max(1, int(args.batch_size * float(getattr(args, "pref_sample_ratio", 0.0))))
         if pref_sampling_mode == "linked":
-            return _sample_linked_pref_batch(main_rb, pref_n, device)
+            return None
+        pref_n = max(1, int(args.batch_size * float(getattr(args, "pref_sample_ratio", 0.0))))
         return _sample_pref_batch(pref_pairs, pref_n, device)
 
     def _run_update_step(update_index: int) -> SACUpdateMetrics:
@@ -1480,6 +1451,7 @@ def run_minimal_training(args) -> None:
             max_grad_norm=float(args.max_grad_norm),
             obs_preprocess=obs_normalizer,
             pref_batch=_sample_pref_batch_for_update(),
+            pref_sampling_mode=pref_sampling_mode if variant == "own" else "separate",
             pref_rank_weight=float(getattr(args, "pref_rank_weight", 0.0)) if variant == "own" else 0.0,
             pref_rank_margin=float(getattr(args, "pref_rank_margin", 0.1)),
             pref_loss_type=str(getattr(args, "pref_loss_type", "margin")),

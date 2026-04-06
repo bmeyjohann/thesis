@@ -284,6 +284,15 @@ def _as_q_list(q_out) -> list[torch.Tensor]:
     raise TypeError(f"Unsupported critic output type: {type(q_out)!r}")
 
 
+def _batch_has_key(batch, key: str) -> bool:
+    try:
+        return key in batch.keys(include_nested=False)
+    except TypeError:
+        return key in batch.keys()
+    except Exception:
+        return key in batch
+
+
 def build_sac(
     *,
     obs_dim: int,
@@ -429,6 +438,7 @@ def sac_update_step(
     max_grad_norm: float,
     obs_preprocess=None,
     pref_batch=None,
+    pref_sampling_mode: str = "separate",
     pref_rank_weight: float = 0.0,
     pref_rank_margin: float = 0.1,
     pref_loss_type: str = "margin",
@@ -507,14 +517,8 @@ def sac_update_step(
     batch_teacher_fraction = 0.0
 
     teacher_mask = None
-    has_teacher_intervened = False
-    try:
-        has_teacher_intervened = "teacher_intervened" in batch.keys(include_nested=False)
-    except TypeError:
-        has_teacher_intervened = "teacher_intervened" in batch.keys()
-    except Exception:
-        has_teacher_intervened = "teacher_intervened" in batch
-    if has_teacher_intervened:
+    pref_sampling_mode_value = str(pref_sampling_mode).strip().lower()
+    if _batch_has_key(batch, "teacher_intervened"):
         teacher_mask = batch["teacher_intervened"].to(torch.bool).reshape(-1)
         batch_teacher_fraction = float(teacher_mask.float().mean().detach().cpu().item())
         q_min_data_flat = q_min_data.reshape(-1)
@@ -530,6 +534,31 @@ def sac_update_step(
         pref_obs = pref_batch["obs"]
         pref_teacher = pref_batch["teacher_actions"]
         pref_student = pref_batch["student_actions"]
+    elif float(pref_rank_weight) > 0.0 and pref_sampling_mode_value == "linked":
+        pref_obs = None
+        pref_teacher = None
+        pref_student = None
+        if teacher_mask is not None and _batch_has_key(batch, "student_actions"):
+            linked_rows = int(teacher_mask.sum().item())
+            pref_linked_rows = float(linked_rows)
+            if linked_rows > 0:
+                pref_obs = obs[teacher_mask]
+                pref_teacher = actions[teacher_mask]
+                pref_student = batch["student_actions"][teacher_mask].to(device=obs.device, dtype=torch.float32)
+    else:
+        pref_obs = None
+        pref_teacher = None
+        pref_student = None
+
+    if (
+        float(pref_rank_weight) > 0.0
+        and pref_obs is not None
+        and pref_teacher is not None
+        and pref_student is not None
+        and pref_obs.shape[0] > 0
+    ):
+        if obs_preprocess is not None and pref_obs is not obs:
+            pref_obs = obs_preprocess(pref_obs)
         q_teacher = torch.stack(sac.critic(pref_obs, pref_teacher), dim=0)
         q_student = torch.stack(sac.critic(pref_obs, pref_student), dim=0)
         pref_q_teacher_mean = float(q_teacher.detach().mean().cpu().item())
