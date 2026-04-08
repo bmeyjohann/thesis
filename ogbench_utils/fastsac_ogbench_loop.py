@@ -1512,7 +1512,7 @@ def run_training_loop(
 
         total_time = time.time() - start_time
         summary_line = (
-            "✅ FastSAC training complete"
+            "[Done] FastSAC training complete"
             f" env_steps={total_env_steps}"
             f" iterations={iteration_idx}"
             f" duration_sec={total_time:.1f}"

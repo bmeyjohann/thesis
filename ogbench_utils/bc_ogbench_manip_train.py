@@ -443,7 +443,7 @@ def run_bc_ogbench_manip(args) -> None:
         record_progress(f"[Checkpoint] saved {final_path}")
         print(
             f"================================================================================\n"
-            f"✅ Behavior cloning training complete env_steps={total_env_steps} iterations={iteration_idx} "
+            f"[Done] Behavior cloning training complete env_steps={total_env_steps} iterations={iteration_idx} "
             f"duration_sec={time.time() - start_time:.1f} models_dir={run_model_dir}",
             flush=True,
         )
