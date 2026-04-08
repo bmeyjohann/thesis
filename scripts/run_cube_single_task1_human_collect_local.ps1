@@ -72,9 +72,9 @@ $datasetPath = if ($ExportReplayDatasetPath) { $ExportReplayDatasetPath } else {
 $logDir = Join-Path $RepoRoot "logs"
 $logPath = Join-Path $logDir "${runName}.log"
 $pythonPathEntries = @(
-    $RepoRoot,
+    (Join-Path $RepoRoot "ogbench"),
     (Join-Path $RepoRoot "fasttd3"),
-    (Join-Path $RepoRoot "ogbench")
+    $RepoRoot
 )
 $pythonPathValue = (($pythonPathEntries + @($env:PYTHONPATH)) | Where-Object { $_ -and $_.Trim().Length -gt 0 }) -join ';'
 

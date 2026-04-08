@@ -7,9 +7,18 @@ import os
 import sys
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parent
+OGBENCH_SUBMODULE_PATH = REPO_ROOT / "ogbench"
+FASTTD3_SUBMODULE_PATH = REPO_ROOT / "fasttd3"
+for _path in (FASTTD3_SUBMODULE_PATH, OGBENCH_SUBMODULE_PATH):
+    _path_str = str(_path)
+    if _path_str in sys.path:
+        sys.path.remove(_path_str)
+    sys.path.insert(0, _path_str)
+
 from ogbench_utils.pvp_td3_ogbench_manip_cli import parse_pvp_td3_manip_args
 
-TOOLS_PATH = Path(__file__).resolve().parent / "tools"
+TOOLS_PATH = REPO_ROOT / "tools"
 if TOOLS_PATH.exists():
     sys.path.append(str(TOOLS_PATH))
 
