@@ -8,13 +8,11 @@ This entrypoint keeps maze workflow explicit:
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
-import ogbench  # noqa: F401  # Registers environments.
-
 from ogbench_utils.fastsac_ogbench_maze_cli import parse_fastsac_maze_args
-from ogbench_utils.fastsac_ogbench_maze_train import run_fastsac_ogbench_maze
 
 TOOLS_PATH = Path(__file__).resolve().parent / "tools"
 if TOOLS_PATH.exists():
@@ -25,8 +23,18 @@ except Exception:  # pragma: no cover
     generate_policy_map = None
 
 
+def _configure_mujoco_gl_for_train() -> None:
+    configured = str(os.environ.get("MUJOCO_GL", "")).strip().lower()
+    if sys.platform.startswith("win") and configured in {"", "egl"}:
+        os.environ["MUJOCO_GL"] = "glfw"
+
+
 def main() -> None:
     args = parse_fastsac_maze_args()
+    _configure_mujoco_gl_for_train()
+    import ogbench  # noqa: F401  # Registers environments.
+    from ogbench_utils.fastsac_ogbench_maze_train import run_fastsac_ogbench_maze
+
     run_fastsac_ogbench_maze(args, generate_policy_map=generate_policy_map)
 
 
