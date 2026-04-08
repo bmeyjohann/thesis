@@ -457,9 +457,11 @@ def sac_update_step(
     update_actor: bool = True,
     critic_loss_reduction: str = "mean",
 ) -> SACUpdateMetrics:
-    obs = batch["observations"]
+    obs_raw = batch["observations"]
+    obs = obs_raw
     actions = batch["actions"]
-    next_obs = batch["next"]["observations"]
+    next_obs_raw = batch["next"]["observations"]
+    next_obs = next_obs_raw
     if obs_preprocess is not None:
         obs = obs_preprocess(obs)
         next_obs = obs_preprocess(next_obs)
@@ -542,7 +544,10 @@ def sac_update_step(
             linked_rows = int(teacher_mask.sum().item())
             pref_linked_rows = float(linked_rows)
             if linked_rows > 0:
-                pref_obs = obs[teacher_mask]
+                # Linked preference rows must reuse the same raw observations and
+                # preprocessing path as the TD batch. Slicing from the already
+                # normalized `obs` tensor here would apply obs_preprocess twice.
+                pref_obs = obs_raw[teacher_mask]
                 pref_teacher = actions[teacher_mask]
                 pref_student = batch["student_actions"][teacher_mask].to(device=obs.device, dtype=torch.float32)
     else:
