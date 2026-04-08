@@ -71,6 +71,12 @@ $datasetDir = if ($env:EXPORT_REPLAY_DATASET_DIR) { $env:EXPORT_REPLAY_DATASET_D
 $datasetPath = if ($ExportReplayDatasetPath) { $ExportReplayDatasetPath } else { Join-Path $datasetDir "cube_single_task1_human_vr_replay_latest.npz" }
 $logDir = Join-Path $RepoRoot "logs"
 $logPath = Join-Path $logDir "${runName}.log"
+$pythonPathEntries = @(
+    $RepoRoot,
+    (Join-Path $RepoRoot "fasttd3"),
+    (Join-Path $RepoRoot "ogbench")
+)
+$pythonPathValue = (($pythonPathEntries + @($env:PYTHONPATH)) | Where-Object { $_ -and $_.Trim().Length -gt 0 }) -join ';'
 
 New-Item -ItemType Directory -Force -Path $datasetDir | Out-Null
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
@@ -166,6 +172,7 @@ Write-Host "project:         $Project"
 Write-Host "vr endpoint:     $VrHost`:$VrPort"
 Write-Host "dataset path:    $datasetPath"
 Write-Host "log path:        $logPath"
+Write-Host "PYTHONPATH:      $pythonPathValue"
 Write-Host "timesteps:       $TotalTimesteps"
 Write-Host "updates / CTA:   $NumUpdates / $CtaRatio"
 Write-Host "fixed alpha:     $FixedAlpha"
@@ -175,6 +182,7 @@ try {
     $env:WANDB_MODE = $WandbMode
     $env:WANDB_CONSOLE = "off"
     $env:WANDB_SILENT = "true"
+    $env:PYTHONPATH = $pythonPathValue
     & $resolvedPythonExe @pythonPrefixArgs @cmd 2>&1 | Tee-Object -FilePath $logPath
 }
 finally {
