@@ -44,6 +44,28 @@ if (-not (Test-Path (Join-Path $RepoRoot "train_fast_sac_ogbench_manip.py"))) {
     throw "Could not find train_fast_sac_ogbench_manip.py under repo root: $RepoRoot"
 }
 
+$pythonPrefixArgs = @()
+$resolvedPythonExe = $null
+if ($PythonExe -and (Test-Path $PythonExe)) {
+    $resolvedPythonExe = (Resolve-Path $PythonExe).Path
+}
+if (-not $resolvedPythonExe) {
+    $pythonCmd = Get-Command $PythonExe -ErrorAction SilentlyContinue
+    if ($pythonCmd) {
+        $resolvedPythonExe = $pythonCmd.Source
+    }
+}
+if (-not $resolvedPythonExe -and $PythonExe -eq "python") {
+    $pyLauncher = Get-Command py -ErrorAction SilentlyContinue
+    if ($pyLauncher) {
+        $resolvedPythonExe = $pyLauncher.Source
+        $pythonPrefixArgs = @("-3")
+    }
+}
+if (-not $resolvedPythonExe) {
+    throw "Could not resolve Python executable '$PythonExe'. Pass -PythonExe with a full path or ensure python/py is on PATH."
+}
+
 $runName = if ($env:RUN_NAME) { $env:RUN_NAME } else { "${ExpPrefix}_${Timestamp}" }
 $datasetDir = if ($env:EXPORT_REPLAY_DATASET_DIR) { $env:EXPORT_REPLAY_DATASET_DIR } else { Join-Path $RepoRoot "local\ogbench_manip_datasets" }
 $datasetPath = if ($ExportReplayDatasetPath) { $ExportReplayDatasetPath } else { Join-Path $datasetDir "cube_single_task1_human_vr_replay_latest.npz" }
@@ -138,7 +160,7 @@ if (-not $VisualizeInterventionColors.IsPresent) {
 
 Write-Host "Starting manipulation human-VR collection run" -ForegroundColor Cyan
 Write-Host "repo:            $RepoRoot"
-Write-Host "python:          $PythonExe"
+Write-Host "python:          $resolvedPythonExe $($pythonPrefixArgs -join ' ')"
 Write-Host "run:             $runName"
 Write-Host "project:         $Project"
 Write-Host "vr endpoint:     $VrHost`:$VrPort"
@@ -153,7 +175,7 @@ try {
     $env:WANDB_MODE = $WandbMode
     $env:WANDB_CONSOLE = "off"
     $env:WANDB_SILENT = "true"
-    & $PythonExe @cmd 2>&1 | Tee-Object -FilePath $logPath
+    & $resolvedPythonExe @pythonPrefixArgs @cmd 2>&1 | Tee-Object -FilePath $logPath
 }
 finally {
     Pop-Location
