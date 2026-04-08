@@ -399,7 +399,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--env_name", type=str, default="SafetyCarGoal2-v0")
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--device", type=str, default="auto")
-    p.add_argument("--controller", type=str, default="policy", choices=["policy", "random", "human", "keyboard", "gamepad"])
+    p.add_argument("--controller", type=str, default="policy", choices=["policy", "random", "human", "keyboard", "gamepad", "scripted"])
     p.add_argument("--intervention_mode", type=str, default="none", choices=["none", "human"])
     p.add_argument("--render_mode", type=str, default="human", choices=["human", "rgb_array", "none", "pygame", "topdown"])
     p.add_argument("--viewer_fps", type=float, default=20.0)
@@ -440,7 +440,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--intervention_threshold", type=float, default=0.1)
     p.add_argument("--intervention_hold_seconds", type=float, default=0.25)
     p.add_argument("--human_action_scale", type=float, default=1.0)
-    p.add_argument("--human_input_device", type=str, default="keyboard", choices=["keyboard", "gamepad"])
+    p.add_argument("--human_input_device", type=str, default="keyboard", choices=["keyboard", "gamepad", "scripted"])
     p.add_argument("--controller_fps_limit", type=int, default=0)
     p.add_argument("--controller_overlay_hz", type=float, default=20.0)
     p.add_argument("--gamepad_config_path", type=str, default=str(DEFAULT_SAFETY_GAMEPAD_CONFIG_PATH))
@@ -624,13 +624,15 @@ def main() -> int:
     args = build_parser().parse_args()
     _apply_ckpt_defaults(args)
 
-    if args.controller in {"human", "keyboard", "gamepad"} and args.intervention_mode == "human":
+    if args.controller in {"human", "keyboard", "gamepad", "scripted"} and args.intervention_mode == "human":
         # Avoid double-human override (controller action + intervention wrapper action).
         args.intervention_mode = "none"
     if args.controller == "keyboard":
         args.human_input_device = "keyboard"
     elif args.controller == "gamepad":
         args.human_input_device = "gamepad"
+    elif args.controller == "scripted":
+        args.human_input_device = "scripted"
 
     if args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -639,7 +641,7 @@ def main() -> int:
 
     controller = None
     control_help: list[str] = []
-    if args.controller in {"human", "keyboard", "gamepad"} or args.intervention_mode == "human":
+    if args.controller in {"human", "keyboard", "gamepad", "scripted"} or args.intervention_mode == "human":
         # Temporary env for action-dim detection.
         tmp_env = make_safety_env(
             args.env_name,
@@ -653,10 +655,14 @@ def main() -> int:
             seed=args.seed,
         )
         act_dim = int(np.prod(tmp_env.action_space.shape))
+        obs_dim_tmp = int(np.prod(tmp_env.observation_space.shape))
+        action_low_tmp = np.asarray(tmp_env.action_space.low, dtype=np.float32)
+        action_high_tmp = np.asarray(tmp_env.action_space.high, dtype=np.float32)
         tmp_env.close()
         controller = build_human_controller(
             input_device=str(getattr(args, "human_input_device", "keyboard")),
             action_dim=act_dim,
+            obs_dim=obs_dim_tmp,
             env_name=args.env_name,
             action_scale=args.human_action_scale,
             wheel_command_limit=float(args.car_wheel_command_limit),
@@ -670,6 +676,8 @@ def main() -> int:
             gamepad_config_path=args.gamepad_config_path,
             gamepad_use_saved_config=bool(getattr(args, "gamepad_use_saved_config", True)),
             gamepad_device_index=int(getattr(args, "gamepad_device_index", 0)),
+            action_low=action_low_tmp,
+            action_high=action_high_tmp,
             show_overlay=not bool(args.show_telemetry_overlay),
             prefer_separate_keyboard_window=wants_external_viewer(getattr(args, "render_mode", "human")),
             control_scheme_override=resolve_control_scheme(
@@ -845,7 +853,16 @@ def main() -> int:
         else:
             if controller is None:
                 raise RuntimeError("Controller requested but not initialized")
-            action = controller.get_action().astype(np.float32)
+            try:
+                action = controller.get_action(obs=obs, env=env)
+            except TypeError:
+                try:
+                    action = controller.get_action(obs=obs)
+                except TypeError:
+                    action = controller.get_action()
+            if action is None:
+                raise RuntimeError("Controller returned no action")
+            action = np.asarray(action, dtype=np.float32)
 
         action = clip_action_to_space(action, env.action_space)
         next_obs, reward, cost, terminated, truncated, info = env.step(action)

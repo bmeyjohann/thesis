@@ -11,6 +11,7 @@ param(
     [string]$RenderMode = $(if ($env:RENDER_MODE) { $env:RENDER_MODE } else { "human" }),
     [string]$HumanInputDevice = $(if ($env:HUMAN_INPUT_DEVICE) { $env:HUMAN_INPUT_DEVICE } else { "gamepad" }),
     [string]$GamepadMode = $(if ($env:GAMEPAD_MODE) { $env:GAMEPAD_MODE } else { "local" }),
+    [string]$UseLayerNormEnv = $(if ($env:USE_LAYER_NORM) { $env:USE_LAYER_NORM } else { "" }),
     [string]$WandbProject = $(if ($env:WANDB_PROJECT) { $env:WANDB_PROJECT } else { "thesis-safetygym" }),
     [string]$WandbMode = $(if ($env:WANDB_MODE) { $env:WANDB_MODE } else { "online" }),
     [int]$GamepadPort = $(if ($env:GAMEPAD_PORT) { [int]$env:GAMEPAD_PORT } else { 8793 })
@@ -21,6 +22,10 @@ $ErrorActionPreference = "Stop"
 $runName = if ($env:RUN_NAME) { $env:RUN_NAME } else { "${ExpPrefix}_${Timestamp}" }
 $wandbGroup = if ($env:WANDB_GROUP) { $env:WANDB_GROUP } else { "safetycar_goal1_own_human_probe_${Timestamp}" }
 $gamepadHost = if ($env:GAMEPAD_HOST) { $env:GAMEPAD_HOST } else { "127.0.0.1" }
+$useLayerNorm = $false
+if ($UseLayerNormEnv) {
+    $useLayerNorm = @("1", "true", "yes", "on") -contains $UseLayerNormEnv.ToLowerInvariant()
+}
 
 if (-not (Test-Path (Join-Path $RepoRoot "train_fast_sac_safetygym_minimal.py"))) {
     throw "Could not find train_fast_sac_safetygym_minimal.py under repo root: $RepoRoot"
@@ -50,7 +55,6 @@ $cmd = @(
     "--actor_hidden_dim", "256",
     "--critic_hidden_dim", "512",
     "--module_impl", "custom",
-    "--use_layer_norm",
     "--alpha_init", "1e-3",
     "--alpha_min", "0.0",
     "--alpha_max", "1.0",
@@ -97,6 +101,10 @@ $cmd = @(
     "--wandb_run_name", $runName
 )
 
+if ($useLayerNorm) {
+    $cmd += "--use_layer_norm"
+}
+
 Write-Host "Starting Safety-Gym Goal1 own-method human run from WSL checkpoint" -ForegroundColor Cyan
 Write-Host "repo:       $RepoRoot"
 Write-Host "python:     $PythonExe"
@@ -104,6 +112,8 @@ Write-Host "checkpoint: $CheckpointPath"
 Write-Host "run:        $runName"
 Write-Host "group:      $wandbGroup"
 Write-Host "input:      $HumanInputDevice ($GamepadMode)"
+Write-Host "render:     $RenderMode"
+Write-Host "layer norm: $useLayerNorm"
 
 Push-Location $RepoRoot
 try {

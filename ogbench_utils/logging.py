@@ -334,9 +334,11 @@ class TrainingLogger:
             metrics_accumulator, updates_count = last_update_metrics
             denom = float(max(1, updates_count))
             actor_denom = float(max(1.0, metrics_accumulator.get("actor_update_count", float(updates_count))))
-            alpha_denom = float(max(1.0, metrics_accumulator.get("alpha_update_count", float(updates_count))))
+            alpha_metric_denom = float(max(1.0, metrics_accumulator.get("alpha_metric_count", float(updates_count))))
+            alpha_step_denom = float(max(1.0, metrics_accumulator.get("alpha_optimizer_step_count", 0.0)))
             pref_loss_type = str(getattr(self.args, "pref_loss_type", "margin")).strip().lower()
             lagrangian_enabled = 1.0 if pref_loss_type == "lagrangian" else 0.0
+            algo_variant = str(getattr(self.args, "algo_variant", "own") or "own").strip().lower()
             logs["Train/critic_loss"] = metrics_accumulator["critic_loss"] / denom
             logs["Train/critic_loss_replay"] = metrics_accumulator["critic_loss_replay"] / denom
             logs["Train/critic_loss_pref"] = metrics_accumulator["critic_loss_pref"] / denom
@@ -365,7 +367,7 @@ class TrainingLogger:
             logs["Train/actor_loss_sac"] = metrics_accumulator["actor_loss_sac"] / actor_denom
             logs["Train/actor_bc_loss_demo"] = metrics_accumulator["actor_bc_loss_demo"] / actor_denom
             logs["Train/actor_bc_loss_pref"] = metrics_accumulator["actor_bc_loss_pref"] / actor_denom
-            logs["Train/alpha_loss"] = metrics_accumulator["alpha_loss"] / alpha_denom
+            logs["Train/alpha_loss"] = metrics_accumulator["alpha_loss"] / alpha_step_denom
             logs["Train/policy_entropy"] = metrics_accumulator["entropy"] / actor_denom
             logs["Train/action_l2"] = metrics_accumulator["action_norm"] / actor_denom
             logs["Train/target_q_mean"] = metrics_accumulator["target_q"] / denom
@@ -390,12 +392,78 @@ class TrainingLogger:
                 )
             logs["Train/replay_reward_mean"] = metrics_accumulator["reward"] / denom
             logs["Train/replay_reward_abs_mean"] = metrics_accumulator["reward_abs"] / denom
-            logs["Train/alpha"] = metrics_accumulator["alpha_value"] / alpha_denom
+            logs["Train/alpha"] = metrics_accumulator["alpha_value"] / alpha_metric_denom
             logs["Train/updates_per_iter"] = updates_count
             logs["Train/actor_updates_per_iter"] = float(metrics_accumulator.get("actor_update_count", 0.0))
-            logs["Train/alpha_updates_per_iter"] = float(metrics_accumulator.get("alpha_update_count", 0.0))
+            logs["Train/alpha_updates_per_iter"] = float(metrics_accumulator.get("alpha_optimizer_step_count", 0.0))
+            logs["Train/intervened_batch_fraction"] = (
+                float(metrics_accumulator.get("intervened_batch_fraction", 0.0)) / denom
+            )
+            logs["Train/action_override_batch_fraction"] = (
+                float(metrics_accumulator.get("action_override_batch_fraction", 0.0)) / denom
+            )
+            logs["Train/intervention_override_mismatch_fraction"] = (
+                float(metrics_accumulator.get("intervention_override_mismatch_fraction", 0.0)) / denom
+            )
+            logs["Train/intervention_override_false_negative_fraction"] = (
+                float(metrics_accumulator.get("intervention_override_false_negative_fraction", 0.0)) / denom
+            )
+            logs["Train/intervention_override_false_positive_fraction"] = (
+                float(metrics_accumulator.get("intervention_override_false_positive_fraction", 0.0)) / denom
+            )
+            logs["Train/pref_linked_rows_per_iter"] = float(metrics_accumulator.get("pref_linked_rows", 0.0)) / denom
+            logs["Train/pref_linked_fraction"] = float(metrics_accumulator.get("pref_linked_fraction", 0.0)) / denom
+            logs["Train/demo_rows_requested_per_iter"] = float(metrics_accumulator.get("demo_rows_requested", 0.0)) / denom
+            logs["Train/demo_rows_sampled_per_iter"] = float(metrics_accumulator.get("demo_rows_sampled", 0.0)) / denom
+            logs["Train/demo_sampling_fraction"] = (
+                float(metrics_accumulator.get("demo_rows_sampled", 0.0))
+                / max(1.0, float(metrics_accumulator.get("demo_rows_requested", 0.0)))
+            )
+            logs["Train/demo_fallback_updates"] = float(metrics_accumulator.get("demo_fallback_updates", 0.0))
+            logs["Train/demo_buffer_nonempty_updates"] = float(
+                metrics_accumulator.get("demo_buffer_nonempty_updates", 0.0)
+            )
+            if algo_variant == "pvp":
+                logs["Train/pvp_td_reward_mean"] = metrics_accumulator["pvp_td_reward"] / denom
+                logs["Train/pvp_proxy_teacher_loss"] = metrics_accumulator["pvp_proxy_teacher_loss"] / denom
+                logs["Train/pvp_proxy_student_loss"] = metrics_accumulator["pvp_proxy_student_loss"] / denom
+                logs["Train/pvp_intervened_batch_fraction"] = (
+                    metrics_accumulator["pvp_intervened_batch_fraction"] / denom
+                )
+                logs["Train/pvp_include_env_reward_in_td"] = (
+                    1.0 if bool(getattr(self.args, "pvp_include_env_reward_in_td", False)) else 0.0
+                )
+                logs["Train/pvp_proxy_value_bound"] = float(getattr(self.args, "pvp_proxy_value_bound", 1.0))
+            elif algo_variant == "eil":
+                logs["Train/eil_good_loss"] = metrics_accumulator["eil_good_loss"] / denom
+                logs["Train/eil_bad_loss"] = metrics_accumulator["eil_bad_loss"] / denom
+                logs["Train/eil_pair_loss"] = metrics_accumulator["eil_pair_loss"] / denom
+                logs["Train/eil_good_batch_fraction"] = metrics_accumulator["eil_good_batch_fraction"] / denom
+                logs["Train/eil_bad_batch_fraction"] = metrics_accumulator["eil_bad_batch_fraction"] / denom
+                logs["Train/eil_intervened_batch_fraction"] = (
+                    metrics_accumulator["eil_intervened_batch_fraction"] / denom
+                )
+                logs["Train/eil_threshold"] = float(getattr(self.args, "eil_threshold", 0.0))
+                logs["Train/eil_good_margin"] = float(getattr(self.args, "eil_good_margin", 0.0))
+                logs["Train/eil_bad_margin"] = float(getattr(self.args, "eil_bad_margin", 0.01))
+                logs["Train/eil_pair_margin"] = float(getattr(self.args, "eil_pair_margin", 0.01))
+                logs["Train/eil_bad_pre_steps"] = float(getattr(self.args, "eil_bad_pre_steps", 8))
+            if bool(getattr(self.args, "alpha_update_student_only", False)):
+                logs["Train/alpha_student_only_fraction"] = (
+                    float(metrics_accumulator.get("alpha_student_only_fraction", 0.0)) / alpha_metric_denom
+                )
+                logs["Train/alpha_student_only_rows_per_update"] = (
+                    float(metrics_accumulator.get("alpha_student_only_rows", 0.0)) / alpha_metric_denom
+                )
+                logs["Train/alpha_student_only_skipped_updates"] = float(
+                    metrics_accumulator.get("alpha_student_only_skipped_updates", 0.0)
+                )
         else:
-            logs["Train/alpha"] = float(log_alpha.exp().detach().cpu().item())
+            fixed_alpha = float(getattr(self.args, "fixed_alpha", -1.0))
+            if fixed_alpha >= 0.0:
+                logs["Train/alpha"] = fixed_alpha
+            else:
+                logs["Train/alpha"] = float(log_alpha.exp().detach().cpu().item())
 
         if "log" in infos and isinstance(infos["log"], dict):
             for k, v in infos["log"].items():
@@ -437,6 +505,22 @@ class TrainingLogger:
         logs["Train/buffer_replay_capacity"] = replay_capacity_f
         logs["Train/buffer_demo_size"] = demo_size_f
         logs["Train/buffer_demo_capacity"] = demo_capacity_f
+        algo_variant_final = str(getattr(self.args, "algo_variant", "own") or "own").strip().lower()
+        pref_sampling_mode_final = str(getattr(self.args, "pref_sampling_mode", "independent") or "independent").strip().lower()
+        if pref_sampling_mode_final == "linked":
+            replay_intervened_fraction_estimate = pref_size_f / max(1.0, replay_size_f)
+            logs["Train/replay_linked_intervened_fraction"] = replay_intervened_fraction_estimate
+            if "Train/total_interventions" in logs and total_env_steps > 0:
+                cumulative_intervention_fraction = float(logs["Train/total_interventions"]) / max(1.0, float(total_env_steps))
+                logs["Train/cumulative_intervention_fraction"] = cumulative_intervention_fraction
+                logs["Train/intervention_storage_gap_fraction"] = (
+                    cumulative_intervention_fraction - replay_intervened_fraction_estimate
+                )
+        if algo_variant_final == "pvp":
+            logs["/Buffers/novice_size"] = replay_size_f
+            logs["/Buffers/human_size"] = demo_size_f
+            logs["Train/buffer_novice_size"] = replay_size_f
+            logs["Train/buffer_human_size"] = demo_size_f
         if timing_summary:
             logs.update(timing_summary)
 

@@ -142,6 +142,7 @@ def build_manip_environment(
     env_kwargs: dict[str, Any] = {}
     if str(getattr(args, "train_render_mode", "none")).lower() == "human":
         env_kwargs["render_mode"] = "human"
+    env_kwargs["visualize_intervention_colors"] = bool(getattr(args, "visualize_intervention_colors", True))
     env_kwargs["hold_targets_on_zero_action"] = bool(getattr(args, "hold_targets_on_zero_action", False))
     env_kwargs["noop_action_threshold"] = float(getattr(args, "noop_action_threshold", 1e-6))
     env_kwargs["disable_rotation"] = bool(getattr(args, "disable_rotation", False))
@@ -180,6 +181,7 @@ def build_manip_eval_environment(args, device: torch.device) -> OGBenchVecEnvAda
     wrappers = make_manip_eval_wrappers(args)
     eval_num_envs = max(1, int(args.eval_num_envs))
     env_kwargs: dict[str, Any] = {}
+    env_kwargs["visualize_intervention_colors"] = bool(getattr(args, "visualize_intervention_colors", True))
     env_kwargs["hold_targets_on_zero_action"] = bool(getattr(args, "hold_targets_on_zero_action", False))
     env_kwargs["noop_action_threshold"] = float(getattr(args, "noop_action_threshold", 1e-6))
     env_kwargs["disable_rotation"] = bool(getattr(args, "disable_rotation", False))

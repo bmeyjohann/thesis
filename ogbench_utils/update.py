@@ -73,8 +73,10 @@ class FastSACUpdater:
         self.pref_lambda_ema = float(getattr(args, "pref_lambda_ema", 0.9))
         self.pref_violation_clip = float(getattr(args, "pref_violation_clip", 10.0))
         self.pref_violation_target = float(getattr(args, "pref_violation_target", 0.0))
+        self.fixed_alpha = float(getattr(args, "fixed_alpha", -1.0))
         self._pref_violation_ema = 0.0
         self._critic_update_count = 0
+        self._apply_alpha_bounds_()
 
     def actor_forward(self, obs_flat: torch.Tensor):
         obs_in = self.reshape_obs(obs_flat)
@@ -87,6 +89,48 @@ class FastSACUpdater:
         features = backbone_module(obs_in)
         q_values = heads_module(features, actions)
         return features, q_values
+
+    def current_alpha_tensor(self) -> torch.Tensor:
+        if self.fixed_alpha >= 0.0:
+            return torch.tensor(self.fixed_alpha, device=self.device, dtype=self.log_alpha.dtype)
+        lower, upper = self._alpha_log_bounds()
+        bounded_log_alpha = self.log_alpha
+        if lower is not None or upper is not None:
+            lo = lower if lower is not None else -float("inf")
+            hi = upper if upper is not None else float("inf")
+            bounded_log_alpha = torch.clamp(bounded_log_alpha, min=lo, max=hi)
+        return bounded_log_alpha.exp()
+
+    def algo_variant(self) -> str:
+        return str(getattr(self.args, "algo_variant", "own") or "own").strip().lower()
+
+    def _alpha_log_bounds(self) -> tuple[float | None, float | None]:
+        min_log_alpha = None
+        if float(getattr(self.args, "alpha_min", 0.0)) > 0.0:
+            min_log_alpha = float(np.log(max(1e-6, float(self.args.alpha_min))))
+        max_log_alpha = None
+        if float(getattr(self.args, "alpha_max", 0.0)) > 0.0:
+            max_log_alpha = float(np.log(float(self.args.alpha_max)))
+        return min_log_alpha, max_log_alpha
+
+    def _apply_alpha_bounds_(self) -> None:
+        if self.fixed_alpha >= 0.0:
+            with torch.no_grad():
+                self.log_alpha.data.copy_(
+                    torch.tensor(
+                        [np.log(max(self.fixed_alpha, 1e-12))],
+                        device=self.log_alpha.device,
+                        dtype=self.log_alpha.dtype,
+                    )
+                )
+            return
+        lower, upper = self._alpha_log_bounds()
+        if lower is None and upper is None:
+            return
+        lo = lower if lower is not None else -float("inf")
+        hi = upper if upper is not None else float("inf")
+        with torch.no_grad():
+            self.log_alpha.data.clamp_(min=lo, max=hi)
 
     def update(
         self,
@@ -107,6 +151,7 @@ class FastSACUpdater:
             "critic_loss_pref_weighted": 0.0,
             "critic_loss_total": 0.0,
             "pref_linked_rows": 0.0,
+            "pref_linked_fraction": 0.0,
             "pref_lambda": 0.0,
             "pref_lambda_delta": 0.0,
             "pref_dual_violation": 0.0,
@@ -135,32 +180,79 @@ class FastSACUpdater:
             "reward": 0.0,
             "reward_abs": 0.0,
             "alpha_value": 0.0,
+            "alpha_metric_count": 0.0,
+            "alpha_optimizer_step_count": 0.0,
+            "alpha_student_only_rows": 0.0,
+            "alpha_student_only_fraction": 0.0,
+            "alpha_student_only_skipped_updates": 0.0,
+            "pvp_td_reward": 0.0,
+            "pvp_proxy_teacher_loss": 0.0,
+            "pvp_proxy_student_loss": 0.0,
+            "intervened_batch_fraction": 0.0,
+            "action_override_batch_fraction": 0.0,
+            "intervention_override_mismatch_fraction": 0.0,
+            "intervention_override_false_negative_fraction": 0.0,
+            "intervention_override_false_positive_fraction": 0.0,
+            "pvp_intervened_batch_fraction": 0.0,
+            "eil_good_loss": 0.0,
+            "eil_bad_loss": 0.0,
+            "eil_pair_loss": 0.0,
+            "eil_good_batch_fraction": 0.0,
+            "eil_bad_batch_fraction": 0.0,
+            "eil_intervened_batch_fraction": 0.0,
             "timing_sample_s": 0.0,
             "timing_opt_s": 0.0,
             "actor_update_count": 0.0,
             "alpha_update_count": 0.0,
+            "demo_rows_requested": 0.0,
+            "demo_rows_sampled": 0.0,
+            "demo_fallback_updates": 0.0,
+            "demo_buffer_nonempty_updates": 0.0,
         }
         updates_count = 0
         cta_ratio = max(1, int(getattr(args, "cta_ratio", 1)))
+        algo_variant = self.algo_variant()
+        pvp_enabled = algo_variant == "pvp"
+        eil_enabled = algo_variant == "eil"
+        deterministic_variant = pvp_enabled or eil_enabled
 
         for _ in range(args.num_updates):
             sample_t0 = time.perf_counter()
-            batch = replay_buffer.sample(main_batch)
+            if pvp_enabled:
+                replay_ready = int(getattr(replay_buffer, "size", 0)) > 0
+                human_ready = demo_buffer is not None and int(getattr(demo_buffer, "size", 0)) > 0
+                if replay_ready and human_ready and b_demo > 0:
+                    novice_batch = replay_buffer.sample(max(1, base_batch - b_demo))
+                    human_batch = demo_buffer.sample(max(1, b_demo))
+                    batch = TensorDict.cat([novice_batch, human_batch], dim=0)
+                elif human_ready and demo_buffer is not None:
+                    batch = demo_buffer.sample(base_batch)
+                elif replay_ready:
+                    batch = replay_buffer.sample(base_batch)
+                else:
+                    break
+            else:
+                batch = replay_buffer.sample(main_batch)
             demo_batch = None
             demo_bc_obs = None
             demo_bc_actions = None
             pref_states_for_actor = None
             pref_teacher_actions_for_actor = None
-            if demo_buffer is not None and b_demo > 0:
+            if (not pvp_enabled) and demo_buffer is not None and b_demo > 0:
                 try:
                     demo_size = getattr(demo_buffer, "size", 0)
                 except Exception:
                     demo_size = 0
-                if demo_size >= b_demo:
+                metrics_accumulator["demo_rows_requested"] += float(b_demo)
+                if demo_size > 0:
+                    metrics_accumulator["demo_buffer_nonempty_updates"] += 1.0
                     demo_batch = demo_buffer.sample(b_demo)
                     batch = TensorDict.cat([batch, demo_batch], dim=0)
                     demo_bc_obs = demo_batch["observations"]
                     demo_bc_actions = demo_batch["actions"]
+                    metrics_accumulator["demo_rows_sampled"] += float(b_demo)
+                else:
+                    metrics_accumulator["demo_fallback_updates"] += 1.0
             sample_elapsed = time.perf_counter() - sample_t0
             metrics_accumulator["timing_sample_s"] += float(sample_elapsed)
 
@@ -180,12 +272,24 @@ class FastSACUpdater:
 
             with autocast(device_type=self.amp_device_type, dtype=self.amp_dtype, enabled=self.amp_enabled):
                 with torch.no_grad():
-                    next_actions, next_log_pi, _, _ = self.actor_forward(next_obs_batch)
+                    alpha_tensor = torch.zeros_like(self.current_alpha_tensor()) if deterministic_variant else self.current_alpha_tensor()
+                    next_actions, next_log_pi, next_mean_actions, _ = self.actor_forward(next_obs_batch)
+                    if deterministic_variant:
+                        next_actions = next_mean_actions
                     next_features_target = self.critic_target_backbone(self.reshape_obs(next_obs_batch))
                     target_q_list = self.critic_target_heads(next_features_target, next_actions)
                     min_next_q = torch.min(torch.stack(target_q_list, dim=0), dim=0).values
-                    min_next_q = min_next_q - self.log_alpha.exp() * next_log_pi
-                    target_q = rewards_batch + (1.0 - dones_batch) * (args.gamma * min_next_q)
+                    if not deterministic_variant:
+                        min_next_q = min_next_q - alpha_tensor * next_log_pi
+                    td_rewards = (
+                        rewards_batch
+                        if (
+                            (not deterministic_variant)
+                            or (pvp_enabled and bool(getattr(args, "pvp_include_env_reward_in_td", False)))
+                        )
+                        else torch.zeros_like(rewards_batch)
+                    )
+                    target_q = td_rewards + (1.0 - dones_batch) * (args.gamma * min_next_q)
 
                 current_backbone = self.actor_backbone if args.arch_shared_trunk else self.critic_backbone
                 current_features = current_backbone(self.reshape_obs(obs_batch))
@@ -211,6 +315,19 @@ class FastSACUpdater:
                 q_disagreement_data = torch.max(q_stack_data, dim=0).values - torch.min(q_stack_data, dim=0).values
                 q_disagreement_data_value = float(q_disagreement_data.detach().mean().cpu().item())
                 q_min_data_value = float(min_q_data.detach().mean().cpu().item())
+                pvp_td_reward_value = float(td_rewards.detach().mean().cpu().item())
+                pvp_proxy_teacher_loss_value = 0.0
+                pvp_proxy_student_loss_value = 0.0
+                pvp_intervened_batch_fraction_value = 0.0
+                eil_good_loss_value = 0.0
+                eil_bad_loss_value = 0.0
+                eil_pair_loss_value = 0.0
+                eil_good_batch_fraction_value = 0.0
+                eil_bad_batch_fraction_value = 0.0
+                eil_intervened_batch_fraction_value = 0.0
+                critic_loss_pref_value = 0.0
+                critic_loss_pref_weighted_value = 0.0
+                critic_loss_total_value = critic_loss_replay_value
 
                 has_teacher_intervened = False
                 teacher_mask = None
@@ -222,10 +339,154 @@ class FastSACUpdater:
                     has_teacher_intervened = "teacher_intervened" in batch
                 if has_teacher_intervened:
                     teacher_mask = batch["teacher_intervened"].to(torch.bool)
+                    pvp_intervened_batch_fraction_value = float(teacher_mask.float().mean().detach().cpu().item())
+                    eil_intervened_batch_fraction_value = pvp_intervened_batch_fraction_value
+                    metrics_accumulator["intervened_batch_fraction"] += pvp_intervened_batch_fraction_value
+
+                has_student_actions = False
+                try:
+                    has_student_actions = "student_actions" in batch.keys(include_nested=False)
+                except TypeError:
+                    has_student_actions = "student_actions" in batch.keys()
+                except Exception:
+                    has_student_actions = "student_actions" in batch
+                if has_student_actions:
+                    student_actions_batch_diag = batch["student_actions"].to(torch.float32)
+                    action_override_mask = (torch.abs(actions_batch - student_actions_batch_diag).sum(dim=-1) > 1e-6)
+                    action_override_fraction_value = float(action_override_mask.float().mean().detach().cpu().item())
+                    metrics_accumulator["action_override_batch_fraction"] += action_override_fraction_value
+                    if teacher_mask is not None:
+                        mismatch_mask = teacher_mask != action_override_mask
+                        metrics_accumulator["intervention_override_mismatch_fraction"] += float(
+                            mismatch_mask.float().mean().detach().cpu().item()
+                        )
+                        metrics_accumulator["intervention_override_false_negative_fraction"] += float(
+                            ((~teacher_mask) & action_override_mask).float().mean().detach().cpu().item()
+                        )
+                        metrics_accumulator["intervention_override_false_positive_fraction"] += float(
+                            (teacher_mask & (~action_override_mask)).float().mean().detach().cpu().item()
+                        )
 
                 # Preference ranking loss
                 pref_sampling_mode = str(getattr(args, "pref_sampling_mode", "independent")).strip().lower()
-                if float(args.pref_rank_weight) > 0.0:
+                if pvp_enabled:
+                    has_student_actions = False
+                    try:
+                        has_student_actions = "student_actions" in batch.keys(include_nested=False)
+                    except TypeError:
+                        has_student_actions = "student_actions" in batch.keys()
+                    except Exception:
+                        has_student_actions = "student_actions" in batch
+                    student_actions_batch = batch["student_actions"] if has_student_actions else actions_batch
+                    if teacher_mask is not None and bool(teacher_mask.any().item()):
+                        q_novice_list = self.critic_heads(current_features, student_actions_batch)
+                        teacher_mask_f = teacher_mask.to(dtype=torch.float32).unsqueeze(-1)
+                        proxy_teacher_terms = []
+                        proxy_student_terms = []
+                        q_value_bound = float(getattr(args, "pvp_proxy_value_bound", 1.0))
+                        for q_behavior, q_novice in zip(current_q_list, q_novice_list):
+                            proxy_teacher_terms.append(
+                                (teacher_mask_f * F.mse_loss(
+                                    q_behavior,
+                                    q_value_bound * torch.ones_like(q_behavior),
+                                    reduction="none",
+                                )).mean()
+                            )
+                            proxy_student_terms.append(
+                                (teacher_mask_f * F.mse_loss(
+                                    q_novice,
+                                    -q_value_bound * torch.ones_like(q_novice),
+                                    reduction="none",
+                                )).mean()
+                            )
+                        proxy_teacher_loss = torch.stack(proxy_teacher_terms).mean()
+                        proxy_student_loss = torch.stack(proxy_student_terms).mean()
+                        qf_loss = qf_loss + proxy_teacher_loss + proxy_student_loss
+                        pvp_proxy_teacher_loss_value = float(proxy_teacher_loss.detach().cpu().item())
+                        pvp_proxy_student_loss_value = float(proxy_student_loss.detach().cpu().item())
+                        critic_loss_total_value = (
+                            critic_loss_replay_value
+                            + pvp_proxy_teacher_loss_value
+                            + pvp_proxy_student_loss_value
+                        )
+                    else:
+                        critic_loss_total_value = critic_loss_replay_value
+                elif eil_enabled:
+                    has_student_actions = False
+                    try:
+                        has_student_actions = "student_actions" in batch.keys(include_nested=False)
+                    except TypeError:
+                        has_student_actions = "student_actions" in batch.keys()
+                    except Exception:
+                        has_student_actions = "student_actions" in batch
+                    student_actions_batch = batch["student_actions"] if has_student_actions else actions_batch
+                    has_eil_good = False
+                    has_eil_bad = False
+                    try:
+                        has_eil_good = "eil_good" in batch.keys(include_nested=False)
+                        has_eil_bad = "eil_bad" in batch.keys(include_nested=False)
+                    except TypeError:
+                        has_eil_good = "eil_good" in batch.keys()
+                        has_eil_bad = "eil_bad" in batch.keys()
+                    except Exception:
+                        has_eil_good = "eil_good" in batch
+                        has_eil_bad = "eil_bad" in batch
+                    eil_good_mask = batch["eil_good"].to(torch.bool) if has_eil_good else None
+                    eil_bad_mask = batch["eil_bad"].to(torch.bool) if has_eil_bad else None
+                    if eil_good_mask is None:
+                        eil_good_mask = torch.zeros(actions_batch.shape[0], dtype=torch.bool, device=self.device)
+                    if eil_bad_mask is None:
+                        eil_bad_mask = torch.zeros(actions_batch.shape[0], dtype=torch.bool, device=self.device)
+                    teacher_mask_local = teacher_mask
+                    if teacher_mask_local is None:
+                        teacher_mask_local = torch.zeros(actions_batch.shape[0], dtype=torch.bool, device=self.device)
+
+                    good_mask = eil_good_mask | teacher_mask_local
+                    bad_exec_mask = eil_bad_mask
+                    bad_student_mask = teacher_mask_local
+                    eil_good_batch_fraction_value = float(good_mask.float().mean().detach().cpu().item())
+                    eil_bad_batch_fraction_value = float(
+                        (bad_exec_mask | bad_student_mask).float().mean().detach().cpu().item()
+                    )
+
+                    q_student_list = self.critic_heads(current_features, student_actions_batch)
+                    threshold = float(getattr(args, "eil_threshold", 0.0))
+                    good_margin = float(getattr(args, "eil_good_margin", 0.0))
+                    bad_margin = float(getattr(args, "eil_bad_margin", 0.01))
+                    pair_margin = float(getattr(args, "eil_pair_margin", 0.01))
+                    good_target = threshold + good_margin
+                    bad_target = threshold - bad_margin
+                    good_mask_f = good_mask.to(dtype=torch.float32).unsqueeze(-1)
+                    bad_exec_mask_f = bad_exec_mask.to(dtype=torch.float32).unsqueeze(-1)
+                    bad_student_mask_f = bad_student_mask.to(dtype=torch.float32).unsqueeze(-1)
+                    good_terms = []
+                    bad_terms = []
+                    pair_terms = []
+                    for q_behavior, q_student in zip(current_q_list, q_student_list):
+                        good_terms.append(
+                            (good_mask_f * torch.clamp(good_target - q_behavior, min=0.0)).mean()
+                        )
+                        bad_terms.append(
+                            (bad_exec_mask_f * torch.clamp(q_behavior - bad_target, min=0.0)).mean()
+                            + (bad_student_mask_f * torch.clamp(q_student - bad_target, min=0.0)).mean()
+                        )
+                        pair_terms.append(
+                            (bad_student_mask_f * torch.clamp(pair_margin - (q_behavior - q_student), min=0.0)).mean()
+                        )
+                    eil_good_loss = torch.stack(good_terms).mean()
+                    eil_bad_loss = torch.stack(bad_terms).mean()
+                    eil_pair_loss = torch.stack(pair_terms).mean()
+                    qf_loss = qf_loss + eil_good_loss + eil_bad_loss + eil_pair_loss
+                    eil_good_loss_value = float(eil_good_loss.detach().cpu().item())
+                    eil_bad_loss_value = float(eil_bad_loss.detach().cpu().item())
+                    eil_pair_loss_value = float(eil_pair_loss.detach().cpu().item())
+                    critic_loss_total_value = (
+                        critic_loss_replay_value
+                        + eil_good_loss_value
+                        + eil_bad_loss_value
+                        + eil_pair_loss_value
+                    )
+                elif float(args.pref_rank_weight) > 0.0:
                     pref_states = None
                     pref_teacher_actions = None
                     pref_student_actions = None
@@ -251,6 +512,9 @@ class FastSACUpdater:
                                 linked_mask = batch["teacher_intervened"].to(torch.bool)
                                 linked_rows = int(linked_mask.sum().item())
                                 metrics_accumulator["pref_linked_rows"] += float(linked_rows)
+                                metrics_accumulator["pref_linked_fraction"] += (
+                                    float(linked_rows) / max(1.0, float(linked_mask.numel()))
+                                )
                                 if linked_rows > 0:
                                     pref_states = obs_batch[linked_mask]
                                     pref_teacher_actions = actions_batch[linked_mask]
@@ -277,18 +541,28 @@ class FastSACUpdater:
                         pref_features = current_backbone(self.reshape_obs(pref_states))
                         q_pos = self.critic_heads(pref_features, pref_teacher_actions)
                         q_neg = self.critic_heads(pref_features, pref_student_actions)
-                        # Per-head preference ranking: every critic is trained to rank teacher > student.
                         q_pos_stack = torch.stack(q_pos, dim=0)
                         q_neg_stack = torch.stack(q_neg, dim=0)
-                        if bool(getattr(args, "pref_stopgrad_positive", False)):
-                            q_pos_term = q_pos_stack.detach()
+                        pref_critic_scope = str(getattr(args, "pref_critic_scope", "all")).strip().lower()
+                        if pref_critic_scope == "min":
+                            q_pos_base = torch.min(q_pos_stack, dim=0).values
+                            q_neg_base = torch.min(q_neg_stack, dim=0).values
                         else:
-                            q_pos_term = q_pos_stack
+                            # Per-head preference ranking: every critic is trained to rank teacher > student.
+                            q_pos_base = q_pos_stack
+                            q_neg_base = q_neg_stack
+                        if bool(getattr(args, "pref_stopgrad_positive", False)):
+                            q_pos_term = q_pos_base.detach()
+                        else:
+                            q_pos_term = q_pos_base
                         margin = float(args.pref_rank_margin)
-                        delta = q_pos_term - q_neg_stack
+                        delta = q_pos_term - q_neg_base
                         pref_loss_type = str(getattr(args, "pref_loss_type", "margin")).strip().lower()
                         if pref_loss_type == "bradley_terry":
                             rank_loss = F.softplus(-delta).mean()
+                            rank_loss_weighted = float(args.pref_rank_weight) * rank_loss
+                        elif pref_loss_type == "hinge":
+                            rank_loss = torch.clamp(margin - delta, min=0.0).mean()
                             rank_loss_weighted = float(args.pref_rank_weight) * rank_loss
                         elif pref_loss_type == "lagrangian":
                             prev_pref_lambda = float(self.pref_lambda)
@@ -333,7 +607,8 @@ class FastSACUpdater:
                         pref_teacher_actions_for_actor = pref_teacher_actions
                 critic_loss_pref_value = float(rank_loss.detach().cpu().item())
                 critic_loss_pref_weighted_value = float(rank_loss_weighted.detach().cpu().item())
-                critic_loss_total_value = critic_loss_replay_value + critic_loss_pref_weighted_value
+                if (not pvp_enabled) and (not eil_enabled):
+                    critic_loss_total_value = critic_loss_replay_value + critic_loss_pref_weighted_value
 
             self.scaler.scale(qf_loss).backward()
             self.scaler.unscale_(self.critic_optimizer)
@@ -354,19 +629,22 @@ class FastSACUpdater:
             reward_mean = float(rewards_batch.detach().mean().cpu().item())
             target_q_mean = float(target_q.detach().mean().cpu().item())
             alpha_loss_value = 0.0
-            alpha_value = float(self.log_alpha.exp().detach().cpu().item())
+            alpha_value = float(self.current_alpha_tensor().detach().cpu().item())
 
             should_update_actor = (self._critic_update_count % cta_ratio) == 0
             if should_update_actor:
                 # Actor update
                 self.actor_optimizer.zero_grad(set_to_none=True)
                 with autocast(device_type=self.amp_device_type, dtype=self.amp_dtype, enabled=self.amp_enabled):
-                    pi_actions, log_pi, _, _ = self.actor_forward(obs_batch)
+                    alpha_tensor = torch.zeros_like(self.current_alpha_tensor()).detach() if deterministic_variant else self.current_alpha_tensor().detach()
+                    pi_actions, log_pi, mean_actions, _ = self.actor_forward(obs_batch)
+                    if deterministic_variant:
+                        pi_actions = mean_actions
                     actor_backbone_eval = current_backbone
                     q_pi_list = self.critic_heads(actor_backbone_eval(self.reshape_obs(obs_batch)), pi_actions)
                     q_stack_pi = torch.stack(q_pi_list, dim=0)
                     min_q_pi = torch.min(q_stack_pi, dim=0).values
-                    actor_loss_sac = (self.log_alpha.exp().detach() * log_pi - min_q_pi).mean()
+                    actor_loss_sac = (-min_q_pi).mean() if deterministic_variant else (alpha_tensor * log_pi - min_q_pi).mean()
                     actor_loss = actor_loss_sac
                     bc_loss_demo = torch.tensor(0.0, device=self.device)
                     bc_loss_pref = torch.tensor(0.0, device=self.device)
@@ -394,7 +672,7 @@ class FastSACUpdater:
                 actor_loss_sac_value = float(actor_loss_sac.detach().cpu().item())
                 bc_demo_loss_value = float(bc_loss_demo.detach().cpu().item())
                 bc_pref_loss_value = float(bc_loss_pref.detach().cpu().item())
-                entropy_value = float((-log_pi).detach().mean().cpu().item())
+                entropy_value = 0.0 if deterministic_variant else float((-log_pi).detach().mean().cpu().item())
                 action_norm_value = float(pi_actions.detach().norm(dim=-1).mean().cpu().item())
                 min_q_pi_mean = float(min_q_pi.detach().mean().cpu().item())
                 q_disagreement_pi = torch.max(q_stack_pi, dim=0).values - torch.min(q_stack_pi, dim=0).values
@@ -418,7 +696,15 @@ class FastSACUpdater:
                 metrics_accumulator["actor_update_count"] += 1.0
 
                 # Alpha update
-                if total_env_steps < int(getattr(args, "alpha_freeze_steps", 0)):
+                if deterministic_variant:
+                    self.alpha_optimizer.zero_grad(set_to_none=True)
+                    alpha_loss_value = 0.0
+                    alpha_value = 0.0
+                elif self.fixed_alpha >= 0.0:
+                    self.alpha_optimizer.zero_grad(set_to_none=True)
+                    alpha_loss_value = 0.0
+                    alpha_value = float(self.fixed_alpha)
+                elif total_env_steps < int(getattr(args, "alpha_freeze_steps", 0)):
                     self.alpha_optimizer.zero_grad(set_to_none=True)
                     alpha_loss_value = 0.0
                     alpha_value = float(self.log_alpha.exp().detach().cpu().item())
@@ -426,23 +712,34 @@ class FastSACUpdater:
                     self.alpha_optimizer.zero_grad(set_to_none=True)
                     _, log_pi_curr, _, _ = self.actor_forward(obs_batch)
                     log_pi_detached = log_pi_curr.detach()
-                    alpha_loss = (-self.log_alpha.exp() * (log_pi_detached + self.target_entropy)).mean()
-                    alpha_loss.backward()
-                    self.alpha_optimizer.step()
-                    with torch.no_grad():
-                        min_log_alpha = None
-                        if float(args.alpha_min) > 0.0:
-                            min_log_alpha = np.log(max(1e-6, float(args.alpha_min)))
-                        max_log_alpha = None
-                        if float(args.alpha_max) > 0.0:
-                            max_log_alpha = np.log(float(args.alpha_max))
-                        lower = min_log_alpha if min_log_alpha is not None else -torch.inf
-                        upper = max_log_alpha if max_log_alpha is not None else torch.inf
-                        if not np.isinf(lower) or not np.isinf(upper):
-                            self.log_alpha.clamp_(min=lower, max=upper)
-                    alpha_loss_value = float(alpha_loss.detach().cpu().item())
-                    alpha_value = float(self.log_alpha.exp().detach().cpu().item())
+                    alpha_rows_total = int(log_pi_detached.shape[0])
+                    alpha_mask = None
+                    if bool(getattr(args, "alpha_update_student_only", False)) and teacher_mask is not None:
+                        alpha_mask = ~teacher_mask.reshape(-1)
+                    if alpha_mask is None:
+                        alpha_rows_used = alpha_rows_total
+                        alpha_log_pi = log_pi_detached
+                    else:
+                        alpha_rows_used = int(alpha_mask.sum().item())
+                        alpha_log_pi = log_pi_detached[alpha_mask]
+                    metrics_accumulator["alpha_student_only_rows"] += float(alpha_rows_used)
+                    if alpha_rows_total > 0:
+                        metrics_accumulator["alpha_student_only_fraction"] += float(alpha_rows_used) / float(alpha_rows_total)
+                    if alpha_rows_used > 0:
+                        alpha_loss = (-self.log_alpha.exp() * (alpha_log_pi + self.target_entropy)).mean()
+                        alpha_loss.backward()
+                        self.alpha_optimizer.step()
+                        self._apply_alpha_bounds_()
+                        alpha_loss_value = float(alpha_loss.detach().cpu().item())
+                        alpha_value = float(self.current_alpha_tensor().detach().cpu().item())
+                        metrics_accumulator["alpha_optimizer_step_count"] += 1.0
+                    else:
+                        alpha_loss_value = 0.0
+                        alpha_value = float(self.current_alpha_tensor().detach().cpu().item())
+                        metrics_accumulator["alpha_student_only_skipped_updates"] += 1.0
+                metrics_accumulator["alpha_metric_count"] += 1.0
                 metrics_accumulator["alpha_update_count"] += 1.0
+                metrics_accumulator["alpha_value"] += alpha_value
 
             # Soft update targets
             source_backbone = self.actor_backbone if args.arch_shared_trunk else self.critic_backbone
@@ -495,7 +792,16 @@ class FastSACUpdater:
                     metrics_accumulator["q_min_non_teacher_data_count"] += non_teacher_count
             metrics_accumulator["reward"] += reward_mean
             metrics_accumulator["reward_abs"] += float(rewards_batch.detach().abs().mean().cpu().item())
-            metrics_accumulator["alpha_value"] += alpha_value
+            metrics_accumulator["pvp_td_reward"] += pvp_td_reward_value
+            metrics_accumulator["pvp_proxy_teacher_loss"] += pvp_proxy_teacher_loss_value
+            metrics_accumulator["pvp_proxy_student_loss"] += pvp_proxy_student_loss_value
+            metrics_accumulator["pvp_intervened_batch_fraction"] += pvp_intervened_batch_fraction_value
+            metrics_accumulator["eil_good_loss"] += eil_good_loss_value
+            metrics_accumulator["eil_bad_loss"] += eil_bad_loss_value
+            metrics_accumulator["eil_pair_loss"] += eil_pair_loss_value
+            metrics_accumulator["eil_good_batch_fraction"] += eil_good_batch_fraction_value
+            metrics_accumulator["eil_bad_batch_fraction"] += eil_bad_batch_fraction_value
+            metrics_accumulator["eil_intervened_batch_fraction"] += eil_intervened_batch_fraction_value
             metrics_accumulator["timing_opt_s"] += float(time.perf_counter() - opt_t0)
             updates_count += 1
 

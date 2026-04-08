@@ -98,6 +98,30 @@ def _maybe_build_train_vr_teleop(args) -> tuple[Optional[VRTeleopInterface], Opt
 
 
 def run_fastsac_ogbench_manip(args, generate_policy_map=None) -> None:
+    algo_variant = str(getattr(args, "algo_variant", "own") or "own").strip().lower()
+    if algo_variant not in {"own", "pvp", "eil"}:
+        raise ValueError(f"Unsupported manip algo_variant={algo_variant!r}.")
+    args.algo_variant = algo_variant
+    if algo_variant == "pvp":
+        if not bool(getattr(args, "demo_buffer_enable", False)):
+            raise ValueError("--algo_variant pvp requires --demo_buffer_enable (used as the human/intervention buffer).")
+        if float(getattr(args, "demo_sample_ratio", 0.0)) <= 0.0:
+            raise ValueError("--algo_variant pvp requires --demo_sample_ratio > 0 for balanced novice/human sampling.")
+        if bool(getattr(args, "store_intervened_in_demo_buffer", False)):
+            raise ValueError("--store_intervened_in_demo_buffer is redundant with --algo_variant pvp buffer routing.")
+        args.pref_buffer_enable = False
+        args.pref_rank_weight = 0.0
+        args.pref_sample_ratio = 0.0
+    elif algo_variant == "eil":
+        args.pref_buffer_enable = False
+        args.pref_rank_weight = 0.0
+        args.pref_sample_ratio = 0.0
+        if float(getattr(args, "fixed_alpha", -1.0)) < 0.0:
+            args.fixed_alpha = 0.0
+        args.alpha_init = 0.0
+        args.alpha_min = 0.0
+        args.alpha_max = 0.0
+        args.alpha_freeze_steps = 0
     canonical_reward_mode = canonicalize_cube_reward_mode(str(getattr(args, "cube_reward_mode", "dense")))
     args.cube_reward_mode = canonical_reward_mode
     if str(getattr(args, "train_render_mode", "none")).lower() == "human":
@@ -146,7 +170,13 @@ def run_fastsac_ogbench_manip(args, generate_policy_map=None) -> None:
         critic_obs_normalizer = torch.compile(critic_obs_normalizer)
 
     buffers = initialize_buffers(args, device, n_obs, n_act, obs_normalizer)
-    replay_buffer = create_replay_buffer(args, device, n_obs, n_act)
+    replay_buffer = create_replay_buffer(
+        args,
+        device,
+        n_obs,
+        n_act,
+        n_env_override=(1 if algo_variant == "pvp" else None),
+    )
     demo_buffer = (
         create_replay_buffer(
             args,

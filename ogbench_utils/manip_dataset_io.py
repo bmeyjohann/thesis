@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -62,8 +64,34 @@ def save_transition_dataset(
         payload["student_actions"] = np.asarray(student_actions, dtype=np.float32)
     if teacher_intervened is not None:
         payload["teacher_intervened"] = np.asarray(teacher_intervened, dtype=np.bool_).reshape(-1)
-    np.savez_compressed(target, **payload)
-    target.with_suffix(".json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    with tempfile.NamedTemporaryFile(
+        dir=target.parent,
+        prefix=f".{target.stem}_",
+        suffix=target.suffix,
+        delete=False,
+    ) as tmp_npz:
+        tmp_npz_path = Path(tmp_npz.name)
+    try:
+        np.savez_compressed(tmp_npz_path, **payload)
+        os.replace(tmp_npz_path, target)
+    finally:
+        tmp_npz_path.unlink(missing_ok=True)
+
+    sidecar = target.with_suffix(".json")
+    with tempfile.NamedTemporaryFile(
+        dir=sidecar.parent,
+        prefix=f".{sidecar.stem}_",
+        suffix=sidecar.suffix,
+        delete=False,
+        mode="w",
+        encoding="utf-8",
+    ) as tmp_json:
+        tmp_json.write(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+        tmp_json_path = Path(tmp_json.name)
+    try:
+        os.replace(tmp_json_path, sidecar)
+    finally:
+        tmp_json_path.unlink(missing_ok=True)
     return target
 
 
@@ -159,5 +187,101 @@ def extend_buffer_from_dataset(
     return {
         "path": str(path),
         "rows_loaded": int(committed),
+        "metadata": metadata,
+    }
+
+
+def _buffer_obs_to_numpy(buffer, env_idx: int, indices: torch.Tensor) -> np.ndarray:
+    obs = buffer.observations[env_idx, indices]
+    if getattr(buffer, "obs_is_pixel", False):
+        obs = obs.to(torch.float32).div_(255.0).view(obs.shape[0], -1)
+    else:
+        obs = obs.to(torch.float32)
+    return obs.detach().cpu().numpy().astype(np.float32, copy=False)
+
+
+def save_buffer_as_transition_dataset(
+    *,
+    buffer,
+    path: Path | str,
+    metadata: dict[str, Any],
+    max_rows: int = 0,
+    filter_mode: str = "all",
+) -> dict[str, Any]:
+    obs_rows: list[np.ndarray] = []
+    action_rows: list[np.ndarray] = []
+    next_obs_rows: list[np.ndarray] = []
+    reward_rows: list[np.ndarray] = []
+    done_rows: list[np.ndarray] = []
+    trunc_rows: list[np.ndarray] = []
+    student_action_rows: list[np.ndarray] = []
+    teacher_intervened_rows: list[np.ndarray] = []
+
+    rows_remaining = int(max_rows) if int(max_rows) > 0 else 0
+
+    for env_idx in range(int(getattr(buffer, "n_env", 1))):
+        cap = int(buffer.env_capacities[env_idx])
+        if cap <= 1 or int(buffer.filled[env_idx].item()) <= 0:
+            continue
+
+        valid_mask = buffer.transition_ready[env_idx, :cap] & buffer.valid_next_mask[env_idx, :cap]
+        if filter_mode == "intervened":
+            valid_mask = valid_mask & buffer.teacher_intervened[env_idx, :cap]
+        elif filter_mode == "non_intervened":
+            valid_mask = valid_mask & (~buffer.teacher_intervened[env_idx, :cap])
+        indices = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1)
+        if indices.numel() <= 0:
+            continue
+        if rows_remaining > 0:
+            indices = indices[:rows_remaining]
+        if indices.numel() <= 0:
+            break
+        next_indices = (indices + 1) % cap
+
+        obs_rows.append(_buffer_obs_to_numpy(buffer, env_idx, indices))
+        next_obs_rows.append(_buffer_obs_to_numpy(buffer, env_idx, next_indices))
+        action_rows.append(buffer.actions[env_idx, indices].detach().cpu().numpy().astype(np.float32, copy=False))
+        student_action_rows.append(
+            buffer.student_actions[env_idx, indices].detach().cpu().numpy().astype(np.float32, copy=False)
+        )
+        teacher_intervened_rows.append(
+            buffer.teacher_intervened[env_idx, indices].detach().cpu().numpy().astype(np.bool_, copy=False)
+        )
+        reward_rows.append(buffer.rewards[env_idx, indices].detach().cpu().numpy().astype(np.float32, copy=False))
+        done_rows.append(buffer.dones[env_idx, indices].detach().cpu().numpy().astype(np.bool_, copy=False))
+        trunc_rows.append(buffer.truncations[env_idx, indices].detach().cpu().numpy().astype(np.bool_, copy=False))
+
+        if rows_remaining > 0:
+            rows_remaining -= int(indices.numel())
+            if rows_remaining <= 0:
+                break
+
+    if not obs_rows:
+        raise ValueError("Replay buffer does not contain any exportable transitions.")
+
+    observations = np.concatenate(obs_rows, axis=0)
+    actions = np.concatenate(action_rows, axis=0)
+    next_observations = np.concatenate(next_obs_rows, axis=0)
+    rewards = np.concatenate(reward_rows, axis=0).reshape(-1)
+    dones = np.concatenate(done_rows, axis=0).reshape(-1)
+    truncations = np.concatenate(trunc_rows, axis=0).reshape(-1)
+    student_actions = np.concatenate(student_action_rows, axis=0)
+    teacher_intervened = np.concatenate(teacher_intervened_rows, axis=0).reshape(-1)
+
+    target = save_transition_dataset(
+        path=path,
+        metadata=metadata,
+        observations=observations,
+        actions=actions,
+        next_observations=next_observations,
+        rewards=rewards,
+        dones=dones,
+        truncations=truncations,
+        student_actions=student_actions,
+        teacher_intervened=teacher_intervened,
+    )
+    return {
+        "path": str(target),
+        "rows_saved": int(observations.shape[0]),
         "metadata": metadata,
     }

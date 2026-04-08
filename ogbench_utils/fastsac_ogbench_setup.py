@@ -160,8 +160,19 @@ def initialize_models(
     initial_target_heads_state = copy.deepcopy(critic_target_heads.state_dict())
 
     target_entropy = -float(n_act)
+    alpha_init = float(getattr(args, "alpha_init", 1e-3))
+    fixed_alpha = float(getattr(args, "fixed_alpha", -1.0))
+    if fixed_alpha >= 0.0:
+        alpha_init = fixed_alpha
+    else:
+        alpha_min = float(getattr(args, "alpha_min", 0.0))
+        alpha_max = float(getattr(args, "alpha_max", 0.0))
+        if alpha_max > 0.0:
+            alpha_init = min(alpha_init, alpha_max)
+        if alpha_min > 0.0:
+            alpha_init = max(alpha_init, alpha_min)
     log_alpha = torch.ones(1, requires_grad=True, device=device)
-    log_alpha.data.copy_(torch.tensor([np.log(0.001)], device=device))
+    log_alpha.data.copy_(torch.tensor([np.log(max(alpha_init, 1e-12))], device=device))
     alpha_optimizer = optim.Adam([log_alpha], lr=args.critic_learning_rate)
 
     return ModelComponents(

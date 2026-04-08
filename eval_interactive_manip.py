@@ -1476,8 +1476,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--visualize_intervention_colors",
         action="store_true",
-        default=False,
+        default=True,
         help="Tint the robot in the native viewer: full intervention colors arm+gripper red, gripper-only colors the gripper amber.",
+    )
+    p.add_argument(
+        "--no_visualize_intervention_colors",
+        dest="visualize_intervention_colors",
+        action="store_false",
+        help="Disable the native-viewer intervention color overlay.",
     )
     return p.parse_args()
 

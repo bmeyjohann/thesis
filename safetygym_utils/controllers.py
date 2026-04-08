@@ -9,7 +9,7 @@ from typing import Optional
 
 import numpy as np
 
-from .env import extract_min_constrained_clearance
+from .env import extract_agent_forward_xy, extract_min_constrained_clearance, unwrap_env
 from .gamepad import (
     DEFAULT_SAFETY_GAMEPAD_CACHE_PATH,
     DEFAULT_SAFETY_GAMEPAD_CONFIG_PATH,
@@ -582,6 +582,179 @@ class SwitchingExpertPolicyController:
         self.safe_controller.close()
 
 
+class ScriptedLidarTeacherController:
+    """Rule-based SafetyCar teacher from goal and obstacle lidar baskets."""
+
+    always_active = True
+
+    def __init__(
+        self,
+        *,
+        action_low: np.ndarray,
+        action_high: np.ndarray,
+        align_tolerance_bins: int = 1,
+        min_goal_signal: float = 1e-6,
+    ):
+        self.action_low = np.asarray(action_low, dtype=np.float32).reshape(-1)
+        self.action_high = np.asarray(action_high, dtype=np.float32).reshape(-1)
+        self.align_tolerance_bins = int(max(0, align_tolerance_bins))
+        self.min_goal_signal = float(max(0.0, min_goal_signal))
+        self._flat_slices: dict[str, slice] | None = None
+        self._lidar_keys: tuple[str, ...] = ()
+        self._front_bin: int | None = None
+        self._num_bins: int | None = None
+
+    @staticmethod
+    def _wheel_limit(action_low: np.ndarray, action_high: np.ndarray) -> float:
+        low = np.asarray(action_low, dtype=np.float32).reshape(-1)
+        high = np.asarray(action_high, dtype=np.float32).reshape(-1)
+        if low.size < 2 or high.size < 2:
+            return 1.0
+        return float(max(np.max(np.abs(low[:2])), np.max(np.abs(high[:2])), 1.0))
+
+    @staticmethod
+    def _iter_wrappers(env):
+        cur = env
+        seen: set[int] = set()
+        while cur is not None and id(cur) not in seen:
+            seen.add(id(cur))
+            yield cur
+            cur = getattr(cur, "env", None)
+
+    def _adapt_raw_wheels_to_env(self, env, wheel_action: np.ndarray) -> np.ndarray:
+        action = np.asarray(wheel_action, dtype=np.float32).reshape(-1)
+        for wrapper in self._iter_wrappers(env):
+            if hasattr(wrapper, "reverse_action") and getattr(wrapper, "action_mode", "raw_wheels") in {"throttle_turn", "cardinal"}:
+                action = np.asarray(wrapper.reverse_action(action), dtype=np.float32).reshape(-1)
+                break
+        low = np.asarray(env.action_space.low, dtype=np.float32).reshape(-1)
+        high = np.asarray(env.action_space.high, dtype=np.float32).reshape(-1)
+        if action.shape[0] < low.shape[0]:
+            action = np.pad(action, (0, low.shape[0] - action.shape[0]), mode="constant")
+        elif action.shape[0] > low.shape[0]:
+            action = action[: low.shape[0]]
+        return np.clip(action, low, high).astype(np.float32, copy=False)
+
+    def _build_obs_slices(self, env) -> None:
+        if self._flat_slices is not None:
+            return
+        base = unwrap_env(env)
+        task = getattr(base, "task", None)
+        obs_info = getattr(task, "obs_info", None)
+        obs_space_dict = getattr(obs_info, "obs_space_dict", None)
+        spaces = getattr(obs_space_dict, "spaces", None)
+        if not isinstance(spaces, dict):
+            raise TypeError("Scripted lidar teacher requires Dict-backed Safety-Gym observations.")
+        offset = 0
+        self._flat_slices = {}
+        lidar_keys: list[str] = []
+        for key, space in spaces.items():
+            shape = tuple(int(v) for v in getattr(space, "shape", ()))
+            width = int(np.prod(shape)) if shape else 1
+            self._flat_slices[str(key)] = slice(offset, offset + width)
+            offset += width
+            if str(key).endswith("_lidar"):
+                lidar_keys.append(str(key))
+        self._lidar_keys = tuple(lidar_keys)
+        goal_slice = self._flat_slices.get("goal_lidar")
+        if goal_slice is None:
+            raise KeyError("goal_lidar not found in Safety-Gym observation slices.")
+        self._num_bins = int(goal_slice.stop - goal_slice.start)
+
+    def _obs_components(self, obs: np.ndarray, env) -> tuple[np.ndarray, np.ndarray]:
+        self._build_obs_slices(env)
+        assert self._flat_slices is not None
+        obs_arr = np.asarray(obs, dtype=np.float32).reshape(-1)
+        goal_slice = self._flat_slices["goal_lidar"]
+        goal = obs_arr[goal_slice].astype(np.float32, copy=True)
+        merged = np.zeros_like(goal)
+        for key in self._lidar_keys:
+            if key == "goal_lidar":
+                continue
+            sl = self._flat_slices.get(key)
+            if sl is None:
+                continue
+            merged = np.maximum(merged, obs_arr[sl].astype(np.float32, copy=False))
+        return goal, merged
+
+    def _ensure_front_bin(self, env) -> int:
+        if self._front_bin is not None:
+            return self._front_bin
+        base = unwrap_env(env)
+        task = getattr(base, "task", None)
+        if task is None or not hasattr(task, "_obs_lidar"):
+            raise RuntimeError("Scripted lidar teacher requires direct access to the Safety-Gym task.")
+        forward = extract_agent_forward_xy(env)
+        if forward is None:
+            raise RuntimeError("Could not extract agent forward direction for scripted lidar teacher.")
+        agent_xy = np.asarray(task.agent.pos[:2], dtype=np.float64)
+        probe_xy = agent_xy + np.asarray(forward, dtype=np.float64) * 1.0
+        probe_lidar = np.asarray(task._obs_lidar(np.asarray([probe_xy], dtype=np.float64), task.goal.group), dtype=np.float32)
+        self._front_bin = int(np.argmax(probe_lidar))
+        self._num_bins = int(probe_lidar.shape[0])
+        return self._front_bin
+
+    def _signed_bin_offset(self, target_bin: int, env) -> int:
+        front_bin = self._ensure_front_bin(env)
+        num_bins = int(self._num_bins or 16)
+        half = num_bins // 2
+        return int(((int(target_bin) - front_bin + half) % num_bins) - half)
+
+    def _select_target_bin(self, goal_lidar: np.ndarray, obstacle_lidar: np.ndarray, env) -> tuple[int, dict[str, float]]:
+        goal = np.asarray(goal_lidar, dtype=np.float32).reshape(-1)
+        obstacles = np.asarray(obstacle_lidar, dtype=np.float32).reshape(-1)
+        goal_idx = int(np.argmax(goal))
+        goal_peak = float(goal[goal_idx])
+        num_bins = int(goal.shape[0])
+        goal_threshold = max(goal_peak, self.min_goal_signal)
+        clear_mask = obstacles < goal_threshold
+
+        def circ_dist(idx: int) -> int:
+            diff = abs(int(idx) - goal_idx)
+            return min(diff, num_bins - diff)
+
+        if bool(clear_mask[goal_idx]):
+            target_idx = goal_idx
+        else:
+            candidates = [idx for idx in range(num_bins) if bool(clear_mask[idx])]
+            if candidates:
+                target_idx = min(candidates, key=lambda idx: (circ_dist(idx), -float(goal[idx]), float(obstacles[idx])))
+            else:
+                target_idx = min(range(num_bins), key=lambda idx: (float(obstacles[idx]), circ_dist(idx), -float(goal[idx])))
+        diag = {
+            "goal_idx": float(goal_idx),
+            "goal_peak": float(goal_peak),
+            "goal_obstacle": float(obstacles[goal_idx]),
+            "target_idx": float(target_idx),
+            "target_obstacle": float(obstacles[target_idx]),
+            "target_goal_signal": float(goal[target_idx]),
+        }
+        return int(target_idx), diag
+
+    def _wheel_action(self, *, signed_offset: int, wheel_limit: float) -> np.ndarray:
+        lim = float(max(1e-6, wheel_limit))
+        if abs(int(signed_offset)) <= self.align_tolerance_bins:
+            return np.asarray([lim, lim], dtype=np.float32)
+        if int(signed_offset) > 0:
+            return np.asarray([lim, -lim], dtype=np.float32)
+        return np.asarray([-lim, lim], dtype=np.float32)
+
+    def get_action(self, obs: np.ndarray | None = None, env=None) -> np.ndarray | None:
+        if obs is None or env is None:
+            return None
+        goal_lidar, obstacle_lidar = self._obs_components(obs, env)
+        target_idx, _diag = self._select_target_bin(goal_lidar, obstacle_lidar, env)
+        signed_offset = self._signed_bin_offset(target_idx, env)
+        wheel_action = self._wheel_action(
+            signed_offset=signed_offset,
+            wheel_limit=self._wheel_limit(self.action_low, self.action_high),
+        )
+        return self._adapt_raw_wheels_to_env(env, wheel_action)
+
+    def close(self) -> None:
+        return None
+
+
 def build_human_controller(
     *,
     input_device: str,
@@ -612,6 +785,13 @@ def build_human_controller(
 ):
     input_device = str(input_device).lower()
     control_scheme = str(control_scheme_override).strip() if control_scheme_override else infer_control_scheme(env_name)
+    if input_device == "scripted":
+        if action_low is None or action_high is None:
+            raise ValueError("Scripted controller requires action_low/action_high.")
+        return ScriptedLidarTeacherController(
+            action_low=np.asarray(action_low, dtype=np.float32),
+            action_high=np.asarray(action_high, dtype=np.float32),
+        )
     if input_device == "expert":
         if obs_dim is None or action_low is None or action_high is None:
             raise ValueError("Expert controller requires obs_dim plus action_low/action_high.")

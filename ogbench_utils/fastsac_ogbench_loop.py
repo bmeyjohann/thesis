@@ -32,8 +32,53 @@ from .fastsac_ogbench_setup import build_updater_from_components, create_replay_
 from .fastsac_ogbench_types import AMPComponents, BufferComponents, ModelComponents
 from .intervention_wrappers import InterventionWrapper
 from .logging import CheckpointManager, TeacherMetricsAccumulator, TimingWindow, TrainingLogger
+from .manip_dataset_io import DEFAULT_MANIP_DATASET_DIR, build_dataset_path, save_buffer_as_transition_dataset
 from .obs import prepare_observation
 from .update import FastSACUpdater
+
+
+def _algo_variant(args) -> str:
+    return str(getattr(args, "algo_variant", "own") or "own").strip().lower()
+
+
+def _is_deterministic_variant(args) -> bool:
+    return _algo_variant(args) in {"pvp", "eil"}
+
+
+def _export_manip_replay_snapshot(
+    *,
+    args,
+    replay_buffer: SimpleReplayBuffer,
+    dataset_path: str,
+    env_name: str,
+    total_env_steps: int,
+    tag: str,
+) -> dict[str, float]:
+    metadata = {
+        "env_name": str(env_name),
+        "exp_name": str(getattr(args, "exp_name", "") or ""),
+        "source_buffer": "replay",
+        "context": "online_training",
+        "export_tag": str(tag),
+        "global_step": int(total_env_steps),
+        "gamma": float(getattr(args, "gamma", 0.0)),
+        "cta_ratio": int(getattr(args, "cta_ratio", 1)),
+        "num_updates": int(getattr(args, "num_updates", 1)),
+        "intervention_mode": str(getattr(args, "intervention_mode", "") or ""),
+        "teacher_type": str(getattr(args, "teacher_type", "") or ""),
+        "disable_rotation": bool(getattr(args, "disable_rotation", False)),
+    }
+    stats = save_buffer_as_transition_dataset(
+        buffer=replay_buffer,
+        path=dataset_path,
+        metadata=metadata,
+        max_rows=int(getattr(args, "export_replay_dataset_max_rows", 0)),
+        filter_mode="all",
+    )
+    return {
+        "Train/export_replay_rows": float(stats["rows_saved"]),
+        "Train/export_replay_saved": 1.0,
+    }
 
 def prefill_replay_buffer_with_demos(
     *,
@@ -226,7 +271,9 @@ def prefill_replay_buffer_with_demos(
             obs = next_obs
             step_teacher_mask = torch.zeros(demo_envs.num_envs, device=device, dtype=torch.bool)
             if isinstance(infos, dict):
-                teacher_mask_raw = infos.get("teacher_intervened")
+                teacher_mask_raw = infos.get("teacher_intervened_mask")
+                if teacher_mask_raw is None:
+                    teacher_mask_raw = infos.get("teacher_intervened")
                 if teacher_mask_raw is not None:
                     teacher_mask = _as_tensor_batch(
                         teacher_mask_raw, device=device, dtype=torch.bool, num_envs=demo_envs.num_envs
@@ -597,7 +644,18 @@ def run_training_loop(
     """Main rollout/update loop for FastSAC OGBench training."""
     rb = replay_buffer
     pref_buffer = buffers.pref_buffer
+    algo_variant = _algo_variant(args)
+    pvp_enabled = algo_variant == "pvp"
+    eil_enabled = algo_variant == "eil"
+    deterministic_variant = _is_deterministic_variant(args)
     store_intervened_in_demo_buffer = bool(getattr(args, "store_intervened_in_demo_buffer", False))
+    if pvp_enabled:
+        if demo_buffer is None:
+            raise ValueError("--algo_variant pvp requires demo_buffer as the human/intervention buffer.")
+        if int(getattr(rb, "n_env", 1)) != 1:
+            raise ValueError("PVP routing requires replay_buffer.n_env == 1.")
+        if int(getattr(demo_buffer, "n_env", 1)) != 1:
+            raise ValueError("PVP routing requires demo_buffer.n_env == 1.")
     if store_intervened_in_demo_buffer:
         if demo_buffer is None:
             raise ValueError("--store_intervened_in_demo_buffer requires --demo_buffer_enable.")
@@ -667,6 +725,34 @@ def run_training_loop(
         next_save_step = first_save_step if first_save_step is not None else save_interval_current
         eval_interval_current = args.eval_interval if args.eval_interval > 0 else None
         next_eval_step = eval_interval_current
+        export_replay_interval = int(max(0, getattr(args, "export_replay_dataset_interval", 0)))
+        export_replay_dataset_path: str | None = None
+        next_export_replay_step: int | None = None
+        last_export_replay_step: int | None = None
+        if export_replay_interval > 0:
+            configured_path = str(getattr(args, "export_replay_dataset_path", "") or "").strip()
+            if configured_path:
+                export_replay_dataset_path = configured_path
+            else:
+                dataset_root = (
+                    str(getattr(args, "export_replay_dataset_dir", "") or "").strip()
+                    or str(DEFAULT_MANIP_DATASET_DIR)
+                )
+                dataset_label = str(getattr(args, "export_replay_dataset_label", "") or "").strip() or "online_replay"
+                export_replay_dataset_path = str(
+                    build_dataset_path(
+                        env_name=current_env_name,
+                        dataset_dir=dataset_root,
+                        label=dataset_label,
+                    )
+                )
+            next_export_replay_step = export_replay_interval
+            msg = (
+                "[Dataset] manipulation replay snapshots enabled "
+                f"path={export_replay_dataset_path} interval={export_replay_interval}"
+            )
+            print(msg, flush=True)
+            record_progress(msg)
 
         run_prefix = current_env_name.replace('-', '_')
         next_learning_starts_at = int(args.learning_starts)
@@ -708,6 +794,11 @@ def run_training_loop(
         human_debug_episode_reward = 0.0
         human_debug_episode_steps = 0
         total_interventions = 0
+        replay_intervention_write_checks = 0
+        replay_intervention_write_mismatches = 0
+        eil_bad_pre_steps = int(max(0, getattr(args, "eil_bad_pre_steps", 8)))
+        eil_pending_rows = [deque() for _ in range(envs.num_envs)] if eil_enabled else []
+        eil_teacher_active = [False for _ in range(envs.num_envs)] if eil_enabled else []
         if human_reward_debug:
             print(
                 "[HumanRewardDebug] enabled: episode-only reward summary "
@@ -727,7 +818,8 @@ def run_training_loop(
             action_t0 = time.perf_counter()
             norm_obs = normalize_obs(obs)
             with torch.no_grad(), autocast(device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled):
-                pi_action, _, _ = actor_head(actor_backbone(norm_obs))
+                sampled_action, _, mean_action = actor_head(actor_backbone(norm_obs))
+                pi_action = mean_action if deterministic_variant else sampled_action
                 pi_action = _apply_binary_gripper_action(
                     pi_action,
                     enabled=args.binary_gripper_actions,
@@ -935,11 +1027,63 @@ def run_training_loop(
                 raise RuntimeError(
                     f"Failed to build transition TensorDict for num_envs={envs.num_envs}; shapes={shape_dbg}"
                 ) from exc
-            rb.extend(transition)
-            if store_intervened_in_demo_buffer:
-                intervened_ids = torch.nonzero(teacher_intervened_for_replay.to(torch.bool), as_tuple=False).flatten()
-                for env_idx in intervened_ids.tolist():
-                    demo_buffer.extend(transition[env_idx : env_idx + 1])
+            def _annotate_eil_row(row: TensorDict, *, good: bool, bad: bool) -> TensorDict:
+                row["eil_good"] = torch.tensor([good], dtype=torch.bool, device=device)
+                row["eil_bad"] = torch.tensor([bad], dtype=torch.bool, device=device)
+                return row
+
+            if pvp_enabled:
+                for env_idx in range(envs.num_envs):
+                    row = transition[env_idx : env_idx + 1]
+                    if bool(teacher_intervened_for_replay[env_idx].item()):
+                        demo_buffer.extend(row)
+                    else:
+                        rb.extend(row)
+            elif eil_enabled:
+                for env_idx in range(envs.num_envs):
+                    row = transition[env_idx : env_idx + 1].clone()
+                    teacher_now = bool(teacher_intervened_for_replay[env_idx].item())
+                    done_now = bool(dones_eff[env_idx].item())
+                    pending_rows = eil_pending_rows[env_idx]
+
+                    if teacher_now:
+                        if not eil_teacher_active[env_idx] and pending_rows:
+                            split_idx = max(0, len(pending_rows) - eil_bad_pre_steps)
+                            pending_list = list(pending_rows)
+                            for queued_row in pending_list[:split_idx]:
+                                rb.extend_single_env(env_idx, _annotate_eil_row(queued_row, good=True, bad=False))
+                            for queued_row in pending_list[split_idx:]:
+                                rb.extend_single_env(env_idx, _annotate_eil_row(queued_row, good=False, bad=True))
+                            pending_rows.clear()
+                        rb.extend_single_env(env_idx, _annotate_eil_row(row, good=True, bad=False))
+                        eil_teacher_active[env_idx] = True
+                    else:
+                        if eil_teacher_active[env_idx]:
+                            eil_teacher_active[env_idx] = False
+                        pending_rows.append(row)
+                        while len(pending_rows) > eil_bad_pre_steps:
+                            rb.extend_single_env(env_idx, _annotate_eil_row(pending_rows.popleft(), good=True, bad=False))
+
+                    if done_now:
+                        while pending_rows:
+                            rb.extend_single_env(env_idx, _annotate_eil_row(pending_rows.popleft(), good=True, bad=False))
+                        eil_teacher_active[env_idx] = False
+            else:
+                rb.extend(transition)
+                for env_idx in range(envs.num_envs):
+                    cap = int(rb.env_capacities[env_idx])
+                    if cap <= 1:
+                        continue
+                    last_slot = (int(rb.env_ptr[env_idx].item()) - 1) % cap
+                    stored_mask = bool(rb.teacher_intervened[env_idx, last_slot].item())
+                    expected_mask = bool(teacher_intervened_for_replay[env_idx].item())
+                    replay_intervention_write_checks += 1
+                    if stored_mask != expected_mask:
+                        replay_intervention_write_mismatches += 1
+                if store_intervened_in_demo_buffer:
+                    intervened_ids = torch.nonzero(teacher_intervened_for_replay.to(torch.bool), as_tuple=False).flatten()
+                    for env_idx in intervened_ids.tolist():
+                        demo_buffer.extend(transition[env_idx : env_idx + 1])
             t_replay += time.perf_counter() - replay_t0
 
             if bool(getattr(args, "compute_q_diagnostics", False)):
@@ -1242,6 +1386,20 @@ def run_training_loop(
                 reward_mode_logs["Train/total_interventions"] = torch.tensor(
                     [float(total_interventions)], device=device, dtype=torch.float32
                 )
+                reward_mode_logs["Train/replay_intervention_write_checks"] = torch.tensor(
+                    [float(replay_intervention_write_checks)], device=device, dtype=torch.float32
+                )
+                reward_mode_logs["Train/replay_intervention_write_mismatches"] = torch.tensor(
+                    [float(replay_intervention_write_mismatches)], device=device, dtype=torch.float32
+                )
+                reward_mode_logs["Train/replay_intervention_write_mismatch_fraction"] = torch.tensor(
+                    [
+                        float(replay_intervention_write_mismatches)
+                        / max(1.0, float(replay_intervention_write_checks))
+                    ],
+                    device=device,
+                    dtype=torch.float32,
+                )
                 if reward_mode_logs:
                     infos_for_logging = dict(infos) if isinstance(infos, dict) else {"log": {}}
                     existing_log = infos_for_logging.get("log")
@@ -1288,6 +1446,27 @@ def run_training_loop(
                 training_logger.log_eval(total_env_steps=total_env_steps, metrics=eval_metrics)
                 next_eval_step += eval_interval_current
 
+            while next_export_replay_step is not None and total_env_steps >= next_export_replay_step:
+                export_logs = _export_manip_replay_snapshot(
+                    args=args,
+                    replay_buffer=rb,
+                    dataset_path=export_replay_dataset_path,
+                    env_name=current_env_name,
+                    total_env_steps=total_env_steps,
+                    tag="periodic",
+                )
+                last_export_replay_step = int(total_env_steps)
+                export_msg = (
+                    "[Dataset] saved manipulation replay snapshot "
+                    f"step={total_env_steps} path={export_replay_dataset_path}"
+                )
+                print(export_msg, flush=True)
+                record_progress(export_msg)
+                wandb_run = training_logger.ensure_wandb_run()
+                if wandb_run is not None:
+                    wandb_run.log(export_logs, step=total_env_steps)
+                next_export_replay_step += export_replay_interval
+
         final_ckpt = checkpoint_manager.save(
             tag='final',
             step_value=total_env_steps,
@@ -1311,6 +1490,25 @@ def run_training_loop(
             current_env_name=current_env_name,
             wandb_run=training_logger.wandb_run,
         )
+        if export_replay_dataset_path is not None and rb.size > 0:
+            export_logs = _export_manip_replay_snapshot(
+                args=args,
+                replay_buffer=rb,
+                dataset_path=export_replay_dataset_path,
+                env_name=current_env_name,
+                total_env_steps=total_env_steps,
+                tag="final",
+            )
+            last_export_replay_step = int(total_env_steps)
+            export_msg = (
+                "[Dataset] saved final manipulation replay snapshot "
+                f"step={total_env_steps} path={export_replay_dataset_path}"
+            )
+            print(export_msg, flush=True)
+            record_progress(export_msg)
+            wandb_run = training_logger.ensure_wandb_run()
+            if wandb_run is not None:
+                wandb_run.log(export_logs, step=total_env_steps)
 
         total_time = time.time() - start_time
         summary_line = (
@@ -1325,4 +1523,26 @@ def run_training_loop(
         record_progress(summary_line)
         return total_env_steps, iteration_idx, total_time
     finally:
+        if 'export_replay_dataset_path' in locals() and export_replay_dataset_path is not None:
+            try:
+                final_export_step = int(locals().get("total_env_steps", 0))
+                if rb.size > 0 and last_export_replay_step != final_export_step:
+                    _export_manip_replay_snapshot(
+                        args=args,
+                        replay_buffer=rb,
+                        dataset_path=export_replay_dataset_path,
+                        env_name=current_env_name,
+                        total_env_steps=final_export_step,
+                        tag="finally",
+                    )
+                    msg = (
+                        "[Dataset] saved best-effort manipulation replay snapshot "
+                        f"step={final_export_step} path={export_replay_dataset_path}"
+                    )
+                    print(msg, flush=True)
+                    record_progress(msg)
+            except Exception as exc:
+                warn = f"[Dataset] failed to save best-effort manipulation replay snapshot: {exc}"
+                print(warn, flush=True)
+                record_progress(warn)
         training_logger.finish()

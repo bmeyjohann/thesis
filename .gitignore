@@ -10,6 +10,7 @@
 *_l.csv
 local/*
 codex/
+experiment_queue*/
 
 # Python
 __pycache__/

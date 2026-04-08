@@ -1082,7 +1082,8 @@ class InterventionWrapper(gym.Wrapper):
         if self.mode == 'human':
             human = self._human_action()
             if human is not None:
-                teacher_candidate_action = self._apply_gripper_binary(human)
+                teacher_candidate_action = self._coerce_action_dim(human, self._action_dim)
+                teacher_candidate_action = self._apply_gripper_binary(teacher_candidate_action)
                 teacher_candidate_available = teacher_candidate_action is not None
                 teleop_diag = {}
                 if self.teleop is not None and hasattr(self.teleop, "get_last_diag"):
@@ -1418,6 +1419,7 @@ class InterventionWrapper(gym.Wrapper):
             if teacher_candidate_available and teacher_candidate_action is not None:
                 info['teacher_action'] = np.array(teacher_candidate_action, dtype=np.float32)
             info['student_action'] = np.array(policy_action, dtype=np.float32)
+        info['applied_action'] = np.array(action_to_take, dtype=np.float32)
 
         # On episode end, flush metrics for logging
         if terminated or truncated:

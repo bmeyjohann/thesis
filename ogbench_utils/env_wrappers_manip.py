@@ -445,7 +445,7 @@ class ManipDisableRotationActionWrapper(gym.ActionWrapper):
     def step(self, action):
         obs, reward, terminated, truncated, info = super().step(action)
         info = dict(info) if isinstance(info, dict) else {}
-        for key in ("teacher_action", "student_action", "teacher_actions", "student_actions", "applied_actions"):
+        for key in ("teacher_action", "student_action", "teacher_actions", "student_actions", "applied_action", "applied_actions"):
             if key in info:
                 info[key] = self._project_action_like(info.get(key))
         return obs, reward, terminated, truncated, info

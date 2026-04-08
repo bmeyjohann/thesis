@@ -38,6 +38,18 @@ def build_train_parser() -> argparse.ArgumentParser:
     p.add_argument('--device', type=str, default='auto')
     p.add_argument('--train_render_mode', type=str, default='none', choices=['none', 'human'],
                    help='Optional live rendering during training (recommended only with num_envs=1).')
+    p.add_argument(
+        '--visualize_intervention_colors',
+        action='store_true',
+        default=True,
+        help='Manip only: tint the live human-render viewer during intervention (default: enabled).',
+    )
+    p.add_argument(
+        '--no_visualize_intervention_colors',
+        dest='visualize_intervention_colors',
+        action='store_false',
+        help='Manip only: disable live intervention tinting in the human-render viewer.',
+    )
     p.add_argument('--static_reset_seed', type=int, default=None,
                    help='If set, forces identical reset seed on every episode reset (deterministic static initial states).')
     # Observations
@@ -68,7 +80,14 @@ def build_train_parser() -> argparse.ArgumentParser:
     p.add_argument('--goal_marker_color', type=str, default='auto',
                    choices=['auto', 'red', 'green', 'blue'],
                    help='Override maze goal marker color (auto keeps env default)')
-    # Rewards
+    # Algorithm variant / rewards
+    p.add_argument(
+        '--algo_variant',
+        type=str,
+        default='own',
+        choices=['own', 'pvp', 'eil'],
+        help='Training objective family. own = current preference-based method, pvp = proxy value propagation baseline, eil = Expert Intervention Learning-style threshold/ranking objective.',
+    )
     p.add_argument('--reward_type', type=str, default='sparse', choices=['sparse', 'dense', 'combined', 'none'])
     p.add_argument('--dense_reward_scale', type=float, default=0.01)
     p.add_argument('--step_penalty', type=float, default=0.0)
@@ -93,6 +112,48 @@ def build_train_parser() -> argparse.ArgumentParser:
                    help='Scale for dense phase-progress reward increments (reach/carry progress terms).')
     p.add_argument('--cube_dense_progress_clip', type=float, default=0.0,
                    help='Optional max per-step phase progress contribution before scaling (0 disables clipping).')
+    p.add_argument(
+        '--pvp_proxy_value_bound',
+        type=float,
+        default=1.0,
+        help='PVP only: target proxy Q magnitude used for teacher/student action supervision (+bound / -bound).',
+    )
+    p.add_argument(
+        '--pvp_include_env_reward_in_td',
+        action='store_true',
+        default=False,
+        help='PVP only: include the environment reward in the TD target instead of running reward-free TD.',
+    )
+    p.add_argument(
+        '--eil_threshold',
+        type=float,
+        default=0.0,
+        help='EIL only: scalar Q threshold that separates acceptable from unacceptable actions.',
+    )
+    p.add_argument(
+        '--eil_good_margin',
+        type=float,
+        default=0.0,
+        help='EIL only: margin above --eil_threshold enforced for good/accepted actions.',
+    )
+    p.add_argument(
+        '--eil_bad_margin',
+        type=float,
+        default=0.01,
+        help='EIL only: margin below --eil_threshold enforced for bad/pre-takeover learner actions.',
+    )
+    p.add_argument(
+        '--eil_pair_margin',
+        type=float,
+        default=0.01,
+        help='EIL only: pairwise margin enforcing teacher actions above student proposals on intervened states.',
+    )
+    p.add_argument(
+        '--eil_bad_pre_steps',
+        type=int,
+        default=8,
+        help='EIL only: number of most recent learner-controlled steps before a takeover that are labeled bad.',
+    )
     p.add_argument('--switch_env_name', type=str, default=None,
                    help='Optional OGBench env id to switch to after a curriculum step')
     p.add_argument('--switch_env_after_steps', type=int, default=0,
@@ -340,6 +401,16 @@ def build_train_parser() -> argparse.ArgumentParser:
                    help='Minimum entropy temperature (alpha). Set to 0 to disable lower clamp.')
     p.add_argument('--alpha_max', type=float, default=1.0,
                    help='Maximum entropy temperature (alpha).')
+    p.add_argument('--alpha_init', type=float, default=1e-3,
+                   help='Initial entropy temperature (alpha) before any updates.')
+    p.add_argument('--fixed_alpha', type=float, default=-1.0,
+                   help='If >= 0, hold alpha fixed at this exact value and disable alpha updates.')
+    p.add_argument(
+        '--alpha_update_student_only',
+        action='store_true',
+        default=False,
+        help='When replay rows carry teacher_intervened markers, update alpha using only non-intervened rows.',
+    )
     p.add_argument('--alpha_freeze_steps', type=int, default=0,
                    help='Disable alpha updates until this many env steps have elapsed (0 disables).')
     p.add_argument('--debug_pixel_dump', action='store_true', default=False,
@@ -385,6 +456,16 @@ def build_train_parser() -> argparse.ArgumentParser:
                    help='Target buffer for offline manipulation dataset loading.')
     p.add_argument('--demo_dataset_max_rows', type=int, default=0,
                    help='Optional max number of rows to load from the offline manipulation dataset (0 = all).')
+    p.add_argument('--export_replay_dataset_interval', type=int, default=0,
+                   help='Env-step interval for atomic replay-dataset snapshots during manipulation training (0 disables).')
+    p.add_argument('--export_replay_dataset_path', type=str, default='',
+                   help='Optional fixed .npz path for periodic/final manipulation replay snapshots.')
+    p.add_argument('--export_replay_dataset_dir', type=str, default='',
+                   help='Directory root for auto-named manipulation replay snapshots.')
+    p.add_argument('--export_replay_dataset_label', type=str, default='online_replay',
+                   help='Label used when auto-naming manipulation replay snapshots.')
+    p.add_argument('--export_replay_dataset_max_rows', type=int, default=0,
+                   help='Optional max rows to export per manipulation replay snapshot (0 = all).')
     # Logging
     p.add_argument('--use_wandb', action='store_true', default=False)
     p.add_argument('--project', type=str, default='ogbench-rsl-rl')
@@ -454,10 +535,17 @@ def build_train_parser() -> argparse.ArgumentParser:
     p.add_argument('--pref_rank_margin', type=float, default=0.1,
                    help='Margin for ranking loss: softplus(margin - (Qpos - Qneg))')
     p.add_argument(
+        '--pref_critic_scope',
+        type=str,
+        default='all',
+        choices=['all', 'min'],
+        help='Apply preference loss to every critic head or only to the min-Q teacher/student pair.',
+    )
+    p.add_argument(
         '--pref_loss_type',
         type=str,
         default='margin',
-        choices=['margin', 'bradley_terry', 'lagrangian'],
+        choices=['margin', 'hinge', 'bradley_terry', 'lagrangian'],
         help='Preference loss formulation for critic updates.',
     )
     p.add_argument(

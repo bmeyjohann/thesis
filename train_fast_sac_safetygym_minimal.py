@@ -80,7 +80,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--intervention_hold_seconds", type=float, default=0.25)
     p.add_argument("--teacher_override_clearance_threshold", type=float, default=-1.0)
     p.add_argument("--human_action_scale", type=float, default=1.0)
-    p.add_argument("--human_input_device", type=str, default="keyboard", choices=["keyboard", "gamepad", "expert", "expert_switch"])
+    p.add_argument("--human_input_device", type=str, default="keyboard", choices=["keyboard", "gamepad", "expert", "expert_switch", "scripted"])
     p.add_argument("--controller_fps_limit", type=int, default=0)
     p.add_argument("--controller_overlay_hz", type=float, default=20.0)
     p.add_argument("--gamepad_mode", type=str, default="local", choices=["local", "connect"])
