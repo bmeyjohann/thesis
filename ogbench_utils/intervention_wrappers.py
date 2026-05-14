@@ -106,6 +106,7 @@ class InterventionWrapper(gym.Wrapper):
         *,
         mode: str = 'human',  # 'human' or 'agent'
         teacher_type: str = 'bfs',
+        teacher_action_noise_std: float = 0.0,
         # Human params
         threshold: float = 0.1,
         hold_time: float = 0.5,
@@ -128,7 +129,7 @@ class InterventionWrapper(gym.Wrapper):
         gripper_intervene_contact_threshold: float = 0.3,
         hard_block_lethal: bool = True,  # intervene if student's step enters lethal/danger cell
         enable_after_steps: int = 0,     # warmup steps per env before enabling interventions
-        agent_mode: str = 'divergence',  # 'always', 'divergence', 'safety_align', 'safety_progress', 'reward_progress', 'manual_gripper'
+        agent_mode: str = 'divergence',  # 'always', 'divergence', 'safety_align', 'safety_progress', 'safety_release_progress', 'reward_progress', 'manual_gripper'
         safety_margin_frac: float = 0.0,  # fraction of maze cell size for safety margin
         release_steps: int = 3,  # consecutive steps to release intervention
         reward_patience_steps: int = 5,  # reward-progress mode trigger/release horizon
@@ -143,9 +144,10 @@ class InterventionWrapper(gym.Wrapper):
 
         assert mode in ('human', 'agent')
         assert tolerance_type in ('angle', 'l2', 'component')
-        assert agent_mode in ('always', 'divergence', 'safety_align', 'safety_progress', 'reward_progress', 'manual_gripper')
+        assert agent_mode in ('always', 'divergence', 'safety_align', 'safety_progress', 'safety_release_progress', 'reward_progress', 'manual_gripper')
         self.mode = mode
         self.teacher_type = teacher_type
+        self.teacher_action_noise_std = float(max(0.0, teacher_action_noise_std))
         self.teleop = teleop_interface
         self.threshold = float(threshold)
         self.hold_time = float(hold_time)
@@ -227,6 +229,16 @@ class InterventionWrapper(gym.Wrapper):
         self._oracle_target_block: Optional[int] = None
         self._last_obs = None
         self._last_info: Optional[dict] = None
+
+    def _maybe_apply_teacher_action_noise(self, teacher_action: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        if teacher_action is None or self.mode != "agent" or self.teacher_action_noise_std <= 0.0:
+            return teacher_action
+        teacher_action = np.asarray(teacher_action, dtype=np.float32).reshape(-1).copy()
+        noise = self._rng.normal(0.0, self.teacher_action_noise_std, size=teacher_action.shape).astype(np.float32)
+        teacher_action = np.clip(teacher_action + noise, -1.0, 1.0)
+        if self.binary_gripper_actions:
+            teacher_action = self._apply_gripper_binary(teacher_action)
+        return teacher_action
 
     def _parse_tolerance_channel_weights(self, raw: Optional[object], action_dim: int) -> Optional[np.ndarray]:
         if raw is None:
@@ -1114,6 +1126,7 @@ class InterventionWrapper(gym.Wrapper):
                     teacher_action = self._teacher_action(self._last_obs, self._last_info or {})
                     teacher_action = self._coerce_action_dim(teacher_action, self._action_dim)
                     teacher_action = self._apply_gripper_binary(teacher_action)
+                    teacher_action = self._maybe_apply_teacher_action_noise(teacher_action)
                 manual_gate_active = self._manual_gate_active()
                 teacher_candidate_action = teacher_action
                 teacher_candidate_available = teacher_candidate_action is not None
@@ -1225,6 +1238,23 @@ class InterventionWrapper(gym.Wrapper):
                         reason = 'gripper'
                     else:
                         if safety_violation or safety_margin or self._progress_violation:
+                            self._progress_active = True
+
+                        if self._progress_active:
+                            if (not safety_violation and not safety_margin and self._progress_good_count >= self.release_steps):
+                                self._progress_active = False
+                            else:
+                                reason = 'safety' if (safety_violation or safety_margin) else 'progress'
+                        if not self._progress_active:
+                            teacher_action = None
+                elif self.agent_mode == 'safety_release_progress':
+                    if gripper_lock_violation:
+                        teacher_action = gripper_lock_action
+                        reason = 'gripper_lock'
+                    elif hard_gripper_violation:
+                        reason = 'gripper'
+                    else:
+                        if safety_violation or safety_margin:
                             self._progress_active = True
 
                         if self._progress_active:

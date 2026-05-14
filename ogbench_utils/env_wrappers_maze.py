@@ -276,6 +276,9 @@ def build_ogbench_maze_wrapper(
     reward_switch_after_steps: int = 0,
     intervention_mode: str = "none",
     teacher_type: str = "bfs",
+    teacher_action_noise_std: float = 0.0,
+    human_intervention_threshold: float = 0.1,
+    human_intervention_hold_time: float = 0.5,
     tolerance_type: str = "angle",
     tolerance_value: float = 30.0,
     tolerance_channel_weights: Optional[str] = None,
@@ -342,6 +345,7 @@ def build_ogbench_maze_wrapper(
             env,
             intervention_mode=intervention_mode,
             teacher_type=teacher_type,
+            teacher_action_noise_std=teacher_action_noise_std,
             tolerance_type=tolerance_type,
             tolerance_value=tolerance_value,
             tolerance_channel_weights=tolerance_channel_weights,
@@ -370,6 +374,8 @@ def build_ogbench_maze_wrapper(
             intervention_episode_prob_decay_steps=intervention_episode_prob_decay_steps,
             intervention_episode_prob_decay_start=intervention_episode_prob_decay_start,
             intervention_episode_prob_seed=intervention_episode_prob_seed,
+            human_threshold=human_intervention_threshold,
+            human_hold_time=human_intervention_hold_time,
             teleop_interface=teleop_interface,
         )
         if intervention_name is not None:

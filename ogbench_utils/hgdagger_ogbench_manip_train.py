@@ -40,6 +40,7 @@ from .fastsac_ogbench_setup import build_teacher_metrics, select_device
 from .logging import TrainingLogger
 from .obs import prepare_observation
 from .policy import GaussianPolicyHead, MLPBackbone
+from .repro import seed_everything
 
 
 @dataclass
@@ -408,6 +409,7 @@ def run_hgdagger_ogbench_manip(args) -> None:
     args.algo_variant = "hg_dagger"
     args.cube_reward_mode = canonicalize_cube_reward_mode(str(getattr(args, "cube_reward_mode", "dense")))
     device = select_device(args)
+    seed_everything(int(getattr(args, "seed", 42)))
     run_log_dir, run_model_dir, record_progress, progress_file = _prepare_run_dirs(args)
     print(f"HG-DAgger OGBench (manip) on {args.env_name} device={device}", flush=True)
     print(f"Log directory: {run_log_dir}", flush=True)

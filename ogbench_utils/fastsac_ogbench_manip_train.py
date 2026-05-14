@@ -35,6 +35,7 @@ from .env_wrappers_manip import canonicalize_cube_reward_mode
 from .fastsac_ogbench_loop import prefill_replay_buffer_with_demos, run_training_loop
 from .fastsac_ogbench_manip_env import build_manip_environment, build_manip_eval_environment
 from .manip_dataset_io import DEFAULT_MANIP_DATASET_DIR, extend_buffer_from_dataset, find_latest_transition_dataset
+from .repro import seed_everything
 from .fastsac_ogbench_setup import (
     build_teacher_metrics,
     build_updater_from_components,
@@ -49,6 +50,7 @@ from .fastsac_ogbench_setup import (
 )
 from .vr_mapping_web import create_vr_source
 from .vr_teleop import VRTeleopInterface, VRManipActionMapper, VRManipMappingConfig, apply_vr_mapping_profile
+from .vr_teleop import wait_for_fresh_gate_press
 
 
 def _maybe_build_train_vr_teleop(args) -> tuple[Optional[VRTeleopInterface], Optional[object]]:
@@ -135,6 +137,7 @@ def run_fastsac_ogbench_manip(args, generate_policy_map=None) -> None:
         )
 
     device = select_device(args)
+    seed_everything(int(getattr(args, "seed", 42)))
     ensure_experiment_name(args)
 
     run_log_dir, run_model_dir, viz_output_dir, viz_cache_path, record_progress, progress_file = prepare_run_dirs(args)
@@ -249,6 +252,12 @@ def run_fastsac_ogbench_manip(args, generate_policy_map=None) -> None:
         record_progress=record_progress,
         training_logger=logging_components.training_logger,
     )
+
+    if bool(getattr(args, "wait_for_human_start", False)) and teleop_interface is not None:
+        wait_for_fresh_gate_press(
+            teleop_interface,
+            label="VRTrainStart",
+        )
 
     try:
         run_training_loop(

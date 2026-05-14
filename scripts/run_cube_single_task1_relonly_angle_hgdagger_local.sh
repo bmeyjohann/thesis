@@ -12,12 +12,15 @@ done
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 WANDB_MODE_VALUE="${WANDB_MODE:-online}"
+WANDB_ENTITY_VALUE="${WANDB_ENTITY:-}"
+WANDB_GROUP_VALUE="${WANDB_GROUP:-}"
 PROJECT="${PROJECT:-ogbench-manip-reward-debug}"
 ENV_NAME="${ENV_NAME:-cube-single-singletask-task1-v0}"
 REWARD_TYPE="${REWARD_TYPE:-sparse}"
 CUBE_REWARD_MODE="${CUBE_REWARD_MODE:-dense}"
 INTERVENTION_EPISODE_PROB="${INTERVENTION_EPISODE_PROB:-1.0}"
 GAMMA="${GAMMA:-0.97}"
+SEED="${SEED:-42}"
 
 NUM_ENVS="${NUM_ENVS:-32}"
 TOTAL_TIMESTEPS="${TOTAL_TIMESTEPS:-120000}"
@@ -61,10 +64,12 @@ mkdir -p logs
 echo "=== Starting ${EXP_NAME} ==="
 echo "Log file: ${LOG_FILE}"
 echo "WANDB mode: ${WANDB_MODE_VALUE}"
+echo "WANDB entity/group: ${WANDB_ENTITY_VALUE:-<default>}/${WANDB_GROUP_VALUE:-<none>}"
 echo "HG-DAgger ensemble size: ${HG_ENSEMBLE_SIZE}"
 echo "Teacher demo prefill: ${DEMO_PREFILL_EPISODES} episodes into expert dataset"
 echo "Intervention episode probability: ${INTERVENTION_EPISODE_PROB}"
 echo "Gamma: ${GAMMA}"
+echo "Seed: ${SEED}"
 echo "UTD (num_updates): ${NUM_UPDATES}"
 echo "Disable rotation: ${DISABLE_ROTATION}"
 
@@ -88,6 +93,7 @@ ARGS=(
   --num_updates "${NUM_UPDATES}"
   --learning_starts "${LEARNING_STARTS}"
   --gamma "${GAMMA}"
+  --seed "${SEED}"
   --use_layer_norm
   --demo_prefill_episodes "${DEMO_PREFILL_EPISODES}"
   --demo_prefill_num_envs "${DEMO_PREFILL_NUM_ENVS}"
@@ -112,6 +118,14 @@ ARGS=(
 
 if [[ "${DISABLE_ROTATION}" == "1" ]]; then
   ARGS+=(--disable_rotation)
+fi
+
+if [[ -n "${WANDB_ENTITY_VALUE}" ]]; then
+  ARGS+=(--wandb_entity "${WANDB_ENTITY_VALUE}")
+fi
+
+if [[ -n "${WANDB_GROUP_VALUE}" ]]; then
+  ARGS+=(--wandb_group "${WANDB_GROUP_VALUE}")
 fi
 
 WANDB_MODE="${WANDB_MODE_VALUE}" \

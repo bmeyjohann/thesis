@@ -31,6 +31,7 @@ if "fasttd3/fast_sac" not in sys.path:
 
 from .fastsac_ogbench_loop import prefill_replay_buffer_with_demos, run_training_loop
 from .fastsac_ogbench_maze_env import build_maze_environment, build_maze_eval_environment
+from .maze_eval_artifacts import MazeEvalArtifactManager
 from .fastsac_ogbench_setup import (
     build_teacher_metrics,
     build_updater_from_components,
@@ -46,6 +47,31 @@ from .fastsac_ogbench_setup import (
 
 
 def run_fastsac_ogbench_maze(args, generate_policy_map=None) -> None:
+    algo_variant = str(getattr(args, "algo_variant", "own") or "own").strip().lower()
+    if algo_variant not in {"own", "pvp", "eil"}:
+        raise ValueError(f"Unsupported maze algo_variant={algo_variant!r}.")
+    args.algo_variant = algo_variant
+    if algo_variant == "pvp":
+        if not bool(getattr(args, "demo_buffer_enable", False)):
+            raise ValueError("--algo_variant pvp requires --demo_buffer_enable (used as the human/intervention buffer).")
+        if float(getattr(args, "demo_sample_ratio", 0.0)) <= 0.0:
+            raise ValueError("--algo_variant pvp requires --demo_sample_ratio > 0 for balanced novice/human sampling.")
+        if bool(getattr(args, "store_intervened_in_demo_buffer", False)):
+            raise ValueError("--store_intervened_in_demo_buffer is redundant with --algo_variant pvp buffer routing.")
+        args.pref_buffer_enable = False
+        args.pref_rank_weight = 0.0
+        args.pref_sample_ratio = 0.0
+    elif algo_variant == "eil":
+        args.pref_buffer_enable = False
+        args.pref_rank_weight = 0.0
+        args.pref_sample_ratio = 0.0
+        if float(getattr(args, "fixed_alpha", -1.0)) < 0.0:
+            args.fixed_alpha = 0.0
+        args.alpha_init = 0.0
+        args.alpha_min = 0.0
+        args.alpha_max = 0.0
+        args.alpha_freeze_steps = 0
+
     if getattr(args, "obs_mode", "state") != "state":
         raise ValueError(
             "FastSAC OGBench maze path no longer supports pixel observations. "
@@ -59,6 +85,11 @@ def run_fastsac_ogbench_maze(args, generate_policy_map=None) -> None:
     print(f"FastSAC OGBench (maze) on {args.env_name} device={device}")
     print(f"Log directory: {run_log_dir}")
     print(f"Model directory: {run_model_dir}")
+    maze_eval_artifacts = MazeEvalArtifactManager(
+        args=args,
+        output_dir=run_log_dir / "eval_trajectories",
+        record_progress=record_progress,
+    )
 
     (
         envs,
@@ -151,6 +182,7 @@ def run_fastsac_ogbench_maze(args, generate_policy_map=None) -> None:
             updater=updater,
             current_env_name=args.env_name,
             initial_obs_raw=initial_obs_raw,
+            maze_eval_artifact_manager=maze_eval_artifacts,
         )
     finally:
         try:

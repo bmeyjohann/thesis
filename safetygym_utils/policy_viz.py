@@ -448,6 +448,10 @@ def _run_rollout_eval(
         car_wheel_command_limit=float(train_args.get("car_wheel_command_limit", 2.0)),
         car_force_scale=float(train_args.get("car_force_scale", 2.0)),
         car_action_mode=str(train_args.get("car_action_mode", "raw_wheels")),
+        point_action_mode=str(train_args.get("point_action_mode", "native")),
+        point_turn_gain=float(train_args.get("point_turn_gain", 2.5)),
+        point_alignment_power=float(train_args.get("point_alignment_power", 1.0)),
+        point_allow_backward=bool(train_args.get("point_allow_backward", False)),
         obs_mask_mode=str(train_args.get("obs_mask_mode", "none")),
         seed=seed,
     )
@@ -707,6 +711,10 @@ def generate_safety_policy_maps(
         car_wheel_command_limit=float(train_args.get("car_wheel_command_limit", 2.0)),
         car_force_scale=float(train_args.get("car_force_scale", 2.0)),
         car_action_mode=str(train_args.get("car_action_mode", "raw_wheels")),
+        point_action_mode=str(train_args.get("point_action_mode", "native")),
+        point_turn_gain=float(train_args.get("point_turn_gain", 2.5)),
+        point_alignment_power=float(train_args.get("point_alignment_power", 1.0)),
+        point_allow_backward=bool(train_args.get("point_allow_backward", False)),
         obs_mask_mode=str(train_args.get("obs_mask_mode", "none")),
         seed=int(seed),
     )

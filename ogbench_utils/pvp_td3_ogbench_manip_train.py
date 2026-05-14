@@ -27,6 +27,7 @@ from .fastsac_ogbench_setup import build_teacher_metrics, select_device
 from .hgdagger_ogbench_manip_train import _default_wandb_mode
 from .logging import TrainingLogger
 from .obs import prepare_observation
+from .repro import seed_everything
 
 
 class TD3Actor(nn.Module):
@@ -373,6 +374,7 @@ def run_pvp_td3_ogbench_manip(args) -> None:
     args.algo_variant = "pvp_td3"
     args.cube_reward_mode = canonicalize_cube_reward_mode(str(getattr(args, "cube_reward_mode", "dense")))
     device = select_device(args)
+    seed_everything(int(getattr(args, "seed", 42)))
     run_log_dir, run_model_dir, record_progress, progress_file = _prepare_run_dirs(args)
     print(f"Faithful PVP-TD3 OGBench (manip) on {args.env_name} device={device}", flush=True)
     print(f"Log directory: {run_log_dir}", flush=True)

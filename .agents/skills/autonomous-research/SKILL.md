@@ -70,6 +70,9 @@ At the start of an autonomous-research session:
    - `queue(action="set_max_concurrent_jobs", max_concurrent_jobs=2)`
 23. In unattended mode, keep queue interactions on the unified `queue` tool so all experiment-queue activity stays under one MCP tool name.
 24. Within `queue`, prefer the summary actions (`queue_status`, `list_jobs`, `get_job`) over `debug=true`. Debug payloads expose absolute paths and are more likely to trigger approval prompts in the Codex app.
+25. Treat Codex shell-sandbox CUDA observations as non-authoritative for queued experiments.
+26. A `torch.cuda.is_available()` failure or success inside the Codex shell sandbox does not prove anything about queue-run GPU availability.
+27. The experiment queue runs jobs outside the Codex shell sandbox, so GPU conclusions must come from queue-run logs, WANDB, or a queued GPU smoke job rather than from local sandbox probes.
 
 ## Objective Ledger
 

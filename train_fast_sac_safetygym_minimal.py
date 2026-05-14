@@ -45,9 +45,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--reward_mode",
         type=str,
         default="dense",
-        choices=["sparse", "dense", "dense_plus_sparse", "dual", "native", "none"],
+        choices=["sparse", "dense", "dense_plus_sparse", "potential_diff", "dual", "native", "none"],
     )
     p.add_argument("--dense_reward_scale", type=float, default=1.0)
+    p.add_argument("--success_reward_scale", type=float, default=1.0)
     p.add_argument("--step_penalty", type=float, default=0.0)
     p.add_argument("--cost_penalty", type=float, default=0.0)
     p.add_argument("--cost_penalty_warmup_steps", type=int, default=0)
@@ -55,6 +56,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--clearance_penalty_scale", type=float, default=0.0)
     p.add_argument("--clearance_margin", type=float, default=0.0)
     p.add_argument("--clearance_penalty_power", type=float, default=1.0)
+    p.add_argument("--clearance_penalty_mode", type=str, default="hinge_power", choices=["hinge_power", "softplus"])
+    p.add_argument("--clearance_penalty_temperature", type=float, default=0.08)
     p.add_argument("--clearance_penalty_warmup_steps", type=int, default=0)
     p.add_argument("--clearance_penalty_ramp_steps", type=int, default=0)
     p.add_argument("--forward_reward_scale", type=float, default=0.0)
@@ -62,12 +65,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--heading_reward_scale", type=float, default=0.0)
     p.add_argument("--heading_positive_only", action="store_true", default=True)
     p.add_argument("--no_heading_positive_only", dest="heading_positive_only", action="store_false")
+    p.add_argument("--adaptive_safety_curriculum", action="store_true", default=False)
+    p.add_argument("--adaptive_safety_goal_target", type=float, default=1.0)
+    p.add_argument("--adaptive_safety_window_episodes", type=int, default=10)
+    p.add_argument("--adaptive_safety_step", type=float, default=0.05)
+    p.add_argument("--adaptive_safety_init", type=float, default=0.0)
+    p.add_argument("--adaptive_safety_min", type=float, default=0.0)
+    p.add_argument("--adaptive_safety_max", type=float, default=1.0)
 
     p.add_argument("--render_mode", type=str, default="none", choices=["human", "none"])
     p.add_argument("--surface_mode", type=str, default="default", choices=["default", "grippy"])
     p.add_argument("--car_wheel_command_limit", type=float, default=1.0)
     p.add_argument("--car_force_scale", type=float, default=1.0)
     p.add_argument("--car_action_mode", type=str, default="raw_wheels", choices=["raw_wheels", "throttle_turn", "cardinal"])
+    p.add_argument("--point_action_mode", type=str, default="native", choices=["native", "world_velocity"])
+    p.add_argument("--point_turn_gain", type=float, default=2.5)
+    p.add_argument("--point_alignment_power", type=float, default=1.0)
+    p.add_argument("--point_allow_backward", action="store_true", default=False)
     p.add_argument("--obs_mask_mode", type=str, default="none", choices=["none", "goal_only_lidar"])
     p.add_argument("--scale_actor_to_env_bounds", action="store_true", default=True)
     p.add_argument("--no_scale_actor_to_env_bounds", dest="scale_actor_to_env_bounds", action="store_false")
@@ -78,11 +92,27 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--use_intervention", action="store_true", default=False)
     p.add_argument("--intervention_threshold", type=float, default=0.1)
     p.add_argument("--intervention_hold_seconds", type=float, default=0.25)
+    p.add_argument("--debug_intervention_console", action="store_true", default=False)
     p.add_argument("--teacher_override_clearance_threshold", type=float, default=-1.0)
+    p.add_argument("--teacher_override_clearance_exit_threshold", type=float, default=-1.0)
+    p.add_argument(
+        "--teacher_override_mode",
+        type=str,
+        default="clearance",
+        choices=["clearance", "teacher_goal_progress"],
+    )
+    p.add_argument("--teacher_goal_progress_steps", type=int, default=3)
+    p.add_argument("--teacher_goal_progress_epsilon", type=float, default=1e-3)
     p.add_argument("--human_action_scale", type=float, default=1.0)
-    p.add_argument("--human_input_device", type=str, default="keyboard", choices=["keyboard", "gamepad", "expert", "expert_switch", "scripted"])
+    p.add_argument(
+        "--human_input_device",
+        type=str,
+        default="keyboard",
+        choices=["keyboard", "gamepad", "expert", "expert_switch", "safe_rl", "scripted"],
+    )
     p.add_argument("--controller_fps_limit", type=int, default=0)
     p.add_argument("--controller_overlay_hz", type=float, default=20.0)
+    p.add_argument("--env_fps_limit", type=float, default=0.0)
     p.add_argument("--gamepad_mode", type=str, default="local", choices=["local", "connect"])
     p.add_argument("--gamepad_host", type=str, default="")
     p.add_argument("--gamepad_port", type=int, default=0)
@@ -93,6 +123,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no_gamepad_use_saved_config", dest="gamepad_use_saved_config", action="store_false")
     p.add_argument("--gamepad_device_index", type=int, default=0)
     p.add_argument("--expert_checkpoint_path", type=str, default="")
+    p.add_argument("--expert_config_path", type=str, default="")
     p.add_argument("--expert_safe_checkpoint_path", type=str, default="")
     p.add_argument("--expert_switch_clearance_threshold", type=float, default=0.08)
     p.add_argument("--expert_device", type=str, default="cpu")
@@ -100,6 +131,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--pref_capacity", type=int, default=100_000)
     p.add_argument("--pref_sampling_mode", type=str, default="linked", choices=["linked", "separate"])
     p.add_argument("--pref_sample_ratio", type=float, default=0.0)
+    p.add_argument("--pref_replay_sample_ratio", type=float, default=0.0)
     p.add_argument("--pref_rank_weight", type=float, default=0.0)
     p.add_argument("--pref_rank_margin", type=float, default=0.1)
     p.add_argument("--pref_loss_type", type=str, default="margin", choices=["margin", "bradley_terry", "lagrangian"])

@@ -35,6 +35,8 @@ def build_train_parser() -> argparse.ArgumentParser:
         help='Manip only: lock effector/cube/goal yaw and expose a 4D xyz+gripper action space.',
     )
     p.add_argument('--total_timesteps', type=int, default=1_000_000)
+    p.add_argument('--seed', type=int, default=42,
+                   help='Random seed for Python/NumPy/Torch plus train/eval env construction.')
     p.add_argument('--device', type=str, default='auto')
     p.add_argument('--train_render_mode', type=str, default='none', choices=['none', 'human'],
                    help='Optional live rendering during training (recommended only with num_envs=1).')
@@ -161,13 +163,17 @@ def build_train_parser() -> argparse.ArgumentParser:
     # Intervention / Teacher
     p.add_argument('--use_intervention', action='store_true', default=False)
     p.add_argument('--intervention_mode', type=str, default='agent',
-                   choices=['human', 'agent', 'agent_always', 'agent_safety_align', 'agent_safety_progress', 'agent_reward_progress', 'agent_manual_gripper'])
+                   choices=['human', 'agent', 'agent_always', 'agent_safety', 'agent_safety_align', 'agent_safety_progress', 'agent_safety_release_progress', 'agent_reward_progress', 'agent_manual_gripper'])
     p.add_argument('--human_input_device', type=str, default='keyboard', choices=['keyboard', 'vr'],
                    help='Human intervention input device. Use vr to consume the persistent raw VR stream.')
     p.add_argument('--human_intervention_threshold', type=float, default=0.1,
                    help='Human intervention action-norm threshold. For VR this is auto-relaxed to ~0 unless explicitly overridden.')
     p.add_argument('--human_intervention_hold_time', type=float, default=0.5,
                    help='Hold time for human intervention takeover logic.')
+    p.add_argument('--wait_for_human_start', action='store_true', default=False,
+                   help='When using human input, wait for a fresh gate-button press before collection/training begins.')
+    p.add_argument('--no_wait_for_human_start', dest='wait_for_human_start', action='store_false',
+                   help='Do not block on a fresh human start trigger.')
     p.add_argument('--vr_mode', type=str, default='connect', choices=['connect', 'listen'],
                    help='VR transport mode when --human_input_device vr is active.')
     p.add_argument('--vr_host', type=str, default='',
@@ -195,6 +201,8 @@ def build_train_parser() -> argparse.ArgumentParser:
     p.add_argument('--no_vr_require_gate', dest='vr_require_gate', action='store_false',
                    help='Allow VR motion without a gate button if no saved mapping profile is loaded.')
     p.add_argument('--teacher_type', type=str, default='bfs', choices=['bfs', 'cube_plan', 'cube_markov'])
+    p.add_argument('--teacher_action_noise_std', type=float, default=0.0,
+                   help='Optional Gaussian noise stddev added to scripted teacher actions before intervention decisions/execution (0 disables).')
     p.add_argument('--tolerance_type', type=str, default='angle', choices=['angle', 'l2', 'component'])
     p.add_argument('--tolerance_value', type=float, default=30.0)
     p.add_argument(
@@ -427,7 +435,7 @@ def build_train_parser() -> argparse.ArgumentParser:
     p.add_argument('--demo_prefill_num_envs', type=int, default=0,
                    help='Number of vector envs to use during demo prefill only (0 reuses --num_envs)')
     p.add_argument('--demo_prefill_intervention_mode', type=str, default='agent_safety_progress',
-                   choices=['human', 'agent', 'agent_always', 'agent_safety_align', 'agent_safety_progress', 'agent_reward_progress', 'agent_manual_gripper'],
+                   choices=['human', 'agent', 'agent_always', 'agent_safety', 'agent_safety_align', 'agent_safety_progress', 'agent_safety_release_progress', 'agent_reward_progress', 'agent_manual_gripper'],
                    help='Intervention mode to use during demo prefill')
     p.add_argument('--demo_prefill_enable_after_steps', type=int, default=0,
                    help='Warm-up steps per env before demo interventions engage')
@@ -469,6 +477,10 @@ def build_train_parser() -> argparse.ArgumentParser:
     # Logging
     p.add_argument('--use_wandb', action='store_true', default=False)
     p.add_argument('--project', type=str, default='ogbench-rsl-rl')
+    p.add_argument('--wandb_entity', type=str, default='',
+                   help='Optional W&B entity/team name.')
+    p.add_argument('--wandb_group', type=str, default='',
+                   help='Optional W&B group used to cluster related runs.')
     p.add_argument('--exp_name', type=str, default=None)
     p.add_argument('--save_interval', type=int, default=200000,
                    help='Env-step interval for checkpoint saves (0 disables)')
@@ -530,6 +542,16 @@ def build_train_parser() -> argparse.ArgumentParser:
             "A replay row is treated as intervention-linked when ||a_exec - a_student||_1 > epsilon."
         ),
     )
+    p.add_argument(
+        '--pref_linked_action_weight_scale',
+        type=float,
+        default=0.0,
+        help=(
+            "Optional smooth weighting for linked preference pairs based on normalized action delta. "
+            "If > 0, pair weight = clamp(mean(abs(a_exec - a_student)) / scale, 0, 1). "
+            "Manip no-rotation actions already live in [-1, 1], so this scale is in action-space units."
+        ),
+    )
     p.add_argument('--pref_rank_weight', type=float, default=1.0,
                    help='Weight for the pairwise ranking loss added to critic loss')
     p.add_argument('--pref_rank_margin', type=float, default=0.1,
@@ -571,6 +593,16 @@ def build_train_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.9,
         help='EMA factor for preference violation in dual update (0 disables EMA).',
+    )
+    p.add_argument(
+        '--pref_lagrangian_scope',
+        type=str,
+        default='global',
+        choices=['global', 'per_linked'],
+        help=(
+            'Use one global Lagrange multiplier or one replay-slot multiplier per linked '
+            'intervention row. per_linked only applies to --pref_sampling_mode=linked.'
+        ),
     )
     p.add_argument(
         '--pref_violation_clip',
@@ -620,6 +652,18 @@ def build_train_parser() -> argparse.ArgumentParser:
                    help='Seed used to sample/lock the visualization goal location')
     p.add_argument('--viz_first_step', type=int, default=None,
                    help='Force the first checkpoint/viz at this env-step (even if save_interval is larger)')
+    p.add_argument(
+        '--eval_save_trajectory_plot',
+        action='store_true',
+        default=False,
+        help='Maze only: save a top-down trajectory plot for evaluation rollouts at each eval interval.',
+    )
+    p.add_argument(
+        '--eval_trajectory_plot_episodes',
+        type=int,
+        default=5,
+        help='Maze only: number of episodes to include in each saved trajectory plot.',
+    )
     return p
 
 def build_eval_parser() -> argparse.ArgumentParser:
@@ -639,7 +683,7 @@ def build_eval_parser() -> argparse.ArgumentParser:
     parser.add_argument('--device', type=str, default='auto',
                         help='Device to run on (auto, cpu, cuda)')
     parser.add_argument('--policy_type', type=str, default='auto',
-                        choices=['auto', 'rsl-rl', 'fastsac', 'fastsac_v2', 'drqv2'],
+                        choices=['auto', 'rsl-rl', 'fastsac', 'fastsac_v2', 'drqv2', 'hgdagger', 'behavior_cloning'],
                         help='Policy checkpoint format to load')
     parser.add_argument('--controller', type=str, default='policy',
                         choices=['policy', 'random', 'human', 'keyboard'],
@@ -726,6 +770,12 @@ def build_eval_parser() -> argparse.ArgumentParser:
     parser.add_argument('--policy_mujoco_gl', type=str, default='auto',
                         choices=['auto', 'egl', 'glfw'],
                         help='Backend for policy environment (auto uses egl unless mirror rendering requires glfw)')
+    parser.add_argument('--save_maze_trajectory_plot', action='store_true', default=False,
+                        help='Maze only: save a top-down trajectory plot after evaluation completes')
+    parser.add_argument('--maze_trajectory_plot_episodes', type=int, default=0,
+                        help='Maze only: number of episodes to include in the saved trajectory plot (0 uses all completed episodes)')
+    parser.add_argument('--maze_eval_output_dir', type=str, default='',
+                        help='Optional directory for saved maze trajectory plots (defaults next to the checkpoint or logs)')
 
     # Reward shaping (should mirror training wrapper settings)
     parser.add_argument('--reward_type', type=str, default='sparse',
@@ -772,10 +822,12 @@ def build_eval_parser() -> argparse.ArgumentParser:
 
     # Intervention / Teleop
     parser.add_argument('--intervention_mode', type=str, default='none',
-                        choices=['none', 'human', 'agent', 'agent_always', 'agent_safety_align', 'agent_safety_progress', 'agent_reward_progress', 'agent_manual_gripper'],
+                        choices=['none', 'human', 'agent', 'agent_always', 'agent_safety', 'agent_safety_align', 'agent_safety_progress', 'agent_safety_release_progress', 'agent_reward_progress', 'agent_manual_gripper'],
                         help='Intervention mode: none, human teleop, or agent teacher')
     parser.add_argument('--teacher_type', type=str, default='bfs', choices=['bfs', 'cube_plan', 'cube_markov'],
                         help='Teacher type when intervention_mode=agent')
+    parser.add_argument('--teacher_action_noise_std', type=float, default=0.0,
+                        help='Optional Gaussian noise stddev added to scripted teacher actions before intervention decisions/execution (0 disables).')
     parser.add_argument('--tolerance_type', type=str, default='angle', choices=['angle', 'l2'],
                         help='Intervention tolerance metric (agent mode)')
     parser.add_argument('--tolerance_value', type=float, default=30.0,

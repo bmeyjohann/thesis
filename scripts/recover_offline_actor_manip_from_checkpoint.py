@@ -4,6 +4,8 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -90,6 +92,7 @@ def _namespace_from_checkpoint_args(args_dict: dict[str, Any]) -> SimpleNamespac
     merged.setdefault("intervention_episode_prob_seed", 0)
     merged.setdefault("teacher_target_mode", "sequential")
     merged.setdefault("cube_success_tolerance", 0.04)
+    merged.setdefault("teacher_action_noise_std", 0.0)
     merged.setdefault("tolerance_channel_weights", None)
     merged.setdefault("tolerance_xyz_value", -1.0)
     merged.setdefault("tolerance_yaw_value", -1.0)
@@ -124,6 +127,7 @@ def _build_models(
     obs_dim: int,
     act_dim: int,
     device: torch.device,
+    load_actor_from_checkpoint: bool = True,
 ) -> tuple[torch.nn.Module, torch.nn.Module, torch.nn.Module, torch.nn.Module, EmpiricalNormalization | None]:
     use_layer_norm = bool(ckpt_args.get("use_layer_norm", False))
     layer_norm_eps = float(ckpt_args.get("layer_norm_eps", 1e-5))
@@ -174,8 +178,9 @@ def _build_models(
         layer_norm_eps=layer_norm_eps,
     ).to(device)
 
-    actor_backbone.load_state_dict(checkpoint["actor_backbone"])
-    actor_head.load_state_dict(checkpoint["actor_head"])
+    if load_actor_from_checkpoint:
+        actor_backbone.load_state_dict(checkpoint["actor_backbone"])
+        actor_head.load_state_dict(checkpoint["actor_head"])
     critic_heads.load_state_dict(checkpoint["critic_heads"])
     if arch_shared_trunk:
         actor_backbone.load_state_dict(checkpoint["shared_backbone"])
@@ -255,19 +260,73 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--checkpoint_path", type=str, required=True)
     p.add_argument("--dataset_path", type=str, required=True)
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
+    p.add_argument("--init_mode", type=str, default="checkpoint", choices=["checkpoint", "random"])
     p.add_argument("--num_gradient_steps", type=int, default=5000)
     p.add_argument("--batch_size", type=int, default=256)
     p.add_argument("--actor_lr", type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=0.0)
+    p.add_argument("--actor_q_weight", type=float, default=1.0)
     p.add_argument("--action_l2_weight", type=float, default=1e-3)
     p.add_argument("--bc_teacher_weight", type=float, default=0.0)
+    p.add_argument(
+        "--teacher_mask_mode",
+        type=str,
+        default="effective",
+        choices=["raw", "diff", "effective", "all"],
+        help="How to define the teacher-like rows used for BC regularization.",
+    )
     p.add_argument("--eval_interval", type=int, default=500)
     p.add_argument("--num_eval_episodes", type=int, default=10)
     p.add_argument("--eval_num_envs", type=int, default=5)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--output_dir", type=str, default="")
     p.add_argument("--name", type=str, default="offline_actor_recover")
+    p.add_argument("--use_wandb", action="store_true", default=False)
+    p.add_argument("--project", type=str, default="ogbench-manip-offline")
+    p.add_argument("--entity", type=str, default="")
+    p.add_argument("--group", type=str, default="")
+    p.add_argument("--wandb_mode", type=str, default="", choices=["", "online", "offline", "disabled"])
     return p.parse_args()
+
+
+def _select_teacher_like_mask(
+    *,
+    teacher_intervened: torch.Tensor | None,
+    diff_mask: torch.Tensor | None,
+    mode: str,
+    num_rows: int,
+    device: torch.device,
+) -> torch.Tensor:
+    raw_mask = teacher_intervened if teacher_intervened is not None else torch.zeros(num_rows, dtype=torch.bool, device=device)
+    delta_mask = diff_mask if diff_mask is not None else torch.zeros(num_rows, dtype=torch.bool, device=device)
+    mode = str(mode).strip().lower()
+    if mode == "all":
+        return torch.ones(num_rows, dtype=torch.bool, device=device)
+    if mode == "raw":
+        return raw_mask
+    if mode == "diff":
+        return delta_mask
+    return raw_mask | delta_mask
+
+
+def _maybe_init_wandb(args: argparse.Namespace, config: dict[str, Any]):
+    if not bool(args.use_wandb):
+        return None
+    if str(args.wandb_mode).strip():
+        os.environ["WANDB_MODE"] = str(args.wandb_mode).strip()
+    import wandb
+
+    init_kwargs: dict[str, Any] = {
+        "project": str(args.project),
+        "name": str(args.name),
+        "config": config,
+        "reinit": True,
+    }
+    if str(args.entity).strip():
+        init_kwargs["entity"] = str(args.entity).strip()
+    if str(args.group).strip():
+        init_kwargs["group"] = str(args.group).strip()
+    return wandb.init(**init_kwargs)
 
 
 def main() -> None:
@@ -292,10 +351,23 @@ def main() -> None:
     data = np.load(dataset_path)
     observations = torch.as_tensor(np.asarray(data["observations"], dtype=np.float32), device=device)
     actions = torch.as_tensor(np.asarray(data["actions"], dtype=np.float32), device=device)
-    student_actions = torch.as_tensor(np.asarray(data["student_actions"], dtype=np.float32), device=device)
-    teacher_intervened = torch.as_tensor(np.asarray(data["teacher_intervened"], dtype=np.bool_), device=device)
-    diff_mask = (torch.abs(actions - student_actions).sum(dim=-1) > 1e-6)
-    teacher_like_mask = diff_mask if int(teacher_intervened.sum().item()) <= 0 else teacher_intervened | diff_mask
+    student_actions_np = data["student_actions"] if "student_actions" in data.files else None
+    teacher_intervened_np = data["teacher_intervened"] if "teacher_intervened" in data.files else None
+    student_actions = None
+    teacher_intervened = None
+    diff_mask = None
+    if student_actions_np is not None:
+        student_actions = torch.as_tensor(np.asarray(student_actions_np, dtype=np.float32), device=device)
+        diff_mask = (torch.abs(actions - student_actions).sum(dim=-1) > 1e-6)
+    if teacher_intervened_np is not None:
+        teacher_intervened = torch.as_tensor(np.asarray(teacher_intervened_np, dtype=np.bool_), device=device)
+    teacher_like_mask = _select_teacher_like_mask(
+        teacher_intervened=teacher_intervened,
+        diff_mask=diff_mask,
+        mode=str(args.teacher_mask_mode),
+        num_rows=int(observations.shape[0]),
+        device=device,
+    )
 
     obs_dim = int(observations.shape[-1])
     act_dim = int(actions.shape[-1])
@@ -305,6 +377,7 @@ def main() -> None:
         obs_dim=obs_dim,
         act_dim=act_dim,
         device=device,
+        load_actor_from_checkpoint=str(args.init_mode).strip().lower() == "checkpoint",
     )
     if obs_normalizer is None:
         obs_normalizer = EmpiricalNormalization(shape=obs_dim, device=device)
@@ -320,6 +393,18 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     best_path = output_dir / "best_checkpoint.pt"
     metrics_path = output_dir / "metrics.jsonl"
+    wandb_run = _maybe_init_wandb(
+        args,
+        config={
+            **vars(args),
+            "checkpoint_path": str(checkpoint_path),
+            "dataset_path": str(dataset_path),
+            "dataset_rows": int(observations.shape[0]),
+            "obs_dim": obs_dim,
+            "act_dim": act_dim,
+            "teacher_mask_rows": int(teacher_like_mask.to(torch.int64).sum().item()),
+        },
+    )
 
     def checkpoint_q_stats() -> dict[str, float]:
         with torch.no_grad():
@@ -331,19 +416,23 @@ def main() -> None:
             features = critic_backbone(obs_norm)
             q_actor = torch.stack(critic_heads(features, mean_actions), dim=0).min(dim=0).values
             q_exec = torch.stack(critic_heads(features, actions[idx]), dim=0).min(dim=0).values
-            q_student = torch.stack(critic_heads(features, student_actions[idx]), dim=0).min(dim=0).values
-            return {
+            payload = {
                 "q_actor_mean": float(q_actor.mean().item()),
                 "q_exec_mean": float(q_exec.mean().item()),
-                "q_student_mean": float(q_student.mean().item()),
             }
+            if student_actions is not None:
+                q_student = torch.stack(critic_heads(features, student_actions[idx]), dim=0).min(dim=0).values
+                payload["q_student_mean"] = float(q_student.mean().item())
+            else:
+                payload["q_student_mean"] = math.nan
+            return payload
 
     initial_q = checkpoint_q_stats()
     print(
         "[RecoverInit] "
         f"dataset_rows={int(observations.shape[0])} "
-        f"teacher_flag_frac={float(teacher_intervened.float().mean().item()):.4f} "
-        f"action_diff_frac={float(diff_mask.float().mean().item()):.4f} "
+        f"teacher_flag_frac={float(teacher_intervened.float().mean().item()) if teacher_intervened is not None else 0.0:.4f} "
+        f"action_diff_frac={float(diff_mask.float().mean().item()) if diff_mask is not None else 0.0:.4f} "
         f"teacher_like_frac={float(teacher_like_mask.float().mean().item()):.4f} "
         f"q_actor_mean={initial_q['q_actor_mean']:.4f} "
         f"q_exec_mean={initial_q['q_exec_mean']:.4f} "
@@ -363,6 +452,34 @@ def main() -> None:
     best_success = float(initial_eval.get("success_rate", 0.0))
     best_metrics = dict(initial_eval)
     best_ckpt = dict(checkpoint)
+    best_ckpt["actor_backbone"] = actor_backbone.state_dict()
+    best_ckpt["actor_head"] = actor_head.state_dict()
+    best_ckpt["critic_backbone"] = critic_backbone.state_dict()
+    best_ckpt["critic_heads"] = critic_heads.state_dict()
+    if obs_normalizer is not None:
+        best_ckpt["obs_normalizer_state"] = obs_normalizer.state_dict()
+
+    initial_payload = {
+        "step": 0,
+        "wall_s": 0.0,
+        "loss": 0.0,
+        "actor_q_loss": 0.0,
+        "action_l2": 0.0,
+        "bc_teacher_loss": 0.0,
+        "Offline/dataset_rows": float(observations.shape[0]),
+        "Offline/teacher_like_fraction": float(teacher_like_mask.float().mean().item()),
+        "Offline/teacher_mask_rows": float(teacher_like_mask.to(torch.int64).sum().item()),
+        "Offline/teacher_flag_fraction": float(teacher_intervened.float().mean().item()) if teacher_intervened is not None else 0.0,
+        "Offline/action_diff_fraction": float(diff_mask.float().mean().item()) if diff_mask is not None else 0.0,
+        **{f"Diag/{k}": v for k, v in initial_q.items()},
+        **{f"Eval/{k}": float(v) for k, v in initial_eval.items()},
+    }
+    with metrics_path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(initial_payload) + "\n")
+    if wandb_run is not None:
+        wandb_run.log(initial_payload, step=0)
+    if not best_path.exists():
+        torch.save(best_ckpt, best_path)
 
     start_time = time.time()
     for step in range(1, int(args.num_gradient_steps) + 1):
@@ -375,7 +492,7 @@ def main() -> None:
             features_critic = critic_backbone(obs_norm)
         q_values = torch.stack(critic_heads(features_critic, mean_actions), dim=0)
         min_q = q_values.min(dim=0).values
-        actor_loss = -min_q.mean()
+        actor_loss = float(args.actor_q_weight) * (-min_q.mean())
         action_l2 = mean_actions.pow(2).mean()
         loss = actor_loss + float(args.action_l2_weight) * action_l2
 
@@ -413,15 +530,22 @@ def main() -> None:
                 "actor_q_loss": float(actor_loss.detach().item()),
                 "action_l2": float(action_l2.detach().item()),
                 "bc_teacher_loss": float(bc_teacher_loss_value),
-                **q_stats,
-                **eval_metrics,
+                "Offline/dataset_rows": float(observations.shape[0]),
+                "Offline/teacher_like_fraction": float(teacher_like_mask.float().mean().item()),
+                "Offline/teacher_mask_rows": float(teacher_like_mask.to(torch.int64).sum().item()),
+                "Offline/teacher_flag_fraction": float(teacher_intervened.float().mean().item()) if teacher_intervened is not None else 0.0,
+                "Offline/action_diff_fraction": float(diff_mask.float().mean().item()) if diff_mask is not None else 0.0,
+                **{f"Diag/{k}": v for k, v in q_stats.items()},
+                **{f"Eval/{k}": float(v) for k, v in eval_metrics.items()},
             }
             with metrics_path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(payload) + "\n")
+            if wandb_run is not None:
+                wandb_run.log(payload, step=int(step))
             print(
                 f"[RecoverEval] step={step} loss={payload['loss']:.4f} "
                 f"actor_q_loss={payload['actor_q_loss']:.4f} action_l2={payload['action_l2']:.4f} "
-                f"q_actor_mean={payload['q_actor_mean']:.4f} q_exec_mean={payload['q_exec_mean']:.4f} "
+                f"q_actor_mean={payload['Diag/q_actor_mean']:.4f} q_exec_mean={payload['Diag/q_exec_mean']:.4f} "
                 f"{_format_metrics(eval_metrics)}",
                 flush=True,
             )
@@ -432,8 +556,17 @@ def main() -> None:
                 best_metrics = dict(eval_metrics)
                 best_ckpt["actor_backbone"] = actor_backbone.state_dict()
                 best_ckpt["actor_head"] = actor_head.state_dict()
+                best_ckpt["critic_backbone"] = critic_backbone.state_dict()
+                best_ckpt["critic_heads"] = critic_heads.state_dict()
                 torch.save(best_ckpt, best_path)
                 print(f"[RecoverBest] step={step} saved={best_path}", flush=True)
+
+    if not best_path.exists():
+        best_ckpt["actor_backbone"] = actor_backbone.state_dict()
+        best_ckpt["actor_head"] = actor_head.state_dict()
+        best_ckpt["critic_backbone"] = critic_backbone.state_dict()
+        best_ckpt["critic_heads"] = critic_heads.state_dict()
+        torch.save(best_ckpt, best_path)
 
     summary = {
         "best_metrics": best_metrics,
@@ -444,6 +577,12 @@ def main() -> None:
     with summary_path.open("w", encoding="utf-8") as fh:
         json.dump(summary, fh, indent=2)
     print(f"[RecoverDone] summary={summary_path}", flush=True)
+    if wandb_run is not None:
+        if hasattr(wandb_run, "summary"):
+            wandb_run.summary["best_checkpoint_path"] = str(best_path if best_path.exists() else "")
+            for key, value in best_metrics.items():
+                wandb_run.summary[f"best/{key}"] = float(value)
+        wandb_run.finish()
 
 
 if __name__ == "__main__":

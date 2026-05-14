@@ -12,6 +12,8 @@ from collections import deque
 
 import numpy as np
 import torch
+from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 from safetygym_utils.controllers import build_human_controller
 from safetygym_utils.gamepad import (
@@ -394,12 +396,13 @@ class EvalEpisodeControlPanel:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Interactive evaluation for Safety-Gymnasium FastSAC checkpoints")
+    p = argparse.ArgumentParser(description="Interactive evaluation for Safety-Gymnasium FastSAC (.pt) and SB3 PPO (.zip) checkpoints")
     p.add_argument("--model_path", type=str, default="")
     p.add_argument("--env_name", type=str, default="SafetyCarGoal2-v0")
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--device", type=str, default="auto")
     p.add_argument("--controller", type=str, default="policy", choices=["policy", "random", "human", "keyboard", "gamepad", "scripted"])
+    p.add_argument("--policy_format", type=str, default="auto", choices=["auto", "fastsac", "ppo"])
     p.add_argument("--intervention_mode", type=str, default="none", choices=["none", "human"])
     p.add_argument("--render_mode", type=str, default="human", choices=["human", "rgb_array", "none", "pygame", "topdown"])
     p.add_argument("--viewer_fps", type=float, default=20.0)
@@ -408,6 +411,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--car_wheel_command_limit", type=float, default=2.0)
     p.add_argument("--car_force_scale", type=float, default=2.0)
     p.add_argument("--car_action_mode", type=str, default="raw_wheels", choices=["raw_wheels", "throttle_turn", "cardinal"])
+    p.add_argument("--point_action_mode", type=str, default="native", choices=["native", "world_velocity"])
+    p.add_argument("--point_turn_gain", type=float, default=2.5)
+    p.add_argument("--point_alignment_power", type=float, default=1.0)
+    p.add_argument("--point_allow_backward", action="store_true", default=False)
     p.add_argument("--obs_mask_mode", type=str, default="none", choices=["none", "goal_only_lidar"])
     p.add_argument("--max_episode_steps", type=int, default=0)
     p.add_argument("--num_episodes", type=int, default=10)
@@ -417,9 +424,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--reward_mode",
         type=str,
         default="sparse",
-        choices=["sparse", "dense", "dense_plus_sparse", "dual", "native", "none"],
+        choices=["sparse", "dense", "dense_plus_sparse", "potential_diff", "dual", "native", "none"],
     )
     p.add_argument("--dense_reward_scale", type=float, default=1.0)
+    p.add_argument("--success_reward_scale", type=float, default=1.0)
     p.add_argument("--step_penalty", type=float, default=0.0)
     p.add_argument("--cost_penalty", type=float, default=0.0)
     p.add_argument("--cost_penalty_warmup_steps", type=int, default=0)
@@ -427,6 +435,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--clearance_penalty_scale", type=float, default=0.0)
     p.add_argument("--clearance_margin", type=float, default=0.0)
     p.add_argument("--clearance_penalty_power", type=float, default=1.0)
+    p.add_argument("--clearance_penalty_mode", type=str, default="hinge_power", choices=["hinge_power", "softplus"])
+    p.add_argument("--clearance_penalty_temperature", type=float, default=0.08)
     p.add_argument("--clearance_penalty_warmup_steps", type=int, default=0)
     p.add_argument("--clearance_penalty_ramp_steps", type=int, default=0)
     p.add_argument("--forward_reward_scale", type=float, default=0.0)
@@ -490,6 +500,7 @@ def _apply_ckpt_defaults(args: argparse.Namespace) -> None:
     _set_if_default("env_name", "SafetyCarGoal2-v0")
     _set_if_default("reward_mode", "sparse")
     _set_if_default("dense_reward_scale", 1.0)
+    _set_if_default("success_reward_scale", 1.0)
     _set_if_default("step_penalty", 0.0)
     _set_if_default("cost_penalty", 0.0)
     _set_if_default("cost_penalty_warmup_steps", 0)
@@ -497,6 +508,8 @@ def _apply_ckpt_defaults(args: argparse.Namespace) -> None:
     _set_if_default("clearance_penalty_scale", 0.0)
     _set_if_default("clearance_margin", 0.0)
     _set_if_default("clearance_penalty_power", 1.0)
+    _set_if_default("clearance_penalty_mode", "hinge_power")
+    _set_if_default("clearance_penalty_temperature", 0.08)
     _set_if_default("clearance_penalty_warmup_steps", 0)
     _set_if_default("clearance_penalty_ramp_steps", 0)
     _set_if_default("forward_reward_scale", 0.0)
@@ -510,6 +523,10 @@ def _apply_ckpt_defaults(args: argparse.Namespace) -> None:
     _set_if_default("car_wheel_command_limit", 2.0)
     _set_if_default("car_force_scale", 2.0)
     _set_if_default("car_action_mode", "raw_wheels")
+    _set_if_default("point_action_mode", "native")
+    _set_if_default("point_turn_gain", 2.5)
+    _set_if_default("point_alignment_power", 1.0)
+    _set_if_default("point_allow_backward", False)
     _set_if_default("obs_mask_mode", "none")
     _set_if_default("actor_hidden_dim", 256)
     _set_if_default("use_layer_norm", False)
@@ -517,6 +534,37 @@ def _apply_ckpt_defaults(args: argparse.Namespace) -> None:
     _set_if_default("init_scale", 0.01)
     if not _bool_flag_explicit("--scale_actor_to_env_bounds", "--no_scale_actor_to_env_bounds"):
         _set_if_default("scale_actor_to_env_bounds", False)
+
+
+def _resolve_policy_format(model_path: str, requested: str) -> str:
+    requested = str(requested or "auto").lower()
+    if requested in {"fastsac", "ppo"}:
+        return requested
+    suffix = Path(str(model_path)).suffix.lower()
+    if suffix == ".zip":
+        return "ppo"
+    return "fastsac"
+
+
+def _load_ppo_vecnormalize(model_path: Path, args: argparse.Namespace):
+    vecnorm_path = model_path.parent / "vecnormalize.pkl"
+    stem = model_path.stem
+    if stem.startswith("ppo_step_") and stem.endswith("_steps"):
+        step_text = stem[len("ppo_step_") :]
+        candidate = model_path.parent / f"ppo_step_vecnormalize_{step_text}.pkl"
+        if candidate.exists():
+            vecnorm_path = candidate
+    if not vecnorm_path.exists():
+        return None
+
+    # VecNormalize.load requires a VecEnv, but we only need the saved obs_rms for prediction.
+    tmp_args = argparse.Namespace(**vars(args))
+    tmp_args.render_mode = "none"
+    tmp_env = DummyVecEnv([lambda: _build_env(tmp_args, controller=None)])
+    vecnorm = VecNormalize.load(str(vecnorm_path), tmp_env)
+    vecnorm.training = False
+    vecnorm.norm_reward = False
+    return vecnorm
 
 
 def _build_env(args: argparse.Namespace, controller):
@@ -528,6 +576,10 @@ def _build_env(args: argparse.Namespace, controller):
         car_wheel_command_limit=args.car_wheel_command_limit,
         car_force_scale=args.car_force_scale,
         car_action_mode=args.car_action_mode,
+        point_action_mode=str(getattr(args, "point_action_mode", "native")),
+        point_turn_gain=float(getattr(args, "point_turn_gain", 2.5)),
+        point_alignment_power=float(getattr(args, "point_alignment_power", 1.0)),
+        point_allow_backward=bool(getattr(args, "point_allow_backward", False)),
         obs_mask_mode=str(getattr(args, "obs_mask_mode", "none")),
         seed=args.seed,
     )
@@ -535,6 +587,7 @@ def _build_env(args: argparse.Namespace, controller):
         env,
         reward_mode=args.reward_mode,
         dense_reward_scale=args.dense_reward_scale,
+        success_reward_scale=float(getattr(args, "success_reward_scale", 1.0)),
         step_penalty=args.step_penalty,
         cost_penalty=args.cost_penalty,
         cost_penalty_warmup_steps=int(getattr(args, "cost_penalty_warmup_steps", 0)),
@@ -542,6 +595,8 @@ def _build_env(args: argparse.Namespace, controller):
         clearance_penalty_scale=float(getattr(args, "clearance_penalty_scale", 0.0)),
         clearance_margin=float(getattr(args, "clearance_margin", 0.0)),
         clearance_penalty_power=float(getattr(args, "clearance_penalty_power", 1.0)),
+        clearance_penalty_mode=str(getattr(args, "clearance_penalty_mode", "hinge_power")),
+        clearance_penalty_temperature=float(getattr(args, "clearance_penalty_temperature", 0.08)),
         clearance_penalty_warmup_steps=int(getattr(args, "clearance_penalty_warmup_steps", 0)),
         clearance_penalty_ramp_steps=int(getattr(args, "clearance_penalty_ramp_steps", 0)),
         forward_reward_scale=float(getattr(args, "forward_reward_scale", 0.0)),
@@ -651,6 +706,10 @@ def main() -> int:
             car_wheel_command_limit=args.car_wheel_command_limit,
             car_force_scale=args.car_force_scale,
             car_action_mode=args.car_action_mode,
+            point_action_mode=str(getattr(args, "point_action_mode", "native")),
+            point_turn_gain=float(getattr(args, "point_turn_gain", 2.5)),
+            point_alignment_power=float(getattr(args, "point_alignment_power", 1.0)),
+            point_allow_backward=bool(getattr(args, "point_allow_backward", False)),
             obs_mask_mode=str(getattr(args, "obs_mask_mode", "none")),
             seed=args.seed,
         )
@@ -683,6 +742,7 @@ def main() -> int:
             control_scheme_override=resolve_control_scheme(
                 str(args.env_name),
                 car_action_mode=str(getattr(args, "car_action_mode", "raw_wheels")),
+                point_action_mode=str(getattr(args, "point_action_mode", "native")),
             ),
         )
         if str(getattr(args, "human_input_device", "keyboard")).lower() == "keyboard":
@@ -701,7 +761,11 @@ def main() -> int:
     ) if wants_external_viewer(args.render_mode) else None
     max_steps = extract_step_limit(env)
     telemetry_panel = EvalTelemetryPanel(draw_hz=float(args.telemetry_overlay_hz)) if bool(args.show_telemetry_overlay) else None
-    control_panel = EvalEpisodeControlPanel() if bool(getattr(args, "show_episode_controls", True)) else None
+    control_panel = (
+        EvalEpisodeControlPanel()
+        if bool(getattr(args, "show_episode_controls", True)) and str(args.render_mode).lower() != "none"
+        else None
+    )
 
     obs, _ = env.reset(seed=args.seed)
     obs = np.asarray(obs, dtype=np.float32).reshape(-1)
@@ -715,29 +779,41 @@ def main() -> int:
 
     actor = None
     obs_preprocess = None
+    ppo_model = None
+    ppo_vecnorm = None
+    policy_format = "fastsac"
     if args.controller == "policy":
         if not args.model_path:
             raise ValueError("--model_path is required for --controller policy")
-        actor = SafetyActor(
-            n_obs=obs_dim,
-            n_act=act_dim,
-            num_envs=1,
-            init_scale=args.init_scale,
-            hidden_dim=args.actor_hidden_dim,
-            use_layer_norm=bool(getattr(args, "use_layer_norm", False)),
-            layer_norm_eps=float(getattr(args, "layer_norm_eps", 1e-5)),
-            device=device,
-        )
-        checkpoint = torch.load(args.model_path, map_location=device, weights_only=False)
-        actor.load_state_dict(checkpoint["actor_state_dict"])
-        actor.eval()
-        obs_norm_state = checkpoint.get("obs_normalizer_state_dict", None)
-        if obs_norm_state and EmpiricalNormalization is not None:
-            obs_preprocess = EmpiricalNormalization(shape=obs_dim, device=device)
-            obs_preprocess.load_state_dict(obs_norm_state, strict=False)
-            obs_preprocess.eval()
+        policy_format = _resolve_policy_format(args.model_path, getattr(args, "policy_format", "auto"))
+        if policy_format == "ppo":
+            model_path = Path(args.model_path).expanduser().resolve()
+            ppo_model = PPO.load(str(model_path), device=device)
+            ppo_vecnorm = _load_ppo_vecnormalize(model_path, args)
+            print(f"loaded SB3 PPO policy: {model_path}", flush=True)
+            if ppo_vecnorm is not None:
+                print("loaded PPO VecNormalize stats", flush=True)
         else:
-            obs_preprocess = torch.nn.Identity()
+            actor = SafetyActor(
+                n_obs=obs_dim,
+                n_act=act_dim,
+                num_envs=1,
+                init_scale=args.init_scale,
+                hidden_dim=args.actor_hidden_dim,
+                use_layer_norm=bool(getattr(args, "use_layer_norm", False)),
+                layer_norm_eps=float(getattr(args, "layer_norm_eps", 1e-5)),
+                device=device,
+            )
+            checkpoint = torch.load(args.model_path, map_location=device, weights_only=False)
+            actor.load_state_dict(checkpoint["actor_state_dict"])
+            actor.eval()
+            obs_norm_state = checkpoint.get("obs_normalizer_state_dict", None)
+            if obs_norm_state and EmpiricalNormalization is not None:
+                obs_preprocess = EmpiricalNormalization(shape=obs_dim, device=device)
+                obs_preprocess.load_state_dict(obs_norm_state, strict=False)
+                obs_preprocess.eval()
+            else:
+                obs_preprocess = torch.nn.Identity()
 
     win = EpisodeWindow(size=max(10, args.num_episodes))
 
@@ -840,14 +916,21 @@ def main() -> int:
                 continue
 
         if args.controller == "policy":
-            with torch.no_grad():
-                obs_t = torch.as_tensor(obs[None, :], device=device, dtype=torch.float32)
-                if obs_preprocess is not None:
-                    obs_t = obs_preprocess(obs_t)
-                _, _, mean = actor(obs_t)
-                action = mean[0].detach().cpu().numpy().astype(np.float32)
-            if bool(getattr(args, "scale_actor_to_env_bounds", False)):
-                action = scale_action_np(action, env.action_space)
+            if ppo_model is not None:
+                ppo_obs = np.asarray(obs, dtype=np.float32).reshape(1, -1)
+                if ppo_vecnorm is not None:
+                    ppo_obs = ppo_vecnorm.normalize_obs(ppo_obs)
+                action, _ = ppo_model.predict(ppo_obs, deterministic=True)
+                action = np.asarray(action, dtype=np.float32).reshape(-1)
+            else:
+                with torch.no_grad():
+                    obs_t = torch.as_tensor(obs[None, :], device=device, dtype=torch.float32)
+                    if obs_preprocess is not None:
+                        obs_t = obs_preprocess(obs_t)
+                    _, _, mean = actor(obs_t)
+                    action = mean[0].detach().cpu().numpy().astype(np.float32)
+                if bool(getattr(args, "scale_actor_to_env_bounds", False)):
+                    action = scale_action_np(action, env.action_space)
         elif args.controller == "random":
             action = env.action_space.sample().astype(np.float32)
         else:
@@ -1007,6 +1090,8 @@ def main() -> int:
     print(json.dumps(summary, sort_keys=True), flush=True)
 
     env.close()
+    if ppo_vecnorm is not None:
+        ppo_vecnorm.close()
     if controller is not None:
         controller.close()
     if telemetry_panel is not None:

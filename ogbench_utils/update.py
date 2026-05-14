@@ -151,9 +151,16 @@ class FastSACUpdater:
             "critic_loss_pref_weighted": 0.0,
             "critic_loss_total": 0.0,
             "pref_linked_rows": 0.0,
+            "pref_linked_effective_rows": 0.0,
             "pref_linked_fraction": 0.0,
+            "pref_linked_effective_fraction": 0.0,
             "pref_lambda": 0.0,
             "pref_lambda_delta": 0.0,
+            "pref_lambda_min": 0.0,
+            "pref_lambda_max_value": 0.0,
+            "pref_lambda_std": 0.0,
+            "pref_lambda_active_fraction": 0.0,
+            "pref_lambda_per_linked_enabled": 0.0,
             "pref_dual_violation": 0.0,
             "pref_dual_signal": 0.0,
             "pref_violation": 0.0,
@@ -177,6 +184,10 @@ class FastSACUpdater:
             "q_min_non_teacher_data_count": 0.0,
             "pref_q_delta_sum": 0.0,
             "pref_q_delta_count": 0.0,
+            "pref_action_delta_sum": 0.0,
+            "pref_action_delta_count": 0.0,
+            "pref_action_weight_sum": 0.0,
+            "pref_action_weight_count": 0.0,
             "reward": 0.0,
             "reward_abs": 0.0,
             "alpha_value": 0.0,
@@ -233,6 +244,10 @@ class FastSACUpdater:
                     break
             else:
                 batch = replay_buffer.sample(main_batch)
+                batch_device = batch["actions"].device
+                batch["pref_lagrangian_buffer_id"] = torch.zeros(
+                    batch.batch_size, device=batch_device, dtype=torch.long
+                )
             demo_batch = None
             demo_bc_obs = None
             demo_bc_actions = None
@@ -247,6 +262,10 @@ class FastSACUpdater:
                 if demo_size > 0:
                     metrics_accumulator["demo_buffer_nonempty_updates"] += 1.0
                     demo_batch = demo_buffer.sample(b_demo)
+                    demo_batch_device = demo_batch["actions"].device
+                    demo_batch["pref_lagrangian_buffer_id"] = torch.ones(
+                        demo_batch.batch_size, device=demo_batch_device, dtype=torch.long
+                    )
                     batch = TensorDict.cat([batch, demo_batch], dim=0)
                     demo_bc_obs = demo_batch["observations"]
                     demo_bc_actions = demo_batch["actions"]
@@ -310,6 +329,10 @@ class FastSACUpdater:
                 pref_violation_ema_value = float(self._pref_violation_ema)
                 pref_lambda_value = float(self.pref_lambda)
                 pref_lambda_delta_value = 0.0
+                pref_lambda_min_value = float(self.pref_lambda)
+                pref_lambda_max_value = float(self.pref_lambda)
+                pref_lambda_std_value = 0.0
+                pref_lambda_active_fraction_value = 1.0 if self.pref_lambda > 1e-8 else 0.0
 
                 critic_loss_replay_value = float(critic_loss_replay_tensor.detach().cpu().item())
                 q_disagreement_data = torch.max(q_stack_data, dim=0).values - torch.min(q_stack_data, dim=0).values
@@ -331,6 +354,7 @@ class FastSACUpdater:
 
                 has_teacher_intervened = False
                 teacher_mask = None
+                linked_action_epsilon = float(getattr(args, "pref_linked_action_epsilon", 1e-6))
                 try:
                     has_teacher_intervened = "teacher_intervened" in batch.keys(include_nested=False)
                 except TypeError:
@@ -352,7 +376,9 @@ class FastSACUpdater:
                     has_student_actions = "student_actions" in batch
                 if has_student_actions:
                     student_actions_batch_diag = batch["student_actions"].to(torch.float32)
-                    action_override_mask = (torch.abs(actions_batch - student_actions_batch_diag).sum(dim=-1) > 1e-6)
+                    action_override_mask = (
+                        torch.abs(actions_batch - student_actions_batch_diag).sum(dim=-1) > linked_action_epsilon
+                    )
                     action_override_fraction_value = float(action_override_mask.float().mean().detach().cpu().item())
                     metrics_accumulator["action_override_batch_fraction"] += action_override_fraction_value
                     if teacher_mask is not None:
@@ -490,6 +516,24 @@ class FastSACUpdater:
                     pref_states = None
                     pref_teacher_actions = None
                     pref_student_actions = None
+                    pref_pair_weights = None
+                    pref_replay_env_indices = None
+                    pref_replay_buffer_indices = None
+                    pref_action_delta_mean_value = 0.0
+                    pref_action_weight_mean_value = 0.0
+
+                    def _weighted_mean(loss_tensor: torch.Tensor, sample_weights: torch.Tensor | None) -> torch.Tensor:
+                        if sample_weights is None:
+                            return loss_tensor.mean()
+                        weights = sample_weights.to(device=loss_tensor.device, dtype=loss_tensor.dtype)
+                        if loss_tensor.ndim == 1:
+                            weight_view = weights
+                        elif loss_tensor.ndim == 2:
+                            weight_view = weights.unsqueeze(-1)
+                        else:
+                            weight_view = weights.unsqueeze(0).unsqueeze(-1)
+                        denom = torch.clamp(weight_view.sum(), min=1e-8)
+                        return (loss_tensor * weight_view).sum() / denom
 
                     if pref_sampling_mode == "linked":
                         has_student_actions = False
@@ -516,9 +560,74 @@ class FastSACUpdater:
                                     float(linked_rows) / max(1.0, float(linked_mask.numel()))
                                 )
                                 if linked_rows > 0:
-                                    pref_states = obs_batch[linked_mask]
-                                    pref_teacher_actions = actions_batch[linked_mask]
-                                    pref_student_actions = linked_student_actions[linked_mask]
+                                    linked_delta_abs = torch.abs(actions_batch - linked_student_actions)
+                                    linked_delta_l1 = linked_delta_abs.sum(dim=-1)
+                                    linked_delta_mean_abs = linked_delta_abs.mean(dim=-1)
+                                    effective_linked_mask = linked_mask & (linked_delta_l1 > linked_action_epsilon)
+                                    effective_rows = int(effective_linked_mask.sum().item())
+                                    metrics_accumulator["pref_linked_effective_rows"] += float(effective_rows)
+                                    metrics_accumulator["pref_linked_effective_fraction"] += (
+                                        float(effective_rows) / max(1.0, float(linked_mask.numel()))
+                                    )
+                                    if effective_rows > 0:
+                                        pref_states = obs_batch[effective_linked_mask]
+                                        pref_teacher_actions = actions_batch[effective_linked_mask]
+                                        pref_student_actions = linked_student_actions[effective_linked_mask]
+                                        try:
+                                            has_replay_indices = (
+                                                "replay_env_indices" in batch.keys(include_nested=False)
+                                                and "replay_buffer_indices" in batch.keys(include_nested=False)
+                                            )
+                                        except TypeError:
+                                            has_replay_indices = (
+                                                "replay_env_indices" in batch.keys()
+                                                and "replay_buffer_indices" in batch.keys()
+                                            )
+                                        except Exception:
+                                            has_replay_indices = (
+                                                "replay_env_indices" in batch
+                                                and "replay_buffer_indices" in batch
+                                            )
+                                        if has_replay_indices:
+                                            pref_replay_env_indices = batch["replay_env_indices"][effective_linked_mask]
+                                            pref_replay_buffer_indices = batch["replay_buffer_indices"][effective_linked_mask]
+                                            try:
+                                                has_buffer_ids = "pref_lagrangian_buffer_id" in batch.keys(include_nested=False)
+                                            except TypeError:
+                                                has_buffer_ids = "pref_lagrangian_buffer_id" in batch.keys()
+                                            except Exception:
+                                                has_buffer_ids = "pref_lagrangian_buffer_id" in batch
+                                            if has_buffer_ids:
+                                                pref_replay_source_mask = (
+                                                    batch["pref_lagrangian_buffer_id"][effective_linked_mask].to(torch.long) == 0
+                                                )
+                                            else:
+                                                pref_replay_source_mask = torch.ones(
+                                                    effective_rows,
+                                                    device=self.device,
+                                                    dtype=torch.bool,
+                                                )
+                                        else:
+                                            pref_replay_source_mask = None
+                                        pref_pair_weights = torch.ones(
+                                            effective_rows, device=self.device, dtype=torch.float32
+                                        )
+                                        weight_scale = float(
+                                            getattr(args, "pref_linked_action_weight_scale", 0.0)
+                                        )
+                                        effective_delta_mean_abs = linked_delta_mean_abs[effective_linked_mask]
+                                        if weight_scale > 0.0:
+                                            pref_pair_weights = torch.clamp(
+                                                effective_delta_mean_abs / weight_scale,
+                                                min=0.0,
+                                                max=1.0,
+                                            )
+                                        pref_action_delta_mean_value = float(
+                                            effective_delta_mean_abs.detach().mean().cpu().item()
+                                        )
+                                        pref_action_weight_mean_value = float(
+                                            pref_pair_weights.detach().mean().cpu().item()
+                                        )
                     elif (
                         self.pref_buffer is not None
                         and b_pref > 0
@@ -531,6 +640,7 @@ class FastSACUpdater:
                             pref_states = pref_sample.states
                             pref_teacher_actions = pref_sample.teacher_actions
                             pref_student_actions = pref_sample.student_actions
+                            pref_pair_weights = None
 
                     if (
                         pref_states is not None
@@ -558,14 +668,18 @@ class FastSACUpdater:
                         margin = float(args.pref_rank_margin)
                         delta = q_pos_term - q_neg_base
                         pref_loss_type = str(getattr(args, "pref_loss_type", "margin")).strip().lower()
+                        pref_lagrangian_scope = str(
+                            getattr(args, "pref_lagrangian_scope", "global")
+                        ).strip().lower()
                         if pref_loss_type == "bradley_terry":
-                            rank_loss = F.softplus(-delta).mean()
+                            rank_terms = F.softplus(-delta)
+                            rank_loss = _weighted_mean(rank_terms, pref_pair_weights)
                             rank_loss_weighted = float(args.pref_rank_weight) * rank_loss
                         elif pref_loss_type == "hinge":
-                            rank_loss = torch.clamp(margin - delta, min=0.0).mean()
+                            rank_terms = torch.clamp(margin - delta, min=0.0)
+                            rank_loss = _weighted_mean(rank_terms, pref_pair_weights)
                             rank_loss_weighted = float(args.pref_rank_weight) * rank_loss
                         elif pref_loss_type == "lagrangian":
-                            prev_pref_lambda = float(self.pref_lambda)
                             pref_lagrangian_violation_type = str(
                                 getattr(args, "pref_lagrangian_violation_type", "hinge")
                             ).strip().lower()
@@ -576,32 +690,124 @@ class FastSACUpdater:
                             pref_violation_value = float(violation.detach().mean().cpu().item())
                             if self.pref_violation_clip > 0.0:
                                 violation = torch.clamp(violation, max=self.pref_violation_clip)
-                            if self.pref_lambda_ema > 0.0:
-                                self._pref_violation_ema = (
-                                    self.pref_lambda_ema * self._pref_violation_ema
-                                    + (1.0 - self.pref_lambda_ema) * float(pref_violation_value)
+                            use_per_linked_lambda = (
+                                pref_sampling_mode == "linked"
+                                and pref_lagrangian_scope == "per_linked"
+                                and pref_replay_env_indices is not None
+                                and pref_replay_buffer_indices is not None
+                                and pref_replay_source_mask is not None
+                                and bool(pref_replay_source_mask.any().item())
+                                and hasattr(replay_buffer, "gather_pref_lagrangian_state")
+                                and hasattr(replay_buffer, "update_pref_lagrangian_state")
+                            )
+                            if use_per_linked_lambda:
+                                replay_row_mask = pref_replay_source_mask
+                                per_lambda, per_ema, _ = replay_buffer.gather_pref_lagrangian_state(
+                                    pref_replay_env_indices[replay_row_mask],
+                                    pref_replay_buffer_indices[replay_row_mask],
+                                    init_lambda=float(getattr(args, "pref_lambda_init", 0.0)),
+                                    device=self.device,
                                 )
-                                dual_violation = float(self._pref_violation_ema)
+                                lambda_all = torch.full(
+                                    (violation.shape[-2],),
+                                    float(self.pref_lambda),
+                                    device=self.device,
+                                    dtype=violation.dtype,
+                                )
+                                lambda_all[replay_row_mask] = per_lambda.to(dtype=violation.dtype)
+                                prev_per_lambda = per_lambda
+                                violation_for_dual = violation.detach()
+                                if violation_for_dual.ndim == 3:
+                                    sample_violation_all = violation_for_dual.mean(dim=(0, 2))
+                                elif violation_for_dual.ndim == 2:
+                                    sample_violation_all = violation_for_dual.mean(dim=-1)
+                                else:
+                                    sample_violation_all = violation_for_dual
+                                sample_violation = sample_violation_all[replay_row_mask]
+                                if self.pref_lambda_ema > 0.0:
+                                    per_ema = (
+                                        self.pref_lambda_ema * per_ema
+                                        + (1.0 - self.pref_lambda_ema) * sample_violation
+                                    )
+                                    dual_violation_tensor = per_ema
+                                else:
+                                    dual_violation_tensor = sample_violation
+                                dual_signal = dual_violation_tensor - float(self.pref_violation_target)
+                                if self.pref_lambda_lr > 0.0:
+                                    per_lambda = torch.clamp(
+                                        per_lambda + self.pref_lambda_lr * dual_signal,
+                                        min=0.0,
+                                    )
+                                    if self.pref_lambda_max > 0.0:
+                                        per_lambda = torch.clamp(per_lambda, max=self.pref_lambda_max)
+                                replay_buffer.update_pref_lagrangian_state(
+                                    pref_replay_env_indices[replay_row_mask],
+                                    pref_replay_buffer_indices[replay_row_mask],
+                                    lambdas=per_lambda,
+                                    violation_emas=per_ema,
+                                )
+                                pref_lambda_value = float(per_lambda.detach().mean().cpu().item())
+                                pref_lambda_delta_value = float(
+                                    (per_lambda - prev_per_lambda).detach().mean().cpu().item()
+                                )
+                                pref_lambda_min_value = float(per_lambda.detach().min().cpu().item())
+                                pref_lambda_max_value = float(per_lambda.detach().max().cpu().item())
+                                pref_lambda_std_value = float(
+                                    per_lambda.detach().std(unbiased=False).cpu().item()
+                                )
+                                pref_lambda_active_fraction_value = float(
+                                    (per_lambda.detach() > 1e-8).float().mean().cpu().item()
+                                )
+                                pref_violation_ema_value = float(per_ema.detach().mean().cpu().item())
+                                pref_dual_violation_value = float(
+                                    dual_violation_tensor.detach().mean().cpu().item()
+                                )
+                                pref_dual_signal_value = float(dual_signal.detach().mean().cpu().item())
+                                lambda_view = lambda_all
+                                if violation.ndim == 3:
+                                    lambda_view = lambda_view.view(1, -1, 1)
+                                elif violation.ndim == 2:
+                                    lambda_view = lambda_view.view(-1, 1)
+                                rank_terms = lambda_view * violation
                             else:
-                                dual_violation = float(pref_violation_value)
-                            pref_dual_violation_value = float(dual_violation)
-                            pref_dual_signal_value = float(dual_violation - self.pref_violation_target)
-                            if self.pref_lambda_lr > 0.0:
-                                self.pref_lambda = max(0.0, self.pref_lambda + self.pref_lambda_lr * pref_dual_signal_value)
-                                if self.pref_lambda_max > 0.0:
-                                    self.pref_lambda = min(self.pref_lambda, self.pref_lambda_max)
-                            pref_lambda_value = float(self.pref_lambda)
-                            pref_lambda_delta_value = pref_lambda_value - prev_pref_lambda
-                            pref_violation_ema_value = float(self._pref_violation_ema)
-                            rank_loss = (pref_lambda_value * violation).mean()
+                                prev_pref_lambda = float(self.pref_lambda)
+                                if self.pref_lambda_ema > 0.0:
+                                    self._pref_violation_ema = (
+                                        self.pref_lambda_ema * self._pref_violation_ema
+                                        + (1.0 - self.pref_lambda_ema) * float(pref_violation_value)
+                                    )
+                                    dual_violation = float(self._pref_violation_ema)
+                                else:
+                                    dual_violation = float(pref_violation_value)
+                                pref_dual_violation_value = float(dual_violation)
+                                pref_dual_signal_value = float(dual_violation - self.pref_violation_target)
+                                if self.pref_lambda_lr > 0.0:
+                                    self.pref_lambda = max(0.0, self.pref_lambda + self.pref_lambda_lr * pref_dual_signal_value)
+                                    if self.pref_lambda_max > 0.0:
+                                        self.pref_lambda = min(self.pref_lambda, self.pref_lambda_max)
+                                pref_lambda_value = float(self.pref_lambda)
+                                pref_lambda_delta_value = pref_lambda_value - prev_pref_lambda
+                                pref_lambda_min_value = pref_lambda_value
+                                pref_lambda_max_value = pref_lambda_value
+                                pref_lambda_std_value = 0.0
+                                pref_lambda_active_fraction_value = 1.0 if pref_lambda_value > 1e-8 else 0.0
+                                pref_violation_ema_value = float(self._pref_violation_ema)
+                                rank_terms = pref_lambda_value * violation
+                            rank_loss = _weighted_mean(rank_terms, pref_pair_weights)
                             # Lagrangian already scales by lambda; keep extra rank weight neutral.
                             rank_loss_weighted = rank_loss
                         else:
-                            rank_loss = F.softplus(margin - delta).mean()
+                            rank_terms = F.softplus(margin - delta)
+                            rank_loss = _weighted_mean(rank_terms, pref_pair_weights)
                             rank_loss_weighted = float(args.pref_rank_weight) * rank_loss
                         pref_q_delta_value = float(delta.detach().mean().cpu().item())
                         metrics_accumulator["pref_q_delta_sum"] += pref_q_delta_value
                         metrics_accumulator["pref_q_delta_count"] += 1.0
+                        if pref_sampling_mode == "linked":
+                            metrics_accumulator["pref_action_delta_sum"] += pref_action_delta_mean_value
+                            metrics_accumulator["pref_action_delta_count"] += 1.0
+                            metrics_accumulator["pref_action_weight_sum"] += pref_action_weight_mean_value
+                            metrics_accumulator["pref_action_weight_count"] += 1.0
                         qf_loss = qf_loss + rank_loss_weighted
                         pref_states_for_actor = pref_states
                         pref_teacher_actions_for_actor = pref_teacher_actions
@@ -757,6 +963,13 @@ class FastSACUpdater:
             metrics_accumulator["critic_loss_total"] += critic_loss_total_value
             metrics_accumulator["pref_lambda"] += pref_lambda_value
             metrics_accumulator["pref_lambda_delta"] += pref_lambda_delta_value
+            metrics_accumulator["pref_lambda_min"] += pref_lambda_min_value
+            metrics_accumulator["pref_lambda_max_value"] += pref_lambda_max_value
+            metrics_accumulator["pref_lambda_std"] += pref_lambda_std_value
+            metrics_accumulator["pref_lambda_active_fraction"] += pref_lambda_active_fraction_value
+            metrics_accumulator["pref_lambda_per_linked_enabled"] += (
+                1.0 if str(getattr(args, "pref_lagrangian_scope", "global")).strip().lower() == "per_linked" else 0.0
+            )
             metrics_accumulator["pref_dual_violation"] += pref_dual_violation_value
             metrics_accumulator["pref_dual_signal"] += pref_dual_signal_value
             metrics_accumulator["pref_violation"] += pref_violation_value

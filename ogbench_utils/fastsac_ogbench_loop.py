@@ -122,7 +122,7 @@ def prefill_replay_buffer_with_demos(
     demo_args.train_render_mode = "none"
 
     wrappers = make_wrappers(demo_args, env_family)
-    env_kwargs = _build_env_kwargs(demo_args)
+    env_kwargs = _build_env_kwargs(demo_args, env_family)
     clip_actions = _default_clip_actions(env_family)
     demo_envs = _build_vec_env_with_fallback(
         env_name=demo_args.env_name,
@@ -640,6 +640,7 @@ def run_training_loop(
     updater: FastSACUpdater,
     current_env_name: str,
     initial_obs_raw: torch.Tensor | None,
+    maze_eval_artifact_manager=None,
 ):
     """Main rollout/update loop for FastSAC OGBench training."""
     rb = replay_buffer
@@ -796,6 +797,11 @@ def run_training_loop(
         total_interventions = 0
         replay_intervention_write_checks = 0
         replay_intervention_write_mismatches = 0
+        first_success_env_steps: int | None = None
+        first_success_wallclock_sec: float | None = None
+        first_success_intervention_steps: int | None = None
+        success_episodes_total = 0
+        completed_episodes_total = 0
         eil_bad_pre_steps = int(max(0, getattr(args, "eil_bad_pre_steps", 8)))
         eil_pending_rows = [deque() for _ in range(envs.num_envs)] if eil_enabled else []
         eil_teacher_active = [False for _ in range(envs.num_envs)] if eil_enabled else []
@@ -887,7 +893,10 @@ def run_training_loop(
             )
             if teacher_mask is None and student_actions is not None and applied_actions is not None:
                 try:
-                    teacher_mask = (torch.abs(applied_actions - student_actions).sum(dim=-1) > 1e-6)
+                    linked_action_epsilon = float(getattr(args, "pref_linked_action_epsilon", 1e-6))
+                    teacher_mask = (
+                        torch.abs(applied_actions - student_actions).sum(dim=-1) > linked_action_epsilon
+                    )
                 except Exception:
                     teacher_mask = None
 
@@ -1107,6 +1116,18 @@ def run_training_loop(
             if done_ids.numel() > 0:
                 rewbuffer += cur_reward_sum[done_ids].tolist()
                 lenbuffer += cur_episode_length[done_ids].tolist()
+                completed_episodes_total += int(done_ids.numel())
+                goals = infos.get("goals_reached") or []
+                success_this_step = 0
+                for env_done_idx, env_idx in enumerate(done_ids.tolist()):
+                    if env_done_idx < len(goals) and float(goals[env_done_idx]) > 0.0:
+                        success_this_step += 1
+                if success_this_step > 0:
+                    success_episodes_total += int(success_this_step)
+                    if first_success_env_steps is None:
+                        first_success_env_steps = int(total_env_steps + envs.num_envs)
+                        first_success_wallclock_sec = float(time.time() - start_time)
+                        first_success_intervention_steps = int(total_interventions)
                 if reward_mode_tracker is not None and "dense_phase_cumulative" in reward_components:
                     dense_phase_final = reward_components["dense_phase_cumulative"][done_ids]
                     reward_window_dense_phase_episode_sum += float(dense_phase_final.sum().item())
@@ -1386,6 +1407,24 @@ def run_training_loop(
                 reward_mode_logs["Train/total_interventions"] = torch.tensor(
                     [float(total_interventions)], device=device, dtype=torch.float32
                 )
+                reward_mode_logs["Train/completed_episodes"] = torch.tensor(
+                    [float(completed_episodes_total)], device=device, dtype=torch.float32
+                )
+                reward_mode_logs["Train/successful_episodes"] = torch.tensor(
+                    [float(success_episodes_total)], device=device, dtype=torch.float32
+                )
+                if first_success_env_steps is not None:
+                    reward_mode_logs["Train/first_success_env_steps"] = torch.tensor(
+                        [float(first_success_env_steps)], device=device, dtype=torch.float32
+                    )
+                if first_success_wallclock_sec is not None:
+                    reward_mode_logs["Train/first_success_wallclock_sec"] = torch.tensor(
+                        [float(first_success_wallclock_sec)], device=device, dtype=torch.float32
+                    )
+                if first_success_intervention_steps is not None:
+                    reward_mode_logs["Train/first_success_intervention_steps"] = torch.tensor(
+                        [float(first_success_intervention_steps)], device=device, dtype=torch.float32
+                    )
                 reward_mode_logs["Train/replay_intervention_write_checks"] = torch.tensor(
                     [float(replay_intervention_write_checks)], device=device, dtype=torch.float32
                 )
@@ -1444,6 +1483,29 @@ def run_training_loop(
                     amp=amp,
                 )
                 training_logger.log_eval(total_env_steps=total_env_steps, metrics=eval_metrics)
+                if maze_eval_artifact_manager is not None:
+                    def _maze_policy_step_fn(obs_tensor: torch.Tensor) -> torch.Tensor:
+                        norm_obs = normalize_obs(obs_tensor)
+                        with torch.no_grad(), autocast(
+                            device_type=amp_device_type,
+                            dtype=amp_dtype,
+                            enabled=amp_enabled,
+                        ):
+                            _, _, mean_actions = actor_head(actor_backbone(norm_obs))
+                            mean_actions = _apply_binary_gripper_action(
+                                mean_actions,
+                                enabled=args.binary_gripper_actions,
+                                threshold=args.binary_gripper_threshold,
+                            )
+                        return mean_actions
+
+                    maze_eval_artifact_manager.maybe_save_trajectory_plot(
+                        device=device,
+                        tag=f"eval_step{total_env_steps}",
+                        step_value=total_env_steps,
+                        policy_step_fn=_maze_policy_step_fn,
+                        wandb_run=training_logger.wandb_run,
+                    )
                 next_eval_step += eval_interval_current
 
             while next_export_replay_step is not None and total_env_steps >= next_export_replay_step:

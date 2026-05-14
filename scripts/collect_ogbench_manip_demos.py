@@ -30,6 +30,7 @@ from ogbench_utils.vr_teleop import (
     VRStatusPanel,
     VRTeleopInterface,
     apply_vr_mapping_profile,
+    wait_for_fresh_gate_press,
 )
 
 
@@ -110,6 +111,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--no_show_status_panel", dest="show_status_panel", action="store_false")
     p.add_argument("--show_topdown_view", action="store_true", default=True)
     p.add_argument("--no_show_topdown_view", dest="show_topdown_view", action="store_false")
+    p.add_argument("--wait_for_human_start", action="store_true", default=True)
+    p.add_argument("--no_wait_for_human_start", dest="wait_for_human_start", action="store_false")
     return p.parse_args()
 
 
@@ -212,6 +215,11 @@ def main() -> int:
     viewer.sync(env)
     if status_panel is not None:
         status_panel.set_topdown_state(extract_manip_topdown_state(env, info if isinstance(info, dict) else None))
+    if bool(args.wait_for_human_start):
+        wait_for_fresh_gate_press(
+            teleop,
+            label="VRDemoStart",
+        )
     fps_dt = 1.0 / max(1.0, float(args.fps))
 
     try:

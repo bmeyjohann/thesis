@@ -9,7 +9,7 @@ from typing import Optional
 
 import numpy as np
 
-from .env import extract_agent_forward_xy, extract_min_constrained_clearance, unwrap_env
+from .env import extract_agent_forward_xy, extract_agent_xy, extract_goal_xy, extract_min_constrained_clearance, unwrap_env
 from .gamepad import (
     DEFAULT_SAFETY_GAMEPAD_CACHE_PATH,
     DEFAULT_SAFETY_GAMEPAD_CONFIG_PATH,
@@ -537,6 +537,75 @@ class ExpertPolicyController:
         return None
 
 
+class SafeRLPolicyController:
+    """Checkpoint-backed CPO/PCPO teacher from the local safe_rl package."""
+
+    always_active = True
+
+    def __init__(
+        self,
+        *,
+        checkpoint_path: str | Path,
+        config_path: str | Path,
+        obs_dim: int,
+        action_low: np.ndarray,
+        action_high: np.ndarray,
+        device: str = "cpu",
+    ):
+        self.checkpoint_path = Path(checkpoint_path).expanduser().resolve()
+        self.config_path = Path(config_path).expanduser().resolve()
+        if not self.checkpoint_path.is_file():
+            raise FileNotFoundError(f"Safe-RL checkpoint not found: {self.checkpoint_path}")
+        if not self.config_path.is_file():
+            raise FileNotFoundError(f"Safe-RL config not found: {self.config_path}")
+        self.obs_dim = int(obs_dim)
+        self.action_low = np.asarray(action_low, dtype=np.float32).reshape(-1)
+        self.action_high = np.asarray(action_high, dtype=np.float32).reshape(-1)
+        self.device = device
+        self._load_model()
+
+    def _load_model(self) -> None:
+        import torch
+        import yaml
+
+        repo_root = Path(__file__).resolve().parent.parent
+        safe_rl_root = repo_root / "safe_rl"
+        safe_rl_root_str = str(safe_rl_root)
+        if safe_rl_root.exists() and safe_rl_root_str not in sys.path:
+            sys.path.insert(0, safe_rl_root_str)
+
+        from safe_rl.modules import ActorCritic
+
+        with self.config_path.open("r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+        policy_cfg = dict(cfg["policy"])
+        policy_cfg.pop("class_name", None)
+        cost_limits = cfg.get("algorithm", {}).get("cost_limits") or [1.0]
+        policy_cfg["num_costs"] = len(cost_limits)
+
+        checkpoint = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
+        action_dim = int(self.action_low.shape[0])
+        device = torch.device(self.device)
+        policy = ActorCritic(self.obs_dim, self.obs_dim, action_dim, **policy_cfg).to(device)
+        policy.load_state_dict(checkpoint["model_state_dict"])
+        policy.eval()
+        self.policy = policy
+        self._torch = torch
+
+    def get_action(self, obs: np.ndarray | None = None, env=None) -> np.ndarray | None:
+        if obs is None:
+            return None
+        torch = self._torch
+        device = next(self.policy.parameters()).device
+        with torch.inference_mode():
+            obs_t = torch.as_tensor(np.asarray(obs, dtype=np.float32).reshape(1, -1), device=device)
+            action = self.policy.act_inference(obs_t)[0].detach().cpu().numpy().astype(np.float32)
+        return np.clip(action, self.action_low, self.action_high).astype(np.float32, copy=False)
+
+    def close(self) -> None:
+        return None
+
+
 class SwitchingExpertPolicyController:
     """Route between a goal-reaching expert and a safe expert using live clearance."""
 
@@ -634,6 +703,37 @@ class ScriptedLidarTeacherController:
         elif action.shape[0] > low.shape[0]:
             action = action[: low.shape[0]]
         return np.clip(action, low, high).astype(np.float32, copy=False)
+
+    def _maybe_world_velocity_action(self, *, signed_offset: int, env) -> np.ndarray | None:
+        for wrapper in self._iter_wrappers(env):
+            if getattr(wrapper, "action_mode", "") == "world_velocity":
+                agent_xy = extract_agent_xy(env)
+                goal_xy = extract_goal_xy(env)
+                if agent_xy is not None and goal_xy is not None:
+                    desired = np.asarray(goal_xy - agent_xy, dtype=np.float32).reshape(-1)
+                    norm = float(np.linalg.norm(desired))
+                    if norm > 1e-6:
+                        desired = desired / norm
+                        low = np.asarray(env.action_space.low, dtype=np.float32).reshape(-1)
+                        high = np.asarray(env.action_space.high, dtype=np.float32).reshape(-1)
+                        return np.clip(desired[: low.shape[0]], low, high).astype(np.float32, copy=False)
+                forward = extract_agent_forward_xy(env)
+                if forward is None:
+                    return None
+                num_bins = int(self._num_bins or 16)
+                angle = float(signed_offset) * (2.0 * np.pi / max(1, num_bins))
+                c = float(np.cos(angle))
+                s = float(np.sin(angle))
+                fx = float(forward[0])
+                fy = float(forward[1])
+                desired = np.asarray([c * fx - s * fy, s * fx + c * fy], dtype=np.float32)
+                norm = float(np.linalg.norm(desired))
+                if norm > 1e-6:
+                    desired = desired / norm
+                low = np.asarray(env.action_space.low, dtype=np.float32).reshape(-1)
+                high = np.asarray(env.action_space.high, dtype=np.float32).reshape(-1)
+                return np.clip(desired[: low.shape[0]], low, high).astype(np.float32, copy=False)
+        return None
 
     def _build_obs_slices(self, env) -> None:
         if self._flat_slices is not None:
@@ -745,6 +845,9 @@ class ScriptedLidarTeacherController:
         goal_lidar, obstacle_lidar = self._obs_components(obs, env)
         target_idx, _diag = self._select_target_bin(goal_lidar, obstacle_lidar, env)
         signed_offset = self._signed_bin_offset(target_idx, env)
+        world_velocity_action = self._maybe_world_velocity_action(signed_offset=signed_offset, env=env)
+        if world_velocity_action is not None:
+            return world_velocity_action
         wheel_action = self._wheel_action(
             signed_offset=signed_offset,
             wheel_limit=self._wheel_limit(self.action_low, self.action_high),
@@ -776,6 +879,7 @@ def build_human_controller(
     action_low: np.ndarray | None = None,
     action_high: np.ndarray | None = None,
     expert_checkpoint_path: str = "",
+    expert_config_path: str = "",
     expert_safe_checkpoint_path: str = "",
     expert_switch_clearance_threshold: float = 0.08,
     expert_device: str = "cpu",
@@ -800,6 +904,23 @@ def build_human_controller(
             raise ValueError("input_device=expert requires expert_checkpoint_path.")
         return ExpertPolicyController(
             checkpoint_path=checkpoint_path,
+            obs_dim=int(obs_dim),
+            action_low=np.asarray(action_low, dtype=np.float32),
+            action_high=np.asarray(action_high, dtype=np.float32),
+            device=str(expert_device),
+        )
+    if input_device == "safe_rl":
+        if obs_dim is None or action_low is None or action_high is None:
+            raise ValueError("Safe-RL controller requires obs_dim plus action_low/action_high.")
+        checkpoint_path = str(expert_checkpoint_path).strip()
+        config_path = str(expert_config_path).strip()
+        if not checkpoint_path:
+            raise ValueError("input_device=safe_rl requires expert_checkpoint_path.")
+        if not config_path:
+            raise ValueError("input_device=safe_rl requires expert_config_path.")
+        return SafeRLPolicyController(
+            checkpoint_path=checkpoint_path,
+            config_path=config_path,
             obs_dim=int(obs_dim),
             action_low=np.asarray(action_low, dtype=np.float32),
             action_high=np.asarray(action_high, dtype=np.float32),

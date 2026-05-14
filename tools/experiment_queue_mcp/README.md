@@ -106,6 +106,8 @@ For `queue_status`, `list_jobs`, and `get_job`, pass `debug=true` only when you 
 - Read-only queue actions inspect persisted queue state without waking the daemon.
 - `set_queue_root` lets the current MCP session switch to another queue root under the same workspace without restarting Codex. This changes only the active MCP session; other sessions keep their own queue root.
 - The default monitoring path (`queue(action="queue_status")`, `queue(action="list_jobs")`, `queue(action="get_job")`) intentionally returns compact summaries without absolute paths so unattended autonomous sessions are less likely to trip client-side approval heuristics.
+- CUDA visibility in the Codex shell sandbox is not authoritative for this MCP. Queued jobs run outside Codex's normal shell sandbox, so sandbox-side `torch.cuda.is_available()` results must not be used to infer whether queue-run experiments have GPU access.
+- Verify queued GPU availability from queue-run logs, WANDB metrics, or an explicit queued GPU smoke job instead of from local sandbox CUDA probes.
 - The explicit debug tools (`queue_debug_status`, `list_jobs_debug`, `get_job_debug`) expose full path-rich metadata and are intended for manual diagnosis when a human is present.
 - The daemon stays alive once started until `shutdown_daemon` is called explicitly or the process is otherwise terminated.
 - The queue supports configurable parallel execution through `set_max_concurrent_jobs`. The default is `2`.

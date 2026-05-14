@@ -29,6 +29,8 @@ EXP_NAME="${EXP_NAME:-${EXP_PREFIX}_${TIMESTAMP}}"
 VARIANT="${VARIANT:-plain}"
 
 REWARD_MODE="${REWARD_MODE:-dense}"
+DENSE_REWARD_SCALE="${DENSE_REWARD_SCALE:-1.0}"
+SUCCESS_REWARD_SCALE="${SUCCESS_REWARD_SCALE:-1.0}"
 STEP_PENALTY="${STEP_PENALTY:--0.001}"
 COST_PENALTY="${COST_PENALTY:-0.0}"
 COST_PENALTY_WARMUP_STEPS="${COST_PENALTY_WARMUP_STEPS:-0}"
@@ -36,11 +38,19 @@ COST_PENALTY_RAMP_STEPS="${COST_PENALTY_RAMP_STEPS:-0}"
 CLEARANCE_PENALTY_SCALE="${CLEARANCE_PENALTY_SCALE:-0.0}"
 CLEARANCE_MARGIN="${CLEARANCE_MARGIN:-0.0}"
 CLEARANCE_PENALTY_POWER="${CLEARANCE_PENALTY_POWER:-1.0}"
+CLEARANCE_PENALTY_MODE="${CLEARANCE_PENALTY_MODE:-hinge_power}"
+CLEARANCE_PENALTY_TEMPERATURE="${CLEARANCE_PENALTY_TEMPERATURE:-0.08}"
 CLEARANCE_PENALTY_WARMUP_STEPS="${CLEARANCE_PENALTY_WARMUP_STEPS:-0}"
 CLEARANCE_PENALTY_RAMP_STEPS="${CLEARANCE_PENALTY_RAMP_STEPS:-0}"
 FORWARD_REWARD_SCALE="${FORWARD_REWARD_SCALE:-0.0}"
 BACKWARD_PENALTY_SCALE="${BACKWARD_PENALTY_SCALE:-0.0}"
 HEADING_REWARD_SCALE="${HEADING_REWARD_SCALE:-0.0}"
+ADAPTIVE_SAFETY_GOAL_TARGET="${ADAPTIVE_SAFETY_GOAL_TARGET:-1.0}"
+ADAPTIVE_SAFETY_WINDOW_EPISODES="${ADAPTIVE_SAFETY_WINDOW_EPISODES:-10}"
+ADAPTIVE_SAFETY_STEP="${ADAPTIVE_SAFETY_STEP:-0.05}"
+ADAPTIVE_SAFETY_INIT="${ADAPTIVE_SAFETY_INIT:-0.0}"
+ADAPTIVE_SAFETY_MIN="${ADAPTIVE_SAFETY_MIN:-0.0}"
+ADAPTIVE_SAFETY_MAX="${ADAPTIVE_SAFETY_MAX:-1.0}"
 LEARNING_STARTS="${LEARNING_STARTS:-5000}"
 NUM_UPDATES="${NUM_UPDATES:-2}"
 POLICY_FREQUENCY="${POLICY_FREQUENCY:-2}"
@@ -56,6 +66,9 @@ CRITIC_HIDDEN_DIM="${CRITIC_HIDDEN_DIM:-1024}"
 CAR_WHEEL_COMMAND_LIMIT="${CAR_WHEEL_COMMAND_LIMIT:-2.0}"
 CAR_FORCE_SCALE="${CAR_FORCE_SCALE:-2.0}"
 CAR_ACTION_MODE="${CAR_ACTION_MODE:-raw_wheels}"
+POINT_ACTION_MODE="${POINT_ACTION_MODE:-native}"
+POINT_TURN_GAIN="${POINT_TURN_GAIN:-2.5}"
+POINT_ALIGNMENT_POWER="${POINT_ALIGNMENT_POWER:-1.0}"
 OBS_MASK_MODE="${OBS_MASK_MODE:-none}"
 MODULE_IMPL="${MODULE_IMPL:-custom}"
 RENDER_MODE="${RENDER_MODE:-none}"
@@ -172,6 +185,11 @@ if [[ "${HEADING_POSITIVE_ONLY:-1}" == "0" ]]; then
   HEADING_POSITIVE_ONLY_FLAG="--no_heading_positive_only"
 fi
 
+ADAPTIVE_SAFETY_FLAG=""
+if [[ "${ADAPTIVE_SAFETY_CURRICULUM:-0}" == "1" ]]; then
+  ADAPTIVE_SAFETY_FLAG="--adaptive_safety_curriculum"
+fi
+
 /home/benjamin/miniconda3/envs/fasttd3/bin/python /home/benjamin/thesis/train_fast_sac_safetygym_minimal.py \
   --env_name "$ENV_NAME" \
   --exp_name "$EXP_NAME" \
@@ -199,6 +217,8 @@ fi
   --critic_loss_reduction "$CRITIC_LOSS_REDUCTION" \
   "$OBS_NORM_FLAG" \
   --reward_mode "$REWARD_MODE" \
+  --dense_reward_scale "$DENSE_REWARD_SCALE" \
+  --success_reward_scale "$SUCCESS_REWARD_SCALE" \
   --step_penalty "$STEP_PENALTY" \
   --cost_penalty "$COST_PENALTY" \
   --cost_penalty_warmup_steps "$COST_PENALTY_WARMUP_STEPS" \
@@ -206,15 +226,27 @@ fi
   --clearance_penalty_scale "$CLEARANCE_PENALTY_SCALE" \
   --clearance_margin "$CLEARANCE_MARGIN" \
   --clearance_penalty_power "$CLEARANCE_PENALTY_POWER" \
+  --clearance_penalty_mode "$CLEARANCE_PENALTY_MODE" \
+  --clearance_penalty_temperature "$CLEARANCE_PENALTY_TEMPERATURE" \
   --clearance_penalty_warmup_steps "$CLEARANCE_PENALTY_WARMUP_STEPS" \
   --clearance_penalty_ramp_steps "$CLEARANCE_PENALTY_RAMP_STEPS" \
   --forward_reward_scale "$FORWARD_REWARD_SCALE" \
   --backward_penalty_scale "$BACKWARD_PENALTY_SCALE" \
   --heading_reward_scale "$HEADING_REWARD_SCALE" \
   "$HEADING_POSITIVE_ONLY_FLAG" \
+  $ADAPTIVE_SAFETY_FLAG \
+  --adaptive_safety_goal_target "$ADAPTIVE_SAFETY_GOAL_TARGET" \
+  --adaptive_safety_window_episodes "$ADAPTIVE_SAFETY_WINDOW_EPISODES" \
+  --adaptive_safety_step "$ADAPTIVE_SAFETY_STEP" \
+  --adaptive_safety_init "$ADAPTIVE_SAFETY_INIT" \
+  --adaptive_safety_min "$ADAPTIVE_SAFETY_MIN" \
+  --adaptive_safety_max "$ADAPTIVE_SAFETY_MAX" \
   --car_wheel_command_limit "$CAR_WHEEL_COMMAND_LIMIT" \
   --car_force_scale "$CAR_FORCE_SCALE" \
   --car_action_mode "$CAR_ACTION_MODE" \
+  --point_action_mode "$POINT_ACTION_MODE" \
+  --point_turn_gain "$POINT_TURN_GAIN" \
+  --point_alignment_power "$POINT_ALIGNMENT_POWER" \
   --obs_mask_mode "$OBS_MASK_MODE" \
   --max_episode_steps "${MAX_EPISODE_STEPS:-0}" \
   $TERMINATE_ON_GOAL_FLAG \
@@ -226,6 +258,10 @@ fi
   --intervention_threshold "${INTERVENTION_THRESHOLD:-0.1}" \
   --intervention_hold_seconds "${INTERVENTION_HOLD_SECONDS:-0.25}" \
   --teacher_override_clearance_threshold "${TEACHER_OVERRIDE_CLEARANCE_THRESHOLD:--1.0}" \
+  --teacher_override_clearance_exit_threshold "${TEACHER_OVERRIDE_CLEARANCE_EXIT_THRESHOLD:--1.0}" \
+  --teacher_override_mode "${TEACHER_OVERRIDE_MODE:-clearance}" \
+  --teacher_goal_progress_steps "${TEACHER_GOAL_PROGRESS_STEPS:-3}" \
+  --teacher_goal_progress_epsilon "${TEACHER_GOAL_PROGRESS_EPSILON:-0.001}" \
   --controller_fps_limit "${CONTROLLER_FPS_LIMIT:-0}" \
   --controller_overlay_hz "${CONTROLLER_OVERLAY_HZ:-20.0}" \
   --gamepad_mode "${GAMEPAD_MODE:-local}" \
@@ -236,12 +272,14 @@ fi
   --gamepad_config_path "${GAMEPAD_CONFIG_PATH:-}" \
   --gamepad_device_index "${GAMEPAD_DEVICE_INDEX:-0}" \
   --expert_checkpoint_path "${EXPERT_CHECKPOINT_PATH:-}" \
+  --expert_config_path "${EXPERT_CONFIG_PATH:-}" \
   --expert_safe_checkpoint_path "${EXPERT_SAFE_CHECKPOINT_PATH:-}" \
   --expert_switch_clearance_threshold "${EXPERT_SWITCH_CLEARANCE_THRESHOLD:-0.08}" \
   --expert_device "${EXPERT_DEVICE:-cpu}" \
   --pref_capacity "${PREF_CAPACITY:-100000}" \
   --pref_sampling_mode "${PREF_SAMPLING_MODE:-linked}" \
   --pref_sample_ratio "${PREF_SAMPLE_RATIO:-0.0}" \
+  --pref_replay_sample_ratio "${PREF_REPLAY_SAMPLE_RATIO:-0.0}" \
   --pref_rank_weight "${PREF_RANK_WEIGHT:-0.0}" \
   --pref_rank_margin "${PREF_RANK_MARGIN:-0.1}" \
   --pref_loss_type "${PREF_LOSS_TYPE:-margin}" \

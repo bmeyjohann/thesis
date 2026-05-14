@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TARGET_SCRIPT="${SCRIPT_DIR}/run_cube_single_task1_relonly_angle_baseline_local.sh"
+if [[ ! -f "${TARGET_SCRIPT}" ]]; then
+  TARGET_SCRIPT="${PWD}/scripts/run_cube_single_task1_relonly_angle_baseline_local.sh"
+fi
+
+exec bash "${TARGET_SCRIPT}" \
+  ENV_NAME="${ENV_NAME:-cube-single-singletask-task1-v0}" \
+  DISABLE_ROTATION="${DISABLE_ROTATION:-1}" \
+  TOTAL_TIMESTEPS="${TOTAL_TIMESTEPS:-10000}" \
+  NUM_ENVS="${NUM_ENVS:-32}" \
+  LEARNING_STARTS="${LEARNING_STARTS:-2000}" \
+  CTA_RATIO="${CTA_RATIO:-2}" \
+  NUM_UPDATES="${NUM_UPDATES:-7}" \
+  FIXED_ALPHA="${FIXED_ALPHA:-0.001}" \
+  PREF_CRITIC_SCOPE="${PREF_CRITIC_SCOPE:-min}" \
+  PREF_LOSS_TYPE="${PREF_LOSS_TYPE:-hinge}" \
+  PREF_RANK_WEIGHT="${PREF_RANK_WEIGHT:-1.0}" \
+  PREF_RANK_MARGIN="${PREF_RANK_MARGIN:-0.1}" \
+  PREF_STOPGRAD_POSITIVE="${PREF_STOPGRAD_POSITIVE:-1}" \
+  STORE_INTERVENED_IN_DEMO_BUFFER="${STORE_INTERVENED_IN_DEMO_BUFFER:-1}" \
+  DEMO_PREFILL_EPISODES="${DEMO_PREFILL_EPISODES:-20}" \
+  DEMO_PREFILL_NUM_ENVS="${DEMO_PREFILL_NUM_ENVS:-20}" \
+  DEMO_SAMPLE_RATIO="${DEMO_SAMPLE_RATIO:-0.5}" \
+  EVAL_INTERVAL="${EVAL_INTERVAL:-5000}" \
+  NUM_EVAL_EPISODES="${NUM_EVAL_EPISODES:-10}" \
+  EVAL_NUM_ENVS="${EVAL_NUM_ENVS:-5}" \
+  PROJECT="${PROJECT:-ogbench-manip-pref-loss-sweep}" \
+  NAME_SUFFIX="${NAME_SUFFIX:-scripted_hinge_m010}" \
+  "$@"

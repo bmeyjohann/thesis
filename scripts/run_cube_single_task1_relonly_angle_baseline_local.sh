@@ -10,8 +10,18 @@ for arg in "$@"; do
   export "${arg}"
 done
 
-PYTHON_BIN="${PYTHON_BIN:-python}"
+if [[ -z "${PYTHON_BIN:-}" ]]; then
+  if [[ -x "/home/benjamin/miniconda3/envs/fasttd3/bin/python" ]]; then
+    PYTHON_BIN="/home/benjamin/miniconda3/envs/fasttd3/bin/python"
+  elif command -v python >/dev/null 2>&1; then
+    PYTHON_BIN="python"
+  else
+    PYTHON_BIN="python3"
+  fi
+fi
 WANDB_MODE_VALUE="${WANDB_MODE:-online}"
+WANDB_ENTITY_VALUE="${WANDB_ENTITY:-}"
+WANDB_GROUP_VALUE="${WANDB_GROUP:-}"
 PROJECT="${PROJECT:-ogbench-manip-reward-debug}"
 ENV_NAME="${ENV_NAME:-cube-single-singletask-task1-v0}"
 ALGO_VARIANT="${ALGO_VARIANT:-own}"
@@ -21,7 +31,9 @@ DEMO_SAMPLE_RATIO="${DEMO_SAMPLE_RATIO:-0.5}"
 DEMO_PREFILL_EPISODES="${DEMO_PREFILL_EPISODES:-20}"
 DEMO_PREFILL_NUM_ENVS="${DEMO_PREFILL_NUM_ENVS:-20}"
 INTERVENTION_EPISODE_PROB="${INTERVENTION_EPISODE_PROB:-1.0}"
+INTERVENTION_MODE="${INTERVENTION_MODE:-agent}"
 GAMMA="${GAMMA:-0.97}"
+SEED="${SEED:-42}"
 
 NUM_ENVS="${NUM_ENVS:-32}"
 TOTAL_TIMESTEPS="${TOTAL_TIMESTEPS:-120000}"
@@ -38,6 +50,7 @@ ALPHA_UPDATE_STUDENT_ONLY="${ALPHA_UPDATE_STUDENT_ONLY:-0}"
 ALPHA_MIN="${ALPHA_MIN:-0.0}"
 ALPHA_MAX="${ALPHA_MAX:-1.0}"
 ALPHA_FREEZE_STEPS="${ALPHA_FREEZE_STEPS:-0}"
+TEACHER_ACTION_NOISE_STD="${TEACHER_ACTION_NOISE_STD:-0.0}"
 
 PREF_RANK_WEIGHT="${PREF_RANK_WEIGHT:-1.0}"
 PREF_RANK_MARGIN="${PREF_RANK_MARGIN:-0.01}"
@@ -47,10 +60,13 @@ PREF_LAMBDA_INIT="${PREF_LAMBDA_INIT:-1.0}"
 PREF_LAMBDA_LR="${PREF_LAMBDA_LR:-1e-3}"
 PREF_LAMBDA_MAX="${PREF_LAMBDA_MAX:-10.0}"
 PREF_LAMBDA_EMA="${PREF_LAMBDA_EMA:-0.9}"
+PREF_LAGRANGIAN_SCOPE="${PREF_LAGRANGIAN_SCOPE:-global}"
 PREF_VIOLATION_CLIP="${PREF_VIOLATION_CLIP:-10.0}"
 PREF_VIOLATION_TARGET="${PREF_VIOLATION_TARGET:-0.0}"
 PREF_LAGRANGIAN_VIOLATION_TYPE="${PREF_LAGRANGIAN_VIOLATION_TYPE:-hinge}"
 PREF_STOPGRAD_POSITIVE="${PREF_STOPGRAD_POSITIVE:-1}"
+PREF_LINKED_ACTION_EPSILON="${PREF_LINKED_ACTION_EPSILON:-1e-6}"
+PREF_LINKED_ACTION_WEIGHT_SCALE="${PREF_LINKED_ACTION_WEIGHT_SCALE:-0.0}"
 STORE_INTERVENED_IN_DEMO_BUFFER="${STORE_INTERVENED_IN_DEMO_BUFFER:-0}"
 PVP_PROXY_VALUE_BOUND="${PVP_PROXY_VALUE_BOUND:-1.0}"
 PVP_INCLUDE_ENV_REWARD_IN_TD="${PVP_INCLUDE_ENV_REWARD_IN_TD:-0}"
@@ -97,22 +113,28 @@ mkdir -p logs
 echo "=== Starting ${EXP_NAME} ==="
 echo "Log file: ${LOG_FILE}"
 echo "WANDB mode: ${WANDB_MODE_VALUE}"
+echo "WANDB entity/group: ${WANDB_ENTITY_VALUE:-<default>}/${WANDB_GROUP_VALUE:-<none>}"
 echo "Teacher demo prefill: ${DEMO_PREFILL_EPISODES} episodes into demo buffer"
 echo "Sampling replay/demo ratio: 50/50 (demo_sample_ratio=${DEMO_SAMPLE_RATIO})"
 echo "Algo variant: ${ALGO_VARIANT}"
 echo "Reward type / cube reward mode: ${REWARD_TYPE} / ${CUBE_REWARD_MODE}"
+echo "Intervention mode: ${INTERVENTION_MODE}"
 echo "Intervention episode probability: ${INTERVENTION_EPISODE_PROB}"
 echo "Gamma: ${GAMMA}"
+echo "Seed: ${SEED}"
 echo "CTA ratio: ${CTA_RATIO}"
 echo "UTD (num_updates): ${NUM_UPDATES}"
 echo "Disable rotation: ${DISABLE_ROTATION}"
 echo "Alpha init: ${ALPHA_INIT}"
 echo "Fixed alpha: ${FIXED_ALPHA}"
+echo "Teacher action noise std: ${TEACHER_ACTION_NOISE_STD}"
 echo "Alpha update student-only: ${ALPHA_UPDATE_STUDENT_ONLY}"
 echo "Alpha min/max/freeze: ${ALPHA_MIN}/${ALPHA_MAX}/${ALPHA_FREEZE_STEPS}"
 echo "Pref critic scope: ${PREF_CRITIC_SCOPE}"
 echo "Pref loss type: ${PREF_LOSS_TYPE}"
+echo "Pref lagrangian scope: ${PREF_LAGRANGIAN_SCOPE}"
 echo "Pref stopgrad positive: ${PREF_STOPGRAD_POSITIVE}"
+echo "Pref linked action epsilon / weight scale: ${PREF_LINKED_ACTION_EPSILON} / ${PREF_LINKED_ACTION_WEIGHT_SCALE}"
 echo "Store intervened in demo buffer: ${STORE_INTERVENED_IN_DEMO_BUFFER}"
 echo "PVP include env reward in TD: ${PVP_INCLUDE_ENV_REWARD_IN_TD}"
 echo "EIL threshold/good/bad/pair/pre: ${EIL_THRESHOLD}/${EIL_GOOD_MARGIN}/${EIL_BAD_MARGIN}/${EIL_PAIR_MARGIN}/${EIL_BAD_PRE_STEPS}"
@@ -140,6 +162,7 @@ ARGS=(
   --eil_pair_margin "${EIL_PAIR_MARGIN}"
   --eil_bad_pre_steps "${EIL_BAD_PRE_STEPS}"
   --use_intervention
+  --intervention_mode "${INTERVENTION_MODE}"
   --teacher_type cube_markov
   --hard_block_lethal
   --num_critics "${NUM_CRITICS}"
@@ -150,8 +173,10 @@ ARGS=(
   --cta_ratio "${CTA_RATIO}"
   --learning_starts "${LEARNING_STARTS}"
   --gamma "${GAMMA}"
+  --seed "${SEED}"
   --alpha_init "${ALPHA_INIT}"
   --fixed_alpha "${FIXED_ALPHA}"
+  --teacher_action_noise_std "${TEACHER_ACTION_NOISE_STD}"
   --alpha_min "${ALPHA_MIN}"
   --alpha_max "${ALPHA_MAX}"
   --alpha_freeze_steps "${ALPHA_FREEZE_STEPS}"
@@ -165,6 +190,8 @@ ARGS=(
   --pref_buffer_enable
   --pref_sampling_mode linked
   --pref_sample_ratio 0.0
+  --pref_linked_action_epsilon "${PREF_LINKED_ACTION_EPSILON}"
+  --pref_linked_action_weight_scale "${PREF_LINKED_ACTION_WEIGHT_SCALE}"
   --pref_rank_weight "${PREF_RANK_WEIGHT}"
   --pref_rank_margin "${PREF_RANK_MARGIN}"
   --pref_critic_scope "${PREF_CRITIC_SCOPE}"
@@ -173,6 +200,7 @@ ARGS=(
   --pref_lambda_lr "${PREF_LAMBDA_LR}"
   --pref_lambda_max "${PREF_LAMBDA_MAX}"
   --pref_lambda_ema "${PREF_LAMBDA_EMA}"
+  --pref_lagrangian_scope "${PREF_LAGRANGIAN_SCOPE}"
   --pref_violation_clip "${PREF_VIOLATION_CLIP}"
   --pref_violation_target "${PREF_VIOLATION_TARGET}"
   --pref_lagrangian_violation_type "${PREF_LAGRANGIAN_VIOLATION_TYPE}"
@@ -235,6 +263,14 @@ fi
 
 if [[ "${PROFILE_TIMING}" == "1" ]]; then
   ARGS+=(--profile_timing)
+fi
+
+if [[ -n "${WANDB_ENTITY_VALUE}" ]]; then
+  ARGS+=(--wandb_entity "${WANDB_ENTITY_VALUE}")
+fi
+
+if [[ -n "${WANDB_GROUP_VALUE}" ]]; then
+  ARGS+=(--wandb_group "${WANDB_GROUP_VALUE}")
 fi
 
 WANDB_MODE="${WANDB_MODE_VALUE}" \

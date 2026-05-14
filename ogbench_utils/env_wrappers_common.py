@@ -77,6 +77,7 @@ def maybe_wrap_intervention(
     *,
     intervention_mode: str,
     teacher_type: str,
+    teacher_action_noise_std: float,
     tolerance_type: str,
     tolerance_value: float,
     tolerance_channel_weights: Optional[str],
@@ -133,6 +134,7 @@ def maybe_wrap_intervention(
             env,
             mode="agent",
             teacher_type=teacher_type,
+            teacher_action_noise_std=teacher_action_noise_std,
             tolerance_type=tolerance_type,
             tolerance_value=tolerance_value,
             tolerance_channel_weights=tolerance_channel_weights,
@@ -166,17 +168,23 @@ def maybe_wrap_intervention(
 
     if intervention_mode in (
         "agent_always",
+        "agent_safety",
         "agent_safety_align",
         "agent_safety_progress",
+        "agent_safety_release_progress",
         "agent_reward_progress",
         "agent_manual_gripper",
     ):
         if intervention_mode == "agent_always":
             agent_mode = "always"
+        elif intervention_mode == "agent_safety":
+            agent_mode = "safety_release_progress"
         elif intervention_mode == "agent_safety_align":
             agent_mode = "safety_align"
         elif intervention_mode == "agent_safety_progress":
             agent_mode = "safety_progress"
+        elif intervention_mode == "agent_safety_release_progress":
+            agent_mode = "safety_release_progress"
         elif intervention_mode == "agent_manual_gripper":
             agent_mode = "manual_gripper"
         else:
@@ -185,6 +193,7 @@ def maybe_wrap_intervention(
             env,
             mode="agent",
             teacher_type=teacher_type,
+            teacher_action_noise_std=teacher_action_noise_std,
             tolerance_type=tolerance_type,
             tolerance_value=tolerance_value,
             tolerance_channel_weights=tolerance_channel_weights,

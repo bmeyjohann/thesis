@@ -42,8 +42,15 @@ ALPHA_FREEZE_STEPS="${ALPHA_FREEZE_STEPS:-0}"
 DEMO_PREFILL_EPISODES="${DEMO_PREFILL_EPISODES:-0}"
 DEMO_PREFILL_NUM_ENVS="${DEMO_PREFILL_NUM_ENVS:-0}"
 DEMO_SAMPLE_RATIO="${DEMO_SAMPLE_RATIO:-0.5}"
+STORE_INTERVENED_IN_DEMO_BUFFER="${STORE_INTERVENED_IN_DEMO_BUFFER:-0}"
+DEMO_DATASET_PATH="${DEMO_DATASET_PATH:-}"
+DEMO_DATASET_DIR="${DEMO_DATASET_DIR:-${DEFAULT_LOCAL_DATASET_DIR}}"
+DEMO_DATASET_AUTO_LOAD="${DEMO_DATASET_AUTO_LOAD:-0}"
+DEMO_DATASET_TARGET="${DEMO_DATASET_TARGET:-demo}"
+DEMO_DATASET_MAX_ROWS="${DEMO_DATASET_MAX_ROWS:-0}"
 
 INTERVENTION_EPISODE_PROB="${INTERVENTION_EPISODE_PROB:-1.0}"
+WAIT_FOR_HUMAN_START="${WAIT_FOR_HUMAN_START:-1}"
 
 PREF_RANK_WEIGHT="${PREF_RANK_WEIGHT:-1.0}"
 PREF_RANK_MARGIN="${PREF_RANK_MARGIN:-0.01}"
@@ -81,6 +88,13 @@ echo "WANDB mode: ${WANDB_MODE_VALUE}"
 echo "VR endpoint: ${VR_HOST}:${VR_PORT}"
 echo "Replay dataset snapshots every ${EXPORT_REPLAY_DATASET_INTERVAL} env steps"
 echo "Viewer intervention colors: ${VISUALIZE_INTERVENTION_COLORS}"
+echo "Wait for human start trigger: ${WAIT_FOR_HUMAN_START}"
+if [[ -n "${DEMO_DATASET_PATH}" ]]; then
+  echo "Offline demo dataset path: ${DEMO_DATASET_PATH}"
+elif [[ "${DEMO_DATASET_AUTO_LOAD}" == "1" ]]; then
+  echo "Offline demo dataset auto-load dir: ${DEMO_DATASET_DIR}"
+fi
+echo "Store online interventions in demo buffer: ${STORE_INTERVENED_IN_DEMO_BUFFER}"
 if [[ -n "${EXPORT_REPLAY_DATASET_PATH}" ]]; then
   echo "Replay dataset path: ${EXPORT_REPLAY_DATASET_PATH}"
 else
@@ -106,6 +120,7 @@ ARGS=(
   --use_intervention
   --intervention_mode human
   --human_input_device vr
+  --wait_for_human_start
   --vr_mode connect
   --vr_host "${VR_HOST}"
   --vr_port "${VR_PORT}"
@@ -133,6 +148,7 @@ ARGS=(
   --demo_prefill_target demo
   --demo_prefill_intervention_mode agent_always
   --demo_sample_ratio "${DEMO_SAMPLE_RATIO}"
+  --demo_dataset_target "${DEMO_DATASET_TARGET}"
   --pref_buffer_enable
   --pref_sampling_mode linked
   --pref_sample_ratio 0.0
@@ -171,8 +187,32 @@ if [[ "${VISUALIZE_INTERVENTION_COLORS}" == "0" ]]; then
   ARGS+=(--no_visualize_intervention_colors)
 fi
 
+if [[ "${WAIT_FOR_HUMAN_START}" == "0" ]]; then
+  ARGS+=(--no_wait_for_human_start)
+fi
+
 if [[ -n "${EXPORT_REPLAY_DATASET_PATH}" ]]; then
   ARGS+=(--export_replay_dataset_path "${EXPORT_REPLAY_DATASET_PATH}")
+fi
+
+if [[ -n "${DEMO_DATASET_PATH}" ]]; then
+  ARGS+=(--demo_dataset_path "${DEMO_DATASET_PATH}")
+fi
+
+if [[ -n "${DEMO_DATASET_DIR}" ]]; then
+  ARGS+=(--demo_dataset_dir "${DEMO_DATASET_DIR}")
+fi
+
+if [[ "${DEMO_DATASET_AUTO_LOAD}" == "1" ]]; then
+  ARGS+=(--demo_dataset_auto_load)
+fi
+
+if [[ "${DEMO_DATASET_MAX_ROWS}" != "0" ]]; then
+  ARGS+=(--demo_dataset_max_rows "${DEMO_DATASET_MAX_ROWS}")
+fi
+
+if [[ "${STORE_INTERVENED_IN_DEMO_BUFFER}" == "1" ]]; then
+  ARGS+=(--store_intervened_in_demo_buffer)
 fi
 
 if [[ -n "${EXPORT_REPLAY_DATASET_DIR}" ]]; then

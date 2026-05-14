@@ -608,12 +608,10 @@ class ExperimentQueue:
         queued_jobs = [job for job in self.list_jobs(limit=None) if job.status == STATUS_QUEUED]
         if not queued_jobs:
             return None
-        queued_jobs.sort(
-            key=lambda item: (
-                Path(item.script_path).stat().st_mtime if Path(item.script_path).exists() else item.submitted_at,
-                item.submitted_at,
-            )
-        )
+        # Queue ordering must follow enqueue time, not the source script's filesystem
+        # mtime. Helpers like batch/finalize launchers can share or preserve old mtimes,
+        # which would otherwise let later-submitted jobs jump ahead of earlier ones.
+        queued_jobs.sort(key=lambda item: (item.submitted_at, item.job_id))
         owner_buckets: dict[str, list[JobRecord]] = {}
         owner_order: list[str] = []
         for job in queued_jobs:

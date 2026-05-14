@@ -214,6 +214,70 @@ class CarCardinalActionWrapper(gym.ActionWrapper):
         return np.asarray([0.0, 1.0 if turn >= 0.0 else -1.0], dtype=np.float32)
 
 
+def _wrap_angle(angle: float) -> float:
+    return float((angle + np.pi) % (2.0 * np.pi) - np.pi)
+
+
+class PointWorldVelocityActionWrapper(gym.ActionWrapper):
+    """Expose SafetyPoint actions as desired world-frame velocity [vx, vy]."""
+
+    def __init__(
+        self,
+        env: gym.Env,
+        *,
+        turn_gain: float = 2.5,
+        alignment_power: float = 1.0,
+        allow_backward: bool = False,
+    ):
+        super().__init__(env)
+        base_space = getattr(env, "action_space", None)
+        if not isinstance(base_space, gym.spaces.Box):
+            raise TypeError("PointWorldVelocityActionWrapper expects a Box action space.")
+        low = np.asarray(base_space.low, dtype=np.float32).reshape(-1)
+        high = np.asarray(base_space.high, dtype=np.float32).reshape(-1)
+        if low.shape[0] < 2:
+            raise ValueError("PointWorldVelocityActionWrapper expects at least 2 native action dims.")
+        self._base_low = low.copy()
+        self._base_high = high.copy()
+        self._turn_gain = float(max(0.0, turn_gain))
+        self._alignment_power = float(max(0.0, alignment_power))
+        self._allow_backward = bool(allow_backward)
+        self.action_mode = "world_velocity"
+        self.action_space = gym.spaces.Box(
+            low=np.full((2,), -1.0, dtype=np.float32),
+            high=np.full((2,), 1.0, dtype=np.float32),
+            dtype=np.float32,
+        )
+
+    def action(self, action):
+        desired = np.asarray(action, dtype=np.float32).reshape(-1)
+        if desired.shape[0] < 2:
+            desired = np.pad(desired, (0, 2 - desired.shape[0]), mode="constant")
+        vx = float(np.clip(desired[0], -1.0, 1.0))
+        vy = float(np.clip(desired[1], -1.0, 1.0))
+        speed = float(min(1.0, np.hypot(vx, vy)))
+        if speed <= 1e-6:
+            return np.zeros((2,), dtype=np.float32)
+
+        forward_xy = extract_agent_forward_xy(self.env)
+        if forward_xy is None:
+            # SafetyPoint native action order is [forward, turn].
+            return np.asarray([speed, 0.0], dtype=np.float32)
+
+        desired_heading = float(np.arctan2(vy, vx))
+        current_heading = float(np.arctan2(float(forward_xy[1]), float(forward_xy[0])))
+        err = _wrap_angle(desired_heading - current_heading)
+        turn = float(np.clip(self._turn_gain * err / np.pi, -1.0, 1.0))
+
+        alignment = float(np.cos(err))
+        if self._allow_backward:
+            forward = speed * np.sign(alignment) * (abs(alignment) ** self._alignment_power)
+        else:
+            forward = speed * (max(0.0, alignment) ** self._alignment_power)
+        native = np.asarray([forward, turn], dtype=np.float32)
+        return np.clip(native, self._base_low[:2], self._base_high[:2]).astype(np.float32, copy=False)
+
+
 class GoalOnlyLidarObservationWrapper(gym.Wrapper):
     """Zero all non-goal lidar channels while preserving agent proprio and goal lidar."""
 
@@ -288,6 +352,10 @@ def make_safety_env(
     car_wheel_command_limit: float = 2.0,
     car_force_scale: float = 2.0,
     car_action_mode: str = "raw_wheels",
+    point_action_mode: str = "native",
+    point_turn_gain: float = 2.5,
+    point_alignment_power: float = 1.0,
+    point_allow_backward: bool = False,
     obs_mask_mode: str = "none",
     seed: Optional[int] = None,
 ):
@@ -313,6 +381,17 @@ def make_safety_env(
             env = CarThrottleTurnActionWrapper(env)
         elif action_mode == "cardinal":
             env = CarCardinalActionWrapper(env)
+    elif "point" in str(env_name).lower():
+        action_mode = str(point_action_mode).strip().lower()
+        if action_mode not in {"native", "world_velocity"}:
+            raise ValueError(f"Unsupported point_action_mode: {point_action_mode}")
+        if action_mode == "world_velocity":
+            env = PointWorldVelocityActionWrapper(
+                env,
+                turn_gain=float(point_turn_gain),
+                alignment_power=float(point_alignment_power),
+                allow_backward=bool(point_allow_backward),
+            )
     obs_mask_mode_l = str(obs_mask_mode).strip().lower()
     if obs_mask_mode_l not in {"none", "goal_only_lidar"}:
         raise ValueError(f"Unsupported obs_mask_mode: {obs_mask_mode}")
@@ -324,7 +403,12 @@ def make_safety_env(
     return env
 
 
-def resolve_control_scheme(env_name: str, *, car_action_mode: str = "raw_wheels") -> str:
+def resolve_control_scheme(
+    env_name: str,
+    *,
+    car_action_mode: str = "raw_wheels",
+    point_action_mode: str = "native",
+) -> str:
     name = str(env_name).lower()
     if "car" in name:
         return (
@@ -332,6 +416,8 @@ def resolve_control_scheme(env_name: str, *, car_action_mode: str = "raw_wheels"
             if str(car_action_mode).strip().lower() in {"throttle_turn", "cardinal"}
             else "differential_wheels"
         )
+    if "point" in name and str(point_action_mode).strip().lower() == "world_velocity":
+        return "world_velocity"
     return "planar_velocity"
 
 
@@ -406,8 +492,12 @@ def extract_agent_forward_xy(env) -> Optional[np.ndarray]:
         agent = getattr(task, "agent", None)
         mat = np.asarray(getattr(agent, "mat", None), dtype=np.float64).reshape(3, 3)
         if np.isfinite(mat).all():
-            # Matches the existing topdown renderer convention for SafetyCar.
-            forward = (-mat[:2, 1]).astype(np.float64, copy=False)
+            agent_class = type(agent).__name__.lower()
+            if agent_class == "point":
+                forward = mat[:2, 0].astype(np.float64, copy=False)
+            else:
+                # Matches the existing topdown renderer convention for SafetyCar.
+                forward = (-mat[:2, 1]).astype(np.float64, copy=False)
             norm = float(np.linalg.norm(forward))
             if norm > 1e-6:
                 return (forward / norm).astype(np.float64, copy=False)

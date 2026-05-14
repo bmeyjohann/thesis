@@ -34,6 +34,7 @@ def make_manip_wrappers(args, teleop_interface=None):
         cube_reward_mode=args.cube_reward_mode,
         intervention_mode=intervention_mode,
         teacher_type=args.teacher_type,
+        teacher_action_noise_std=args.teacher_action_noise_std,
         tolerance_type=args.tolerance_type,
         tolerance_value=args.tolerance_value,
         tolerance_channel_weights=args.tolerance_channel_weights,
@@ -90,6 +91,7 @@ def make_manip_eval_wrappers(args):
         cube_reward_mode=args.cube_reward_mode,
         intervention_mode="none",
         teacher_type=args.teacher_type,
+        teacher_action_noise_std=args.teacher_action_noise_std,
         tolerance_type=args.tolerance_type,
         tolerance_value=args.tolerance_value,
         tolerance_channel_weights=args.tolerance_channel_weights,
@@ -156,6 +158,7 @@ def build_manip_environment(
         device=device,
         wrappers=wrappers,
         clip_actions=MANIP_CLIP_ACTIONS,
+        seed=int(getattr(args, "seed", 42)),
         **env_kwargs,
     )
     record_progress("[Init] manip env adapter constructed")
@@ -213,5 +216,6 @@ def build_manip_eval_environment(args, device: torch.device) -> OGBenchVecEnvAda
         device=device,
         wrappers=wrappers,
         clip_actions=MANIP_CLIP_ACTIONS,
+        seed=int(getattr(args, "seed", 42)) + 100_000,
         **env_kwargs,
     )

@@ -52,14 +52,17 @@ class IdentityNormalizer(nn.Module):
 
 
 class MLPBackbone(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int):
+    def __init__(self, input_dim: int, hidden_dim: int, use_layer_norm: bool = False, layer_norm_eps: float = 1e-5):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-        )
+        layers: list[nn.Module] = [nn.Linear(input_dim, hidden_dim)]
+        if use_layer_norm:
+            layers.append(nn.LayerNorm(hidden_dim, eps=float(layer_norm_eps)))
+        layers.append(nn.ReLU())
+        layers.append(nn.Linear(hidden_dim, hidden_dim))
+        if use_layer_norm:
+            layers.append(nn.LayerNorm(hidden_dim, eps=float(layer_norm_eps)))
+        layers.append(nn.ReLU())
+        self.net = nn.Sequential(*layers)
         self.output_dim = hidden_dim
 
     def forward(self, x):
@@ -205,16 +208,28 @@ class GaussianPolicyHead(nn.Module):
     LOG_STD_MAX = 2
     LOG_STD_MIN = -5
 
-    def __init__(self, feature_dim: int, action_dim: int, hidden_dim: int, init_scale: float):
+    def __init__(
+        self,
+        feature_dim: int,
+        action_dim: int,
+        hidden_dim: int,
+        init_scale: float,
+        use_layer_norm: bool = False,
+        layer_norm_eps: float = 1e-5,
+    ):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(feature_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-        )
-        self.fc_mu = nn.Linear(hidden_dim // 2, action_dim)
-        self.fc_logstd = nn.Linear(hidden_dim // 2, action_dim)
+        hidden_dim_2 = max(1, hidden_dim // 2)
+        layers: list[nn.Module] = [nn.Linear(feature_dim, hidden_dim)]
+        if use_layer_norm:
+            layers.append(nn.LayerNorm(hidden_dim, eps=float(layer_norm_eps)))
+        layers.append(nn.ReLU())
+        layers.append(nn.Linear(hidden_dim, hidden_dim_2))
+        if use_layer_norm:
+            layers.append(nn.LayerNorm(hidden_dim_2, eps=float(layer_norm_eps)))
+        layers.append(nn.ReLU())
+        self.net = nn.Sequential(*layers)
+        self.fc_mu = nn.Linear(hidden_dim_2, action_dim)
+        self.fc_logstd = nn.Linear(hidden_dim_2, action_dim)
         nn.init.normal_(self.fc_mu.weight, 0.0, init_scale)
         nn.init.constant_(self.fc_mu.bias, 0.0)
 
@@ -234,15 +249,19 @@ class GaussianPolicyHead(nn.Module):
 
 
 class CriticHead(nn.Module):
-    def __init__(self, feature_dim: int, action_dim: int, hidden_dim: int):
+    def __init__(self, feature_dim: int, action_dim: int, hidden_dim: int, use_layer_norm: bool = False, layer_norm_eps: float = 1e-5):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(feature_dim + action_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 2, 1),
-        )
+        hidden_dim_2 = max(1, hidden_dim // 2)
+        layers: list[nn.Module] = [nn.Linear(feature_dim + action_dim, hidden_dim)]
+        if use_layer_norm:
+            layers.append(nn.LayerNorm(hidden_dim, eps=float(layer_norm_eps)))
+        layers.append(nn.ReLU())
+        layers.append(nn.Linear(hidden_dim, hidden_dim_2))
+        if use_layer_norm:
+            layers.append(nn.LayerNorm(hidden_dim_2, eps=float(layer_norm_eps)))
+        layers.append(nn.ReLU())
+        layers.append(nn.Linear(hidden_dim_2, 1))
+        self.net = nn.Sequential(*layers)
 
     def forward(self, features, actions):
         x = torch.cat([features, actions], dim=-1)
@@ -250,10 +269,25 @@ class CriticHead(nn.Module):
 
 
 class CriticEnsemble(nn.Module):
-    def __init__(self, feature_dim: int, action_dim: int, hidden_dim: int, num_heads: int):
+    def __init__(
+        self,
+        feature_dim: int,
+        action_dim: int,
+        hidden_dim: int,
+        num_heads: int,
+        use_layer_norm: bool = False,
+        layer_norm_eps: float = 1e-5,
+    ):
         super().__init__()
         self.heads = nn.ModuleList([
-            CriticHead(feature_dim, action_dim, hidden_dim) for _ in range(num_heads)
+            CriticHead(
+                feature_dim,
+                action_dim,
+                hidden_dim,
+                use_layer_norm=use_layer_norm,
+                layer_norm_eps=layer_norm_eps,
+            )
+            for _ in range(num_heads)
         ])
 
     def forward(self, features, actions):
@@ -271,6 +305,36 @@ class ActorWrapper:
 
     def __call__(self, obs):
         return self.head(self.backbone(obs))
+
+
+class EnsembleActorWrapper:
+    def __init__(self, backbones: nn.ModuleList, heads: nn.ModuleList):
+        self.backbones = backbones
+        self.heads = heads
+
+    def eval(self):
+        self.backbones.eval()
+        self.heads.eval()
+
+    def _mean_stack(self, obs: torch.Tensor) -> torch.Tensor:
+        means = []
+        for backbone, head in zip(self.backbones, self.heads):
+            _, _, mean = head(backbone(obs))
+            means.append(mean)
+        return torch.stack(means, dim=0)
+
+    def __call__(self, obs):
+        stack = self._mean_stack(obs)
+        mean = stack.mean(dim=0)
+        dummy_log = torch.zeros(mean.shape[0], 1, device=mean.device)
+        return mean, dummy_log, mean
+
+    def action_disagreement(self, obs: torch.Tensor) -> torch.Tensor:
+        stack = self._mean_stack(obs)
+        if stack.shape[0] <= 1:
+            return torch.zeros(stack.shape[1], device=stack.device)
+        var = torch.var(stack, dim=0, unbiased=False)
+        return torch.linalg.vector_norm(var, dim=-1)
 
 
 class CriticWrapper:
@@ -382,6 +446,10 @@ def load_checkpoint(model_path: Path, device: torch.device):
     ckpt = torch.load(model_path, map_location=device)
     if 'drq_encoder' in ckpt:
         return ckpt, 'drqv2'
+    if 'ensemble_backbones' in ckpt and 'ensemble_heads' in ckpt:
+        return ckpt, 'hgdagger'
+    if 'actor_backbone_state' in ckpt and 'actor_head_state' in ckpt:
+        return ckpt, 'behavior_cloning'
     if 'actor_backbone' in ckpt:
         return ckpt, 'fastsac_v2'
     required = {"actor_state_dict", "qnet_state_dict", "obs_normalizer_state", "args"}
@@ -393,6 +461,8 @@ def load_checkpoint(model_path: Path, device: torch.device):
 
 def build_networks(ckpt: dict, device: torch.device, policy_type: str):
     args = ckpt.get('args', {}) or {}
+    use_layer_norm = bool(args.get('use_layer_norm', False))
+    layer_norm_eps = float(args.get('layer_norm_eps', 1e-5))
     if policy_type == 'fastsac':
         obs_dim = ckpt['obs_normalizer_state']['_mean'].shape[1]
         act_dim = ckpt['actor_state_dict']['fc_mu.weight'].shape[0]
@@ -422,6 +492,86 @@ def build_networks(ckpt: dict, device: torch.device, policy_type: str):
         obs_norm.eval()
 
         return actor, critic, obs_norm, args
+
+    if policy_type == 'behavior_cloning':
+        obs_mode = args.get('obs_mode', 'state')
+        if obs_mode != 'state':
+            raise NotImplementedError('Behavior cloning policy maps support only state observations for now')
+        actor_backbone_state = ckpt['actor_backbone_state']
+        obs_dim = actor_backbone_state['net.0.weight'].shape[1]
+        backbone_hidden = actor_backbone_state['net.0.weight'].shape[0]
+        actor_backbone = MLPBackbone(
+            obs_dim,
+            backbone_hidden,
+            use_layer_norm=use_layer_norm,
+            layer_norm_eps=layer_norm_eps,
+        ).to(device)
+        actor_backbone.load_state_dict(actor_backbone_state)
+        actor_backbone.eval()
+
+        actor_head_state = ckpt['actor_head_state']
+        act_dim = actor_head_state['fc_mu.weight'].shape[0]
+        actor_head = GaussianPolicyHead(
+            actor_backbone.output_dim,
+            act_dim,
+            int(args.get('actor_hidden_dim', backbone_hidden)),
+            float(args.get('init_scale', 0.01)),
+            use_layer_norm=use_layer_norm,
+            layer_norm_eps=layer_norm_eps,
+        ).to(device)
+        actor_head.load_state_dict(actor_head_state)
+        actor_head.eval()
+        obs_state = ckpt.get('obs_normalizer_state')
+        if obs_state:
+            obs_norm = EmpiricalNormalization(shape=obs_dim, device=device)
+            obs_norm.load_state_dict(obs_state)
+            obs_norm.eval()
+        else:
+            obs_norm = IdentityNormalizer()
+        return ActorWrapper(actor_backbone, actor_head), None, obs_norm, args
+
+    if policy_type == 'hgdagger':
+        obs_mode = args.get('obs_mode', 'state')
+        if obs_mode != 'state':
+            raise NotImplementedError('HG-DAgger policy maps support only state observations for now')
+        backbone_states = ckpt['ensemble_backbones']
+        head_states = ckpt['ensemble_heads']
+        if not backbone_states or not head_states:
+            raise ValueError('HG-DAgger checkpoint is missing ensemble members')
+        obs_dim = backbone_states[0]['net.0.weight'].shape[1]
+        backbone_hidden = backbone_states[0]['net.0.weight'].shape[0]
+        backbones = nn.ModuleList()
+        heads = nn.ModuleList()
+        for backbone_state, head_state in zip(backbone_states, head_states):
+            backbone = MLPBackbone(
+                obs_dim,
+                backbone_hidden,
+                use_layer_norm=use_layer_norm,
+                layer_norm_eps=layer_norm_eps,
+            ).to(device)
+            backbone.load_state_dict(backbone_state)
+            backbone.eval()
+            act_dim = head_state['fc_mu.weight'].shape[0]
+            head = GaussianPolicyHead(
+                backbone.output_dim,
+                act_dim,
+                int(args.get('actor_hidden_dim', backbone_hidden)),
+                float(args.get('init_scale', 0.01)),
+                use_layer_norm=use_layer_norm,
+                layer_norm_eps=layer_norm_eps,
+            ).to(device)
+            head.load_state_dict(head_state)
+            head.eval()
+            backbones.append(backbone)
+            heads.append(head)
+        obs_state = ckpt.get('obs_normalizer_state')
+        if obs_state:
+            obs_norm = EmpiricalNormalization(shape=obs_dim, device=device)
+            obs_norm.load_state_dict(obs_state)
+            obs_norm.eval()
+        else:
+            obs_norm = IdentityNormalizer()
+        return EnsembleActorWrapper(backbones, heads), None, obs_norm, args
 
     if policy_type == 'drqv2':
         pixel_shape = ckpt.get('pixel_shape') or args.get('pixel_shape')
@@ -493,7 +643,14 @@ def build_networks(ckpt: dict, device: torch.device, policy_type: str):
 
         actor_head_state = ckpt['actor_head']
         act_dim = actor_head_state['fc_mu.weight'].shape[0]
-        actor_head = GaussianPolicyHead(actor_backbone.output_dim, act_dim, actor_hidden_dim, args.get('init_scale', 0.01)).to(device)
+        actor_head = GaussianPolicyHead(
+            actor_backbone.output_dim,
+            act_dim,
+            actor_hidden_dim,
+            args.get('init_scale', 0.01),
+            use_layer_norm=use_layer_norm,
+            layer_norm_eps=layer_norm_eps,
+        ).to(device)
         actor_head.load_state_dict(actor_head_state)
         actor_head.eval()
         actor = ActorWrapper(actor_backbone, actor_head)
@@ -519,7 +676,14 @@ def build_networks(ckpt: dict, device: torch.device, policy_type: str):
         num_heads = len(head_keys)
         first_head = critic_heads_state['heads.0.net.0.weight']
         critic_head_hidden = first_head.shape[0]
-        critic_heads = CriticEnsemble(critic_backbone.output_dim, act_dim, critic_head_hidden, num_heads).to(device)
+        critic_heads = CriticEnsemble(
+            critic_backbone.output_dim,
+            act_dim,
+            critic_head_hidden,
+            num_heads,
+            use_layer_norm=use_layer_norm,
+            layer_norm_eps=layer_norm_eps,
+        ).to(device)
         critic_heads.load_state_dict(critic_heads_state)
         critic_heads.eval()
         critic = CriticWrapper(critic_backbone, critic_heads)
@@ -535,13 +699,25 @@ def build_networks(ckpt: dict, device: torch.device, policy_type: str):
     first_weight = actor_backbone_state['net.0.weight']
     obs_dim = first_weight.shape[1]
     backbone_hidden = first_weight.shape[0]
-    actor_backbone = MLPBackbone(obs_dim, backbone_hidden).to(device)
+    actor_backbone = MLPBackbone(
+        obs_dim,
+        backbone_hidden,
+        use_layer_norm=use_layer_norm,
+        layer_norm_eps=layer_norm_eps,
+    ).to(device)
     actor_backbone.load_state_dict(actor_backbone_state)
     actor_backbone.eval()
 
     actor_head_state = ckpt['actor_head']
     act_dim = actor_head_state['fc_mu.weight'].shape[0]
-    actor_head = GaussianPolicyHead(actor_backbone.output_dim, act_dim, args.get('actor_hidden_dim', backbone_hidden), args.get('init_scale', 0.01)).to(device)
+    actor_head = GaussianPolicyHead(
+        actor_backbone.output_dim,
+        act_dim,
+        args.get('actor_hidden_dim', backbone_hidden),
+        args.get('init_scale', 0.01),
+        use_layer_norm=use_layer_norm,
+        layer_norm_eps=layer_norm_eps,
+    ).to(device)
     actor_head.load_state_dict(actor_head_state)
     actor_head.eval()
     actor = ActorWrapper(actor_backbone, actor_head)
@@ -551,7 +727,12 @@ def build_networks(ckpt: dict, device: torch.device, policy_type: str):
         critic_backbone = actor_backbone
     else:
         first_w = critic_backbone_state['net.0.weight']
-        critic_backbone = MLPBackbone(first_w.shape[1], first_w.shape[0]).to(device)
+        critic_backbone = MLPBackbone(
+            first_w.shape[1],
+            first_w.shape[0],
+            use_layer_norm=use_layer_norm,
+            layer_norm_eps=layer_norm_eps,
+        ).to(device)
         critic_backbone.load_state_dict(critic_backbone_state)
         critic_backbone.eval()
 
@@ -559,7 +740,14 @@ def build_networks(ckpt: dict, device: torch.device, policy_type: str):
     head_keys = [k for k in critic_heads_state.keys() if k.endswith('net.0.weight')]
     num_heads = len(head_keys)
     head_hidden = critic_heads_state['heads.0.net.0.weight'].shape[0]
-    critic_heads = CriticEnsemble(critic_backbone.output_dim, act_dim, head_hidden, num_heads).to(device)
+    critic_heads = CriticEnsemble(
+        critic_backbone.output_dim,
+        act_dim,
+        head_hidden,
+        num_heads,
+        use_layer_norm=use_layer_norm,
+        layer_norm_eps=layer_norm_eps,
+    ).to(device)
     critic_heads.load_state_dict(critic_heads_state)
     critic_heads.eval()
     critic = CriticWrapper(critic_backbone, critic_heads)
@@ -692,7 +880,7 @@ def snap_goal_to_free(goal: np.ndarray,
     return xy_candidates[idx].astype(np.float32)
 
 
-def evaluate_grid(actor: Actor, critic: Critic, obs_norm: EmpiricalNormalization,
+def evaluate_grid(actor, critic, obs_norm: EmpiricalNormalization,
                   train_args: dict, goal: np.ndarray, xs: np.ndarray, ys: np.ndarray,
                   device: torch.device, free_mask: np.ndarray | None = None,
                   maze_unit: float | None = None, offsets: tuple[float, float] | None = None,
@@ -726,19 +914,53 @@ def evaluate_grid(actor: Actor, critic: Critic, obs_norm: EmpiricalNormalization
     with torch.no_grad():
         norm_obs = obs_norm(obs_tensor)
         _, _, mean_actions = actor(norm_obs)
-        q_outputs = critic(norm_obs, mean_actions)
-        if isinstance(q_outputs, tuple):
-            q_list = list(q_outputs)
+        if critic is not None:
+            q_outputs = critic(norm_obs, mean_actions)
+            if isinstance(q_outputs, tuple):
+                q_list = list(q_outputs)
+            else:
+                q_list = q_outputs
+            q_stack = torch.stack(q_list, dim=0)
+            value = torch.min(q_stack, dim=0).values.cpu().numpy().reshape(mesh_x.shape)
+            if q_stack.shape[0] == 1:
+                disagreement = np.zeros_like(value)
+            else:
+                q_max = torch.max(q_stack, dim=0).values
+                q_min = torch.min(q_stack, dim=0).values
+                disagreement = (q_max - q_min).cpu().numpy().reshape(mesh_x.shape)
+            flat_vals = value.flatten()
+            finite_mask = np.isfinite(flat_vals)
+            equalized = np.full_like(flat_vals, np.nan, dtype=float)
+            if np.any(finite_mask):
+                hist, bin_edges = np.histogram(flat_vals[finite_mask], bins=512)
+                if hist.sum() > 0:
+                    cdf = np.cumsum(hist).astype(float)
+                    cdf /= cdf[-1]
+                    equalized_values = np.interp(flat_vals[finite_mask], bin_edges[1:], cdf, left=0.0, right=1.0)
+                    equalized[finite_mask] = equalized_values
+            aux_map = equalized.reshape(value.shape)
+            value_title = "min(Q1, Q2) — higher → better"
+            value_cbar = "Estimated return (normalized)"
+            aux_title = "min(Q1, Q2) — histogram equalized"
+            aux_cbar = "Equalized percentile"
+            disagreement_title = "|Q1 - Q2| — critic disagreement"
+            disagreement_cbar = "Absolute value difference"
         else:
-            q_list = q_outputs
-        q_stack = torch.stack(q_list, dim=0)
-        value = torch.min(q_stack, dim=0).values.cpu().numpy().reshape(mesh_x.shape)
-        if q_stack.shape[0] == 1:
-            disagreement = np.zeros_like(value)
-        else:
-            q_max = torch.max(q_stack, dim=0).values
-            q_min = torch.min(q_stack, dim=0).values
-            disagreement = (q_max - q_min).cpu().numpy().reshape(mesh_x.shape)
+            action_np = mean_actions.cpu().numpy().reshape(*mesh_x.shape, -1)
+            value = action_np[..., 0]
+            aux_map = action_np[..., 1] if action_np.shape[-1] > 1 else np.zeros_like(value)
+            if hasattr(actor, "action_disagreement"):
+                disagreement = actor.action_disagreement(norm_obs).cpu().numpy().reshape(mesh_x.shape)
+                disagreement_title = "Ensemble action disagreement"
+                disagreement_cbar = "Variance norm"
+            else:
+                disagreement = np.zeros_like(value)
+                disagreement_title = "Action disagreement"
+                disagreement_cbar = "Disagreement"
+            value_title = "Actor mean — action[0]"
+            value_cbar = "Mean action[0]"
+            aux_title = "Actor mean — action[1]"
+            aux_cbar = "Mean action[1]"
         actions = mean_actions.cpu().numpy().reshape(*mesh_x.shape, -1)
 
     traversable_grid = traversable.reshape(mesh_x.shape)
@@ -747,11 +969,18 @@ def evaluate_grid(actor: Actor, critic: Critic, obs_norm: EmpiricalNormalization
         "grid_x": mesh_x,
         "grid_y": mesh_y,
         "value": value,
+        "aux_map": aux_map,
         "disagreement": disagreement,
         "actions": actions,
         "traversable": traversable_grid,
         "maze_unit": maze_unit,
         "offsets": offsets,
+        "value_title": value_title,
+        "value_cbar": value_cbar,
+        "aux_title": aux_title,
+        "aux_cbar": aux_cbar,
+        "disagreement_title": disagreement_title,
+        "disagreement_cbar": disagreement_cbar,
     }
 
 
@@ -763,6 +992,7 @@ def plot_maps(xs: np.ndarray, ys: np.ndarray, results: dict, output_dir: Path,
               goal: np.ndarray | None = None,
               dangerous_id: int = DANGEROUS_TILE_ID) -> tuple[Path, Path]:
     value = results["value"]
+    aux_map = results["aux_map"]
     disagreement = results["disagreement"]
     actions = results["actions"]
 
@@ -771,19 +1001,7 @@ def plot_maps(xs: np.ndarray, ys: np.ndarray, results: dict, output_dir: Path,
     extent = [xs.min() - dx / 2, xs.max() + dx / 2, ys.min() - dy / 2, ys.max() + dy / 2]
 
     value_masked = np.ma.masked_invalid(value)
-    # Histogram equalization for value map
-    flat_vals = value.flatten()
-    finite_mask = np.isfinite(flat_vals)
-    equalized = np.full_like(flat_vals, np.nan, dtype=float)
-    if np.any(finite_mask):
-        hist, bin_edges = np.histogram(flat_vals[finite_mask], bins=512)
-        if hist.sum() > 0:
-            cdf = np.cumsum(hist).astype(float)
-            cdf /= cdf[-1]
-            equalized_values = np.interp(flat_vals[finite_mask], bin_edges[1:], cdf, left=0.0, right=1.0)
-            equalized[finite_mask] = equalized_values
-    equalized_map = equalized.reshape(value.shape)
-    equalized_masked = np.ma.masked_invalid(equalized_map)
+    aux_masked = np.ma.masked_invalid(aux_map)
 
     mag = np.linalg.norm(actions[..., :2], axis=-1)
     mag_masked = np.ma.masked_invalid(mag)
@@ -841,18 +1059,18 @@ def plot_maps(xs: np.ndarray, ys: np.ndarray, results: dict, output_dir: Path,
     fig, axes = plt.subplots(1, 4, figsize=(24, 6), constrained_layout=True)
 
     im0 = axes[0].imshow(value_masked, extent=extent, cmap="viridis", aspect="equal", origin="lower")
-    axes[0].set_title("min(Q1, Q2) — higher → better")
+    axes[0].set_title(results["value_title"])
     axes[0].set_xlabel("x")
     axes[0].set_ylabel("y")
     cbar0 = fig.colorbar(im0, ax=axes[0], shrink=0.8)
-    cbar0.set_label("Estimated return (normalized)")
+    cbar0.set_label(results["value_cbar"])
 
-    im_eq = axes[1].imshow(equalized_masked, extent=extent, cmap="viridis", aspect="equal", origin="lower", vmin=0.0, vmax=1.0)
-    axes[1].set_title("min(Q1, Q2) — histogram equalized")
+    im_eq = axes[1].imshow(aux_masked, extent=extent, cmap="viridis", aspect="equal", origin="lower")
+    axes[1].set_title(results["aux_title"])
     axes[1].set_xlabel("x")
     axes[1].set_ylabel("y")
     cbar_eq = fig.colorbar(im_eq, ax=axes[1], shrink=0.8)
-    cbar_eq.set_label("Equalized percentile")
+    cbar_eq.set_label(results["aux_cbar"])
 
     im1 = axes[2].imshow(mag_masked, extent=extent, cmap="plasma", aspect="equal", origin="lower")
     axes[2].set_title("Actor mean — color = |a|, arrows = direction")
@@ -888,11 +1106,11 @@ def plot_maps(xs: np.ndarray, ys: np.ndarray, results: dict, output_dir: Path,
     )
 
     im2 = axes[3].imshow(disagreement_masked, extent=extent, cmap="magma", aspect="equal", origin="lower")
-    axes[3].set_title("|Q1 - Q2| — critic disagreement")
+    axes[3].set_title(results["disagreement_title"])
     axes[3].set_xlabel("x")
     axes[3].set_ylabel("y")
     cbar2 = fig.colorbar(im2, ax=axes[3], shrink=0.8)
-    cbar2.set_label("Absolute value difference")
+    cbar2.set_label(results["disagreement_cbar"])
 
     for idx, ax in enumerate(axes):
         overlay(ax, add_legend=False, render_walls=True)

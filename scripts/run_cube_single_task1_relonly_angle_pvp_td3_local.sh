@@ -11,11 +11,14 @@ done
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 WANDB_MODE_VALUE="${WANDB_MODE:-online}"
+WANDB_ENTITY_VALUE="${WANDB_ENTITY:-}"
+WANDB_GROUP_VALUE="${WANDB_GROUP:-}"
 PROJECT="${PROJECT:-ogbench-manip-reward-debug}"
 ENV_NAME="${ENV_NAME:-cube-single-singletask-task1-v0}"
 REWARD_TYPE="${REWARD_TYPE:-sparse}"
 CUBE_REWARD_MODE="${CUBE_REWARD_MODE:-dense}"
 INTERVENTION_EPISODE_PROB="${INTERVENTION_EPISODE_PROB:-1.0}"
+SEED="${SEED:-42}"
 
 NUM_ENVS="${NUM_ENVS:-32}"
 TOTAL_TIMESTEPS="${TOTAL_TIMESTEPS:-50000}"
@@ -68,8 +71,10 @@ mkdir -p logs
 echo "=== Starting ${EXP_NAME} ==="
 echo "Log file: ${LOG_FILE}"
 echo "WANDB mode: ${WANDB_MODE_VALUE}"
+echo "WANDB entity/group: ${WANDB_ENTITY_VALUE:-<default>}/${WANDB_GROUP_VALUE:-<none>}"
 echo "Faithful PVP-TD3 with balanced novice/human buffers"
 echo "Intervention episode probability: ${INTERVENTION_EPISODE_PROB}"
+echo "Seed: ${SEED}"
 echo "Rotation disabled: ${DISABLE_ROTATION}"
 
 ARGS=(
@@ -93,6 +98,7 @@ ARGS=(
   --num_updates "${NUM_UPDATES}"
   --learning_starts "${LEARNING_STARTS}"
   --gamma "${GAMMA}"
+  --seed "${SEED}"
   --tau "${TAU}"
   --actor_learning_rate "${ACTOR_LR}"
   --critic_learning_rate "${CRITIC_LR}"
@@ -133,6 +139,14 @@ if [[ "${PVP_BALANCE_SAMPLE}" == "0" ]]; then
 fi
 if [[ "${PVP_STOP_TD_ON_INTERVENTION_START}" == "0" ]]; then
   ARGS+=(--no_pvp_stop_td_on_intervention_start)
+fi
+
+if [[ -n "${WANDB_ENTITY_VALUE}" ]]; then
+  ARGS+=(--wandb_entity "${WANDB_ENTITY_VALUE}")
+fi
+
+if [[ -n "${WANDB_GROUP_VALUE}" ]]; then
+  ARGS+=(--wandb_group "${WANDB_GROUP_VALUE}")
 fi
 
 WANDB_MODE="${WANDB_MODE_VALUE}" \

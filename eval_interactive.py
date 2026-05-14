@@ -60,6 +60,10 @@ from ogbench_utils.obs import (
     reshape_observation,
     POLICY_OBS_KEYS,
 )
+from ogbench_utils.maze_eval_artifacts import (
+    plot_maze_trajectory_episodes,
+    rollout_maze_policy_episodes,
+)
 
 # Fix WSL window positioning issues  
 os.environ['SDL_VIDEO_CENTERED'] = '1'
@@ -91,6 +95,7 @@ def _coerce_args_dict(raw: Any) -> dict[str, Any]:
 
 _CLI_FLAG_ALIASES: dict[str, tuple[str, ...]] = {
     'env_name': ('--env_name',),
+    'max_episode_steps': ('--max_episode_steps',),
     'include_goal': ('--include_goal', '--no_include_goal'),
     'include_distance': ('--include_distance',),
     'include_direction': ('--include_direction',),
@@ -899,6 +904,52 @@ class FastSACPolicy:
         return float(q_min.mean().item()), float(q_mean.mean().item())
 
 
+class HGDaggerPolicy:
+    """Actor-only wrapper for HG-DAgger ensemble checkpoints."""
+
+    def __init__(self, *, obs_normalizer: nn.Module, backbones: nn.ModuleList, heads: nn.ModuleList):
+        self.obs_normalizer = obs_normalizer
+        self.backbones = backbones
+        self.heads = heads
+        self.obs_mode = 'state'
+        self.pixel_shape = None
+        self.action_dim = int(self.heads[0].fc_mu.out_features)
+        self.device = next(self.backbones[0].parameters()).device
+
+    def eval(self):
+        self.obs_normalizer.eval()
+        self.backbones.eval()
+        self.heads.eval()
+
+    def _normalize(self, obs):
+        try:
+            return self.obs_normalizer(obs, center=True)
+        except TypeError:
+            return self.obs_normalizer(obs)
+
+    def act(self, obs_dict, deterministic: bool = True, prev_actions: torch.Tensor | None = None):
+        obs = obs_dict["policy"].to(self.device)
+        norm_obs = self._normalize(obs)
+        with torch.no_grad():
+            means = []
+            actions = []
+            for backbone, head in zip(self.backbones, self.heads):
+                member_actions, _, member_means = head(backbone(norm_obs))
+                means.append(member_means)
+                actions.append(member_actions)
+            mean_stack = torch.stack(means, dim=0)
+            action_stack = torch.stack(actions, dim=0)
+            mean_action = mean_stack.mean(dim=0)
+            sampled_action = action_stack.mean(dim=0)
+        return mean_action if deterministic else sampled_action
+
+    def q_value(self, obs: torch.Tensor, action: np.ndarray | torch.Tensor) -> Optional[float]:
+        return None
+
+    def q_values(self, obs: torch.Tensor, action: np.ndarray | torch.Tensor) -> Optional[tuple[float, float]]:
+        return None
+
+
 class DrQPolicy:
     """Wrapper around DrQV2Agent/DrQV2RecurrentAgent for pixel observations."""
 
@@ -1239,6 +1290,10 @@ def _resolve_policy_type(args_policy_type: str, checkpoint: Dict[str, Any]) -> s
     keys = set(checkpoint.keys())
     if {'drq_encoder', 'drq_actor'} <= keys:
         return 'drqv2'
+    if {'ensemble_backbones', 'ensemble_heads'} <= keys:
+        return 'hgdagger'
+    if {'actor_backbone_state', 'actor_head_state'} <= keys:
+        return 'behavior_cloning'
     if {'actor_backbone', 'actor_head'} <= keys:
         return 'fastsac_v2'
     if {'actor_state_dict', 'qnet_state_dict'} <= keys:
@@ -1393,6 +1448,94 @@ def load_trained_policy(
             print("ℹ️ DrQ-v2 critic weights not found; Q overlays disabled")
         policy = DrQPolicy(agent=agent, pixel_shape=pixel_shape, device=device)
         policy.eval()
+    elif policy_type == 'hgdagger':
+        obs_mode = train_args.get('obs_mode', getattr(args, 'obs_mode', 'state'))
+        if obs_mode != 'state':
+            raise ValueError("HG-DAgger eval currently supports obs_mode='state' only.")
+        use_layer_norm = bool(train_args.get('use_layer_norm', False))
+        layer_norm_eps = float(train_args.get('layer_norm_eps', 1e-5))
+        backbone_states = checkpoint['ensemble_backbones']
+        head_states = checkpoint['ensemble_heads']
+        if not backbone_states or not head_states:
+            raise ValueError("HG-DAgger checkpoint is missing ensemble members.")
+        obs_dim = backbone_states[0]['net.0.weight'].shape[1]
+        backbone_hidden = backbone_states[0]['net.0.weight'].shape[0]
+        backbones = nn.ModuleList()
+        heads = nn.ModuleList()
+        for backbone_state, head_state in zip(backbone_states, head_states):
+            backbone = MLPBackbone(
+                obs_dim,
+                backbone_hidden,
+                use_layer_norm=use_layer_norm,
+                layer_norm_eps=layer_norm_eps,
+            ).to(device)
+            backbone.load_state_dict(backbone_state)
+            backbone.eval()
+            head = GaussianPolicyHead(
+                backbone.output_dim,
+                act_dim,
+                int(train_args.get('actor_hidden_dim', backbone_hidden)),
+                float(train_args.get('init_scale', 0.01)),
+                use_layer_norm=use_layer_norm,
+                layer_norm_eps=layer_norm_eps,
+            ).to(device)
+            head.load_state_dict(head_state)
+            head.eval()
+            backbones.append(backbone)
+            heads.append(head)
+        obs_state = checkpoint.get('obs_normalizer_state')
+        obs_normalizer = EmpiricalNormalization(shape=obs_dim, device=device)
+        if obs_state:
+            obs_normalizer.load_state_dict(obs_state)
+        obs_normalizer.eval()
+        policy = HGDaggerPolicy(obs_normalizer=obs_normalizer, backbones=backbones, heads=heads)
+        policy.eval()
+        training_info['obs_mode'] = obs_mode
+        training_info['hg_ensemble_size'] = len(backbones)
+        training_info['hg_tau_estimate'] = checkpoint.get('hg_tau_estimate')
+    elif policy_type == 'behavior_cloning':
+        obs_mode = train_args.get('obs_mode', getattr(args, 'obs_mode', 'state'))
+        if obs_mode != 'state':
+            raise ValueError("Behavior cloning eval currently supports obs_mode='state' only.")
+        use_layer_norm = bool(train_args.get('use_layer_norm', False))
+        layer_norm_eps = float(train_args.get('layer_norm_eps', 1e-5))
+        actor_backbone_state = checkpoint['actor_backbone_state']
+        obs_dim = actor_backbone_state['net.0.weight'].shape[1]
+        backbone_hidden = actor_backbone_state['net.0.weight'].shape[0]
+        backbone = MLPBackbone(
+            obs_dim,
+            backbone_hidden,
+            use_layer_norm=use_layer_norm,
+            layer_norm_eps=layer_norm_eps,
+        ).to(device)
+        backbone.load_state_dict(actor_backbone_state)
+        backbone.eval()
+        actor_head = GaussianPolicyHead(
+            backbone.output_dim,
+            act_dim,
+            int(train_args.get('actor_hidden_dim', backbone_hidden)),
+            float(train_args.get('init_scale', 0.01)),
+            use_layer_norm=use_layer_norm,
+            layer_norm_eps=layer_norm_eps,
+        ).to(device)
+        actor_head.load_state_dict(checkpoint['actor_head_state'])
+        actor_head.eval()
+        obs_state = checkpoint.get('obs_normalizer_state')
+        obs_normalizer = EmpiricalNormalization(shape=obs_dim, device=device)
+        if obs_state:
+            obs_normalizer.load_state_dict(obs_state)
+        obs_normalizer.eval()
+        policy = FastSACPolicy(
+            obs_normalizer=obs_normalizer,
+            obs_mode='state',
+            pixel_shape=None,
+            actor_backbone=backbone,
+            actor_head=actor_head,
+            critic_backbone=None,
+            critic_heads=None,
+        )
+        policy.eval()
+        training_info['obs_mode'] = obs_mode
     else:  # fastsac_v2
         if not FASTSAC_AVAILABLE:
             raise ImportError("FastSAC components are unavailable; ensure 'fasttd3/fast_sac' is on PYTHONPATH or installed.")
@@ -1992,26 +2135,11 @@ def run_headless_evaluation(policy, env, args, device):
                 action = np.concatenate([move_global, np.array([view_delta], dtype=np.float32)], axis=0)
             else:
                 action = move_global
-        if args.action_scale != 1.0:
-            action *= args.action_scale
-        if args.clip_actions:
-            action = clip_action_l2_np(action, max_norm=1.0)
+            if args.action_scale != 1.0:
+                action *= args.action_scale
+            if args.clip_actions:
+                action = clip_action_l2_np(action, max_norm=1.0)
             obs, reward, terminated, truncated, info = env.step(action)
-        if args.log_q_values and steps % max(1, int(args.log_q_every)) == 0:
-            q_action = action
-            if isinstance(info, dict) and info.get('teacher_intervened', False):
-                q_action = info.get('teacher_action', q_action)
-            if hasattr(policy, 'q_values'):
-                try:
-                    if isinstance(policy, DrQPolicy):
-                        q_vals = policy.q_values(obs_tensor, q_action, prev_actions=prev_tensor)
-                    else:
-                        q_vals = policy.q_values(obs_tensor, q_action)
-                except Exception:
-                    q_vals = None
-                if q_vals is not None:
-                    q_min, q_mean = q_vals
-                    print(f"Qmin={q_min:.3f} Qmean={q_mean:.3f}")
             if history_len > 0 and action_history is not None:
                 action_history.append(action_local.copy())
             if goal_history_len > 0 and goal_history is not None:
@@ -2021,6 +2149,22 @@ def run_headless_evaluation(policy, env, args, device):
             ep_reward += float(reward)
             steps += 1
             done = bool(terminated or truncated)
+
+            if args.log_q_values and steps % max(1, int(args.log_q_every)) == 0:
+                q_action = action
+                if isinstance(info, dict) and info.get('teacher_intervened', False):
+                    q_action = info.get('teacher_action', q_action)
+                if hasattr(policy, 'q_values'):
+                    try:
+                        if isinstance(policy, DrQPolicy):
+                            q_vals = policy.q_values(obs_tensor, q_action, prev_actions=prev_tensor)
+                        else:
+                            q_vals = policy.q_values(obs_tensor, q_action)
+                    except Exception:
+                        q_vals = None
+                    if q_vals is not None:
+                        q_min, q_mean = q_vals
+                        print(f"Qmin={q_min:.3f} Qmean={q_mean:.3f}")
 
         episode_rewards.append(ep_reward)
         episode_lengths.append(steps)
@@ -2058,6 +2202,65 @@ def _evaluate_goal_reached(info: Any, *, distance_epsilon: float) -> tuple[bool,
     if not goal_flag and distance is not None and distance <= distance_epsilon:
         goal_flag = True
     return goal_flag, distance
+
+
+def _default_maze_eval_output_dir(args) -> Path:
+    if getattr(args, 'maze_eval_output_dir', ''):
+        return Path(str(args.maze_eval_output_dir)).expanduser().resolve()
+    if getattr(args, 'model_path', None):
+        return Path(str(args.model_path)).resolve().parent / "eval_trajectories"
+    return Path("logs") / "maze_eval"
+
+
+def _maybe_save_maze_trajectory_plot(policy, args, device) -> Optional[Path]:
+    if not bool(getattr(args, 'save_maze_trajectory_plot', False)):
+        return None
+    if infer_ogbench_env_family(str(getattr(args, 'env_name', ''))) != 'maze':
+        return None
+    if str(getattr(policy, 'obs_mode', getattr(args, 'obs_mode', 'state'))) != 'state':
+        print("⚠️ Maze trajectory plots currently support state-observation policies only.")
+        return None
+    num_episodes = int(getattr(args, 'maze_trajectory_plot_episodes', 0))
+    if num_episodes <= 0:
+        num_episodes = max(1, int(getattr(args, 'num_episodes', 1) or 1))
+
+    def _policy_step_fn(obs_tensor: torch.Tensor) -> torch.Tensor:
+        obs_tensor = obs_tensor.to(device)
+        obs_dict = TensorDict({"policy": obs_tensor}, batch_size=[obs_tensor.shape[0]], device=device)
+        with torch.no_grad():
+            try:
+                actions = policy.act(obs_dict, deterministic=True, prev_actions=None, goal_history=None)
+            except TypeError:
+                try:
+                    actions = policy.act(obs_dict, deterministic=True, prev_actions=None)
+                except TypeError:
+                    actions = policy.act(obs_dict, deterministic=True)
+        return actions
+
+    output_dir = _default_maze_eval_output_dir(args)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    tag_root = Path(str(getattr(args, 'model_path', 'maze_eval'))).stem if getattr(args, 'model_path', None) else "maze_eval"
+    tag = f"{tag_root}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    out_path = output_dir / f"{tag}.png"
+    episodes, (maze_layout, maze_unit, offsets, dangerous_id) = rollout_maze_policy_episodes(
+        args=args,
+        device=device,
+        policy_step_fn=_policy_step_fn,
+        num_episodes=num_episodes,
+        max_steps=(int(args.max_episode_steps) if int(args.max_episode_steps) > 0 else None),
+    )
+    plot_maze_trajectory_episodes(
+        episodes=episodes,
+        output_path=out_path,
+        env_name=str(getattr(args, 'env_name', 'maze')),
+        maze_layout=maze_layout,
+        maze_unit=maze_unit,
+        offsets=offsets,
+        dangerous_id=dangerous_id,
+        title_suffix="eval_cli",
+    )
+    print(f"🗺️ Saved maze trajectory plot: {out_path}")
+    return out_path
 
 
 def run_interactive_evaluation(policy, env, args, device, mirror: MirrorEnvProcess | None):
@@ -2479,6 +2682,7 @@ def main():
             run_headless_evaluation(policy, env, args, device)
         else:
             run_interactive_evaluation(policy, env, args, device, mirror=mirror)
+        _maybe_save_maze_trajectory_plot(policy, args, device)
     except Exception as exc:
         print(f"❌ Evaluation failed: {exc}")
         import traceback

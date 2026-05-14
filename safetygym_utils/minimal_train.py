@@ -115,6 +115,10 @@ def _make_env_with_wrappers(
         car_wheel_command_limit=float(args.car_wheel_command_limit),
         car_force_scale=float(args.car_force_scale),
         car_action_mode=str(getattr(args, "car_action_mode", "raw_wheels")),
+        point_action_mode=str(getattr(args, "point_action_mode", "native")),
+        point_turn_gain=float(getattr(args, "point_turn_gain", 2.5)),
+        point_alignment_power=float(getattr(args, "point_alignment_power", 1.0)),
+        point_allow_backward=bool(getattr(args, "point_allow_backward", False)),
         obs_mask_mode=str(getattr(args, "obs_mask_mode", "none")),
         seed=seed,
     )
@@ -122,6 +126,7 @@ def _make_env_with_wrappers(
         env,
         reward_mode=args.reward_mode,
         dense_reward_scale=float(args.dense_reward_scale),
+        success_reward_scale=float(getattr(args, "success_reward_scale", 1.0)),
         step_penalty=float(args.step_penalty),
         cost_penalty=float(getattr(args, "cost_penalty", 0.0)),
         cost_penalty_warmup_steps=int(getattr(args, "cost_penalty_warmup_steps", 0)),
@@ -129,12 +134,21 @@ def _make_env_with_wrappers(
         clearance_penalty_scale=float(getattr(args, "clearance_penalty_scale", 0.0)),
         clearance_margin=float(getattr(args, "clearance_margin", 0.0)),
         clearance_penalty_power=float(getattr(args, "clearance_penalty_power", 1.0)),
+        clearance_penalty_mode=str(getattr(args, "clearance_penalty_mode", "hinge_power")),
+        clearance_penalty_temperature=float(getattr(args, "clearance_penalty_temperature", 0.08)),
         clearance_penalty_warmup_steps=int(getattr(args, "clearance_penalty_warmup_steps", 0)),
         clearance_penalty_ramp_steps=int(getattr(args, "clearance_penalty_ramp_steps", 0)),
         forward_reward_scale=float(getattr(args, "forward_reward_scale", 0.0)),
         backward_penalty_scale=float(getattr(args, "backward_penalty_scale", 0.0)),
         heading_reward_scale=float(getattr(args, "heading_reward_scale", 0.0)),
         heading_positive_only=bool(getattr(args, "heading_positive_only", True)),
+        adaptive_safety_curriculum=bool(getattr(args, "adaptive_safety_curriculum", False)),
+        adaptive_safety_goal_target=float(getattr(args, "adaptive_safety_goal_target", 1.0)),
+        adaptive_safety_window_episodes=int(getattr(args, "adaptive_safety_window_episodes", 10)),
+        adaptive_safety_step=float(getattr(args, "adaptive_safety_step", 0.05)),
+        adaptive_safety_init=float(getattr(args, "adaptive_safety_init", 0.0)),
+        adaptive_safety_min=float(getattr(args, "adaptive_safety_min", 0.0)),
+        adaptive_safety_max=float(getattr(args, "adaptive_safety_max", 1.0)),
     )
     if bool(getattr(args, "terminate_on_goal", False)):
         env = TerminateOnGoalWrapper(env)
@@ -147,6 +161,11 @@ def _make_env_with_wrappers(
             threshold=float(args.intervention_threshold),
             hold_seconds=float(args.intervention_hold_seconds),
             clearance_override_threshold=float(getattr(args, "teacher_override_clearance_threshold", -1.0)),
+            clearance_override_exit_threshold=float(getattr(args, "teacher_override_clearance_exit_threshold", -1.0)),
+            clearance_override_mode=str(getattr(args, "teacher_override_mode", "clearance")),
+            teacher_goal_progress_steps=int(getattr(args, "teacher_goal_progress_steps", 3)),
+            teacher_goal_progress_epsilon=float(getattr(args, "teacher_goal_progress_epsilon", 1e-3)),
+            debug_console=bool(getattr(args, "debug_intervention_console", False)),
         )
     return env
 
@@ -507,6 +526,11 @@ def _episode_metrics(
     ep_reward_forward: float,
     ep_reward_backward_penalty: float,
     ep_reward_heading: float,
+    ep_cost_penalty_scale_mean: float,
+    ep_clearance_penalty_scale_mean: float,
+    ep_adaptive_safety_scale_mean: float,
+    ep_adaptive_goal_window_mean: float,
+    ep_adaptive_cost_window_mean: float,
     ep_mean_constrained_clearance: float,
     ep_min_constrained_clearance: float,
     ep_len: int,
@@ -541,6 +565,15 @@ def _episode_metrics(
         "reward_forward_sum": float(ep_reward_forward),
         "reward_backward_penalty_sum": float(ep_reward_backward_penalty),
         "reward_heading_sum": float(ep_reward_heading),
+        "reward_cost_penalty_scale": float(ep_cost_penalty_scale_mean),
+        "reward_clearance_penalty_scale": float(ep_clearance_penalty_scale_mean),
+        "reward_adaptive_safety_scale": float(ep_adaptive_safety_scale_mean),
+        "reward_adaptive_goal_window_mean": (
+            float(ep_adaptive_goal_window_mean) if np.isfinite(ep_adaptive_goal_window_mean) else 0.0
+        ),
+        "reward_adaptive_cost_window_mean": (
+            float(ep_adaptive_cost_window_mean) if np.isfinite(ep_adaptive_cost_window_mean) else 0.0
+        ),
         "mean_constrained_clearance": float(ep_mean_constrained_clearance),
         "min_constrained_clearance": float(ep_min_constrained_clearance),
         "intervention_steps": float(info.get("teacher_intervention_steps", 0.0)),
@@ -632,6 +665,11 @@ def _run_eval(
         ep_reward_forward = 0.0
         ep_reward_backward_penalty = 0.0
         ep_reward_heading = 0.0
+        ep_cost_penalty_scale_sum = 0.0
+        ep_clearance_penalty_scale_sum = 0.0
+        ep_adaptive_safety_scale_sum = 0.0
+        ep_adaptive_goal_window_last = float("nan")
+        ep_adaptive_cost_window_last = float("nan")
         ep_clearance_sum = 0.0
         ep_clearance_count = 0
         ep_min_clearance = float("inf")
@@ -668,6 +706,11 @@ def _run_eval(
             ep_reward_forward += float(info.get("reward_forward_component", 0.0))
             ep_reward_backward_penalty += float(info.get("reward_backward_penalty_component", 0.0))
             ep_reward_heading += float(info.get("reward_heading_component", 0.0))
+            ep_cost_penalty_scale_sum += float(info.get("reward_cost_penalty_scale", 0.0))
+            ep_clearance_penalty_scale_sum += float(info.get("reward_clearance_penalty_scale", 0.0))
+            ep_adaptive_safety_scale_sum += float(info.get("reward_adaptive_safety_scale", 0.0))
+            ep_adaptive_goal_window_last = float(info.get("reward_adaptive_goal_window_mean", float("nan")))
+            ep_adaptive_cost_window_last = float(info.get("reward_adaptive_cost_window_mean", float("nan")))
             step_clearance = info.get("min_constrained_clearance", float("nan"))
             if np.isfinite(step_clearance):
                 ep_clearance_sum += float(step_clearance)
@@ -725,6 +768,11 @@ def _run_eval(
                 ep_reward_forward=ep_reward_forward,
                 ep_reward_backward_penalty=ep_reward_backward_penalty,
                 ep_reward_heading=ep_reward_heading,
+                ep_cost_penalty_scale_mean=float(ep_cost_penalty_scale_sum / max(1, ep_len)),
+                ep_clearance_penalty_scale_mean=float(ep_clearance_penalty_scale_sum / max(1, ep_len)),
+                ep_adaptive_safety_scale_mean=float(ep_adaptive_safety_scale_sum / max(1, ep_len)),
+                ep_adaptive_goal_window_mean=ep_adaptive_goal_window_last,
+                ep_adaptive_cost_window_mean=ep_adaptive_cost_window_last,
                 ep_mean_constrained_clearance=(
                     float(ep_clearance_sum / max(1, ep_clearance_count)) if ep_clearance_count > 0 else float("nan")
                 ),
@@ -976,6 +1024,7 @@ def run_minimal_training(args) -> None:
             action_low=low_np,
             action_high=high_np,
             expert_checkpoint_path=str(getattr(args, "expert_checkpoint_path", "") or ""),
+            expert_config_path=str(getattr(args, "expert_config_path", "") or ""),
             expert_safe_checkpoint_path=str(getattr(args, "expert_safe_checkpoint_path", "") or ""),
             expert_switch_clearance_threshold=float(getattr(args, "expert_switch_clearance_threshold", 0.08)),
             expert_device=str(getattr(args, "expert_device", "cpu")),
@@ -983,6 +1032,7 @@ def run_minimal_training(args) -> None:
             control_scheme_override=resolve_control_scheme(
                 str(args.env_name),
                 car_action_mode=str(getattr(args, "car_action_mode", "raw_wheels")),
+                point_action_mode=str(getattr(args, "point_action_mode", "native")),
             ),
         )
         env = _make_env_with_wrappers(args=args, seed=int(args.seed), with_intervention=True, controller=controller)
@@ -1076,10 +1126,10 @@ def run_minimal_training(args) -> None:
         obs_normalizer = torch.nn.Identity()
     _maybe_load_checkpoint(args=args, sac=sac, obs_normalizer=obs_normalizer, device=device)
 
-    def _make_rb() -> SimpleReplayBuffer:
+    def _make_rb(buffer_size: int | None = None) -> SimpleReplayBuffer:
         return SimpleReplayBuffer(
             n_env=1,
-            buffer_size=int(args.buffer_size),
+            buffer_size=int(buffer_size if buffer_size is not None else args.buffer_size),
             n_obs=obs_dim,
             n_act=act_dim,
             n_critic_obs=obs_dim,
@@ -1117,6 +1167,12 @@ def run_minimal_training(args) -> None:
     pref_sampling_mode = str(getattr(args, "pref_sampling_mode", "linked")).strip().lower()
     if pref_sampling_mode not in {"linked", "separate"}:
         raise ValueError(f"Unsupported pref_sampling_mode: {pref_sampling_mode}")
+    pref_replay_sample_ratio = float(getattr(args, "pref_replay_sample_ratio", 0.0))
+    pref_rb = (
+        _make_rb(pref_capacity)
+        if variant == "own" and pref_capacity > 1 and pref_replay_sample_ratio > 0.0
+        else None
+    )
     dataset_target = str(getattr(args, "demo_dataset_target", "variant")).strip().lower()
     dataset_requested = bool(str(getattr(args, "demo_dataset_path", "") or "").strip()) or bool(
         getattr(args, "demo_dataset_auto_load", False)
@@ -1327,6 +1383,8 @@ def run_minimal_training(args) -> None:
                         variant == "hilserl" or bool(getattr(args, "store_intervened_in_demo_buffer", False))
                     ):
                         demo_rb.extend(transition)
+                    if teacher_intervened and pref_rb is not None:
+                        pref_rb.extend(transition)
                     if variant == "own" and teacher_intervened and pref_capacity > 0 and pref_sampling_mode != "linked":
                         pref_pairs.append(
                             {
@@ -1422,6 +1480,12 @@ def run_minimal_training(args) -> None:
             if novice_rb.size >= int(args.batch_size):
                 return novice_rb.sample(int(args.batch_size))
             return main_rb.sample(int(args.batch_size))
+        if variant == "own" and pref_rb is not None and pref_rb.size > 0 and pref_replay_sample_ratio > 0.0:
+            pref_n = int(round(int(args.batch_size) * min(max(pref_replay_sample_ratio, 0.0), 1.0)))
+            pref_n = min(max(1, pref_n), int(args.batch_size) - 1)
+            base_n = int(args.batch_size) - pref_n
+            if main_rb.size >= base_n and pref_rb.size >= pref_n:
+                return TensorDict.cat([main_rb.sample(base_n), pref_rb.sample(pref_n)], dim=0)
         if (
             variant in {"own", "hilserl"}
             and demo_rb is not None
@@ -1507,7 +1571,10 @@ def run_minimal_training(args) -> None:
                 if human_rb is not None:
                     logs["train/buffer_human_size"] = float(human_rb.size)
                 if variant == "own":
-                    if pref_sampling_mode == "linked":
+                    if pref_rb is not None:
+                        logs["train/buffer_pref_size"] = float(pref_rb.linked_pref_pair_count())
+                        logs["train/buffer_pref_replay_size"] = float(pref_rb.size)
+                    elif pref_sampling_mode == "linked":
                         logs["train/buffer_pref_size"] = float(main_rb.linked_pref_pair_count())
                     else:
                         logs["train/buffer_pref_size"] = float(len(pref_pairs))
@@ -1630,6 +1697,8 @@ def run_minimal_training(args) -> None:
     win = EpisodeWindow(size=100)
     max_steps = extract_step_limit(env)
     start_time = time.time()
+    env_fps_limit = float(max(0.0, getattr(args, "env_fps_limit", 0.0)))
+    env_step_period = (1.0 / env_fps_limit) if env_fps_limit > 0.0 else 0.0
     next_log = int(args.log_interval) if int(args.log_interval) > 0 else None
     next_eval = int(args.eval_interval)
     next_save = int(args.save_interval)
@@ -1646,6 +1715,11 @@ def run_minimal_training(args) -> None:
     ep_reward_forward = 0.0
     ep_reward_backward_penalty = 0.0
     ep_reward_heading = 0.0
+    ep_cost_penalty_scale_sum = 0.0
+    ep_clearance_penalty_scale_sum = 0.0
+    ep_adaptive_safety_scale_sum = 0.0
+    ep_adaptive_goal_window_last = float("nan")
+    ep_adaptive_cost_window_last = float("nan")
     ep_clearance_sum = 0.0
     ep_clearance_count = 0
     ep_min_clearance = float("inf")
@@ -1660,6 +1734,7 @@ def run_minimal_training(args) -> None:
     update_window: dict[str, float] = defaultdict(float)
 
     for step in range(1, int(args.total_timesteps) + 1):
+        step_t0 = time.perf_counter()
         if step <= int(effective_learning_starts):
             student_action = env.action_space.sample().astype(np.float32)
         else:
@@ -1708,6 +1783,8 @@ def run_minimal_training(args) -> None:
                 variant == "hilserl" or bool(getattr(args, "store_intervened_in_demo_buffer", False))
             ):
                 demo_rb.extend(transition)
+            if teacher_intervened and pref_rb is not None:
+                pref_rb.extend(transition)
             if variant == "own" and teacher_intervened and pref_capacity > 0 and pref_sampling_mode != "linked":
                 pref_pairs.append(
                     {
@@ -1731,6 +1808,11 @@ def run_minimal_training(args) -> None:
         ep_reward_forward += float(info.get("reward_forward_component", 0.0))
         ep_reward_backward_penalty += float(info.get("reward_backward_penalty_component", 0.0))
         ep_reward_heading += float(info.get("reward_heading_component", 0.0))
+        ep_cost_penalty_scale_sum += float(info.get("reward_cost_penalty_scale", 0.0))
+        ep_clearance_penalty_scale_sum += float(info.get("reward_clearance_penalty_scale", 0.0))
+        ep_adaptive_safety_scale_sum += float(info.get("reward_adaptive_safety_scale", 0.0))
+        ep_adaptive_goal_window_last = float(info.get("reward_adaptive_goal_window_mean", float("nan")))
+        ep_adaptive_cost_window_last = float(info.get("reward_adaptive_cost_window_mean", float("nan")))
         step_clearance = info.get("min_constrained_clearance", float("nan"))
         if np.isfinite(step_clearance):
             ep_clearance_sum += float(step_clearance)
@@ -1770,6 +1852,11 @@ def run_minimal_training(args) -> None:
                     ep_reward_forward=ep_reward_forward,
                     ep_reward_backward_penalty=ep_reward_backward_penalty,
                     ep_reward_heading=ep_reward_heading,
+                    ep_cost_penalty_scale_mean=float(ep_cost_penalty_scale_sum / max(1, ep_len)),
+                    ep_clearance_penalty_scale_mean=float(ep_clearance_penalty_scale_sum / max(1, ep_len)),
+                    ep_adaptive_safety_scale_mean=float(ep_adaptive_safety_scale_sum / max(1, ep_len)),
+                    ep_adaptive_goal_window_mean=ep_adaptive_goal_window_last,
+                    ep_adaptive_cost_window_mean=ep_adaptive_cost_window_last,
                     ep_mean_constrained_clearance=(
                         float(ep_clearance_sum / max(1, ep_clearance_count)) if ep_clearance_count > 0 else float("nan")
                     ),
@@ -1804,6 +1891,11 @@ def run_minimal_training(args) -> None:
             ep_reward_forward = 0.0
             ep_reward_backward_penalty = 0.0
             ep_reward_heading = 0.0
+            ep_cost_penalty_scale_sum = 0.0
+            ep_clearance_penalty_scale_sum = 0.0
+            ep_adaptive_safety_scale_sum = 0.0
+            ep_adaptive_goal_window_last = float("nan")
+            ep_adaptive_cost_window_last = float("nan")
             ep_clearance_sum = 0.0
             ep_clearance_count = 0
             ep_min_clearance = float("inf")
@@ -1812,6 +1904,11 @@ def run_minimal_training(args) -> None:
             ep_first_goal_hit_step = None
             ep_first_goal_reward_sum = 0.0
             ep_first_goal_dense_reward_sum = 0.0
+
+        if env_step_period > 0.0:
+            remaining = env_step_period - (time.perf_counter() - step_t0)
+            if remaining > 0.0:
+                time.sleep(remaining)
 
         if next_log is not None and step >= next_log:
             next_log += int(args.log_interval)
@@ -1829,7 +1926,10 @@ def run_minimal_training(args) -> None:
             if human_rb is not None:
                 logs["train/buffer_human_size"] = float(human_rb.size)
             if variant == "own":
-                if pref_sampling_mode == "linked":
+                if pref_rb is not None:
+                    logs["train/buffer_pref_size"] = float(pref_rb.linked_pref_pair_count())
+                    logs["train/buffer_pref_replay_size"] = float(pref_rb.size)
+                elif pref_sampling_mode == "linked":
                     logs["train/buffer_pref_size"] = float(main_rb.linked_pref_pair_count())
                 else:
                     logs["train/buffer_pref_size"] = float(len(pref_pairs))

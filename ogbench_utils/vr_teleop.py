@@ -8,7 +8,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 DEFAULT_VR_PORT = 8765
 DEFAULT_VR_SERVE_HOST = "0.0.0.0"
@@ -1423,6 +1423,87 @@ class VRTeleopInterface:
     def reset(self) -> None:
         self.mapper.reset()
         self._suppress_until_gate_release = bool(getattr(self.mapper.config, "require_gate", False))
+
+
+def wait_for_fresh_gate_press(
+    teleop: VRTeleopInterface,
+    *,
+    label: str = "VR start gate",
+    poll_hz: float = 20.0,
+    timeout_sec: float = 0.0,
+    on_poll: Optional[Callable[[dict[str, Any]], None]] = None,
+) -> bool:
+    """
+    Block until the configured VR gate button has been released and then pressed.
+
+    This is used to keep human demo collection / intervention training from
+    starting before the operator is ready and has positioned the camera.
+    """
+    if teleop is None:
+        return True
+    require_gate = bool(getattr(teleop.mapper.config, "require_gate", False))
+    if not require_gate:
+        print(f"[{label}] gate not required by mapping; starting immediately", flush=True)
+        return True
+
+    hand = str(getattr(teleop.mapper.config, "hand", "right"))
+    gate_button = str(getattr(teleop.mapper.config, "gate_button", "grip"))
+    poll_dt = 1.0 / max(1.0, float(poll_hz))
+    deadline = (time.time() + float(timeout_sec)) if float(timeout_sec) > 0.0 else None
+    saw_release = False
+    last_status: tuple[bool, bool, bool] | None = None
+    last_status_print = 0.0
+
+    print(
+        f"[{label}] waiting for fresh gate press on {hand} controller "
+        f"(button={gate_button}). Release it first, then press to begin.",
+        flush=True,
+    )
+    while True:
+        now = time.time()
+        sample = teleop.get_latest_sample()
+        controller = extract_controller_state(sample, hand=hand)
+        connected = bool(controller.get("connected", False)) if isinstance(controller, dict) else False
+        tracked = bool(controller.get("tracked", False)) if isinstance(controller, dict) else False
+        gate_pressed = controller_button_pressed(controller, gate_button)
+
+        if callable(on_poll):
+            try:
+                on_poll(
+                    {
+                        "connected": connected,
+                        "tracked": tracked,
+                        "gate_pressed": gate_pressed,
+                        "saw_release": saw_release,
+                    }
+                )
+            except Exception:
+                pass
+
+        status = (connected, tracked, gate_pressed)
+        if status != last_status or (now - last_status_print) >= 2.0:
+            if not connected:
+                print(f"[{label}] waiting for VR controller connection...", flush=True)
+            elif not tracked:
+                print(f"[{label}] controller connected but not tracked yet...", flush=True)
+            elif gate_pressed and not saw_release:
+                print(f"[{label}] gate is currently held; release it to arm startup.", flush=True)
+            elif saw_release and not gate_pressed:
+                print(f"[{label}] armed. Press the gate button to start.", flush=True)
+            last_status = status
+            last_status_print = now
+
+        if connected and tracked and (not gate_pressed):
+            saw_release = True
+
+        if connected and tracked and saw_release and gate_pressed:
+            print(f"[{label}] start trigger received.", flush=True)
+            return True
+
+        if deadline is not None and now >= deadline:
+            print(f"[{label}] timed out waiting for start trigger.", flush=True)
+            return False
+        time.sleep(poll_dt)
 
 
 class VRStatusPanel:

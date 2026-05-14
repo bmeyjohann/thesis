@@ -111,6 +111,16 @@ def augment_rollout_summary(summary: Dict[str, float], prefix: str) -> Dict[str,
         out[f"{prefix}/mean_backward_penalty_reward"] = float(out[f"{prefix}/reward_backward_penalty_sum_mean"])
     if f"{prefix}/reward_heading_sum_mean" in out:
         out[f"{prefix}/mean_heading_reward"] = float(out[f"{prefix}/reward_heading_sum_mean"])
+    if f"{prefix}/reward_cost_penalty_scale_mean" in out:
+        out[f"{prefix}/safety_cost_scale"] = float(out[f"{prefix}/reward_cost_penalty_scale_mean"])
+    if f"{prefix}/reward_clearance_penalty_scale_mean" in out:
+        out[f"{prefix}/safety_clearance_scale"] = float(out[f"{prefix}/reward_clearance_penalty_scale_mean"])
+    if f"{prefix}/reward_adaptive_safety_scale_mean" in out:
+        out[f"{prefix}/adaptive_safety_scale"] = float(out[f"{prefix}/reward_adaptive_safety_scale_mean"])
+    if f"{prefix}/reward_adaptive_goal_window_mean_mean" in out:
+        out[f"{prefix}/adaptive_goal_window_mean"] = float(out[f"{prefix}/reward_adaptive_goal_window_mean_mean"])
+    if f"{prefix}/reward_adaptive_cost_window_mean_mean" in out:
+        out[f"{prefix}/adaptive_cost_window_mean"] = float(out[f"{prefix}/reward_adaptive_cost_window_mean_mean"])
     if f"{prefix}/episode_cost_sum_mean" in out:
         out[f"{prefix}/mean_episode_cost"] = float(out[f"{prefix}/episode_cost_sum_mean"])
         out[f"{prefix}/collision_cost_sum"] = float(out[f"{prefix}/episode_cost_sum_mean"])

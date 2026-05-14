@@ -557,7 +557,7 @@ def create_mcp_server(queue: ExperimentQueue, daemon_command: list[str]) -> Fast
             description="For prime_queue_session, whether to enqueue and cancel a temporary no-op job.",
         ),
     ) -> dict[str, Any]:
-        """Unified experiment queue tool. Use the `action` argument to select queue behavior."""
+        """Unified experiment queue tool. Use the `action` argument to select queue behavior. Queued jobs run outside Codex's normal shell sandbox, so do not infer queue CUDA availability from sandbox-local CUDA checks."""
         try:
             if action == "help":
                 return {
@@ -567,6 +567,11 @@ def create_mcp_server(queue: ExperimentQueue, daemon_command: list[str]) -> Fast
                     "preferred_for_autonomy": True,
                     "note": (
                         "For autonomous runs, use this unified `queue` tool for all experiment-queue operations."
+                    ),
+                    "cuda_note": (
+                        "Queued jobs run outside Codex's normal shell sandbox. Do not infer queue GPU availability "
+                        "from sandbox-local CUDA checks such as torch.cuda.is_available(); verify it from queue-run "
+                        "logs, WANDB, or a queued smoke job."
                     ),
                 }
 

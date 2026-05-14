@@ -169,14 +169,15 @@ def make_eval_wrappers(args, env_family: str):
     return [wrapper]
 
 
-def _build_env_kwargs(args) -> Dict[str, Any]:
+def _build_env_kwargs(args, env_family: str) -> Dict[str, Any]:
     env_kwargs: Dict[str, Any] = {}
-    if hasattr(args, "hold_targets_on_zero_action"):
-        env_kwargs["hold_targets_on_zero_action"] = bool(getattr(args, "hold_targets_on_zero_action", False))
-    if hasattr(args, "noop_action_threshold"):
-        env_kwargs["noop_action_threshold"] = float(getattr(args, "noop_action_threshold", 1e-6))
-    if hasattr(args, "disable_rotation"):
-        env_kwargs["disable_rotation"] = bool(getattr(args, "disable_rotation", False))
+    if str(env_family).lower() == "manip":
+        if hasattr(args, "hold_targets_on_zero_action"):
+            env_kwargs["hold_targets_on_zero_action"] = bool(getattr(args, "hold_targets_on_zero_action", False))
+        if hasattr(args, "noop_action_threshold"):
+            env_kwargs["noop_action_threshold"] = float(getattr(args, "noop_action_threshold", 1e-6))
+        if hasattr(args, "disable_rotation"):
+            env_kwargs["disable_rotation"] = bool(getattr(args, "disable_rotation", False))
     max_episode_steps = int(getattr(args, "max_episode_steps", 0) or 0)
     if max_episode_steps > 0:
         env_kwargs["max_episode_steps"] = max_episode_steps
@@ -315,7 +316,7 @@ def build_environment(
 ]:
     """Build training vector env + normalizers for FastSAC OGBench pipeline."""
     wrappers = make_wrappers(args, env_family)
-    env_kwargs = _build_env_kwargs(args)
+    env_kwargs = _build_env_kwargs(args, env_family)
     clip_actions = _default_clip_actions(env_family)
     record_progress("[Init] constructing vector env adapter")
     envs = _build_vec_env_with_fallback(
@@ -348,7 +349,7 @@ def build_environment(
 def build_eval_environment(args, device: torch.device, env_family: str) -> OGBenchVecEnvAdapter:
     """Build evaluation vector env for FastSAC OGBench pipeline."""
     wrappers = make_eval_wrappers(args, env_family)
-    env_kwargs = _build_env_kwargs(args)
+    env_kwargs = _build_env_kwargs(args, env_family)
     clip_actions = _default_clip_actions(env_family)
     eval_envs = _build_vec_env_with_fallback(
         env_name=args.env_name,

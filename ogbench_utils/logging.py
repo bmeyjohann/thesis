@@ -271,6 +271,8 @@ class TrainingLogger:
             try:
                 self.wandb_run = wandb.init(
                     project=self.args.project,
+                    entity=(str(getattr(self.args, "wandb_entity", "")).strip() or None),
+                    group=(str(getattr(self.args, "wandb_group", "")).strip() or None),
                     name=self.args.exp_name,
                     id=self.args.exp_name,
                     config=vars(self.args),
@@ -346,6 +348,15 @@ class TrainingLogger:
             logs["Train/critic_loss_total"] = metrics_accumulator["critic_loss_total"] / denom
             logs["Train/pref_lambda"] = metrics_accumulator["pref_lambda"] / denom
             logs["Train/pref_lambda_delta"] = metrics_accumulator["pref_lambda_delta"] / denom
+            logs["Train/pref_lambda_min"] = metrics_accumulator.get("pref_lambda_min", 0.0) / denom
+            logs["Train/pref_lambda_max"] = metrics_accumulator.get("pref_lambda_max_value", 0.0) / denom
+            logs["Train/pref_lambda_std"] = metrics_accumulator.get("pref_lambda_std", 0.0) / denom
+            logs["Train/pref_lambda_active_fraction"] = (
+                metrics_accumulator.get("pref_lambda_active_fraction", 0.0) / denom
+            )
+            logs["Train/pref_lambda_per_linked_enabled"] = (
+                metrics_accumulator.get("pref_lambda_per_linked_enabled", 0.0) / denom
+            )
             logs["Train/pref_dual_violation"] = metrics_accumulator["pref_dual_violation"] / denom
             logs["Train/pref_dual_signal"] = metrics_accumulator["pref_dual_signal"] / denom
             logs["Train/pref_violation"] = metrics_accumulator["pref_violation"] / denom
@@ -359,7 +370,10 @@ class TrainingLogger:
                 1.0 if pref_lagrangian_violation_type == "smooth" else 0.0
             )
             logs["Train/pref_lambda_lr"] = float(getattr(self.args, "pref_lambda_lr", 0.0))
-            logs["Train/pref_lambda_max"] = float(getattr(self.args, "pref_lambda_max", 0.0))
+            logs["Train/pref_lambda_max_cfg"] = float(getattr(self.args, "pref_lambda_max", 0.0))
+            logs["Train/pref_lagrangian_scope_is_per_linked"] = (
+                1.0 if str(getattr(self.args, "pref_lagrangian_scope", "global")).strip().lower() == "per_linked" else 0.0
+            )
             logs["Train/pref_lambda_ema_cfg"] = float(getattr(self.args, "pref_lambda_ema", 0.0))
             logs["Train/pref_violation_clip"] = float(getattr(self.args, "pref_violation_clip", 0.0))
             logs["Train/pref_violation_target"] = float(getattr(self.args, "pref_violation_target", 0.0))
@@ -412,7 +426,23 @@ class TrainingLogger:
                 float(metrics_accumulator.get("intervention_override_false_positive_fraction", 0.0)) / denom
             )
             logs["Train/pref_linked_rows_per_iter"] = float(metrics_accumulator.get("pref_linked_rows", 0.0)) / denom
+            logs["Train/pref_linked_effective_rows_per_iter"] = (
+                float(metrics_accumulator.get("pref_linked_effective_rows", 0.0)) / denom
+            )
             logs["Train/pref_linked_fraction"] = float(metrics_accumulator.get("pref_linked_fraction", 0.0)) / denom
+            logs["Train/pref_linked_effective_fraction"] = (
+                float(metrics_accumulator.get("pref_linked_effective_fraction", 0.0)) / denom
+            )
+            pref_action_delta_count = float(metrics_accumulator.get("pref_action_delta_count", 0.0))
+            if pref_action_delta_count > 0.0:
+                logs["Train/pref_action_delta_mean"] = (
+                    float(metrics_accumulator.get("pref_action_delta_sum", 0.0)) / pref_action_delta_count
+                )
+            pref_action_weight_count = float(metrics_accumulator.get("pref_action_weight_count", 0.0))
+            if pref_action_weight_count > 0.0:
+                logs["Train/pref_action_weight_mean"] = (
+                    float(metrics_accumulator.get("pref_action_weight_sum", 0.0)) / pref_action_weight_count
+                )
             logs["Train/demo_rows_requested_per_iter"] = float(metrics_accumulator.get("demo_rows_requested", 0.0)) / denom
             logs["Train/demo_rows_sampled_per_iter"] = float(metrics_accumulator.get("demo_rows_sampled", 0.0)) / denom
             logs["Train/demo_sampling_fraction"] = (
@@ -550,6 +580,12 @@ class TrainingLogger:
             pref_lambda = float(logs["Train/pref_lambda"])
             if pref_lambda > 1e-8:
                 log_line_parts.append(f"lambda {pref_lambda:.2f}")
+                if float(logs.get("Train/pref_lambda_per_linked_enabled", 0.0)) > 0.5:
+                    lam_min = float(logs.get("Train/pref_lambda_min", pref_lambda))
+                    lam_max = float(logs.get("Train/pref_lambda_max", pref_lambda))
+                    lam_std = float(logs.get("Train/pref_lambda_std", 0.0))
+                    log_line_parts.append(f"lambda_range {lam_min:.2f}-{lam_max:.2f}")
+                    log_line_parts.append(f"lambda_std {lam_std:.3f}")
         if self.args.store_denied_actions and last_denied_samples > 0:
             log_line_parts.append(f"denied {last_denied_samples}")
         if timing_summary:

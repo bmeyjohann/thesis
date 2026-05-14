@@ -12,6 +12,8 @@ done
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 WANDB_MODE_VALUE="${WANDB_MODE:-online}"
+WANDB_ENTITY_VALUE="${WANDB_ENTITY:-}"
+WANDB_GROUP_VALUE="${WANDB_GROUP:-}"
 PROJECT="${PROJECT:-ogbench-manip-reward-debug}"
 ENV_NAME="${ENV_NAME:-cube-single-singletask-task1-v0}"
 DISABLE_ROTATION="${DISABLE_ROTATION:-0}"
@@ -25,6 +27,7 @@ NUM_UPDATES="${NUM_UPDATES:-1}"
 CTA_RATIO="${CTA_RATIO:-1}"
 LEARNING_STARTS="${LEARNING_STARTS:-2000}"
 GAMMA="${GAMMA:-0.97}"
+SEED="${SEED:-42}"
 
 DEMO_PREFILL_EPISODES="${DEMO_PREFILL_EPISODES:-20}"
 DEMO_PREFILL_NUM_ENVS="${DEMO_PREFILL_NUM_ENVS:-20}"
@@ -58,8 +61,10 @@ mkdir -p logs
 echo "=== Starting ${EXP_NAME} ==="
 echo "Log file: ${LOG_FILE}"
 echo "WANDB mode: ${WANDB_MODE_VALUE}"
+echo "WANDB entity/group: ${WANDB_ENTITY_VALUE:-<default>}/${WANDB_GROUP_VALUE:-<none>}"
 echo "Disable rotation: ${DISABLE_ROTATION}"
 echo "Intervention episode probability: ${INTERVENTION_EPISODE_PROB}"
+echo "Seed: ${SEED}"
 echo "March HILSERL repro: UTD=${NUM_UPDATES} CTA=${CTA_RATIO} learned alpha, demo prefill=${DEMO_PREFILL_EPISODES}, demo_sample_ratio=${DEMO_SAMPLE_RATIO}"
 
 ARGS=(
@@ -86,6 +91,7 @@ ARGS=(
   --cta_ratio "${CTA_RATIO}"
   --learning_starts "${LEARNING_STARTS}"
   --gamma "${GAMMA}"
+  --seed "${SEED}"
   --alpha_min 0.0
   --alpha_max 1.0
   --alpha_freeze_steps 0
@@ -118,6 +124,14 @@ ARGS=(
 
 if [[ "${DISABLE_ROTATION}" == "1" ]]; then
   ARGS+=(--disable_rotation)
+fi
+
+if [[ -n "${WANDB_ENTITY_VALUE}" ]]; then
+  ARGS+=(--wandb_entity "${WANDB_ENTITY_VALUE}")
+fi
+
+if [[ -n "${WANDB_GROUP_VALUE}" ]]; then
+  ARGS+=(--wandb_group "${WANDB_GROUP_VALUE}")
 fi
 
 WANDB_MODE="${WANDB_MODE_VALUE}" \

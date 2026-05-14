@@ -30,6 +30,14 @@ DEVICE="${DEVICE:-auto}"
 SEED="${SEED:-0}"
 NAME="${NAME:-offline_actor_recover_qonly}"
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/models/offline_actor_recover/${NAME}}"
+INIT_MODE="${INIT_MODE:-checkpoint}"
+ACTOR_Q_WEIGHT="${ACTOR_Q_WEIGHT:-1.0}"
+TEACHER_MASK_MODE="${TEACHER_MASK_MODE:-effective}"
+USE_WANDB="${USE_WANDB:-1}"
+PROJECT="${PROJECT:-ogbench-manip-offline}"
+ENTITY="${ENTITY:-}"
+GROUP="${GROUP:-}"
+WANDB_MODE_OVERRIDE="${WANDB_MODE_OVERRIDE:-}"
 
 LOG_DIR="${REPO_ROOT}/logs"
 mkdir -p "${LOG_DIR}"
@@ -41,21 +49,39 @@ echo "Dataset: ${DATASET_PATH}"
 echo "Output dir: ${OUTPUT_DIR}"
 echo "Log file: ${LOG_FILE}"
 
-"${PYTHON_BIN}" "${REPO_ROOT}/scripts/recover_offline_actor_manip_from_checkpoint.py" \
-  --checkpoint_path "${CHECKPOINT_PATH}" \
-  --dataset_path "${DATASET_PATH}" \
-  --device "${DEVICE}" \
-  --num_gradient_steps "${NUM_GRADIENT_STEPS}" \
-  --batch_size "${BATCH_SIZE}" \
-  --actor_lr "${ACTOR_LR}" \
-  --action_l2_weight "${ACTION_L2_WEIGHT}" \
-  --bc_teacher_weight "${BC_TEACHER_WEIGHT}" \
-  --eval_interval "${EVAL_INTERVAL}" \
-  --num_eval_episodes "${NUM_EVAL_EPISODES}" \
-  --eval_num_envs "${EVAL_NUM_ENVS}" \
-  --seed "${SEED}" \
-  --name "${NAME}" \
-  --output_dir "${OUTPUT_DIR}" \
-  2>&1 | tee "${LOG_FILE}"
+CMD=(
+  "${PYTHON_BIN}" "${REPO_ROOT}/scripts/recover_offline_actor_manip_from_checkpoint.py"
+  --checkpoint_path "${CHECKPOINT_PATH}"
+  --dataset_path "${DATASET_PATH}"
+  --device "${DEVICE}"
+  --num_gradient_steps "${NUM_GRADIENT_STEPS}"
+  --batch_size "${BATCH_SIZE}"
+  --actor_lr "${ACTOR_LR}"
+  --action_l2_weight "${ACTION_L2_WEIGHT}"
+  --bc_teacher_weight "${BC_TEACHER_WEIGHT}"
+  --init_mode "${INIT_MODE}"
+  --actor_q_weight "${ACTOR_Q_WEIGHT}"
+  --teacher_mask_mode "${TEACHER_MASK_MODE}"
+  --eval_interval "${EVAL_INTERVAL}"
+  --num_eval_episodes "${NUM_EVAL_EPISODES}"
+  --eval_num_envs "${EVAL_NUM_ENVS}"
+  --seed "${SEED}"
+  --name "${NAME}"
+  --output_dir "${OUTPUT_DIR}"
+)
+if [[ "${USE_WANDB}" == "1" ]]; then
+  CMD+=(--use_wandb --project "${PROJECT}")
+fi
+if [[ -n "${ENTITY}" ]]; then
+  CMD+=(--entity "${ENTITY}")
+fi
+if [[ -n "${GROUP}" ]]; then
+  CMD+=(--group "${GROUP}")
+fi
+if [[ -n "${WANDB_MODE_OVERRIDE}" ]]; then
+  CMD+=(--wandb_mode "${WANDB_MODE_OVERRIDE}")
+fi
+
+"${CMD[@]}" 2>&1 | tee "${LOG_FILE}"
 
 echo "=== Finished ${NAME} ==="
