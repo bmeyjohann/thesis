@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VARIANT="${1:?variant required: pref_only|bc_only|bc_pref|bc_pref_aux|bc_pref_aux_pretrain}"
+ROOT="/home/benjamin/thesis"
+BASE="$ROOT/scripts/generated/run_safetycar_thesis_method_intervention_20260518.sh"
+
+export STEPS="${STEPS:-60000}"
+export SEED="${SEED:-91}"
+export OBS_FRAME_STACK="${OBS_FRAME_STACK:-1}"
+export WANDB_GROUP="${WANDB_GROUP:-safetycar_flowsec_variants_20260602}"
+export REWARD_MODE="${REWARD_MODE:-dense}"
+export DENSE_REWARD_SCALE="${DENSE_REWARD_SCALE:-1.0}"
+export SUCCESS_REWARD_SCALE="${SUCCESS_REWARD_SCALE:-0.0}"
+export STEP_PENALTY="${STEP_PENALTY:-0.0}"
+export CLEARANCE_PENALTY_SCALE="${CLEARANCE_PENALTY_SCALE:-0.0}"
+export TEACHER_MODE_OVERRIDE="${TEACHER_MODE_OVERRIDE:-clearance_or_progress}"
+export TEACHER_PROGRESS_SCORE_MODE="${TEACHER_PROGRESS_SCORE_MODE:-euclidean}"
+export TEACHER_PROGRESS_BAD_STEPS="${TEACHER_PROGRESS_BAD_STEPS:-3}"
+export TEACHER_PROGRESS_GOOD_STEPS="${TEACHER_PROGRESS_GOOD_STEPS:-5}"
+export TEACHER_PROGRESS_EPSILON="${TEACHER_PROGRESS_EPSILON:-0.001}"
+export TEACHER_OVERRIDE_CLEARANCE_THRESHOLD="${TEACHER_OVERRIDE_CLEARANCE_THRESHOLD:-0.08}"
+export TEACHER_OVERRIDE_CLEARANCE_EXIT_THRESHOLD="${TEACHER_OVERRIDE_CLEARANCE_EXIT_THRESHOLD:-0.12}"
+export EVAL_INTERVAL="${EVAL_INTERVAL:-10000}"
+export SAVE_INTERVAL="${SAVE_INTERVAL:-10000}"
+export DISABLE_POLICY_VIZ="${DISABLE_POLICY_VIZ:-1}"
+
+case "$VARIANT" in
+  pref_only)
+    export RUN_TS="${RUN_TS:-$(date +%Y%m%d_%H%M%S)_flowsec_prefonly_60k}"
+    export ACTOR_BC_WEIGHT=0.0
+    export ACTOR_BC_ONLY_UNTIL_STEP=0
+    export PREF_RANK_WEIGHT=1.0
+    export PREF_SAMPLE_RATIO=0.5
+    export PREF_LAMBDA_INIT="${PREF_LAMBDA_INIT:-1.0}"
+    export PREF_LAMBDA_LR="${PREF_LAMBDA_LR:-0.001}"
+    ;;
+  bc_only)
+    export RUN_TS="${RUN_TS:-$(date +%Y%m%d_%H%M%S)_flowsec_bconly_60k}"
+    export ACTOR_BC_WEIGHT="${ACTOR_BC_WEIGHT:-1.0}"
+    export ACTOR_BC_ONLY_UNTIL_STEP="$STEPS"
+    export PREF_RANK_WEIGHT=0.0
+    export PREF_SAMPLE_RATIO=0.0
+    ;;
+  bc_pref)
+    export RUN_TS="${RUN_TS:-$(date +%Y%m%d_%H%M%S)_flowsec_bcpref_60k}"
+    export ACTOR_BC_WEIGHT="${ACTOR_BC_WEIGHT:-1.0}"
+    export ACTOR_BC_ONLY_UNTIL_STEP=0
+    export PREF_RANK_WEIGHT=1.0
+    export PREF_SAMPLE_RATIO=0.5
+    export PREF_LAMBDA_INIT="${PREF_LAMBDA_INIT:-1.0}"
+    export PREF_LAMBDA_LR="${PREF_LAMBDA_LR:-0.001}"
+    ;;
+  bc_pref_aux)
+    export RUN_TS="${RUN_TS:-$(date +%Y%m%d_%H%M%S)_flowsec_bcpref_aux_60k}"
+    export ACTOR_BC_WEIGHT="${ACTOR_BC_WEIGHT:-1.0}"
+    export ACTOR_BC_ONLY_UNTIL_STEP=0
+    export PREF_RANK_WEIGHT=1.0
+    export PREF_SAMPLE_RATIO=0.5
+    export PREF_LAMBDA_INIT="${PREF_LAMBDA_INIT:-1.0}"
+    export PREF_LAMBDA_LR="${PREF_LAMBDA_LR:-0.001}"
+    export INTERVENTION_AUX_HEAD=1
+    export INTERVENTION_AUX_WEIGHT="${INTERVENTION_AUX_WEIGHT:-0.25}"
+    export INTERVENTION_AUX_POS_WEIGHT="${INTERVENTION_AUX_POS_WEIGHT:-2.0}"
+    ;;
+  bc_pref_aux_pretrain)
+    export RUN_TS="${RUN_TS:-$(date +%Y%m%d_%H%M%S)_flowsec_bcpref_auxpretrain_60k}"
+    export ACTOR_BC_WEIGHT="${ACTOR_BC_WEIGHT:-1.0}"
+    export ACTOR_BC_ONLY_UNTIL_STEP=0
+    export PREF_RANK_WEIGHT=1.0
+    export PREF_SAMPLE_RATIO=0.5
+    export PREF_LAMBDA_INIT="${PREF_LAMBDA_INIT:-1.0}"
+    export PREF_LAMBDA_LR="${PREF_LAMBDA_LR:-0.001}"
+    export INTERVENTION_AUX_HEAD=1
+    export INTERVENTION_AUX_WEIGHT="${INTERVENTION_AUX_WEIGHT:-0.25}"
+    export INTERVENTION_AUX_POS_WEIGHT="${INTERVENTION_AUX_POS_WEIGHT:-1.0}"
+    export PREFILL_DEMO_EPISODES="${PREFILL_DEMO_EPISODES:-80}"
+    export PREFILL_MAX_STEPS_PER_EPISODE="${PREFILL_MAX_STEPS_PER_EPISODE:-300}"
+    export PREFILL_POLICY="${PREFILL_POLICY:-student}"
+    export INTERVENTION_AUX_PRETRAIN_UPDATES="${INTERVENTION_AUX_PRETRAIN_UPDATES:-2000}"
+    export INTERVENTION_AUX_PRETRAIN_BATCH_SIZE="${INTERVENTION_AUX_PRETRAIN_BATCH_SIZE:-256}"
+    export INTERVENTION_AUX_PRETRAIN_DISTILL_WEIGHT="${INTERVENTION_AUX_PRETRAIN_DISTILL_WEIGHT:-1.0}"
+    export INTERVENTION_AUX_PRETRAIN_LR="${INTERVENTION_AUX_PRETRAIN_LR:-0.0003}"
+    ;;
+  *)
+    echo "Unknown variant: $VARIANT" >&2
+    exit 2
+    ;;
+esac
+
+exec "$BASE" scriptedgeo_reward

@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="/home/benjamin/thesis"
+BASE="$ROOT/scripts/generated/run_safetycar_thesis_method_intervention_20260518.sh"
+MODE="${1:?mode required: bc1|bc3_lidar|bconly10k|guarded_bc1|demo_guard_bc1|demo_guard_bc1_resetnorm|stored_demo_bconly20k|fullteacher_stored_demo_bconly20k|fullteacher_stored_demo_bconly10k_fast|truefullteacher_stored_demo_bconly10k_fast|truefullteacher_stored_demo_bconly20k_fast|truefullteacher_weightedbc10k|rich_stored_demo_bconly20k|rich_stored_demo_bconly10k_fast}"
+case "$MODE" in
+  bc1)
+    export RUN_TS="${RUN_TS:-$(date +%Y%m%d_%H%M%S)_bc1}"
+    export ACTOR_BC_WEIGHT="1.0"
+    export PREF_RANK_WEIGHT="0.5"
+    export TEACHER_PROGRESS_BAD_STEPS="3"
+    export TEACHER_PROGRESS_GOOD_STEPS="5"
+    ;;
+  bc3_lidar)
+    export RUN_TS="${RUN_TS:-$(date +%Y%m%d_%H%M%S)_bc3lidar}"
+    export ACTOR_BC_WEIGHT="3.0"
+    export ACTOR_BC_OBSTACLE_LIDAR_WEIGHT_SCALE="2.0"
+    export ACTOR_BC_GOAL_BLOCK_WEIGHT_SCALE="2.0"
+    export PREF_RANK_WEIGHT="0.25"
+    export TEACHER_PROGRESS_BAD_STEPS="2"
+    export TEACHER_PROGRESS_GOOD_STEPS="6"
+    ;;
+  bconly10k)
+    export RUN_TS="${RUN_TS:-$(date +%Y%m%d_%H%M%S)_bconly10k}"
+    export ACTOR_BC_WEIGHT="1.0"
+    export ACTOR_BC_ONLY_UNTIL_STEP="10000"
+    export PREF_RANK_WEIGHT="0.0"
+    export PREF_SAMPLE_RATIO="0.0"
+    export TEACHER_PROGRESS_BAD_STEPS="2"
+    export TEACHER_PROGRESS_GOOD_STEPS="6"
+    ;;
+  guarded_bc1)
+    export RUN_TS="${RUN_TS:-$(date +%Y%m%d_%H%M%S)_guardbc1}"
+    export ACTOR_BC_WEIGHT="1.0"
+    export PREF_RANK_WEIGHT="0.25"
+    export TEACHER_PROGRESS_BAD_STEPS="2"
+    export TEACHER_PROGRESS_GOOD_STEPS="6"
+    export TEACHER_OVERRIDE_CLEARANCE_THRESHOLD="0.05"
+    export TEACHER_OVERRIDE_CLEARANCE_EXIT_THRESHOLD="0.12"
+    ;;
+  demo_guard_bc1)
+    export RUN_TS="${RUN_TS:-$(date +%Y%m%d_%H%M%S)_demoguardbc1}"
+    export ACTOR_BC_WEIGHT="1.0"
+    export PREF_RANK_WEIGHT="0.25"
+    export DEMO_SAMPLE_RATIO="0.5"
+    export PREFILL_DEMO_EPISODES="20"
+    export DEMO_PRETRAIN_UPDATES="500"
+    export TEACHER_PROGRESS_BAD_STEPS="2"
+    export TEACHER_PROGRESS_GOOD_STEPS="6"
+    export TEACHER_OVERRIDE_CLEARANCE_THRESHOLD="0.05"
+    export TEACHER_OVERRIDE_CLEARANCE_EXIT_THRESHOLD="0.12"
+    ;;
+  demo_guard_bc1_resetnorm)
+    export RUN_TS="${RUN_TS:-$(date +%Y%m%d_%H%M%S)_demoguardbc1_resetnorm}"
+    export ACTOR_BC_WEIGHT="1.0"
+    export PREF_RANK_WEIGHT="0.25"
+    export DEMO_SAMPLE_RATIO="0.5"
+    export PREFILL_DEMO_EPISODES="20"
+    export DEMO_PRETRAIN_UPDATES="500"
+    export TEACHER_PROGRESS_BAD_STEPS="2"
+    export TEACHER_PROGRESS_GOOD_STEPS="6"
+    export TEACHER_OVERRIDE_CLEARANCE_THRESHOLD="0.05"
+    export TEACHER_OVERRIDE_CLEARANCE_EXIT_THRESHOLD="0.12"
+    export NO_LOAD_OBS_NORMALIZER_FROM_CHECKPOINT="1"
+    ;;
+  stored_demo_bconly20k)
+    export RUN_TS="${RUN_TS:-$(date +%Y%m%d_%H%M%S)_storeddemo_bconly20k}"
+    export STEPS="${STEPS:-60000}"
+    export ACTOR_BC_WEIGHT="3.0"
+    export ACTOR_BC_ONLY_UNTIL_STEP="20000"
+    export PREF_RANK_WEIGHT="0.0"
+    export PREF_SAMPLE_RATIO="0.0"
+    export DEMO_SAMPLE_RATIO="0.5"
+    export PREFILL_DEMO_EPISODES="50"
+    export DEMO_PRETRAIN_UPDATES="2000"
+    export STORE_INTERVENED_IN_DEMO_BUFFER="1"
+    export TEACHER_PROGRESS_BAD_STEPS="2"
+    export TEACHER_PROGRESS_GOOD_STEPS="6"
+    export TEACHER_OVERRIDE_CLEARANCE_THRESHOLD="0.05"
+    export TEACHER_OVERRIDE_CLEARANCE_EXIT_THRESHOLD="0.12"
+    ;;
+  fullteacher_stored_demo_bconly20k)
+    export RUN_TS="${RUN_TS:-$(date +%Y%m%d_%H%M%S)_fullteacher_storeddemo_bconly20k}"
+    export STEPS="${STEPS:-60000}"
+    export ACTOR_BC_WEIGHT="3.0"
+    export ACTOR_BC_ONLY_UNTIL_STEP="20000"
+    export PREF_RANK_WEIGHT="0.0"
+    export PREF_SAMPLE_RATIO="0.0"
+    export DEMO_SAMPLE_RATIO="0.5"
+    export PREFILL_DEMO_EPISODES="50"
+    export DEMO_PRETRAIN_UPDATES="2000"
+    export STORE_INTERVENED_IN_DEMO_BUFFER="1"
+    export TEACHER_PROGRESS_BAD_STEPS="2"
+    export TEACHER_PROGRESS_GOOD_STEPS="6"
+    ;;
+  fullteacher_stored_demo_bconly10k_fast)
+    export RUN_TS="${RUN_TS:-$(date +%Y%m%d_%H%M%S)_fullteacher_storeddemo_bconly10kfast}"
+    export STEPS="${STEPS:-30000}"
+    export ACTOR_BC_WEIGHT="3.0"
+    export ACTOR_BC_ONLY_UNTIL_STEP="10000"
+    export PREF_RANK_WEIGHT="0.0"
+    export PREF_SAMPLE_RATIO="0.0"
+    export DEMO_SAMPLE_RATIO="0.5"
+    export PREFILL_DEMO_EPISODES="10"
+    export DEMO_PRETRAIN_UPDATES="1000"
+    export STORE_INTERVENED_IN_DEMO_BUFFER="1"
+    export TEACHER_PROGRESS_BAD_STEPS="2"
+    export TEACHER_PROGRESS_GOOD_STEPS="6"
+    ;;
+  truefullteacher_stored_demo_bconly10k_fast)
+    export RUN_TS="${RUN_TS:-$(date +%Y%m%d_%H%M%S)_truefullteacher_storeddemo_bconly10kfast}"
+    export STEPS="${STEPS:-30000}"
+    export TEACHER_MODE_OVERRIDE="clearance"
+    export ACTOR_BC_WEIGHT="3.0"
+    export ACTOR_BC_ONLY_UNTIL_STEP="10000"
+    export PREF_RANK_WEIGHT="0.0"
+    export PREF_SAMPLE_RATIO="0.0"
+    export DEMO_SAMPLE_RATIO="0.5"
+    export PREFILL_DEMO_EPISODES="10"
+    export DEMO_PRETRAIN_UPDATES="1000"
+    export STORE_INTERVENED_IN_DEMO_BUFFER="1"
+    ;;
+  truefullteacher_stored_demo_bconly20k_fast)
+    export RUN_TS="${RUN_TS:-$(date +%Y%m%d_%H%M%S)_truefullteacher_storeddemo_bconly20kfast}"
+    export STEPS="${STEPS:-40000}"
+    export TEACHER_MODE_OVERRIDE="clearance"
+    export ACTOR_BC_WEIGHT="3.0"
+    export ACTOR_BC_ONLY_UNTIL_STEP="20000"
+    export PREF_RANK_WEIGHT="0.0"
+    export PREF_SAMPLE_RATIO="0.0"
+    export DEMO_SAMPLE_RATIO="0.5"
+    export PREFILL_DEMO_EPISODES="20"
+    export DEMO_PRETRAIN_UPDATES="2000"
+    export STORE_INTERVENED_IN_DEMO_BUFFER="1"
+    ;;
+  truefullteacher_weightedbc10k)
+    export RUN_TS="${RUN_TS:-$(date +%Y%m%d_%H%M%S)_truefullteacher_weightedbc10k}"
+    export STEPS="${STEPS:-30000}"
+    export TEACHER_MODE_OVERRIDE="clearance"
+    export ACTOR_BC_WEIGHT="5.0"
+    export ACTOR_BC_ONLY_UNTIL_STEP="10000"
+    export ACTOR_BC_OBSTACLE_LIDAR_WEIGHT_SCALE="5.0"
+    export ACTOR_BC_GOAL_BLOCK_WEIGHT_SCALE="5.0"
+    export PREF_RANK_WEIGHT="0.0"
+    export PREF_SAMPLE_RATIO="0.0"
+    export DEMO_SAMPLE_RATIO="0.5"
+    export PREFILL_DEMO_EPISODES="10"
+    export DEMO_PRETRAIN_UPDATES="1000"
+    export STORE_INTERVENED_IN_DEMO_BUFFER="1"
+    ;;
+  rich_stored_demo_bconly20k)
+    export RUN_TS="${RUN_TS:-$(date +%Y%m%d_%H%M%S)_rich_storeddemo_bconly20k}"
+    export STEPS="${STEPS:-60000}"
+    export NO_INIT_CHECKPOINT="1"
+    export OBS_MASK_MODE="privileged_geometry_rich"
+    export ACTOR_BC_WEIGHT="3.0"
+    export ACTOR_BC_ONLY_UNTIL_STEP="20000"
+    export PREF_RANK_WEIGHT="0.0"
+    export PREF_SAMPLE_RATIO="0.0"
+    export DEMO_SAMPLE_RATIO="0.5"
+    export PREFILL_DEMO_EPISODES="50"
+    export DEMO_PRETRAIN_UPDATES="2000"
+    export STORE_INTERVENED_IN_DEMO_BUFFER="1"
+    export TEACHER_PROGRESS_BAD_STEPS="2"
+    export TEACHER_PROGRESS_GOOD_STEPS="6"
+    export TEACHER_OVERRIDE_CLEARANCE_THRESHOLD="0.05"
+    export TEACHER_OVERRIDE_CLEARANCE_EXIT_THRESHOLD="0.12"
+    ;;
+  rich_stored_demo_bconly10k_fast)
+    export RUN_TS="${RUN_TS:-$(date +%Y%m%d_%H%M%S)_rich_storeddemo_bconly10kfast}"
+    export STEPS="${STEPS:-30000}"
+    export NO_INIT_CHECKPOINT="1"
+    export OBS_MASK_MODE="privileged_geometry_rich"
+    export DISABLE_POLICY_VIZ="1"
+    export ACTOR_BC_WEIGHT="3.0"
+    export ACTOR_BC_ONLY_UNTIL_STEP="10000"
+    export PREF_RANK_WEIGHT="0.0"
+    export PREF_SAMPLE_RATIO="0.0"
+    export DEMO_SAMPLE_RATIO="0.5"
+    export PREFILL_DEMO_EPISODES="10"
+    export DEMO_PRETRAIN_UPDATES="1000"
+    export STORE_INTERVENED_IN_DEMO_BUFFER="1"
+    export TEACHER_PROGRESS_BAD_STEPS="2"
+    export TEACHER_PROGRESS_GOOD_STEPS="6"
+    export TEACHER_OVERRIDE_CLEARANCE_THRESHOLD="0.05"
+    export TEACHER_OVERRIDE_CLEARANCE_EXIT_THRESHOLD="0.12"
+    ;;
+  *)
+    echo "unknown mode: $MODE" >&2
+    exit 2
+    ;;
+esac
+exec "$BASE" scriptedgeo_reward

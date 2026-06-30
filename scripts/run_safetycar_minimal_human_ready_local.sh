@@ -4,6 +4,11 @@ set -euo pipefail
 ROOT="/home/benjamin/thesis"
 cd "$ROOT"
 
+export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/matplotlib-thesis}"
+export WANDB_CACHE_DIR="${WANDB_CACHE_DIR:-$ROOT/logs/.cache/wandb}"
+export WANDB_CONFIG_DIR="${WANDB_CONFIG_DIR:-$ROOT/logs/.config/wandb}"
+mkdir -p "$MPLCONFIGDIR" "$WANDB_CACHE_DIR" "$WANDB_CONFIG_DIR"
+
 for arg in "$@"; do
   case "$arg" in
     *=*)
@@ -23,6 +28,7 @@ WANDB_MODE="${WANDB_MODE:-online}"
 PROJECT="${PROJECT:-thesis-safetygym}"
 SEED="${SEED:-1}"
 ENV_NAME="${ENV_NAME:-SafetyCarGoal2-v0}"
+DEVICE="${DEVICE:-auto}"
 
 EXP_PREFIX="${EXP_PREFIX:-safetycar_min_human_ready}"
 EXP_NAME="${EXP_NAME:-${EXP_PREFIX}_${TIMESTAMP}}"
@@ -70,6 +76,9 @@ POINT_ACTION_MODE="${POINT_ACTION_MODE:-native}"
 POINT_TURN_GAIN="${POINT_TURN_GAIN:-2.5}"
 POINT_ALIGNMENT_POWER="${POINT_ALIGNMENT_POWER:-1.0}"
 OBS_MASK_MODE="${OBS_MASK_MODE:-none}"
+FIXED_LAYOUT_PRESET="${FIXED_LAYOUT_PRESET:-none}"
+LAYOUT_CURRICULUM="${LAYOUT_CURRICULUM:-none}"
+LAYOUT_CURRICULUM_LEVEL="${LAYOUT_CURRICULUM_LEVEL:-0}"
 MODULE_IMPL="${MODULE_IMPL:-custom}"
 RENDER_MODE="${RENDER_MODE:-none}"
 LOG_INTERVAL="${LOG_INTERVAL:-2000}"
@@ -100,6 +109,11 @@ if [[ "${TERMINATE_ON_GOAL:-0}" == "1" ]]; then
   TERMINATE_ON_GOAL_FLAG="--terminate_on_goal"
 fi
 
+TERMINATE_ON_COST_FLAG=""
+if [[ "${TERMINATE_ON_COST:-0}" == "1" ]]; then
+  TERMINATE_ON_COST_FLAG="--terminate_on_cost"
+fi
+
 USE_LAYER_NORM_FLAG=""
 if [[ "${USE_LAYER_NORM:-0}" == "1" ]]; then
   USE_LAYER_NORM_FLAG="--use_layer_norm"
@@ -108,6 +122,11 @@ fi
 DEMO_DATASET_AUTO_LOAD_FLAG=""
 if [[ "${DEMO_DATASET_AUTO_LOAD:-0}" == "1" ]]; then
   DEMO_DATASET_AUTO_LOAD_FLAG="--demo_dataset_auto_load"
+fi
+
+DEMO_DATASET_CLEAR_TEACHER_FLAGS_FLAG=""
+if [[ "${DEMO_DATASET_CLEAR_TEACHER_FLAGS_IN_REPLAY:-0}" == "1" ]]; then
+  DEMO_DATASET_CLEAR_TEACHER_FLAGS_FLAG="--demo_dataset_clear_teacher_flags_in_replay"
 fi
 
 STORE_INTERVENED_FLAG=""
@@ -195,10 +214,11 @@ fi
   --exp_name "$EXP_NAME" \
   --variant "$VARIANT" \
   --seed "$SEED" \
+  --device "$DEVICE" \
   --render_mode "$RENDER_MODE" \
   --total_timesteps "$TOTAL_TIMESTEPS" \
   --learning_starts "$LEARNING_STARTS" \
-  --batch_size 64 \
+  --batch_size "${BATCH_SIZE:-64}" \
   --num_updates "$NUM_UPDATES" \
   --policy_frequency "$POLICY_FREQUENCY" \
   --gamma "$GAMMA" \
@@ -215,6 +235,15 @@ fi
   --alpha_min "$ALPHA_MIN" \
   --alpha_max "$ALPHA_MAX" \
   --critic_loss_reduction "$CRITIC_LOSS_REDUCTION" \
+  --actor_bc_weight "${ACTOR_BC_WEIGHT:-0.0}" \
+  --actor_bc_reward_weight_scale "${ACTOR_BC_REWARD_WEIGHT_SCALE:-0.0}" \
+  --actor_bc_reward_weight_max "${ACTOR_BC_REWARD_WEIGHT_MAX:-10.0}" \
+  --actor_bc_obstacle_lidar_weight_scale "${ACTOR_BC_OBSTACLE_LIDAR_WEIGHT_SCALE:-0.0}" \
+  --actor_bc_obstacle_lidar_weight_max "${ACTOR_BC_OBSTACLE_LIDAR_WEIGHT_MAX:-10.0}" \
+  --actor_bc_goal_block_weight_scale "${ACTOR_BC_GOAL_BLOCK_WEIGHT_SCALE:-0.0}" \
+  --actor_bc_goal_block_weight_max "${ACTOR_BC_GOAL_BLOCK_WEIGHT_MAX:-10.0}" \
+  --actor_bc_only_until_step "${ACTOR_BC_ONLY_UNTIL_STEP:-0}" \
+  --actor_bc_only_pretrain_updates "${ACTOR_BC_ONLY_PRETRAIN_UPDATES:-0}" \
   "$OBS_NORM_FLAG" \
   --reward_mode "$REWARD_MODE" \
   --dense_reward_scale "$DENSE_REWARD_SCALE" \
@@ -248,8 +277,12 @@ fi
   --point_turn_gain "$POINT_TURN_GAIN" \
   --point_alignment_power "$POINT_ALIGNMENT_POWER" \
   --obs_mask_mode "$OBS_MASK_MODE" \
+  --fixed_layout_preset "$FIXED_LAYOUT_PRESET" \
+  --layout_curriculum "$LAYOUT_CURRICULUM" \
+  --layout_curriculum_level "$LAYOUT_CURRICULUM_LEVEL" \
   --max_episode_steps "${MAX_EPISODE_STEPS:-0}" \
   $TERMINATE_ON_GOAL_FLAG \
+  $TERMINATE_ON_COST_FLAG \
   "$SCALE_FLAG" \
   "$RESEED_FLAG" \
   $INTERVENTION_FLAG \
@@ -262,6 +295,9 @@ fi
   --teacher_override_mode "${TEACHER_OVERRIDE_MODE:-clearance}" \
   --teacher_goal_progress_steps "${TEACHER_GOAL_PROGRESS_STEPS:-3}" \
   --teacher_goal_progress_epsilon "${TEACHER_GOAL_PROGRESS_EPSILON:-0.001}" \
+  --teacher_progress_bad_steps "${TEACHER_PROGRESS_BAD_STEPS:-3}" \
+  --teacher_progress_good_steps "${TEACHER_PROGRESS_GOOD_STEPS:-5}" \
+  --teacher_progress_epsilon "${TEACHER_PROGRESS_EPSILON:-0.0001}" \
   --controller_fps_limit "${CONTROLLER_FPS_LIMIT:-0}" \
   --controller_overlay_hz "${CONTROLLER_OVERLAY_HZ:-20.0}" \
   --gamepad_mode "${GAMEPAD_MODE:-local}" \
@@ -275,6 +311,7 @@ fi
   --expert_config_path "${EXPERT_CONFIG_PATH:-}" \
   --expert_safe_checkpoint_path "${EXPERT_SAFE_CHECKPOINT_PATH:-}" \
   --expert_switch_clearance_threshold "${EXPERT_SWITCH_CLEARANCE_THRESHOLD:-0.08}" \
+  --learned_intervention_threshold "${LEARNED_INTERVENTION_THRESHOLD:-0.5}" \
   --expert_device "${EXPERT_DEVICE:-cpu}" \
   --pref_capacity "${PREF_CAPACITY:-100000}" \
   --pref_sampling_mode "${PREF_SAMPLING_MODE:-linked}" \
@@ -301,6 +338,7 @@ fi
   $DEMO_DATASET_AUTO_LOAD_FLAG \
   --demo_dataset_target "${DEMO_DATASET_TARGET:-variant}" \
   --demo_dataset_max_rows "${DEMO_DATASET_MAX_ROWS:-0}" \
+  $DEMO_DATASET_CLEAR_TEACHER_FLAGS_FLAG \
   --demo_pretrain_updates "${DEMO_PRETRAIN_UPDATES:-0}" \
   --demo_pretrain_batch_size "${DEMO_PRETRAIN_BATCH_SIZE:-0}" \
   $CRITIC_RESET_FLAG \
@@ -323,6 +361,21 @@ fi
   --export_final_replay_dataset_path "${EXPORT_FINAL_REPLAY_DATASET_PATH:-}" \
   $EXPORT_DEMO_FLAG \
   --export_final_demo_dataset_path "${EXPORT_FINAL_DEMO_DATASET_PATH:-}" \
+  ${BC_EVAL_HOTKEY_FLAG:-} \
+  --bc_eval_interval "${BC_EVAL_INTERVAL:-0}" \
+  --bc_eval_epochs "${BC_EVAL_EPOCHS:-10}" \
+  --bc_eval_batch_size "${BC_EVAL_BATCH_SIZE:-256}" \
+  --bc_eval_context_len "${BC_EVAL_CONTEXT_LEN:-8}" \
+  --bc_eval_hidden_dim "${BC_EVAL_HIDDEN_DIM:-256}" \
+  --bc_eval_num_layers "${BC_EVAL_NUM_LAYERS:-3}" \
+  --bc_eval_intervention_threshold "${BC_EVAL_INTERVENTION_THRESHOLD:-0.5}" \
+  --bc_eval_num_episodes "${BC_EVAL_NUM_EPISODES:-3}" \
+  --bc_eval_render_mode "${BC_EVAL_RENDER_MODE:-pygame}" \
+  --bc_eval_fps "${BC_EVAL_FPS:-30}" \
+  --bc_eval_device "${BC_EVAL_DEVICE:-cpu}" \
+  --bc_eval_student_policy "${BC_EVAL_STUDENT_POLICY:-checkpoint}" \
+  --bc_eval_student_checkpoint_path "${BC_EVAL_STUDENT_CHECKPOINT_PATH:-}" \
+  --bc_eval_dataset_label "${BC_EVAL_DATASET_LABEL:-hotkey_human_intervention_replay}" \
   --log_interval "$LOG_INTERVAL" \
   --eval_interval "$CHECKPOINT_INTERVAL" \
   --num_eval_episodes "$NUM_EVAL_EPISODES" \

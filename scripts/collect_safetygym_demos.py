@@ -26,7 +26,7 @@ from safetygym_utils.gamepad import (
 )
 from safetygym_utils.env import clip_action_to_space, make_safety_env, resolve_control_scheme
 from safetygym_utils.rendering import build_external_viewer, resolve_env_render_mode, wants_external_viewer
-from safetygym_utils.wrappers import RewardModeWrapper
+from safetygym_utils.wrappers import FixedSafetyLayoutWrapper, RewardModeWrapper, SafetyLayoutCurriculumWrapper, TerminateOnGoalWrapper
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -40,13 +40,40 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--car_wheel_command_limit", type=float, default=2.0)
     p.add_argument("--car_force_scale", type=float, default=2.0)
     p.add_argument("--car_action_mode", type=str, default="raw_wheels", choices=["raw_wheels", "throttle_turn", "cardinal"])
+    p.add_argument(
+        "--obs_mask_mode",
+        type=str,
+        default="none",
+        choices=["none", "goal_only_lidar", "privileged_geometry", "privileged_geometry_rich"],
+    )
     p.add_argument("--max_episode_steps", type=int, default=0)
     p.add_argument("--reward_mode", type=str, default="sparse", choices=["sparse", "dense", "dense_plus_sparse", "native", "none"])
     p.add_argument("--dense_reward_scale", type=float, default=1.0)
+    p.add_argument("--success_reward_scale", type=float, default=1.0)
     p.add_argument("--step_penalty", type=float, default=0.0)
+    p.add_argument("--clearance_penalty_scale", type=float, default=0.0)
+    p.add_argument("--clearance_margin", type=float, default=0.0)
+    p.add_argument("--clearance_penalty_power", type=float, default=1.0)
+    p.add_argument("--clearance_penalty_mode", type=str, default="hinge_power", choices=["hinge_power", "softplus"])
+    p.add_argument("--clearance_penalty_temperature", type=float, default=0.08)
+    p.add_argument("--terminate_on_goal", action="store_true", default=False)
+    p.add_argument(
+        "--fixed_layout_preset",
+        type=str,
+        default="none",
+        choices=["none", "car_center_block", "point_center_block", "point_wall_gap"],
+    )
+    p.add_argument(
+        "--layout_curriculum",
+        type=str,
+        default="none",
+        choices=["none", "car_block_bridge", "car_block_progression", "car_random_blocked_filter"],
+    )
+    p.add_argument("--layout_curriculum_level", type=int, default=0)
     p.add_argument("--num_episodes", type=int, default=10)
+    p.add_argument("--max_steps", type=int, default=0)
     p.add_argument("--fps", type=int, default=30)
-    p.add_argument("--human_input_device", type=str, default="gamepad", choices=["keyboard", "gamepad"])
+    p.add_argument("--human_input_device", type=str, default="gamepad", choices=["keyboard", "gamepad", "scripted", "scripted_geo"])
     p.add_argument("--human_action_scale", type=float, default=1.0)
     p.add_argument("--controller_fps_limit", type=int, default=0)
     p.add_argument("--controller_overlay_hz", type=float, default=20.0)
@@ -75,18 +102,39 @@ def main() -> int:
         car_wheel_command_limit=args.car_wheel_command_limit,
         car_force_scale=args.car_force_scale,
         car_action_mode=args.car_action_mode,
+        obs_mask_mode=str(args.obs_mask_mode),
         seed=args.seed,
     )
+    if str(args.fixed_layout_preset).strip().lower() != "none":
+        env = FixedSafetyLayoutWrapper(env, preset=str(args.fixed_layout_preset))
+    if str(args.layout_curriculum).strip().lower() != "none":
+        env = SafetyLayoutCurriculumWrapper(
+            env,
+            curriculum=str(args.layout_curriculum),
+            level=int(args.layout_curriculum_level),
+        )
     env = RewardModeWrapper(
         env,
         reward_mode=args.reward_mode,
         dense_reward_scale=args.dense_reward_scale,
+        success_reward_scale=float(args.success_reward_scale),
         step_penalty=args.step_penalty,
+        clearance_penalty_scale=float(args.clearance_penalty_scale),
+        clearance_margin=float(args.clearance_margin),
+        clearance_penalty_power=float(args.clearance_penalty_power),
+        clearance_penalty_mode=str(args.clearance_penalty_mode),
+        clearance_penalty_temperature=float(args.clearance_penalty_temperature),
     )
+    if bool(args.terminate_on_goal):
+        env = TerminateOnGoalWrapper(env)
     act_dim = int(np.prod(env.action_space.shape))
+    obs_dim = int(np.prod(env.observation_space.shape))
+    action_low = np.asarray(env.action_space.low, dtype=np.float32).reshape(-1)
+    action_high = np.asarray(env.action_space.high, dtype=np.float32).reshape(-1)
     controller = build_human_controller(
         input_device=str(args.human_input_device),
         action_dim=act_dim,
+        obs_dim=obs_dim,
         env_name=args.env_name,
         action_scale=float(args.human_action_scale),
         wheel_command_limit=float(args.car_wheel_command_limit),
@@ -100,6 +148,8 @@ def main() -> int:
         gamepad_config_path=args.gamepad_config_path,
         gamepad_use_saved_config=bool(args.gamepad_use_saved_config),
         gamepad_device_index=int(args.gamepad_device_index),
+        action_low=action_low,
+        action_high=action_high,
         prefer_separate_keyboard_window=wants_external_viewer(args.render_mode),
         control_scheme_override=resolve_control_scheme(args.env_name, car_action_mode=args.car_action_mode),
     )
@@ -113,6 +163,8 @@ def main() -> int:
     cost_rows = []
     student_rows = []
     intervened_rows = []
+    episode_id_rows = []
+    episode_step_rows = []
     viewer = build_external_viewer(
         render_mode=args.render_mode,
         title=f"SafetyGym Demo Collect {args.env_name}",
@@ -125,10 +177,29 @@ def main() -> int:
     if viewer is not None:
         viewer.draw_env(env)
     episodes = 0
+    episode_steps = 0
     steps = 0
     try:
-        while episodes < int(args.num_episodes):
-            action = controller.get_action().astype(np.float32)
+        while episodes < int(args.num_episodes) and (
+            int(getattr(args, "max_steps", 0)) <= 0 or steps < int(args.max_steps)
+        ):
+            while hasattr(controller, "is_paused") and bool(controller.is_paused()):
+                try:
+                    controller.get_action(obs=obs, env=env)
+                except TypeError:
+                    try:
+                        controller.get_action(obs=obs)
+                    except TypeError:
+                        controller.get_action()
+                time.sleep(0.05)
+            try:
+                action_raw = controller.get_action(obs=obs, env=env)
+            except TypeError:
+                try:
+                    action_raw = controller.get_action(obs=obs)
+                except TypeError:
+                    action_raw = controller.get_action()
+            action = np.asarray(action_raw, dtype=np.float32)
             action = clip_action_to_space(action, env.action_space)
             next_obs, reward, cost, terminated, truncated, _info = env.step(action)
             next_obs = np.asarray(next_obs, dtype=np.float32).reshape(-1)
@@ -143,9 +214,15 @@ def main() -> int:
             cost_rows.append(float(cost))
             student_rows.append(np.zeros_like(action, dtype=np.float32))
             intervened_rows.append(True)
+            if hasattr(controller, "set_intervention_status"):
+                controller.set_intervention_status(active=True, probability=None)
+            episode_id_rows.append(int(episodes))
+            episode_step_rows.append(int(episode_steps))
             steps += 1
+            episode_steps += 1
             if terminated or truncated:
                 episodes += 1
+                episode_steps = 0
                 print(f"episode={episodes} collected_steps={steps}", flush=True)
                 obs, _ = env.reset(seed=args.seed + episodes)
                 obs = np.asarray(obs, dtype=np.float32).reshape(-1)
@@ -178,6 +255,7 @@ def main() -> int:
         "surface_mode": args.surface_mode,
         "reward_mode": args.reward_mode,
         "num_episodes_requested": int(args.num_episodes),
+        "max_steps_requested": int(getattr(args, "max_steps", 0)),
         "num_episodes_collected": int(episodes),
         "num_steps_collected": int(len(obs_rows)),
     }
@@ -193,6 +271,8 @@ def main() -> int:
         costs=np.asarray(cost_rows, dtype=np.float32),
         student_actions=np.asarray(student_rows, dtype=np.float32),
         teacher_intervened=np.asarray(intervened_rows, dtype=np.bool_),
+        episode_ids=np.asarray(episode_id_rows, dtype=np.int64),
+        episode_steps=np.asarray(episode_step_rows, dtype=np.int64),
     )
     print(json.dumps({"dataset_path": str(path), "rows": len(obs_rows), "episodes": episodes}, sort_keys=True), flush=True)
     return 0
