@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import json
 import time
@@ -15,16 +16,25 @@ import torch
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
-from safetygym_utils.controllers import build_human_controller
+from safetygym_utils.controllers import (
+    LearnedGateScriptedGeometricTeacherController,
+    LearnedInterventionPolicyController,
+    build_human_controller,
+)
 from safetygym_utils.gamepad import (
     DEFAULT_SAFETY_GAMEPAD_CACHE_PATH,
     DEFAULT_SAFETY_GAMEPAD_CONFIG_PATH,
     DEFAULT_SAFETY_GAMEPAD_PORT,
 )
-from safetygym_utils.env import clip_action_to_space, extract_goal_distance, extract_step_limit, make_safety_env, resolve_control_scheme, scale_action_np
-from safetygym_utils.io import load_args_json, maybe_find_args_json_from_model
+from safetygym_utils.env import clip_action_to_space, extract_agent_xy, extract_goal_distance, extract_goal_xy, extract_step_limit, make_safety_env, resolve_control_scheme, scale_action_np
+from safetygym_utils.eval_manifest import save_eval_manifest
+from safetygym_utils.heading_policy import load_heading_policy
+from safetygym_utils.io import load_args_json, maybe_find_args_json_from_model, save_args_json
+from safetygym_utils.knn_policy import load_knn_policy
+from safetygym_utils.maneuver_policy import load_maneuver_policy
 from safetygym_utils.metrics import EpisodeWindow, augment_rollout_summary, classify_outcome
 from safetygym_utils.policy_viz import (
+    _body_xy_and_yaw,
     _extract_bounds,
     _extract_overlay_specs,
     plot_episode_contact_sheet,
@@ -32,7 +42,18 @@ from safetygym_utils.policy_viz import (
 )
 from safetygym_utils.rendering import build_external_viewer, resolve_env_render_mode, wants_external_viewer
 from safetygym_utils.sac import SafetyActor
-from safetygym_utils.wrappers import HumanInterventionWrapper, RewardModeWrapper, TerminateOnGoalWrapper
+from safetygym_utils.wrappers import (
+    FixedSafetyLayoutWrapper,
+    FootprintCostWrapper,
+    FrameStackObservationWrapper,
+    HumanInterventionWrapper,
+    RewardModeWrapper,
+    SafetyLayoutSeedReplayWrapper,
+    SafetyLayoutCurriculumWrapper,
+    TerminateOnCostWrapper,
+    TerminateOnGoalWrapper,
+    parse_layout_seed_replay,
+)
 
 _FAST_SAC_PATH = Path(__file__).resolve().parent / "fasttd3" / "fast_sac"
 if _FAST_SAC_PATH.exists():
@@ -140,6 +161,19 @@ class EvalTelemetryPanel:
             "distance": float(info.get("goal_distance", float("nan"))),
             "distance_prev": float(info.get("goal_distance_prev", float("nan"))),
             "goal_met": 1.0 if bool(info.get("goal_met", False)) else 0.0,
+            "teacher_intervened": 1.0 if bool(info.get("teacher_intervened", False)) else 0.0,
+            "teacher_gate_active": 1.0 if bool(info.get("teacher_gate_active", False)) else 0.0,
+            "teacher_progress_score": float(info.get("teacher_progress_score", float("nan"))),
+            "teacher_progress_decoupled": float(info.get("teacher_progress_score_decoupled", 0.0)),
+            "teacher_progress_clearance_potential": float(info.get("teacher_progress_clearance_potential", float("nan"))),
+            "teacher_progress_score_mode_id": (
+                2.0
+                if str(info.get("teacher_progress_score_mode", "")) == "potential_field"
+                else (1.0 if str(info.get("teacher_progress_score_mode", "")) == "euclidean" else 0.0)
+            ),
+            "teacher_bad_count": float(info.get("teacher_progress_bad_count", 0.0)),
+            "teacher_good_count": float(info.get("teacher_progress_good_count", 0.0)),
+            "teacher_clearance": float(info.get("teacher_gate_clearance", float("nan"))),
         }
         if action is not None:
             self._action = np.asarray(action, dtype=np.float32).reshape(-1)
@@ -169,9 +203,12 @@ class EvalTelemetryPanel:
             if event.type == pygame.QUIT:
                 pass
 
-        screen.fill((20, 20, 24))
+        teacher_active = self._current.get("teacher_intervened", 0.0) > 0.5
+        screen.fill((62, 12, 16) if teacher_active else (20, 20, 24))
+        if teacher_active:
+            pygame.draw.rect(screen, (210, 20, 24), (0, 0, self.width, 42))
         lines = [
-            "Reward telemetry",
+            "Reward telemetry - TEACHER INTERVENTION" if teacher_active else "Reward telemetry",
             (
                 f"reward={self._current.get('reward', 0.0):+.4f} "
                 f"dense={self._current.get('dense', 0.0):+.4f} "
@@ -181,6 +218,18 @@ class EvalTelemetryPanel:
                 f"dist={self._current.get('distance', float('nan')):+.4f} "
                 f"prev={self._current.get('distance_prev', float('nan')):+.4f} "
                 f"goal_met={int(self._current.get('goal_met', 0.0) > 0.5)}"
+            ),
+            (
+                f"teacher={int(self._current.get('teacher_intervened', 0.0) > 0.5)} "
+                f"gate={int(self._current.get('teacher_gate_active', 0.0) > 0.5)} "
+                f"score={self._current.get('teacher_progress_score', float('nan')):+.4f} "
+                f"clear={self._current.get('teacher_clearance', float('nan')):+.4f}"
+            ),
+            (
+                f"bad={int(self._current.get('teacher_bad_count', 0.0))} "
+                f"good={int(self._current.get('teacher_good_count', 0.0))} "
+                f"score_mode={int(self._current.get('teacher_progress_score_mode_id', 0.0))} "
+                f"clr_pot={self._current.get('teacher_progress_clearance_potential', float('nan')):+.4f}"
             ),
             f"action={np.array2string(np.asarray(self._action), precision=2)}",
         ]
@@ -401,8 +450,26 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--env_name", type=str, default="SafetyCarGoal2-v0")
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--device", type=str, default="auto")
-    p.add_argument("--controller", type=str, default="policy", choices=["policy", "random", "human", "keyboard", "gamepad", "scripted"])
-    p.add_argument("--policy_format", type=str, default="auto", choices=["auto", "fastsac", "ppo"])
+    p.add_argument(
+        "--controller",
+        type=str,
+        default="policy",
+        choices=[
+            "policy",
+            "random",
+            "human",
+            "keyboard",
+            "gamepad",
+            "scripted",
+            "scripted_goal_geom",
+            "scripted_geo",
+            "scripted_geo_legacy",
+            "scripted_visual_mpc",
+            "imitation",
+            "bc_gate_scripted_geo",
+        ],
+    )
+    p.add_argument("--policy_format", type=str, default="auto", choices=["auto", "fastsac", "ppo", "maneuver_bc", "heading_bc", "knn_bc"])
     p.add_argument("--intervention_mode", type=str, default="none", choices=["none", "human"])
     p.add_argument("--render_mode", type=str, default="human", choices=["human", "rgb_array", "none", "pygame", "topdown"])
     p.add_argument("--viewer_fps", type=float, default=20.0)
@@ -415,7 +482,29 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--point_turn_gain", type=float, default=2.5)
     p.add_argument("--point_alignment_power", type=float, default=1.0)
     p.add_argument("--point_allow_backward", action="store_true", default=False)
-    p.add_argument("--obs_mask_mode", type=str, default="none", choices=["none", "goal_only_lidar"])
+    p.add_argument(
+        "--obs_mask_mode",
+        type=str,
+        default="none",
+        choices=["none", "goal_only_lidar", "privileged_geometry", "privileged_geometry_rich"],
+    )
+    p.add_argument(
+        "--fixed_layout_preset",
+        type=str,
+        default="none",
+        choices=["none", "car_center_block", "car_single_block", "point_center_block", "point_wall_gap"],
+    )
+    p.add_argument(
+        "--layout_curriculum",
+        type=str,
+        default="none",
+        choices=["none", "car_block_bridge", "car_block_progression", "car_random_blocked_filter"],
+    )
+    p.add_argument("--layout_curriculum_level", type=int, default=0)
+    p.add_argument("--layout_seed_replay", type=str, default="")
+    p.add_argument("--layout_seed_replay_prob", type=float, default=0.0)
+    p.add_argument("--layout_seed_replay_mode", type=str, default="cycle", choices=["cycle", "random"])
+    p.add_argument("--obs_frame_stack", type=int, default=1)
     p.add_argument("--max_episode_steps", type=int, default=0)
     p.add_argument("--num_episodes", type=int, default=10)
     p.add_argument("--fps", type=int, default=30)
@@ -432,6 +521,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cost_penalty", type=float, default=0.0)
     p.add_argument("--cost_penalty_warmup_steps", type=int, default=0)
     p.add_argument("--cost_penalty_ramp_steps", type=int, default=0)
+    p.add_argument("--footprint_cost", action="store_true", default=False)
+    p.add_argument("--footprint_cost_mode", type=str, default="visual", choices=["visual", "keepout"])
+    p.add_argument("--footprint_cost_margin", type=float, default=0.0)
+    p.add_argument("--footprint_cost_value", type=float, default=1.0)
     p.add_argument("--clearance_penalty_scale", type=float, default=0.0)
     p.add_argument("--clearance_margin", type=float, default=0.0)
     p.add_argument("--clearance_penalty_power", type=float, default=1.0)
@@ -446,13 +539,92 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no_heading_positive_only", dest="heading_positive_only", action="store_false")
     p.add_argument("--terminate_on_goal", action="store_true", default=False)
     p.add_argument("--no_terminate_on_goal", dest="terminate_on_goal", action="store_false")
+    p.add_argument("--terminate_on_cost", action="store_true", default=False)
+    p.add_argument("--no_terminate_on_cost", dest="terminate_on_cost", action="store_false")
 
     p.add_argument("--intervention_threshold", type=float, default=0.1)
     p.add_argument("--intervention_hold_seconds", type=float, default=0.25)
+    p.add_argument("--teacher_override_clearance_threshold", type=float, default=-1.0)
+    p.add_argument("--teacher_override_clearance_exit_threshold", type=float, default=-1.0)
+    p.add_argument("--teacher_clearance_source", type=str, default="keepout", choices=["keepout", "visual", "footprint", "visual_footprint", "footprint_cost"])
+    p.add_argument(
+        "--teacher_override_mode",
+        type=str,
+        default="clearance",
+        choices=[
+            "clearance",
+            "clearance_projected_release",
+            "clearance_projected_release_or_progress",
+            "teacher_goal_progress",
+            "student_forward_clearance",
+            "student_projected_clearance",
+            "reward_progress",
+            "clearance_or_progress",
+            "pcpo_value_progress",
+            "pcpo_cost_value_progress",
+        ],
+    )
+    p.add_argument("--teacher_goal_progress_steps", type=int, default=3)
+    p.add_argument("--teacher_goal_progress_epsilon", type=float, default=1e-3)
+    p.add_argument("--teacher_progress_bad_steps", type=int, default=3)
+    p.add_argument("--teacher_progress_good_steps", type=int, default=5)
+    p.add_argument("--teacher_progress_epsilon", type=float, default=1e-4)
+    p.add_argument(
+        "--teacher_progress_trigger_mode",
+        type=str,
+        default="worse",
+        choices=["worse", "not_improving", "no_progress", "not_progressing", "no-improve"],
+    )
+    p.add_argument(
+        "--teacher_progress_release_mode",
+        type=str,
+        default="improve",
+        choices=["improve", "non_worse", "not_worse", "not-worse", "stable", "plateau"],
+    )
+    p.add_argument(
+        "--teacher_progress_score_mode",
+        type=str,
+        default="reward_wrapper",
+        choices=["reward_wrapper", "euclidean", "potential_field", "reward", "wrapper", "potential", "clearance", "clearance_potential"],
+    )
+    p.add_argument("--teacher_progress_dense_scale", type=float, default=1.0)
+    p.add_argument("--teacher_progress_clearance_scale", type=float, default=-1.0)
+    p.add_argument("--teacher_progress_clearance_margin", type=float, default=0.0)
+    p.add_argument(
+        "--teacher_progress_clearance_mode",
+        type=str,
+        default="softplus",
+        choices=["softplus", "hinge", "quadratic_hinge", "exp_soft", "hinge_power"],
+    )
+    p.add_argument("--teacher_progress_clearance_temperature", type=float, default=0.001)
+    p.add_argument("--intervention_debug_console", action="store_true", default=False)
     p.add_argument("--human_action_scale", type=float, default=1.0)
-    p.add_argument("--human_input_device", type=str, default="keyboard", choices=["keyboard", "gamepad", "scripted"])
+    p.add_argument(
+        "--human_input_device",
+        type=str,
+        default="keyboard",
+        choices=[
+            "keyboard",
+            "gamepad",
+            "scripted",
+            "scripted_goal_geom",
+            "scripted_geo",
+            "scripted_geo_legacy",
+            "scripted_visual_mpc",
+            "heading_bc",
+            "imitation",
+            "bc_gate_scripted_geo",
+            "flow_imitation",
+        ],
+    )
     p.add_argument("--controller_fps_limit", type=int, default=0)
     p.add_argument("--controller_overlay_hz", type=float, default=20.0)
+    p.add_argument("--scripted_geo_heading_tolerance", type=float, default=0.20)
+    p.add_argument("--scripted_geo_lookahead", type=float, default=1.0)
+    p.add_argument("--scripted_geo_safety_margin", type=float, default=0.18)
+    p.add_argument("--scripted_geo_grid_resolution", type=float, default=0.08)
+    p.add_argument("--scripted_geo_emergency_clearance", type=float, default=0.08)
+    p.add_argument("--scripted_geo_action_shield_steps", type=int, default=1)
     p.add_argument("--gamepad_config_path", type=str, default=str(DEFAULT_SAFETY_GAMEPAD_CONFIG_PATH))
     p.add_argument("--gamepad_mode", type=str, default="local", choices=["local", "connect"])
     p.add_argument("--gamepad_host", type=str, default="")
@@ -462,10 +634,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--gamepad_use_saved_config", action="store_true", default=True)
     p.add_argument("--no_gamepad_use_saved_config", dest="gamepad_use_saved_config", action="store_false")
     p.add_argument("--gamepad_device_index", type=int, default=0)
+    p.add_argument("--imitation_checkpoint_path", type=str, default="")
 
     p.add_argument("--actor_hidden_dim", type=int, default=256)
     p.add_argument("--use_layer_norm", action="store_true", default=False)
     p.add_argument("--layer_norm_eps", type=float, default=1e-5)
+    p.add_argument("--temporal_encoder", type=str, default="none", choices=["none", "attention"])
+    p.add_argument("--intervention_aux_head", action="store_true", default=False)
     p.add_argument("--init_scale", type=float, default=0.01)
     p.add_argument("--scale_actor_to_env_bounds", action="store_true", default=False)
     p.add_argument("--no_scale_actor_to_env_bounds", dest="scale_actor_to_env_bounds", action="store_false")
@@ -478,6 +653,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--save_episode_plots", action="store_true", default=False)
     p.add_argument("--episode_plot_dir", type=str, default="")
     p.add_argument("--episode_plot_max_episodes", type=int, default=9)
+    p.add_argument("--episode_plot_reward_surface", action="store_true", default=False)
+    p.add_argument("--episode_plot_surface_resolution", type=int, default=140)
     return p
 
 
@@ -505,6 +682,10 @@ def _apply_ckpt_defaults(args: argparse.Namespace) -> None:
     _set_if_default("cost_penalty", 0.0)
     _set_if_default("cost_penalty_warmup_steps", 0)
     _set_if_default("cost_penalty_ramp_steps", 0)
+    _set_if_default("footprint_cost", False)
+    _set_if_default("footprint_cost_mode", "visual")
+    _set_if_default("footprint_cost_margin", 0.0)
+    _set_if_default("footprint_cost_value", 1.0)
     _set_if_default("clearance_penalty_scale", 0.0)
     _set_if_default("clearance_margin", 0.0)
     _set_if_default("clearance_penalty_power", 1.0)
@@ -519,6 +700,8 @@ def _apply_ckpt_defaults(args: argparse.Namespace) -> None:
         _set_if_default("heading_positive_only", True)
     if not _bool_flag_explicit("--terminate_on_goal", "--no_terminate_on_goal"):
         _set_if_default("terminate_on_goal", False)
+    if not _bool_flag_explicit("--terminate_on_cost", "--no_terminate_on_cost"):
+        _set_if_default("terminate_on_cost", False)
     _set_if_default("surface_mode", "default")
     _set_if_default("car_wheel_command_limit", 2.0)
     _set_if_default("car_force_scale", 2.0)
@@ -528,9 +711,18 @@ def _apply_ckpt_defaults(args: argparse.Namespace) -> None:
     _set_if_default("point_alignment_power", 1.0)
     _set_if_default("point_allow_backward", False)
     _set_if_default("obs_mask_mode", "none")
+    _set_if_default("obs_frame_stack", 1)
+    if "--fixed_layout_preset" not in cli_args:
+        _set_if_default("fixed_layout_preset", "none")
+    if "--layout_curriculum" not in cli_args:
+        _set_if_default("layout_curriculum", "none")
+    if "--layout_curriculum_level" not in cli_args:
+        _set_if_default("layout_curriculum_level", 0)
     _set_if_default("actor_hidden_dim", 256)
     _set_if_default("use_layer_norm", False)
     _set_if_default("layer_norm_eps", 1e-5)
+    _set_if_default("temporal_encoder", "none")
+    _set_if_default("intervention_aux_head", False)
     _set_if_default("init_scale", 0.01)
     if not _bool_flag_explicit("--scale_actor_to_env_bounds", "--no_scale_actor_to_env_bounds"):
         _set_if_default("scale_actor_to_env_bounds", False)
@@ -538,11 +730,27 @@ def _apply_ckpt_defaults(args: argparse.Namespace) -> None:
 
 def _resolve_policy_format(model_path: str, requested: str) -> str:
     requested = str(requested or "auto").lower()
-    if requested in {"fastsac", "ppo"}:
+    if requested in {"fastsac", "ppo", "maneuver_bc", "heading_bc", "knn_bc"}:
         return requested
     suffix = Path(str(model_path)).suffix.lower()
     if suffix == ".zip":
         return "ppo"
+    if suffix == ".npz":
+        try:
+            with np.load(Path(str(model_path)).expanduser(), allow_pickle=True) as data:
+                if "format" in data.files and str(data["format"].item()) == "knn_bc":
+                    return "knn_bc"
+        except Exception:
+            pass
+    try:
+        checkpoint = torch.load(Path(str(model_path)).expanduser(), map_location="cpu", weights_only=False)
+        if isinstance(checkpoint, dict):
+            if checkpoint.get("format") == "maneuver_bc":
+                return "maneuver_bc"
+            if checkpoint.get("format") == "heading_bc":
+                return "heading_bc"
+    except Exception:
+        pass
     return "fastsac"
 
 
@@ -560,6 +768,7 @@ def _load_ppo_vecnormalize(model_path: Path, args: argparse.Namespace):
     # VecNormalize.load requires a VecEnv, but we only need the saved obs_rms for prediction.
     tmp_args = argparse.Namespace(**vars(args))
     tmp_args.render_mode = "none"
+    tmp_args.intervention_mode = "none"
     tmp_env = DummyVecEnv([lambda: _build_env(tmp_args, controller=None)])
     vecnorm = VecNormalize.load(str(vecnorm_path), tmp_env)
     vecnorm.training = False
@@ -583,6 +792,31 @@ def _build_env(args: argparse.Namespace, controller):
         obs_mask_mode=str(getattr(args, "obs_mask_mode", "none")),
         seed=args.seed,
     )
+    if str(getattr(args, "fixed_layout_preset", "none")).strip().lower() != "none":
+        env = FixedSafetyLayoutWrapper(env, preset=str(args.fixed_layout_preset))
+    if str(getattr(args, "layout_curriculum", "none")).strip().lower() != "none":
+        env = SafetyLayoutCurriculumWrapper(
+            env,
+            curriculum=str(args.layout_curriculum),
+            level=int(getattr(args, "layout_curriculum_level", 0)),
+        )
+    replay_seeds = parse_layout_seed_replay(getattr(args, "layout_seed_replay", ""))
+    replay_prob = float(getattr(args, "layout_seed_replay_prob", 0.0))
+    if replay_seeds and replay_prob > 0.0:
+        env = SafetyLayoutSeedReplayWrapper(
+            env,
+            seeds=list(replay_seeds),
+            replay_prob=replay_prob,
+            mode=str(getattr(args, "layout_seed_replay_mode", "cycle")),
+            rng_seed=int(args.seed),
+        )
+    if bool(getattr(args, "footprint_cost", False)):
+        env = FootprintCostWrapper(
+            env,
+            mode=str(getattr(args, "footprint_cost_mode", "visual")),
+            margin=float(getattr(args, "footprint_cost_margin", 0.0)),
+            cost_value=float(getattr(args, "footprint_cost_value", 1.0)),
+        )
     env = RewardModeWrapper(
         env,
         reward_mode=args.reward_mode,
@@ -604,6 +838,8 @@ def _build_env(args: argparse.Namespace, controller):
         heading_reward_scale=float(getattr(args, "heading_reward_scale", 0.0)),
         heading_positive_only=bool(getattr(args, "heading_positive_only", True)),
     )
+    if bool(getattr(args, "terminate_on_cost", False)):
+        env = TerminateOnCostWrapper(env)
     if bool(getattr(args, "terminate_on_goal", False)):
         env = TerminateOnGoalWrapper(env)
     if args.intervention_mode == "human":
@@ -614,8 +850,105 @@ def _build_env(args: argparse.Namespace, controller):
             controller=controller,
             threshold=args.intervention_threshold,
             hold_seconds=args.intervention_hold_seconds,
+            clearance_override_threshold=float(getattr(args, "teacher_override_clearance_threshold", -1.0)),
+            clearance_override_exit_threshold=float(getattr(args, "teacher_override_clearance_exit_threshold", -1.0)),
+            clearance_override_mode=str(getattr(args, "teacher_override_mode", "clearance")),
+            teacher_goal_progress_steps=int(getattr(args, "teacher_goal_progress_steps", 3)),
+            teacher_goal_progress_epsilon=float(getattr(args, "teacher_goal_progress_epsilon", 1e-3)),
+            teacher_progress_bad_steps=int(getattr(args, "teacher_progress_bad_steps", 3)),
+            teacher_progress_good_steps=int(getattr(args, "teacher_progress_good_steps", 5)),
+            teacher_progress_epsilon=float(getattr(args, "teacher_progress_epsilon", 1e-4)),
+            teacher_progress_trigger_mode=str(getattr(args, "teacher_progress_trigger_mode", "worse")),
+            teacher_progress_release_mode=str(getattr(args, "teacher_progress_release_mode", "improve")),
+            teacher_progress_score_mode=str(getattr(args, "teacher_progress_score_mode", "reward_wrapper")),
+            teacher_progress_dense_scale=float(getattr(args, "teacher_progress_dense_scale", 1.0)),
+            teacher_progress_clearance_scale=float(getattr(args, "teacher_progress_clearance_scale", -1.0)),
+            teacher_progress_clearance_margin=float(getattr(args, "teacher_progress_clearance_margin", 0.0)),
+            teacher_progress_clearance_mode=str(getattr(args, "teacher_progress_clearance_mode", "softplus")),
+            teacher_progress_clearance_temperature=float(getattr(args, "teacher_progress_clearance_temperature", 0.001)),
+            teacher_clearance_source=str(getattr(args, "teacher_clearance_source", "keepout")),
+            debug_console=bool(getattr(args, "intervention_debug_console", False)),
         )
+    obs_frame_stack = int(getattr(args, "obs_frame_stack", 1))
+    if obs_frame_stack > 1:
+        env = FrameStackObservationWrapper(env, num_frames=obs_frame_stack)
     return env
+
+
+def _snapshot_eval_layout(
+    *,
+    env,
+    task,
+    overlay_specs: list[dict[str, Any]],
+    reset_info: dict[str, Any],
+    args: argparse.Namespace,
+) -> tuple[dict[str, Any], dict[str, tuple[np.ndarray, float]]]:
+    overlay_poses: dict[str, tuple[np.ndarray, float]] = {}
+    obstacles: list[dict[str, Any]] = []
+    for spec in overlay_specs:
+        pose = _body_xy_and_yaw(task, str(spec["name"]))
+        if pose is None:
+            continue
+        pos_xy, yaw = pose
+        overlay_poses[str(spec["name"])] = (
+            np.asarray(pos_xy, dtype=np.float64).reshape(2).copy(),
+            float(yaw),
+        )
+        size = np.asarray(spec.get("size", [0.1]), dtype=np.float64).reshape(-1)
+        obstacles.append(
+            {
+                "name": str(spec["name"]),
+                "geom_type": str(spec.get("geom_type", "sphere")),
+                "xy": [float(pos_xy[0]), float(pos_xy[1])],
+                "yaw": float(yaw),
+                "size": [float(x) for x in size.tolist()],
+            }
+        )
+    agent_xy = extract_agent_xy(env)
+    goal_xy = extract_goal_xy(env)
+    return (
+        {
+            "layout_curriculum": str(
+                reset_info.get("layout_curriculum", getattr(args, "layout_curriculum", "none"))
+            ),
+            "layout_curriculum_level": int(
+                reset_info.get("layout_curriculum_level", getattr(args, "layout_curriculum_level", -1))
+            ),
+            "fixed_layout_preset": str(
+                reset_info.get("fixed_layout_preset", getattr(args, "fixed_layout_preset", "none"))
+            ),
+            "agent_xy": [
+                float(x)
+                for x in np.asarray(
+                    agent_xy if agent_xy is not None else [float("nan"), float("nan")],
+                    dtype=np.float64,
+                )
+                .reshape(2)
+                .tolist()
+            ],
+            "goal_xy": [
+                float(x)
+                for x in np.asarray(
+                    goal_xy if goal_xy is not None else [float("nan"), float("nan")],
+                    dtype=np.float64,
+                )
+                .reshape(2)
+                .tolist()
+            ],
+            "obstacles": obstacles,
+        },
+        overlay_poses,
+    )
+
+
+def _layout_hash(layout_snapshot: dict[str, Any]) -> str:
+    payload = {
+        "agent_xy": layout_snapshot.get("agent_xy"),
+        "goal_xy": layout_snapshot.get("goal_xy"),
+        "obstacles": layout_snapshot.get("obstacles"),
+    }
+    text = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]
 
 
 def _episode_metrics(
@@ -679,15 +1012,15 @@ def main() -> int:
     args = build_parser().parse_args()
     _apply_ckpt_defaults(args)
 
-    if args.controller in {"human", "keyboard", "gamepad", "scripted"} and args.intervention_mode == "human":
+    if args.controller in {"human", "keyboard", "gamepad", "scripted", "scripted_goal_geom", "scripted_geo", "scripted_geo_legacy", "scripted_visual_mpc", "imitation", "bc_gate_scripted_geo"} and args.intervention_mode == "human":
         # Avoid double-human override (controller action + intervention wrapper action).
         args.intervention_mode = "none"
     if args.controller == "keyboard":
         args.human_input_device = "keyboard"
     elif args.controller == "gamepad":
         args.human_input_device = "gamepad"
-    elif args.controller == "scripted":
-        args.human_input_device = "scripted"
+    elif args.controller in {"scripted", "scripted_goal_geom", "scripted_geo", "scripted_geo_legacy", "scripted_visual_mpc"}:
+        args.human_input_device = args.controller
 
     if args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -696,7 +1029,7 @@ def main() -> int:
 
     controller = None
     control_help: list[str] = []
-    if args.controller in {"human", "keyboard", "gamepad", "scripted"} or args.intervention_mode == "human":
+    if args.controller in {"human", "keyboard", "gamepad", "scripted", "scripted_goal_geom", "scripted_geo", "scripted_geo_legacy", "scripted_visual_mpc", "imitation", "bc_gate_scripted_geo"} or args.intervention_mode == "human":
         # Temporary env for action-dim detection.
         tmp_env = make_safety_env(
             args.env_name,
@@ -718,33 +1051,70 @@ def main() -> int:
         action_low_tmp = np.asarray(tmp_env.action_space.low, dtype=np.float32)
         action_high_tmp = np.asarray(tmp_env.action_space.high, dtype=np.float32)
         tmp_env.close()
-        controller = build_human_controller(
-            input_device=str(getattr(args, "human_input_device", "keyboard")),
-            action_dim=act_dim,
-            obs_dim=obs_dim_tmp,
-            env_name=args.env_name,
-            action_scale=args.human_action_scale,
-            wheel_command_limit=float(args.car_wheel_command_limit),
-            overlay_fps_limit=int(args.controller_fps_limit),
-            overlay_draw_hz=float(args.controller_overlay_hz),
-            gamepad_mode=str(getattr(args, "gamepad_mode", "local")),
-            gamepad_host=str(getattr(args, "gamepad_host", "")),
-            gamepad_port=int(getattr(args, "gamepad_port", 0) or DEFAULT_SAFETY_GAMEPAD_PORT),
-            gamepad_cache_path=getattr(args, "gamepad_cache_path", DEFAULT_SAFETY_GAMEPAD_CACHE_PATH),
-            gamepad_reconnect_seconds=float(getattr(args, "gamepad_reconnect_seconds", 2.0)),
-            gamepad_config_path=args.gamepad_config_path,
-            gamepad_use_saved_config=bool(getattr(args, "gamepad_use_saved_config", True)),
-            gamepad_device_index=int(getattr(args, "gamepad_device_index", 0)),
-            action_low=action_low_tmp,
-            action_high=action_high_tmp,
-            show_overlay=not bool(args.show_telemetry_overlay),
-            prefer_separate_keyboard_window=wants_external_viewer(getattr(args, "render_mode", "human")),
-            control_scheme_override=resolve_control_scheme(
-                str(args.env_name),
-                car_action_mode=str(getattr(args, "car_action_mode", "raw_wheels")),
-                point_action_mode=str(getattr(args, "point_action_mode", "native")),
-            ),
-        )
+        if args.controller == "bc_gate_scripted_geo" or (
+            args.intervention_mode == "human"
+            and str(getattr(args, "human_input_device", "")).lower() == "bc_gate_scripted_geo"
+        ):
+            ckpt_path = str(getattr(args, "imitation_checkpoint_path", "") or "")
+            if not ckpt_path:
+                raise ValueError("--imitation_checkpoint_path is required for bc_gate_scripted_geo")
+            controller = LearnedGateScriptedGeometricTeacherController(
+                checkpoint_path=ckpt_path,
+                action_low=action_low_tmp,
+                action_high=action_high_tmp,
+                intervention_threshold=float(getattr(args, "intervention_threshold", 0.1)),
+                device=str(device),
+            )
+        elif args.controller == "imitation" or (
+            args.intervention_mode == "human" and str(getattr(args, "human_input_device", "")).lower() == "imitation"
+        ):
+            ckpt_path = str(getattr(args, "imitation_checkpoint_path", "") or getattr(args, "model_path", ""))
+            if not ckpt_path:
+                raise ValueError("--imitation_checkpoint_path or --model_path is required for --controller imitation")
+            controller = LearnedInterventionPolicyController(
+                checkpoint_path=ckpt_path,
+                action_low=action_low_tmp,
+                action_high=action_high_tmp,
+                intervention_threshold=float(getattr(args, "intervention_threshold", 0.1)),
+                device=str(device),
+            )
+        else:
+            controller = build_human_controller(
+                input_device=str(getattr(args, "human_input_device", "keyboard")),
+                action_dim=act_dim,
+                obs_dim=obs_dim_tmp,
+                env_name=args.env_name,
+                action_scale=args.human_action_scale,
+                wheel_command_limit=float(args.car_wheel_command_limit),
+                overlay_fps_limit=int(args.controller_fps_limit),
+                overlay_draw_hz=float(args.controller_overlay_hz),
+                gamepad_mode=str(getattr(args, "gamepad_mode", "local")),
+                gamepad_host=str(getattr(args, "gamepad_host", "")),
+                gamepad_port=int(getattr(args, "gamepad_port", 0) or DEFAULT_SAFETY_GAMEPAD_PORT),
+                gamepad_cache_path=getattr(args, "gamepad_cache_path", DEFAULT_SAFETY_GAMEPAD_CACHE_PATH),
+                gamepad_reconnect_seconds=float(getattr(args, "gamepad_reconnect_seconds", 2.0)),
+                gamepad_config_path=args.gamepad_config_path,
+                gamepad_use_saved_config=bool(getattr(args, "gamepad_use_saved_config", True)),
+                gamepad_device_index=int(getattr(args, "gamepad_device_index", 0)),
+                action_low=action_low_tmp,
+                action_high=action_high_tmp,
+                expert_checkpoint_path=str(getattr(args, "imitation_checkpoint_path", "") or getattr(args, "model_path", "")),
+                learned_intervention_threshold=float(getattr(args, "intervention_threshold", 0.1)),
+                expert_device=str(device),
+                scripted_geo_heading_tolerance=float(getattr(args, "scripted_geo_heading_tolerance", 0.20)),
+                scripted_geo_lookahead=float(getattr(args, "scripted_geo_lookahead", 1.0)),
+                scripted_geo_safety_margin=float(getattr(args, "scripted_geo_safety_margin", 0.18)),
+                scripted_geo_grid_resolution=float(getattr(args, "scripted_geo_grid_resolution", 0.08)),
+                scripted_geo_emergency_clearance=float(getattr(args, "scripted_geo_emergency_clearance", 0.08)),
+                scripted_geo_action_shield_steps=int(getattr(args, "scripted_geo_action_shield_steps", 1)),
+                show_overlay=not bool(args.show_telemetry_overlay),
+                prefer_separate_keyboard_window=wants_external_viewer(getattr(args, "render_mode", "human")),
+                control_scheme_override=resolve_control_scheme(
+                    str(args.env_name),
+                    car_action_mode=str(getattr(args, "car_action_mode", "raw_wheels")),
+                    point_action_mode=str(getattr(args, "point_action_mode", "native")),
+                ),
+            )
         if str(getattr(args, "human_input_device", "keyboard")).lower() == "keyboard":
             control_help = [
                 "Keyboard controls",
@@ -760,20 +1130,127 @@ def main() -> int:
         scale=float(args.viewer_scale),
     ) if wants_external_viewer(args.render_mode) else None
     max_steps = extract_step_limit(env)
-    telemetry_panel = EvalTelemetryPanel(draw_hz=float(args.telemetry_overlay_hz)) if bool(args.show_telemetry_overlay) else None
+    telemetry_panel = None
+    if bool(args.show_telemetry_overlay):
+        if viewer is not None:
+            print(
+                "[EvalTelemetry] disabled separate pygame telemetry panel because render_mode "
+                f"{args.render_mode!r} already uses a pygame viewer. Intervention state is shown in the env viewer.",
+                flush=True,
+            )
+        else:
+            telemetry_panel = EvalTelemetryPanel(draw_hz=float(args.telemetry_overlay_hz))
     control_panel = (
         EvalEpisodeControlPanel()
         if bool(getattr(args, "show_episode_controls", True)) and str(args.render_mode).lower() != "none"
         else None
     )
 
-    obs, _ = env.reset(seed=args.seed)
+    obs, reset_info = env.reset(seed=args.seed)
     obs = np.asarray(obs, dtype=np.float32).reshape(-1)
+    def _set_viewer_intervention(info: Dict[str, Any] | None = None) -> None:
+        if viewer is None or not hasattr(viewer, "set_intervention_status"):
+            return
+        info = dict(info or {})
+        active = bool(info.get("teacher_intervened", False))
+        label = str(
+            info.get("teacher_reason")
+            or info.get("teacher_gate_mode")
+            or info.get("teacher_override_mode")
+            or ""
+        )
+        try:
+            viewer.set_intervention_status(active=active, label=label)
+        except TypeError:
+            viewer.set_intervention_status(active, label)
+
+    def _set_viewer_cost(cost_value: float = 0.0) -> None:
+        if viewer is None or not hasattr(viewer, "set_cost_status"):
+            return
+        active = float(cost_value) > 0.0
+        xy = None
+        if active:
+            try:
+                xy = np.asarray(task.agent.pos[:2], dtype=np.float64).copy()
+            except Exception:
+                xy = None
+        label = f"cost={float(cost_value):.1f}" if active else ""
+        try:
+            viewer.set_cost_status(active=active, xy=xy, label=label)
+        except TypeError:
+            viewer.set_cost_status(active, xy, label)
+
+    def _set_controller_status(info: Dict[str, Any] | None = None, cost_value: float = 0.0, action_value: np.ndarray | None = None) -> None:
+        if controller is None:
+            return
+        info = dict(info or {})
+        teacher_active = bool(info.get("teacher_intervened", False))
+        manual_controller = str(getattr(args, "controller", "")).lower() in {"human", "keyboard", "gamepad"}
+        manual_active = False
+        if manual_controller and action_value is not None:
+            try:
+                manual_active = float(np.linalg.norm(np.asarray(action_value, dtype=np.float32).reshape(-1))) > 1e-6
+            except Exception:
+                manual_active = False
+        if hasattr(controller, "set_intervention_status"):
+            try:
+                controller.set_intervention_status(active=bool(teacher_active or manual_active))
+            except TypeError:
+                try:
+                    controller.set_intervention_status(bool(teacher_active or manual_active))
+                except Exception:
+                    pass
+        if hasattr(controller, "set_cost_status"):
+            active = float(cost_value) > 0.0
+            label = f"{float(cost_value):.1f}" if active else ""
+            try:
+                controller.set_cost_status(active=active, label=label)
+            except TypeError:
+                try:
+                    controller.set_cost_status(active, label)
+                except Exception:
+                    pass
+
+    _set_viewer_intervention(None)
+    _set_controller_status(None, 0.0, None)
     if viewer is not None:
         viewer.draw_env(env)
     task = env.unwrapped.task
     overlay_specs = _extract_overlay_specs(task)
     bounds = _extract_bounds(task, x_range=None, y_range=None)
+
+    def _reset_episode(seed: int):
+        next_obs, next_reset_info = env.reset(seed=int(seed))
+        next_obs = np.asarray(next_obs, dtype=np.float32).reshape(-1)
+        _set_viewer_intervention(None)
+        _set_viewer_cost(0.0)
+        layout, poses = _snapshot_eval_layout(
+            env=env,
+            task=task,
+            overlay_specs=overlay_specs,
+            reset_info=dict(next_reset_info or {}),
+            args=args,
+        )
+        layout["layout_hash"] = _layout_hash(layout)
+        start_xy = np.asarray(layout["agent_xy"], dtype=np.float64).reshape(2)
+        goal_xy = np.asarray(layout["goal_xy"], dtype=np.float64).reshape(2)
+        if not np.isfinite(start_xy).all():
+            start_xy = np.asarray(task.agent.pos[:2], dtype=np.float64).copy()
+        if not np.isfinite(goal_xy).all():
+            goal_xy = np.asarray(task.goal.pos[:2], dtype=np.float64).copy()
+        return next_obs, layout, poses, goal_xy, [start_xy.copy()], [goal_xy.copy()], [], []
+
+    layout_snapshot, overlay_poses = _snapshot_eval_layout(
+        env=env,
+        task=task,
+        overlay_specs=overlay_specs,
+        reset_info=dict(reset_info or {}),
+        args=args,
+    )
+    layout_snapshot["layout_hash"] = _layout_hash(layout_snapshot)
+    initial_goal_xy = np.asarray(layout_snapshot["goal_xy"], dtype=np.float64).reshape(2)
+    if not np.isfinite(initial_goal_xy).all():
+        initial_goal_xy = np.asarray(task.goal.pos[:2], dtype=np.float64).copy()
     obs_dim = int(obs.shape[0])
     act_dim = int(np.prod(env.action_space.shape))
 
@@ -781,6 +1258,9 @@ def main() -> int:
     obs_preprocess = None
     ppo_model = None
     ppo_vecnorm = None
+    maneuver_policy = None
+    heading_policy = None
+    knn_policy = None
     policy_format = "fastsac"
     if args.controller == "policy":
         if not args.model_path:
@@ -793,6 +1273,18 @@ def main() -> int:
             print(f"loaded SB3 PPO policy: {model_path}", flush=True)
             if ppo_vecnorm is not None:
                 print("loaded PPO VecNormalize stats", flush=True)
+        elif policy_format == "maneuver_bc":
+            model_path = Path(args.model_path).expanduser().resolve()
+            maneuver_policy = load_maneuver_policy(model_path, device=device)
+            print(f"loaded maneuver BC policy: {model_path}", flush=True)
+        elif policy_format == "heading_bc":
+            model_path = Path(args.model_path).expanduser().resolve()
+            heading_policy = load_heading_policy(model_path, device=device)
+            print(f"loaded heading BC policy: {model_path}", flush=True)
+        elif policy_format == "knn_bc":
+            model_path = Path(args.model_path).expanduser().resolve()
+            knn_policy = load_knn_policy(model_path)
+            print(f"loaded KNN BC policy: {model_path}", flush=True)
         else:
             actor = SafetyActor(
                 n_obs=obs_dim,
@@ -802,6 +1294,9 @@ def main() -> int:
                 hidden_dim=args.actor_hidden_dim,
                 use_layer_norm=bool(getattr(args, "use_layer_norm", False)),
                 layer_norm_eps=float(getattr(args, "layer_norm_eps", 1e-5)),
+                temporal_encoder=str(getattr(args, "temporal_encoder", "none")),
+                obs_frame_stack=int(getattr(args, "obs_frame_stack", 1)),
+                intervention_aux_head=bool(getattr(args, "intervention_aux_head", False)),
                 device=device,
             )
             checkpoint = torch.load(args.model_path, map_location=device, weights_only=False)
@@ -830,13 +1325,18 @@ def main() -> int:
     ep_first_goal_hit_step: int | None = None
     ep_first_goal_reward_sum = 0.0
     ep_first_goal_dense_reward_sum = 0.0
-    ep_path = [np.asarray(task.agent.pos[:2], dtype=np.float64).copy()]
-    ep_goal_positions = [np.asarray(task.goal.pos[:2], dtype=np.float64).copy()]
+    initial_agent_xy = np.asarray(layout_snapshot["agent_xy"], dtype=np.float64).reshape(2)
+    if not np.isfinite(initial_agent_xy).all():
+        initial_agent_xy = np.asarray(task.agent.pos[:2], dtype=np.float64).copy()
+    ep_path = [initial_agent_xy.copy()]
+    ep_goal_positions = [initial_goal_xy.copy()]
     ep_goal_hit_points: list[np.ndarray] = []
+    ep_cost_points: list[np.ndarray] = []
     episodes = 0
     episode_idx = 0
     eval_fps = float(args.fps)
     saved_episode_plot_paths: list[Path] = []
+    layout_hashes: list[str] = []
 
     while episodes < args.num_episodes:
         if control_panel is not None:
@@ -848,8 +1348,16 @@ def main() -> int:
                 break
             if prev_requested:
                 episode_idx = max(0, int(episode_idx - 1))
-                obs, _ = env.reset(seed=args.seed + episode_idx)
-                obs = np.asarray(obs, dtype=np.float32).reshape(-1)
+                (
+                    obs,
+                    layout_snapshot,
+                    overlay_poses,
+                    initial_goal_xy,
+                    ep_path,
+                    ep_goal_positions,
+                    ep_goal_hit_points,
+                    ep_cost_points,
+                ) = _reset_episode(args.seed + episode_idx)
                 if viewer is not None:
                     viewer.draw_env(env)
                 ep_ret = 0.0
@@ -865,14 +1373,19 @@ def main() -> int:
                 ep_first_goal_hit_step = None
                 ep_first_goal_reward_sum = 0.0
                 ep_first_goal_dense_reward_sum = 0.0
-                ep_path = [np.asarray(task.agent.pos[:2], dtype=np.float64).copy()]
-                ep_goal_positions = [np.asarray(task.goal.pos[:2], dtype=np.float64).copy()]
-                ep_goal_hit_points = []
                 continue
             if next_requested:
                 episode_idx = min(max(0, int(args.num_episodes) - 1), int(episode_idx + 1))
-                obs, _ = env.reset(seed=args.seed + episode_idx)
-                obs = np.asarray(obs, dtype=np.float32).reshape(-1)
+                (
+                    obs,
+                    layout_snapshot,
+                    overlay_poses,
+                    initial_goal_xy,
+                    ep_path,
+                    ep_goal_positions,
+                    ep_goal_hit_points,
+                    ep_cost_points,
+                ) = _reset_episode(args.seed + episode_idx)
                 if viewer is not None:
                     viewer.draw_env(env)
                 ep_ret = 0.0
@@ -888,13 +1401,18 @@ def main() -> int:
                 ep_first_goal_hit_step = None
                 ep_first_goal_reward_sum = 0.0
                 ep_first_goal_dense_reward_sum = 0.0
-                ep_path = [np.asarray(task.agent.pos[:2], dtype=np.float64).copy()]
-                ep_goal_positions = [np.asarray(task.goal.pos[:2], dtype=np.float64).copy()]
-                ep_goal_hit_points = []
                 continue
             if reset_requested:
-                obs, _ = env.reset(seed=args.seed + episode_idx)
-                obs = np.asarray(obs, dtype=np.float32).reshape(-1)
+                (
+                    obs,
+                    layout_snapshot,
+                    overlay_poses,
+                    initial_goal_xy,
+                    ep_path,
+                    ep_goal_positions,
+                    ep_goal_hit_points,
+                    ep_cost_points,
+                ) = _reset_episode(args.seed + episode_idx)
                 if viewer is not None:
                     viewer.draw_env(env)
                 ep_ret = 0.0
@@ -910,13 +1428,16 @@ def main() -> int:
                 ep_first_goal_hit_step = None
                 ep_first_goal_reward_sum = 0.0
                 ep_first_goal_dense_reward_sum = 0.0
-                ep_path = [np.asarray(task.agent.pos[:2], dtype=np.float64).copy()]
-                ep_goal_positions = [np.asarray(task.goal.pos[:2], dtype=np.float64).copy()]
-                ep_goal_hit_points = []
                 continue
 
         if args.controller == "policy":
-            if ppo_model is not None:
+            if knn_policy is not None:
+                action = knn_policy.act(obs)
+            elif maneuver_policy is not None:
+                action = maneuver_policy.act(obs, device=device)
+            elif heading_policy is not None:
+                action = heading_policy.act(obs, env=env, device=device)
+            elif ppo_model is not None:
                 ppo_obs = np.asarray(obs, dtype=np.float32).reshape(1, -1)
                 if ppo_vecnorm is not None:
                     ppo_obs = ppo_vecnorm.normalize_obs(ppo_obs)
@@ -950,6 +1471,9 @@ def main() -> int:
         action = clip_action_to_space(action, env.action_space)
         next_obs, reward, cost, terminated, truncated, info = env.step(action)
         next_obs = np.asarray(next_obs, dtype=np.float32).reshape(-1)
+        _set_viewer_intervention(dict(info))
+        _set_viewer_cost(float(cost))
+        _set_controller_status(dict(info), float(cost), action)
         if viewer is not None:
             viewer.draw_env(env)
         if telemetry_panel is not None:
@@ -970,6 +1494,8 @@ def main() -> int:
         ep_reward_cost_penalty += float(info.get("reward_cost_penalty_component", 0.0))
         ep_len += 1
         ep_path.append(np.asarray(task.agent.pos[:2], dtype=np.float64).copy())
+        if float(cost) > 0.0:
+            ep_cost_points.append(np.asarray(task.agent.pos[:2], dtype=np.float64).copy())
         if bool(info.get("goal_met", False)):
             ep_goal_met_any = True
             ep_goal_met_count += 1
@@ -1008,6 +1534,7 @@ def main() -> int:
                     ep_first_goal_dense_reward_sum if ep_first_goal_hit_step is not None else float(ep_reward_dense)
                 ),
             )
+            layout_hashes.append(str(layout_snapshot.get("layout_hash", _layout_hash(layout_snapshot))))
             win.add(ep)
             if bool(getattr(args, "save_episode_plots", False)):
                 plot_dir = (
@@ -1016,6 +1543,20 @@ def main() -> int:
                     else Path("logs") / "safetygym_eval_plots" / Path(str(args.model_path or "policy")).stem
                 )
                 if len(saved_episode_plot_paths) < int(max(0, getattr(args, "episode_plot_max_episodes", 9))):
+                    reward_surface_config = None
+                    if bool(getattr(args, "episode_plot_reward_surface", False)):
+                        reward_surface_config = {
+                            "resolution": int(getattr(args, "episode_plot_surface_resolution", 140)),
+                            "dense_reward_scale": float(getattr(args, "dense_reward_scale", 1.0)),
+                            "clearance_penalty_scale": float(getattr(args, "clearance_penalty_scale", 0.0)),
+                            "clearance_margin": float(getattr(args, "clearance_margin", 0.0)),
+                            "clearance_penalty_power": float(getattr(args, "clearance_penalty_power", 1.0)),
+                            "clearance_penalty_mode": str(getattr(args, "clearance_penalty_mode", "softplus")),
+                            "clearance_penalty_temperature": float(
+                                getattr(args, "clearance_penalty_temperature", 0.001)
+                            ),
+                        }
+                    save_args_json(plot_dir / f"episode_{episodes + 1:03d}_layout.json", layout_snapshot)
                     plot_path = plot_eval_episode_trajectory(
                         output_path=plot_dir / f"episode_{episodes + 1:03d}.png",
                         task=task,
@@ -1033,6 +1574,14 @@ def main() -> int:
                         episode_reward=float(ep_ret),
                         goals_reached=int(ep_goal_met_count),
                         final_distance=float(final_dist),
+                        reward_surface_config=reward_surface_config,
+                        initial_goal_xy=initial_goal_xy,
+                        overlay_poses=overlay_poses,
+                        cost_points=(
+                            np.asarray(ep_cost_points, dtype=np.float64)
+                            if ep_cost_points
+                            else np.zeros((0, 2), dtype=np.float64)
+                        ),
                     )
                     saved_episode_plot_paths.append(Path(plot_path))
             outcome = "success" if ep["outcome_success"] > 0.5 else ("timeout" if ep["outcome_timeout"] > 0.5 else "kill")
@@ -1044,8 +1593,16 @@ def main() -> int:
             )
             episodes += 1
             episode_idx = min(int(episodes), max(0, int(args.num_episodes) - 1))
-            obs, _ = env.reset(seed=args.seed + episodes)
-            obs = np.asarray(obs, dtype=np.float32).reshape(-1)
+            (
+                obs,
+                layout_snapshot,
+                overlay_poses,
+                initial_goal_xy,
+                ep_path,
+                ep_goal_positions,
+                ep_goal_hit_points,
+                ep_cost_points,
+            ) = _reset_episode(args.seed + episodes)
             if viewer is not None:
                 viewer.draw_env(env)
             ep_ret = 0.0
@@ -1061,28 +1618,56 @@ def main() -> int:
             ep_first_goal_hit_step = None
             ep_first_goal_reward_sum = 0.0
             ep_first_goal_dense_reward_sum = 0.0
-            ep_path = [np.asarray(task.agent.pos[:2], dtype=np.float64).copy()]
-            ep_goal_positions = [np.asarray(task.goal.pos[:2], dtype=np.float64).copy()]
-            ep_goal_hit_points = []
         else:
             obs = next_obs
 
         if eval_fps > 0:
             time.sleep(1.0 / float(eval_fps))
 
+    unique_layouts = len(set(layout_hashes))
+    total_layouts = len(layout_hashes)
     summary = augment_rollout_summary(win.summary("eval"), "eval")
     if "eval/mean_reward" not in summary and "eval/episode_return_mean" in summary:
         summary["eval/mean_reward"] = float(summary["eval/episode_return_mean"])
+    summary["eval/layout_unique_count"] = float(unique_layouts)
+    summary["eval/layout_total_count"] = float(total_layouts)
+    summary["eval/layout_unique_fraction"] = float(unique_layouts / max(1, total_layouts))
+    summary["eval/layout_duplicate_count"] = float(total_layouts - unique_layouts)
     if bool(getattr(args, "save_episode_plots", False)) and saved_episode_plot_paths:
         plot_dir = (
             Path(str(args.episode_plot_dir)).expanduser()
             if str(getattr(args, "episode_plot_dir", "")).strip()
             else Path("logs") / "safetygym_eval_plots" / Path(str(args.model_path or "policy")).stem
         )
+        save_args_json(
+            plot_dir / "layout_summary.json",
+            {
+                "layout_unique_count": int(unique_layouts),
+                "layout_total_count": int(total_layouts),
+                "layout_unique_fraction": float(unique_layouts / max(1, total_layouts)),
+                "layout_duplicate_count": int(total_layouts - unique_layouts),
+                "layout_hashes": list(layout_hashes),
+            },
+        )
+        save_eval_manifest(
+            output_dir=plot_dir,
+            args=args,
+            source="eval_interactive_safetygym",
+            step_value=None,
+            layout_hashes=layout_hashes,
+            extra={
+                "model_path": str(getattr(args, "model_path", "")),
+                "policy_format": str(getattr(args, "policy_format", "auto")),
+                "controller": str(getattr(args, "controller", "")),
+            },
+        )
         sheet_path = plot_episode_contact_sheet(
             image_paths=saved_episode_plot_paths,
             output_path=plot_dir / "episode_contact_sheet.png",
-            title=f"SafetyGym eval episodes: {Path(str(args.model_path or 'policy')).stem}",
+            title=(
+                f"SafetyGym eval episodes: {Path(str(args.model_path or 'policy')).stem} "
+                f"(layouts {unique_layouts}/{total_layouts})"
+            ),
             max_cols=3,
         )
         if sheet_path is not None:

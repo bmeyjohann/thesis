@@ -49,6 +49,8 @@ def save_transition_dataset(
     costs: Optional[np.ndarray] = None,
     student_actions: Optional[np.ndarray] = None,
     teacher_intervened: Optional[np.ndarray] = None,
+    episode_ids: Optional[np.ndarray] = None,
+    episode_steps: Optional[np.ndarray] = None,
 ) -> Path:
     target = Path(path).expanduser()
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -67,6 +69,10 @@ def save_transition_dataset(
         payload["student_actions"] = np.asarray(student_actions, dtype=np.float32)
     if teacher_intervened is not None:
         payload["teacher_intervened"] = np.asarray(teacher_intervened, dtype=np.bool_).reshape(-1)
+    if episode_ids is not None:
+        payload["episode_ids"] = np.asarray(episode_ids, dtype=np.int64).reshape(-1)
+    if episode_steps is not None:
+        payload["episode_steps"] = np.asarray(episode_steps, dtype=np.int64).reshape(-1)
     with tempfile.NamedTemporaryFile(
         dir=target.parent,
         prefix=f".{target.stem}_",
@@ -119,6 +125,29 @@ def load_transition_dataset_metadata(path: Path | str) -> dict[str, Any]:
 def load_transition_dataset(path: Path | str) -> dict[str, Any]:
     source = Path(path).expanduser()
     with np.load(source, allow_pickle=True) as data:
+        n_rows = int(np.asarray(data["actions"]).shape[0])
+        if "episode_ids" in data.files:
+            episode_ids = np.asarray(data["episode_ids"], dtype=np.int64).reshape(-1)
+        else:
+            dones_for_eps = np.asarray(data["dones"], dtype=np.bool_).reshape(-1)
+            episode_ids = np.zeros((n_rows,), dtype=np.int64)
+            cur_ep = 0
+            for idx in range(n_rows):
+                episode_ids[idx] = cur_ep
+                if bool(dones_for_eps[idx]):
+                    cur_ep += 1
+        if "episode_steps" in data.files:
+            episode_steps = np.asarray(data["episode_steps"], dtype=np.int64).reshape(-1)
+        else:
+            episode_steps = np.zeros((n_rows,), dtype=np.int64)
+            prev_ep = None
+            cur_step = 0
+            for idx, ep in enumerate(episode_ids.tolist()):
+                if prev_ep is None or int(ep) != int(prev_ep):
+                    cur_step = 0
+                episode_steps[idx] = cur_step
+                cur_step += 1
+                prev_ep = int(ep)
         out = {
             "metadata": load_transition_dataset_metadata(source),
             "observations": np.asarray(data["observations"], dtype=np.float32),
@@ -138,6 +167,8 @@ def load_transition_dataset(path: Path | str) -> dict[str, Any]:
                 if "teacher_intervened" in data.files
                 else np.ones((np.asarray(data["actions"]).shape[0],), dtype=np.bool_)
             ),
+            "episode_ids": episode_ids,
+            "episode_steps": episode_steps,
         }
     return out
 
@@ -164,6 +195,7 @@ def extend_buffer_from_dataset(
     expected_obs_dim: Optional[int] = None,
     expected_act_dim: Optional[int] = None,
     filter_mode: str = "all",
+    teacher_intervened_override: Optional[bool] = None,
 ) -> dict[str, Any]:
     data = load_transition_dataset(dataset_path)
     obs = data["observations"]
@@ -173,6 +205,8 @@ def extend_buffer_from_dataset(
     dones = data["dones"]
     truncations = data["truncations"]
     teacher_intervened = data["teacher_intervened"]
+    if teacher_intervened_override is not None:
+        teacher_intervened = np.full_like(teacher_intervened, bool(teacher_intervened_override), dtype=np.bool_)
     student_actions = data["student_actions"]
 
     if obs.ndim != 2 or next_obs.ndim != 2 or actions.ndim != 2:
@@ -251,6 +285,8 @@ def save_buffer_as_transition_dataset(
     trunc_rows: list[np.ndarray] = []
     student_action_rows: list[np.ndarray] = []
     teacher_intervened_rows: list[np.ndarray] = []
+    episode_id_rows: list[np.ndarray] = []
+    episode_step_rows: list[np.ndarray] = []
 
     rows_remaining = int(max_rows) if int(max_rows) > 0 else 0
 
@@ -282,6 +318,20 @@ def save_buffer_as_transition_dataset(
         teacher_intervened_rows.append(
             buffer.teacher_intervened[env_idx, indices].detach().cpu().numpy().astype(np.bool_, copy=False)
         )
+        done_np = buffer.dones[env_idx, indices].detach().cpu().numpy().astype(np.bool_, copy=False).reshape(-1)
+        ep_ids = np.zeros((int(indices.numel()),), dtype=np.int64)
+        ep_steps = np.zeros((int(indices.numel()),), dtype=np.int64)
+        cur_ep = 0
+        cur_step = 0
+        for row_idx in range(int(indices.numel())):
+            ep_ids[row_idx] = int(env_idx) * 1_000_000_000 + cur_ep
+            ep_steps[row_idx] = cur_step
+            cur_step += 1
+            if bool(done_np[row_idx]):
+                cur_ep += 1
+                cur_step = 0
+        episode_id_rows.append(ep_ids)
+        episode_step_rows.append(ep_steps)
         reward_rows.append(buffer.rewards[env_idx, indices].detach().cpu().numpy().astype(np.float32, copy=False))
         done_rows.append(buffer.dones[env_idx, indices].detach().cpu().numpy().astype(np.bool_, copy=False))
         trunc_rows.append(buffer.truncations[env_idx, indices].detach().cpu().numpy().astype(np.bool_, copy=False))
@@ -302,6 +352,8 @@ def save_buffer_as_transition_dataset(
     truncations = np.concatenate(trunc_rows, axis=0).reshape(-1)
     student_actions = np.concatenate(student_action_rows, axis=0)
     teacher_intervened = np.concatenate(teacher_intervened_rows, axis=0).reshape(-1)
+    episode_ids = np.concatenate(episode_id_rows, axis=0).reshape(-1)
+    episode_steps = np.concatenate(episode_step_rows, axis=0).reshape(-1)
 
     target = save_transition_dataset(
         path=path,
@@ -314,6 +366,8 @@ def save_buffer_as_transition_dataset(
         truncations=truncations,
         student_actions=student_actions,
         teacher_intervened=teacher_intervened,
+        episode_ids=episode_ids,
+        episode_steps=episode_steps,
     )
     return {
         "path": str(target),

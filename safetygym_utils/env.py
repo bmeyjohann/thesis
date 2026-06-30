@@ -333,6 +333,257 @@ class GoalOnlyLidarObservationWrapper(gym.Wrapper):
         raise ValueError(f"Unexpected env.step() output length for GoalOnlyLidarObservationWrapper: {len(out)}")
 
 
+def build_privileged_geometry_observation(
+    env: gym.Env,
+    observation,
+    *,
+    position_scale: float = 3.0,
+    rich: bool = False,
+) -> np.ndarray:
+    """Append the same task-geometry features used by PrivilegedGeometryObservationWrapper."""
+    position_scale = float(max(1e-6, position_scale))
+    obs = np.asarray(observation, dtype=np.float32).reshape(-1)
+    base = unwrap_env(env)
+    task = getattr(base, "task", None)
+    layout = getattr(getattr(task, "world_info", None), "layout", {}) if task is not None else {}
+    object_names = {
+        str(name)
+        for name in getattr(layout, "keys", lambda: [])()
+        if str(name).startswith(("hazard", "vase", "pillar", "gremlin"))
+    }
+    cfg = getattr(getattr(task, "world_info", None), "world_config_dict", {}) if task is not None else {}
+    if isinstance(cfg, dict):
+        for section in ("geoms", "free_geoms", "mocaps"):
+            items = cfg.get(section, {})
+            if isinstance(items, dict):
+                object_names.update(
+                    str(name)
+                    for name in items.keys()
+                    if str(name).startswith(("hazard", "vase", "pillar", "gremlin"))
+                )
+
+    def _layout_xy(name: str) -> np.ndarray:
+        try:
+            xy = np.asarray(layout.get(name), dtype=np.float64).reshape(-1)
+            if xy.size >= 2 and np.isfinite(xy[:2]).all():
+                return xy[:2].astype(np.float64, copy=True)
+        except Exception:
+            pass
+        return np.zeros((2,), dtype=np.float64)
+
+    def _object_xy(name: str) -> np.ndarray:
+        try:
+            pos = np.asarray(task.data.body(str(name)).xpos[:2], dtype=np.float64).reshape(2)
+            if np.isfinite(pos).all():
+                return pos.astype(np.float64, copy=True)
+        except Exception:
+            pass
+        return _layout_xy(name)
+
+    def _object_geometry_features(name: str) -> tuple[float, float, float, float, float, float, float]:
+        obj_cfg = None
+        if isinstance(cfg, dict):
+            for section in ("geoms", "free_geoms", "mocaps"):
+                items = cfg.get(section, {})
+                if isinstance(items, dict) and name in items:
+                    obj_cfg = items.get(name)
+                    break
+        yaw = 0.0
+        size_x = size_y = approx_radius = 0.0
+        if isinstance(obj_cfg, dict):
+            try:
+                yaw = float(obj_cfg.get("rot", 0.0))
+            except Exception:
+                yaw = 0.0
+            geoms = obj_cfg.get("geoms", [])
+            if isinstance(geoms, list) and geoms:
+                geom0 = geoms[0]
+                if isinstance(geom0, dict):
+                    try:
+                        size = np.asarray(geom0.get("size", [0.0]), dtype=np.float64).reshape(-1)
+                        if size.size >= 1:
+                            size_x = float(size[0])
+                        if size.size >= 2:
+                            size_y = float(size[1])
+                        else:
+                            size_y = float(size_x)
+                        if size.size >= 3:
+                            approx_radius = float(np.linalg.norm(size[:2]))
+                        else:
+                            approx_radius = float(max(abs(size_x), abs(size_y)))
+                    except Exception:
+                        size_x = size_y = approx_radius = 0.0
+        is_hazard = 1.0 if name.startswith("hazard") else 0.0
+        is_movable = 1.0 if name.startswith(("vase", "gremlin")) else 0.0
+        return (
+            float(approx_radius),
+            float(size_x),
+            float(size_y),
+            float(np.cos(yaw)),
+            float(np.sin(yaw)),
+            float(is_hazard),
+            float(is_movable),
+        )
+
+    agent_xy = extract_agent_xy(env)
+    if agent_xy is None:
+        agent_xy = np.zeros((2,), dtype=np.float64)
+    goal_xy = extract_goal_xy(env)
+    if goal_xy is None:
+        goal_xy = _layout_xy("goal")
+    forward_xy = extract_agent_forward_xy(env)
+    if forward_xy is None:
+        forward_xy = np.zeros((2,), dtype=np.float64)
+
+    features: list[float] = []
+    features.extend((np.asarray(forward_xy, dtype=np.float64)[:2]).tolist())
+    goal_rel = (
+        np.asarray(goal_xy, dtype=np.float64)[:2] - np.asarray(agent_xy, dtype=np.float64)[:2]
+    ) / position_scale
+    features.extend(goal_rel.tolist())
+    for name in tuple(sorted(object_names)):
+        rel = (_object_xy(name) - np.asarray(agent_xy, dtype=np.float64)[:2]) / position_scale
+        dist = float(np.linalg.norm(rel))
+        features.extend([float(rel[0]), float(rel[1]), dist])
+        if rich:
+            features.extend(_object_geometry_features(name))
+    extra = np.asarray(features, dtype=np.float32)
+    return np.concatenate([obs, extra], axis=0).astype(np.float32, copy=False)
+
+
+class PrivilegedGeometryObservationWrapper(gym.Wrapper):
+    """Append task geometry to the flat Safety-Gym observation for bottleneck diagnosis."""
+
+    def __init__(self, env: gym.Env, *, position_scale: float = 3.0, rich: bool = False):
+        super().__init__(env)
+        self.position_scale = float(max(1e-6, position_scale))
+        self.rich = bool(rich)
+        base = unwrap_env(env)
+        task = getattr(base, "task", None)
+        layout = getattr(getattr(task, "world_info", None), "layout", {}) if task is not None else {}
+        object_names = {
+            str(name)
+            for name in getattr(layout, "keys", lambda: [])()
+            if str(name).startswith(("hazard", "vase", "pillar", "gremlin"))
+        }
+        cfg = getattr(getattr(task, "world_info", None), "world_config_dict", {}) if task is not None else {}
+        if isinstance(cfg, dict):
+            for section in ("geoms", "free_geoms", "mocaps"):
+                items = cfg.get(section, {})
+                if isinstance(items, dict):
+                    object_names.update(
+                        str(name)
+                        for name in items.keys()
+                        if str(name).startswith(("hazard", "vase", "pillar", "gremlin"))
+                    )
+        self._object_names = tuple(sorted(object_names))
+        base_space = getattr(env, "observation_space", None)
+        if not isinstance(base_space, gym.spaces.Box):
+            raise TypeError("PrivilegedGeometryObservationWrapper expects a flat Box observation space.")
+        low = np.asarray(base_space.low, dtype=np.float32).reshape(-1)
+        high = np.asarray(base_space.high, dtype=np.float32).reshape(-1)
+        per_object_dim = 10 if self.rich else 3
+        extra_dim = 4 + per_object_dim * len(self._object_names)
+        self.observation_space = gym.spaces.Box(
+            low=np.concatenate([low, np.full((extra_dim,), -np.inf, dtype=np.float32)]),
+            high=np.concatenate([high, np.full((extra_dim,), np.inf, dtype=np.float32)]),
+            dtype=np.float32,
+        )
+
+    def _layout_xy(self, name: str) -> np.ndarray:
+        base = unwrap_env(self.env)
+        task = getattr(base, "task", None)
+        layout = getattr(getattr(task, "world_info", None), "layout", {}) if task is not None else {}
+        try:
+            xy = np.asarray(layout.get(name), dtype=np.float64).reshape(-1)
+            if xy.size >= 2 and np.isfinite(xy[:2]).all():
+                return xy[:2].astype(np.float64, copy=True)
+        except Exception:
+            pass
+        return np.zeros((2,), dtype=np.float64)
+
+    def _object_xy(self, name: str) -> np.ndarray:
+        base = unwrap_env(self.env)
+        task = getattr(base, "task", None)
+        try:
+            pos = np.asarray(task.data.body(str(name)).xpos[:2], dtype=np.float64).reshape(2)
+            if np.isfinite(pos).all():
+                return pos.astype(np.float64, copy=True)
+        except Exception:
+            pass
+        return self._layout_xy(name)
+
+    def _object_geometry_features(self, name: str) -> tuple[float, float, float, float, float, float, float]:
+        base = unwrap_env(self.env)
+        task = getattr(base, "task", None)
+        cfg = getattr(getattr(task, "world_info", None), "world_config_dict", {}) if task is not None else {}
+        obj_cfg = None
+        if isinstance(cfg, dict):
+            for section in ("geoms", "free_geoms", "mocaps"):
+                items = cfg.get(section, {})
+                if isinstance(items, dict) and name in items:
+                    obj_cfg = items.get(name)
+                    break
+        yaw = 0.0
+        size_x = size_y = approx_radius = 0.0
+        if isinstance(obj_cfg, dict):
+            try:
+                yaw = float(obj_cfg.get("rot", 0.0))
+            except Exception:
+                yaw = 0.0
+            geoms = obj_cfg.get("geoms", [])
+            if isinstance(geoms, list) and geoms:
+                geom0 = geoms[0]
+                if isinstance(geom0, dict):
+                    try:
+                        size = np.asarray(geom0.get("size", [0.0]), dtype=np.float64).reshape(-1)
+                        if size.size >= 1:
+                            size_x = float(size[0])
+                        if size.size >= 2:
+                            size_y = float(size[1])
+                        else:
+                            size_y = float(size_x)
+                        if size.size >= 3:
+                            approx_radius = float(np.linalg.norm(size[:2]))
+                        else:
+                            approx_radius = float(max(abs(size_x), abs(size_y)))
+                    except Exception:
+                        size_x = size_y = approx_radius = 0.0
+        is_hazard = 1.0 if name.startswith("hazard") else 0.0
+        is_movable = 1.0 if name.startswith(("vase", "gremlin")) else 0.0
+        return (
+            float(approx_radius),
+            float(size_x),
+            float(size_y),
+            float(np.cos(yaw)),
+            float(np.sin(yaw)),
+            float(is_hazard),
+            float(is_movable),
+        )
+
+    def _augment_observation(self, observation):
+        return build_privileged_geometry_observation(
+            self.env,
+            observation,
+            position_scale=self.position_scale,
+            rich=self.rich,
+        )
+
+    def reset(self, **kwargs):
+        observation, info = self.env.reset(**kwargs)
+        return self._augment_observation(observation), info
+
+    def step(self, action):
+        out = self.env.step(action)
+        if len(out) == 6:
+            observation, reward, cost, terminated, truncated, info = out
+            return self._augment_observation(observation), reward, cost, terminated, truncated, info
+        if len(out) == 5:
+            observation, reward, terminated, truncated, info = out
+            return self._augment_observation(observation), reward, terminated, truncated, info
+        raise ValueError(f"Unexpected env.step() output length for PrivilegedGeometryObservationWrapper: {len(out)}")
+
+
 def ensure_safety_gymnasium_importable() -> None:
     """Add the local safety-gymnasium checkout to sys.path when present."""
     repo_root = Path(__file__).resolve().parent.parent
@@ -393,10 +644,13 @@ def make_safety_env(
                 allow_backward=bool(point_allow_backward),
             )
     obs_mask_mode_l = str(obs_mask_mode).strip().lower()
-    if obs_mask_mode_l not in {"none", "goal_only_lidar"}:
+    if obs_mask_mode_l not in {"none", "goal_only_lidar", "privileged_geometry", "privileged_geometry_rich"}:
         raise ValueError(f"Unsupported obs_mask_mode: {obs_mask_mode}")
     if obs_mask_mode_l == "goal_only_lidar":
         env = GoalOnlyLidarObservationWrapper(env)
+    elif obs_mask_mode_l in {"privileged_geometry", "privileged_geometry_rich"}:
+        env.reset(seed=int(seed) if seed is not None else None)
+        env = PrivilegedGeometryObservationWrapper(env, rich=obs_mask_mode_l == "privileged_geometry_rich")
     env = SurfaceConfigWrapper(env, mode=surface_mode)
     if seed is not None:
         env.reset(seed=int(seed))

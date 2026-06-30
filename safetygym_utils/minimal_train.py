@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import defaultdict, deque
+import copy
+import hashlib
 import json
 import random
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +14,7 @@ import sys
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from tensordict import TensorDict
 
 _FAST_SAC_PATH = Path(__file__).resolve().parent.parent / "fasttd3" / "fast_sac"
@@ -30,12 +34,38 @@ from .dataset_io import (
     load_transition_dataset,
     save_buffer_as_transition_dataset,
 )
-from .env import clip_action_to_space, extract_goal_distance, extract_step_limit, make_safety_env, resolve_control_scheme
+from .env import (
+    clip_action_to_space,
+    extract_agent_xy,
+    extract_goal_distance,
+    extract_goal_xy,
+    extract_step_limit,
+    make_safety_env,
+    resolve_control_scheme,
+)
+from .eval_manifest import save_eval_manifest
 from .io import save_args_json
 from .metrics import EpisodeWindow, augment_rollout_summary, classify_outcome
-from .policy_viz import _extract_bounds, _extract_overlay_specs, plot_episode_contact_sheet, plot_eval_episode_trajectory
+from .policy_viz import (
+    _body_xy_and_yaw,
+    _extract_bounds,
+    _extract_overlay_specs,
+    plot_episode_contact_sheet,
+    plot_eval_episode_trajectory,
+)
 from .sac import SACUpdateMetrics, SACTensors, SafetyActor, SafetyCritic, sac_update_step
-from .wrappers import HumanInterventionWrapper, RewardModeWrapper, TerminateOnGoalWrapper
+from .wrappers import (
+    FixedSafetyLayoutWrapper,
+    FootprintCostWrapper,
+    FrameStackObservationWrapper,
+    HumanInterventionWrapper,
+    SafetyLayoutSeedReplayWrapper,
+    SafetyLayoutCurriculumWrapper,
+    RewardModeWrapper,
+    TerminateOnCostWrapper,
+    TerminateOnGoalWrapper,
+    parse_layout_seed_replay,
+)
 from .controllers import (
     DEFAULT_SAFETY_GAMEPAD_CACHE_PATH,
     DEFAULT_SAFETY_GAMEPAD_CONFIG_PATH,
@@ -122,6 +152,32 @@ def _make_env_with_wrappers(
         obs_mask_mode=str(getattr(args, "obs_mask_mode", "none")),
         seed=seed,
     )
+    layout_curriculum = str(getattr(args, "layout_curriculum", "none")).strip().lower()
+    if str(getattr(args, "fixed_layout_preset", "none")).strip().lower() != "none":
+        env = FixedSafetyLayoutWrapper(env, preset=str(getattr(args, "fixed_layout_preset", "none")))
+    elif layout_curriculum not in {"", "none"}:
+        env = SafetyLayoutCurriculumWrapper(
+            env,
+            curriculum=layout_curriculum,
+            level=int(getattr(args, "layout_curriculum_level", 0)),
+        )
+    replay_seeds = parse_layout_seed_replay(getattr(args, "layout_seed_replay", ""))
+    replay_prob = float(getattr(args, "layout_seed_replay_prob", 0.0))
+    if replay_seeds and replay_prob > 0.0:
+        env = SafetyLayoutSeedReplayWrapper(
+            env,
+            seeds=list(replay_seeds),
+            replay_prob=replay_prob,
+            mode=str(getattr(args, "layout_seed_replay_mode", "cycle")),
+            rng_seed=int(seed),
+        )
+    if bool(getattr(args, "footprint_cost", False)):
+        env = FootprintCostWrapper(
+            env,
+            mode=str(getattr(args, "footprint_cost_mode", "visual")),
+            margin=float(getattr(args, "footprint_cost_margin", 0.0)),
+            cost_value=float(getattr(args, "footprint_cost_value", 1.0)),
+        )
     env = RewardModeWrapper(
         env,
         reward_mode=args.reward_mode,
@@ -150,6 +206,8 @@ def _make_env_with_wrappers(
         adaptive_safety_min=float(getattr(args, "adaptive_safety_min", 0.0)),
         adaptive_safety_max=float(getattr(args, "adaptive_safety_max", 1.0)),
     )
+    if bool(getattr(args, "terminate_on_cost", False)):
+        env = TerminateOnCostWrapper(env)
     if bool(getattr(args, "terminate_on_goal", False)):
         env = TerminateOnGoalWrapper(env)
     if with_intervention:
@@ -165,9 +223,101 @@ def _make_env_with_wrappers(
             clearance_override_mode=str(getattr(args, "teacher_override_mode", "clearance")),
             teacher_goal_progress_steps=int(getattr(args, "teacher_goal_progress_steps", 3)),
             teacher_goal_progress_epsilon=float(getattr(args, "teacher_goal_progress_epsilon", 1e-3)),
+            teacher_progress_bad_steps=int(getattr(args, "teacher_progress_bad_steps", 3)),
+            teacher_progress_good_steps=int(getattr(args, "teacher_progress_good_steps", 5)),
+            teacher_progress_epsilon=float(getattr(args, "teacher_progress_epsilon", 1e-4)),
+            teacher_progress_trigger_mode=str(getattr(args, "teacher_progress_trigger_mode", "worse")),
+            teacher_progress_release_mode=str(getattr(args, "teacher_progress_release_mode", "improve")),
+            teacher_progress_score_mode=str(getattr(args, "teacher_progress_score_mode", "reward_wrapper")),
+            teacher_progress_dense_scale=float(getattr(args, "teacher_progress_dense_scale", 1.0)),
+            teacher_progress_clearance_scale=float(getattr(args, "teacher_progress_clearance_scale", -1.0)),
+            teacher_progress_clearance_margin=float(getattr(args, "teacher_progress_clearance_margin", 0.0)),
+            teacher_progress_clearance_mode=str(getattr(args, "teacher_progress_clearance_mode", "softplus")),
+            teacher_progress_clearance_temperature=float(getattr(args, "teacher_progress_clearance_temperature", 0.001)),
+            teacher_clearance_source=str(getattr(args, "teacher_clearance_source", "keepout")),
             debug_console=bool(getattr(args, "debug_intervention_console", False)),
         )
+    obs_frame_stack = int(getattr(args, "obs_frame_stack", 1))
+    if obs_frame_stack > 1:
+        env = FrameStackObservationWrapper(env, num_frames=obs_frame_stack)
     return env
+
+
+def _snapshot_eval_layout(
+    *,
+    env,
+    task,
+    overlay_specs: list[dict[str, Any]],
+    reset_info: dict[str, Any],
+    args,
+) -> tuple[dict[str, Any], dict[str, tuple[np.ndarray, float]]]:
+    overlay_poses: dict[str, tuple[np.ndarray, float]] = {}
+    obstacles: list[dict[str, Any]] = []
+    for spec in overlay_specs:
+        pose = _body_xy_and_yaw(task, str(spec["name"]))
+        if pose is None:
+            continue
+        pos_xy, yaw = pose
+        overlay_poses[str(spec["name"])] = (
+            np.asarray(pos_xy, dtype=np.float64).reshape(2).copy(),
+            float(yaw),
+        )
+        size = np.asarray(spec.get("size", [0.1]), dtype=np.float64).reshape(-1)
+        obstacles.append(
+            {
+                "name": str(spec["name"]),
+                "geom_type": str(spec.get("geom_type", "sphere")),
+                "xy": [float(pos_xy[0]), float(pos_xy[1])],
+                "yaw": float(yaw),
+                "size": [float(x) for x in size.tolist()],
+            }
+        )
+
+    agent_xy = extract_agent_xy(env)
+    goal_xy = extract_goal_xy(env)
+    return (
+        {
+            "layout_curriculum": str(
+                reset_info.get("layout_curriculum", getattr(args, "layout_curriculum", "none"))
+            ),
+            "layout_curriculum_level": int(
+                reset_info.get("layout_curriculum_level", getattr(args, "layout_curriculum_level", -1))
+            ),
+            "fixed_layout_preset": str(
+                reset_info.get("fixed_layout_preset", getattr(args, "fixed_layout_preset", "none"))
+            ),
+            "agent_xy": [
+                float(x)
+                for x in np.asarray(
+                    agent_xy if agent_xy is not None else [float("nan"), float("nan")],
+                    dtype=np.float64,
+                )
+                .reshape(2)
+                .tolist()
+            ],
+            "goal_xy": [
+                float(x)
+                for x in np.asarray(
+                    goal_xy if goal_xy is not None else [float("nan"), float("nan")],
+                    dtype=np.float64,
+                )
+                .reshape(2)
+                .tolist()
+            ],
+            "obstacles": obstacles,
+        },
+        overlay_poses,
+    )
+
+
+def _layout_hash(layout_snapshot: dict[str, Any]) -> str:
+    payload = {
+        "agent_xy": layout_snapshot.get("agent_xy"),
+        "goal_xy": layout_snapshot.get("goal_xy"),
+        "obstacles": layout_snapshot.get("obstacles"),
+    }
+    text = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]
 
 
 def _maybe_init_wandb(args, log_dir: Path):
@@ -362,8 +512,24 @@ def _accumulate_update_metrics(update_window: dict[str, float], last_update: SAC
     update_window["critic_loss_total"] += float(last_update.critic_loss_total)
     update_window["critic_loss_pref"] += float(last_update.critic_loss_pref)
     update_window["critic_loss_pref_weighted"] += float(last_update.critic_loss_pref_weighted)
+    update_window["pvp_proxy_teacher_loss"] += float(getattr(last_update, "pvp_proxy_teacher_loss", 0.0))
+    update_window["pvp_proxy_student_loss"] += float(getattr(last_update, "pvp_proxy_student_loss", 0.0))
+    update_window["eil_good_loss"] += float(getattr(last_update, "eil_good_loss", 0.0))
+    update_window["eil_bad_loss"] += float(getattr(last_update, "eil_bad_loss", 0.0))
+    update_window["eil_pair_loss"] += float(getattr(last_update, "eil_pair_loss", 0.0))
+    update_window["eil_good_batch_fraction"] += float(getattr(last_update, "eil_good_batch_fraction", 0.0))
+    update_window["eil_bad_batch_fraction"] += float(getattr(last_update, "eil_bad_batch_fraction", 0.0))
     update_window["actor_loss"] += float(last_update.actor_loss)
     update_window["actor_loss_sac"] += float(last_update.actor_loss_sac)
+    update_window["actor_loss_bc"] += float(last_update.actor_loss_bc)
+    update_window["actor_loss_ref"] += float(getattr(last_update, "actor_loss_ref", 0.0))
+    update_window["actor_bc_rows"] += float(last_update.actor_bc_rows)
+    update_window["actor_bc_weight_mean"] += float(last_update.actor_bc_weight_mean)
+    update_window["actor_bc_only_updates"] += float(last_update.actor_bc_only_updates)
+    update_window["intervention_aux_loss"] += float(getattr(last_update, "intervention_aux_loss", 0.0))
+    update_window["intervention_aux_acc"] += float(getattr(last_update, "intervention_aux_acc", 0.0))
+    update_window["intervention_aux_label_rate"] += float(getattr(last_update, "intervention_aux_label_rate", 0.0))
+    update_window["intervention_aux_pred_rate"] += float(getattr(last_update, "intervention_aux_pred_rate", 0.0))
     update_window["alpha_loss"] += float(last_update.alpha_loss)
     update_window["alpha"] += float(last_update.alpha)
     update_window["target_q_mean"] += float(last_update.target_q_mean)
@@ -392,6 +558,11 @@ def _accumulate_update_metrics(update_window: dict[str, float], last_update: SAC
     update_window["pref_action_delta_l2_sum"] += float(last_update.pref_action_delta_l2) * float(
         last_update.pref_linked_rows
     )
+    update_window["pref_action_delta_kept_fraction"] += float(
+        getattr(last_update, "pref_action_delta_kept_fraction", 1.0)
+    )
+    update_window["pref_action_weight_mean"] += float(getattr(last_update, "pref_action_weight_mean", 0.0))
+    update_window["pref_augmented_rows"] += float(getattr(last_update, "pref_augmented_rows", 0.0))
     update_window["pref_lambda"] += float(last_update.pref_lambda)
     update_window["pref_lambda_delta"] += float(last_update.pref_lambda_delta)
     update_window["pref_dual_violation"] += float(last_update.pref_dual_violation)
@@ -414,6 +585,15 @@ def _append_update_window_logs(*, logs: Dict[str, float], update_window: dict[st
             "train/critic_loss_total": float(update_window["critic_loss_total"] / denom),
             "train/actor_loss": float(update_window["actor_loss"] / actor_denom),
             "train/actor_loss_sac": float(update_window["actor_loss_sac"] / actor_denom),
+            "train/actor_loss_bc": float(update_window["actor_loss_bc"] / actor_denom),
+            "train/actor_loss_ref": float(update_window["actor_loss_ref"] / actor_denom),
+            "train/actor_bc_rows": float(update_window["actor_bc_rows"] / actor_denom),
+            "train/actor_bc_weight_mean": float(update_window["actor_bc_weight_mean"] / actor_denom),
+            "train/actor_bc_only_updates_per_iter": float(update_window["actor_bc_only_updates"] / denom),
+            "train/intervention_aux_loss": float(update_window["intervention_aux_loss"] / actor_denom),
+            "train/intervention_aux_acc": float(update_window["intervention_aux_acc"] / actor_denom),
+            "train/intervention_aux_label_rate": float(update_window["intervention_aux_label_rate"] / actor_denom),
+            "train/intervention_aux_pred_rate": float(update_window["intervention_aux_pred_rate"] / actor_denom),
             "train/alpha_loss": float(update_window["alpha_loss"] / alpha_denom),
             "train/alpha": float(update_window["alpha"] / denom),
             "train/target_q_mean": float(update_window["target_q_mean"] / denom),
@@ -461,14 +641,44 @@ def _append_update_window_logs(*, logs: Dict[str, float], update_window: dict[st
                 "train/pref_lambda_ema_cfg": float(getattr(args, "pref_lambda_ema", 0.0)),
                 "train/pref_violation_clip": float(getattr(args, "pref_violation_clip", 0.0)),
                 "train/pref_violation_target": float(getattr(args, "pref_violation_target", 0.0)),
+                "train/pref_stopgrad_positive_enabled": (
+                    1.0 if bool(getattr(args, "pref_stopgrad_positive", False)) else 0.0
+                ),
+                "train/pref_action_delta_min": float(getattr(args, "pref_action_delta_min", 0.0)),
+                "train/pref_action_delta_kept_fraction": float(
+                    update_window["pref_action_delta_kept_fraction"] / denom
+                ),
             }
         )
         if pref_rows > 0.0:
             logs["train/pref_linked_rows"] = float(pref_rows / denom)
+            logs["train/pref_augmented_rows"] = float(update_window["pref_augmented_rows"] / denom)
             logs["train/pref_q_delta_mean"] = float(update_window["pref_q_delta_sum"] / pref_rows)
             logs["train/pref_q_teacher_mean"] = float(update_window["pref_q_teacher_sum"] / pref_rows)
             logs["train/pref_q_student_mean"] = float(update_window["pref_q_student_sum"] / pref_rows)
             logs["train/pref_action_delta_l2"] = float(update_window["pref_action_delta_l2_sum"] / pref_rows)
+            logs["train/pref_action_weight_mean"] = float(update_window["pref_action_weight_mean"] / denom)
+    elif variant == "pvp":
+        logs.update(
+            {
+                "train/pvp_proxy_teacher_loss": float(update_window["pvp_proxy_teacher_loss"] / denom),
+                "train/pvp_proxy_student_loss": float(update_window["pvp_proxy_student_loss"] / denom),
+            }
+        )
+    elif variant == "eil":
+        logs.update(
+            {
+                "train/eil_good_loss": float(update_window["eil_good_loss"] / denom),
+                "train/eil_bad_loss": float(update_window["eil_bad_loss"] / denom),
+                "train/eil_pair_loss": float(update_window["eil_pair_loss"] / denom),
+                "train/eil_good_batch_fraction": float(update_window["eil_good_batch_fraction"] / denom),
+                "train/eil_bad_batch_fraction": float(update_window["eil_bad_batch_fraction"] / denom),
+                "train/eil_threshold": float(getattr(args, "eil_threshold", 0.0)),
+                "train/eil_good_margin": float(getattr(args, "eil_good_margin", 0.0)),
+                "train/eil_bad_margin": float(getattr(args, "eil_bad_margin", 0.0)),
+                "train/eil_pair_margin": float(getattr(args, "eil_pair_margin", 0.0)),
+            }
+        )
 
 
 def _build_transition(
@@ -482,6 +692,8 @@ def _build_transition(
     device: torch.device,
     student_action: np.ndarray | None = None,
     teacher_intervened: bool | None = None,
+    eil_good: bool | None = None,
+    eil_bad: bool | None = None,
 ) -> TensorDict:
     payload = {
         "observations": torch.as_tensor(obs, device=device, dtype=torch.float32).view(1, -1),
@@ -497,6 +709,10 @@ def _build_transition(
         payload["student_actions"] = torch.as_tensor(student_action[None, :], device=device, dtype=torch.float32)
     if teacher_intervened is not None:
         payload["teacher_intervened"] = torch.as_tensor([bool(teacher_intervened)], device=device, dtype=torch.bool)
+    if eil_good is not None:
+        payload["eil_good"] = torch.as_tensor([bool(eil_good)], device=device, dtype=torch.bool)
+    if eil_bad is not None:
+        payload["eil_bad"] = torch.as_tensor([bool(eil_bad)], device=device, dtype=torch.bool)
     return TensorDict(payload, batch_size=(1,), device=device)
 
 
@@ -541,6 +757,9 @@ def _episode_metrics(
     first_goal_hit_step: int | None,
     first_goal_reward_sum: float,
     first_goal_dense_reward_sum: float,
+    ep_teacher_progress_score_mean: float = float("nan"),
+    ep_teacher_progress_clearance_potential_mean: float = float("nan"),
+    ep_teacher_progress_decoupled_mean: float = float("nan"),
 ) -> Dict[str, float]:
     goal_met_count = int(info.get("goal_hit_count", 0))
     goal_met_any = goal_met_count > 0
@@ -580,6 +799,17 @@ def _episode_metrics(
         "intervention_fraction": float(info.get("teacher_fraction_steps", 0.0)),
         "intervention_num_bursts": float(info.get("teacher_num_bursts", 0.0)),
         "intervention_avg_burst_len": float(info.get("teacher_avg_burst_len", 0.0)),
+        "teacher_progress_score": (
+            float(ep_teacher_progress_score_mean) if np.isfinite(ep_teacher_progress_score_mean) else 0.0
+        ),
+        "teacher_progress_clearance_potential": (
+            float(ep_teacher_progress_clearance_potential_mean)
+            if np.isfinite(ep_teacher_progress_clearance_potential_mean)
+            else 0.0
+        ),
+        "teacher_progress_decoupled": (
+            float(ep_teacher_progress_decoupled_mean) if np.isfinite(ep_teacher_progress_decoupled_mean) else 0.0
+        ),
         "goal_met": 1.0 if goal_met_any else 0.0,
         "goal_met_count": float(goal_met_count),
         "first_goal_success": 1.0 if first_goal_hit_step is not None else 0.0,
@@ -627,9 +857,22 @@ def _run_eval(
     obs_normalizer,
     log_dir: Path | None = None,
     step_value: int | None = None,
+    checkpoint_path: Path | None = None,
 ) -> Dict[str, float]:
+    normalizer_was_training = bool(getattr(obs_normalizer, "training", False))
+    if hasattr(obs_normalizer, "eval"):
+        obs_normalizer.eval()
+    eval_args = args
+    eval_replay_prob = float(getattr(args, "eval_layout_seed_replay_prob", -1.0))
+    if eval_replay_prob >= 0.0:
+        class _EvalArgs:
+            pass
+
+        eval_args = _EvalArgs()
+        eval_args.__dict__.update(vars(args))
+        eval_args.layout_seed_replay_prob = float(eval_replay_prob)
     env = _make_env_with_wrappers(
-        args=args,
+        args=eval_args,
         seed=int(args.seed + 10_000),
         with_intervention=False,
         controller=None,
@@ -647,6 +890,7 @@ def _run_eval(
     save_episode_plots = bool(getattr(args, "eval_save_episode_plots", False))
     episode_plot_max = int(max(0, getattr(args, "eval_episode_plot_max_episodes", 9)))
     saved_episode_plot_paths: list[Path] = []
+    layout_hashes: list[str] = []
     plot_dir: Path | None = None
     if save_episode_plots and log_dir is not None and step_value is not None:
         plot_dir = log_dir / "eval_episode_plots" / f"step_{int(step_value)}"
@@ -654,6 +898,19 @@ def _run_eval(
     for episode_idx in range(int(args.num_eval_episodes)):
         obs, info = env.reset(seed=int(args.seed + 10_000 + episode_idx))
         obs = np.asarray(obs, dtype=np.float32).reshape(-1)
+        layout_snapshot, overlay_poses = _snapshot_eval_layout(
+            env=env,
+            task=task,
+            overlay_specs=overlay_specs,
+            reset_info=dict(info or {}),
+            args=args,
+        )
+        layout_hash = _layout_hash(layout_snapshot)
+        layout_snapshot["layout_hash"] = layout_hash
+        layout_hashes.append(layout_hash)
+        initial_goal_xy = np.asarray(layout_snapshot["goal_xy"], dtype=np.float64).reshape(2)
+        if not np.isfinite(initial_goal_xy).all():
+            initial_goal_xy = np.asarray(task.goal.pos[:2], dtype=np.float64).copy()
         ep_ret = 0.0
         ep_cost = 0.0
         ep_reward_raw_env = 0.0
@@ -735,6 +992,7 @@ def _run_eval(
         info = dict(info)
         info["goal_hit_count"] = goal_hit_count
         if save_episode_plots and plot_dir is not None and len(saved_episode_plot_paths) < episode_plot_max:
+            save_args_json(plot_dir / f"episode_{episode_idx + 1:03d}_layout.json", layout_snapshot)
             plot_path = plot_eval_episode_trajectory(
                 output_path=plot_dir / f"episode_{episode_idx + 1:03d}.png",
                 task=task,
@@ -752,6 +1010,8 @@ def _run_eval(
                 episode_reward=float(ep_ret),
                 goals_reached=int(goal_hit_count),
                 final_distance=float(final_dist),
+                initial_goal_xy=initial_goal_xy,
+                overlay_poses=overlay_poses,
             )
             saved_episode_plot_paths.append(Path(plot_path))
         win.add(
@@ -790,17 +1050,51 @@ def _run_eval(
             )
         )
 
+    unique_layouts = len(set(layout_hashes))
+    total_layouts = len(layout_hashes)
+    if plot_dir is not None and total_layouts > 0:
+        save_args_json(
+            plot_dir / "layout_summary.json",
+            {
+                "layout_unique_count": int(unique_layouts),
+                "layout_total_count": int(total_layouts),
+                "layout_unique_fraction": float(unique_layouts / max(1, total_layouts)),
+                "layout_duplicate_count": int(total_layouts - unique_layouts),
+                "layout_hashes": list(layout_hashes),
+            },
+        )
+        save_eval_manifest(
+            output_dir=plot_dir,
+            args=args,
+            source="safetygym_minimal_train_eval",
+            step_value=step_value,
+            layout_hashes=layout_hashes,
+            extra={
+                "checkpoint_path": str(checkpoint_path) if checkpoint_path is not None else None,
+                "log_dir": str(log_dir) if log_dir is not None else None,
+            },
+        )
     if save_episode_plots and plot_dir is not None and saved_episode_plot_paths:
         sheet_path = plot_episode_contact_sheet(
             image_paths=saved_episode_plot_paths,
             output_path=plot_dir / "episode_contact_sheet.png",
-            title=f"SafetyGym minimal eval step {int(step_value or 0)}",
+            title=(
+                f"SafetyGym minimal eval step {int(step_value or 0)} "
+                f"(layouts {unique_layouts}/{total_layouts})"
+            ),
             max_cols=3,
         )
         if sheet_path is not None:
             print(f"[EvalPlots] saved {sheet_path}", flush=True)
     env.close()
-    return augment_rollout_summary(win.summary("eval"), "eval")
+    if normalizer_was_training and hasattr(obs_normalizer, "train"):
+        obs_normalizer.train()
+    summary = augment_rollout_summary(win.summary("eval"), "eval")
+    summary["eval/layout_unique_count"] = float(unique_layouts)
+    summary["eval/layout_total_count"] = float(total_layouts)
+    summary["eval/layout_unique_fraction"] = float(unique_layouts / max(1, total_layouts))
+    summary["eval/layout_duplicate_count"] = float(total_layouts - unique_layouts)
+    return summary
 
 
 def _save_checkpoint(
@@ -899,7 +1193,15 @@ def _maybe_load_checkpoint(*, args, sac: SACTensors, obs_normalizer, device: tor
         return
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     if bool(getattr(args, "load_actor_from_checkpoint", True)) and "actor_state_dict" in checkpoint:
-        sac.actor.load_state_dict(checkpoint["actor_state_dict"])
+        try:
+            sac.actor.load_state_dict(checkpoint["actor_state_dict"])
+        except RuntimeError:
+            if getattr(sac.actor, "intervention_aux_head", None) is None:
+                raise
+            missing, unexpected = sac.actor.load_state_dict(checkpoint["actor_state_dict"], strict=False)
+            allowed_missing = {"intervention_aux_head.weight", "intervention_aux_head.bias"}
+            if set(missing) - allowed_missing or unexpected:
+                raise
     if bool(getattr(args, "load_critic_from_checkpoint", True)) and "critic_state_dict" in checkpoint:
         sac.critic.load_state_dict(checkpoint["critic_state_dict"])
     if bool(getattr(args, "load_critic_target_from_checkpoint", True)) and "critic_target_state_dict" in checkpoint:
@@ -909,7 +1211,11 @@ def _maybe_load_checkpoint(*, args, sac: SACTensors, obs_normalizer, device: tor
     if bool(getattr(args, "load_alpha_from_checkpoint", True)) and "log_alpha" in checkpoint:
         log_alpha = torch.as_tensor(checkpoint["log_alpha"], device=device, dtype=torch.float32).reshape_as(sac.log_alpha)
         sac.log_alpha.data.copy_(log_alpha)
-    if bool(getattr(args, "obs_normalization", True)) and hasattr(obs_normalizer, "load_state_dict"):
+    if (
+        bool(getattr(args, "obs_normalization", True))
+        and bool(getattr(args, "load_obs_normalizer_from_checkpoint", True))
+        and hasattr(obs_normalizer, "load_state_dict")
+    ):
         state = checkpoint.get("obs_normalizer_state_dict")
         if state:
             obs_normalizer.load_state_dict(state, strict=False)
@@ -931,6 +1237,8 @@ def _reset_critic_stack(
     hidden_critic: int,
     use_layer_norm: bool,
     layer_norm_eps: float,
+    temporal_encoder: str,
+    obs_frame_stack: int,
     lr_critic: float,
     weight_decay: float,
     device: torch.device,
@@ -943,6 +1251,8 @@ def _reset_critic_stack(
             num_critics=2,
             use_layer_norm=use_layer_norm,
             layer_norm_eps=layer_norm_eps,
+            temporal_encoder=temporal_encoder,
+            obs_frame_stack=obs_frame_stack,
             device=device,
         )
         critic_target = SafetyCritic(
@@ -952,6 +1262,8 @@ def _reset_critic_stack(
             num_critics=2,
             use_layer_norm=use_layer_norm,
             layer_norm_eps=layer_norm_eps,
+            temporal_encoder=temporal_encoder,
+            obs_frame_stack=obs_frame_stack,
             device=device,
         )
     else:
@@ -989,7 +1301,7 @@ def run_minimal_training(args) -> None:
     log_dir, model_dir = _prepare_run_dirs(args)
     wandb_run = _maybe_init_wandb(args, log_dir)
     variant = str(getattr(args, "variant", "plain")).strip().lower()
-    if variant not in {"plain", "own", "pvp", "hilserl"}:
+    if variant not in {"plain", "own", "pvp", "eil", "hilserl"}:
         raise ValueError(f"Unsupported variant: {variant}")
 
     controller = None
@@ -1027,7 +1339,14 @@ def run_minimal_training(args) -> None:
             expert_config_path=str(getattr(args, "expert_config_path", "") or ""),
             expert_safe_checkpoint_path=str(getattr(args, "expert_safe_checkpoint_path", "") or ""),
             expert_switch_clearance_threshold=float(getattr(args, "expert_switch_clearance_threshold", 0.08)),
+            learned_intervention_threshold=float(getattr(args, "learned_intervention_threshold", 0.5)),
             expert_device=str(getattr(args, "expert_device", "cpu")),
+            scripted_geo_heading_tolerance=float(getattr(args, "scripted_geo_heading_tolerance", 0.20)),
+            scripted_geo_lookahead=float(getattr(args, "scripted_geo_lookahead", 1.0)),
+            scripted_geo_safety_margin=float(getattr(args, "scripted_geo_safety_margin", 0.18)),
+            scripted_geo_grid_resolution=float(getattr(args, "scripted_geo_grid_resolution", 0.08)),
+            scripted_geo_emergency_clearance=float(getattr(args, "scripted_geo_emergency_clearance", 0.08)),
+            scripted_geo_action_shield_steps=int(getattr(args, "scripted_geo_action_shield_steps", 1)),
             prefer_separate_keyboard_window=str(getattr(args, "render_mode", "none")).lower() == "human",
             control_scheme_override=resolve_control_scheme(
                 str(args.env_name),
@@ -1051,8 +1370,13 @@ def run_minimal_training(args) -> None:
             hidden_dim=int(args.actor_hidden_dim),
             use_layer_norm=bool(getattr(args, "use_layer_norm", False)),
             layer_norm_eps=float(getattr(args, "layer_norm_eps", 1e-5)),
+            temporal_encoder=str(getattr(args, "temporal_encoder", "none")),
+            obs_frame_stack=int(getattr(args, "obs_frame_stack", 1)),
+            intervention_aux_head=bool(getattr(args, "intervention_aux_head", False)),
             device=device,
         )
+        actor._checkpoint_temporal_encoder = str(getattr(args, "temporal_encoder", "none"))
+        actor._checkpoint_obs_frame_stack = int(getattr(args, "obs_frame_stack", 1))
         critic = SafetyCritic(
             n_obs=obs_dim,
             n_act=act_dim,
@@ -1060,6 +1384,8 @@ def run_minimal_training(args) -> None:
             num_critics=2,
             use_layer_norm=bool(getattr(args, "use_layer_norm", False)),
             layer_norm_eps=float(getattr(args, "layer_norm_eps", 1e-5)),
+            temporal_encoder=str(getattr(args, "temporal_encoder", "none")),
+            obs_frame_stack=int(getattr(args, "obs_frame_stack", 1)),
             device=device,
         )
         critic_target = SafetyCritic(
@@ -1069,6 +1395,8 @@ def run_minimal_training(args) -> None:
             num_critics=2,
             use_layer_norm=bool(getattr(args, "use_layer_norm", False)),
             layer_norm_eps=float(getattr(args, "layer_norm_eps", 1e-5)),
+            temporal_encoder=str(getattr(args, "temporal_encoder", "none")),
+            obs_frame_stack=int(getattr(args, "obs_frame_stack", 1)),
             device=device,
         )
     else:
@@ -1125,6 +1453,15 @@ def run_minimal_training(args) -> None:
     else:
         obs_normalizer = torch.nn.Identity()
     _maybe_load_checkpoint(args=args, sac=sac, obs_normalizer=obs_normalizer, device=device)
+    freeze_obs_normalizer = bool(getattr(args, "freeze_obs_normalizer_after_load", False))
+    if freeze_obs_normalizer and hasattr(obs_normalizer, "eval"):
+        obs_normalizer.eval()
+    actor_reference = None
+    if float(getattr(args, "actor_reference_distill_weight", 0.0)) > 0.0:
+        actor_reference = copy.deepcopy(sac.actor).to(device)
+        actor_reference.eval()
+        for param in actor_reference.parameters():
+            param.requires_grad_(False)
 
     def _make_rb(buffer_size: int | None = None) -> SimpleReplayBuffer:
         return SimpleReplayBuffer(
@@ -1173,6 +1510,42 @@ def run_minimal_training(args) -> None:
         if variant == "own" and pref_capacity > 1 and pref_replay_sample_ratio > 0.0
         else None
     )
+    eil_pending_rows: deque[TensorDict] = deque()
+    eil_teacher_active = False
+    eil_bad_pre_steps = int(max(0, getattr(args, "eil_bad_pre_steps", 8)))
+
+    def _annotate_eil_row(row: TensorDict, *, good: bool, bad: bool) -> TensorDict:
+        row = row.clone()
+        row["eil_good"] = torch.as_tensor([bool(good)], device=device, dtype=torch.bool)
+        row["eil_bad"] = torch.as_tensor([bool(bad)], device=device, dtype=torch.bool)
+        return row
+
+    def _store_main_transition(row: TensorDict, *, teacher_now: bool, done_now: bool) -> None:
+        nonlocal eil_teacher_active
+        if variant != "eil":
+            main_rb.extend(row)
+            return
+        if bool(teacher_now):
+            if not eil_teacher_active and eil_pending_rows:
+                pending = list(eil_pending_rows)
+                split_idx = max(0, len(pending) - eil_bad_pre_steps)
+                for queued_row in pending[:split_idx]:
+                    main_rb.extend(_annotate_eil_row(queued_row, good=True, bad=False))
+                for queued_row in pending[split_idx:]:
+                    main_rb.extend(_annotate_eil_row(queued_row, good=False, bad=True))
+                eil_pending_rows.clear()
+            main_rb.extend(_annotate_eil_row(row, good=True, bad=False))
+            eil_teacher_active = True
+        else:
+            if eil_teacher_active:
+                eil_teacher_active = False
+            eil_pending_rows.append(row.clone())
+            while len(eil_pending_rows) > eil_bad_pre_steps:
+                main_rb.extend(_annotate_eil_row(eil_pending_rows.popleft(), good=True, bad=False))
+        if bool(done_now):
+            while eil_pending_rows:
+                main_rb.extend(_annotate_eil_row(eil_pending_rows.popleft(), good=True, bad=False))
+            eil_teacher_active = False
     dataset_target = str(getattr(args, "demo_dataset_target", "variant")).strip().lower()
     dataset_requested = bool(str(getattr(args, "demo_dataset_path", "") or "").strip()) or bool(
         getattr(args, "demo_dataset_auto_load", False)
@@ -1203,6 +1576,9 @@ def run_minimal_training(args) -> None:
                 max_rows=max_rows,
                 expected_obs_dim=obs_dim,
                 expected_act_dim=act_dim,
+                teacher_intervened_override=False
+                if bool(getattr(args, "demo_dataset_clear_teacher_flags_in_replay", False))
+                else None,
             )
             print(f"[Dataset] loaded {stats['rows_loaded']} rows into replay buffer", flush=True)
         elif dataset_target == "demo":
@@ -1226,6 +1602,9 @@ def run_minimal_training(args) -> None:
                 max_rows=max_rows,
                 expected_obs_dim=obs_dim,
                 expected_act_dim=act_dim,
+                teacher_intervened_override=False
+                if bool(getattr(args, "demo_dataset_clear_teacher_flags_in_replay", False))
+                else None,
             )
             print(f"[Dataset] loaded {stats_main['rows_loaded']} rows into replay buffer", flush=True)
             if variant == "hilserl":
@@ -1319,6 +1698,165 @@ def run_minimal_training(args) -> None:
             flush=True,
         )
 
+    bc_eval_enabled = bool(getattr(args, "bc_eval_hotkey_enable", True))
+    bc_eval_interval = int(max(0, getattr(args, "bc_eval_interval", 0)))
+    next_bc_eval_step: int | None = bc_eval_interval if bc_eval_interval > 0 else None
+    bc_eval_dataset_path: str | None = None
+    bc_eval_processes: list[subprocess.Popen] = []
+    if bc_eval_interval > 0:
+        print(f"[BC Eval] periodic learned-teacher eval enabled interval={bc_eval_interval}", flush=True)
+
+    def _resolve_hotkey_dataset_path() -> str:
+        nonlocal bc_eval_dataset_path
+        if bc_eval_dataset_path is not None:
+            return bc_eval_dataset_path
+        if export_replay_dataset_path is not None:
+            bc_eval_dataset_path = export_replay_dataset_path
+            return bc_eval_dataset_path
+        dataset_root = str(getattr(args, "export_replay_dataset_dir", "") or "").strip() or str(DEFAULT_SAFETYGYM_DATASET_DIR)
+        bc_eval_dataset_path = str(
+            build_dataset_path(
+                env_name=str(args.env_name),
+                dataset_dir=dataset_root,
+                label=str(getattr(args, "bc_eval_dataset_label", "hotkey_human_intervention_replay")),
+            )
+        )
+        return bc_eval_dataset_path
+
+    def _run_hotkey_bc_eval(current_step: int) -> None:
+        if not bc_eval_enabled:
+            print("[BC Eval] hotkey ignored because bc_eval_hotkey_enable=0.", flush=True)
+            return
+        if main_rb.size <= 0:
+            print("[BC Eval] hotkey ignored because replay buffer is empty.", flush=True)
+            return
+        dataset_path = _resolve_hotkey_dataset_path()
+        try:
+            _export_replay_snapshot(
+                args=args,
+                replay_buffer=main_rb,
+                dataset_path=dataset_path,
+                env_name=str(args.env_name),
+                step_value=int(current_step),
+                tag="hotkey",
+                context="hotkey_bc_eval",
+            )
+        except Exception as exc:
+            print(f"[BC Eval] failed to save hotkey dataset: {exc}", flush=True)
+            return
+
+        output_root = log_dir / "hotkey_bc_eval"
+        exp_name = f"step_{int(current_step)}"
+        python_bin = sys.executable
+        train_cmd = [
+            python_bin,
+            "train_safetygym_human_imitation.py",
+            "--dataset_path",
+            dataset_path,
+            "--env_name",
+            str(args.env_name),
+            "--output_dir",
+            str(output_root),
+            "--exp_name",
+            exp_name,
+            "--seed",
+            str(int(args.seed)),
+            "--device",
+            str(getattr(args, "bc_eval_device", "cpu")),
+            "--epochs",
+            str(int(getattr(args, "bc_eval_epochs", 10))),
+            "--batch_size",
+            str(int(getattr(args, "bc_eval_batch_size", 256))),
+            "--context_len",
+            str(int(getattr(args, "bc_eval_context_len", 8))),
+            "--hidden_dim",
+            str(int(getattr(args, "bc_eval_hidden_dim", 256))),
+            "--num_layers",
+            str(int(getattr(args, "bc_eval_num_layers", 3))),
+            "--intervention_threshold",
+            str(float(getattr(args, "bc_eval_intervention_threshold", 0.5))),
+            "--surface_mode",
+            str(getattr(args, "surface_mode", "default")),
+            "--car_wheel_command_limit",
+            str(float(getattr(args, "car_wheel_command_limit", 1.0))),
+            "--car_force_scale",
+            str(float(getattr(args, "car_force_scale", 1.0))),
+            "--car_action_mode",
+            str(getattr(args, "car_action_mode", "raw_wheels")),
+            "--point_action_mode",
+            str(getattr(args, "point_action_mode", "native")),
+        ]
+        print("[BC Eval] training learned intervention teacher from current replay snapshot...", flush=True)
+        try:
+            subprocess.run(train_cmd, cwd=str(Path(__file__).resolve().parent.parent), check=True)
+        except subprocess.CalledProcessError as exc:
+            print(f"[BC Eval] teacher training failed with exit code {exc.returncode}.", flush=True)
+            return
+        checkpoint_path = output_root / exp_name / "best.pt"
+        if not checkpoint_path.is_file():
+            print(f"[BC Eval] expected checkpoint was not created: {checkpoint_path}", flush=True)
+            return
+        student_ckpt = str(getattr(args, "bc_eval_student_checkpoint_path", "") or getattr(args, "init_checkpoint_path", "") or "")
+        student_policy = str(getattr(args, "bc_eval_student_policy", "checkpoint"))
+        if student_policy == "checkpoint" and not student_ckpt:
+            student_policy = "random"
+        eval_cmd = [
+            python_bin,
+            "eval_safetygym_imitation_teacher.py",
+            "--teacher_checkpoint_path",
+            str(checkpoint_path),
+            "--student_policy",
+            student_policy,
+            "--student_checkpoint_path",
+            student_ckpt,
+            "--env_name",
+            str(args.env_name),
+            "--seed",
+            str(int(args.seed) + 70_000 + int(current_step)),
+            "--num_episodes",
+            str(int(getattr(args, "bc_eval_num_episodes", 3))),
+            "--render_mode",
+            str(getattr(args, "bc_eval_render_mode", "pygame")),
+            "--fps",
+            str(float(getattr(args, "bc_eval_fps", 30.0))),
+            "--reward_mode",
+            str(getattr(args, "reward_mode", "dense")),
+            "--dense_reward_scale",
+            str(float(getattr(args, "dense_reward_scale", 1.0))),
+            "--step_penalty",
+            str(float(getattr(args, "step_penalty", 0.0))),
+            "--surface_mode",
+            str(getattr(args, "surface_mode", "default")),
+            "--car_wheel_command_limit",
+            str(float(getattr(args, "car_wheel_command_limit", 1.0))),
+            "--car_force_scale",
+            str(float(getattr(args, "car_force_scale", 1.0))),
+            "--car_action_mode",
+            str(getattr(args, "car_action_mode", "raw_wheels")),
+            "--point_action_mode",
+            str(getattr(args, "point_action_mode", "native")),
+            "--obs_mask_mode",
+            str(getattr(args, "obs_mask_mode", "none")),
+            "--intervention_threshold",
+            str(float(getattr(args, "bc_eval_intervention_threshold", 0.5))),
+            "--device",
+            str(getattr(args, "bc_eval_device", "cpu")),
+        ]
+        if bool(getattr(args, "terminate_on_goal", False)):
+            eval_cmd.append("--terminate_on_goal")
+        if str(getattr(args, "bc_eval_render_mode", "pygame")).strip().lower() == "none":
+            print(f"[BC Eval] running headless eval with checkpoint {checkpoint_path}", flush=True)
+            try:
+                subprocess.run(eval_cmd, cwd=str(Path(__file__).resolve().parent.parent), check=True)
+            except subprocess.CalledProcessError as exc:
+                print(f"[BC Eval] teacher eval failed with exit code {exc.returncode}.", flush=True)
+        else:
+            print(f"[BC Eval] launching eval viewer with checkpoint {checkpoint_path}", flush=True)
+            try:
+                bc_eval_processes.append(subprocess.Popen(eval_cmd, cwd=str(Path(__file__).resolve().parent.parent)))
+            except Exception as exc:
+                print(f"[BC Eval] failed to launch eval process: {exc}", flush=True)
+
     def _reset_obs(reset_seed: int | None):
         if reset_seed is None:
             ob, _info = env.reset()
@@ -1362,15 +1900,27 @@ def run_minimal_training(args) -> None:
                     obs=obs,
                     action=applied_action,
                     next_obs=next_obs,
-                    reward=float(reward),
+                    reward=(
+                        0.0
+                        if variant == "pvp" and not bool(getattr(args, "pvp_include_env_reward_in_td", False))
+                        else float(reward)
+                    ),
                     done=bool(terminated or truncated),
                     truncated=bool(truncated),
                     device=device,
                     student_action=student_action,
                     teacher_intervened=teacher_intervened,
                 )
-                main_rb.extend(transition)
-                if bool(args.obs_normalization) and hasattr(obs_normalizer, "update"):
+                _store_main_transition(
+                    transition,
+                    teacher_now=teacher_intervened,
+                    done_now=bool(terminated or truncated),
+                )
+                if (
+                    bool(args.obs_normalization)
+                    and not freeze_obs_normalizer
+                    and hasattr(obs_normalizer, "update")
+                ):
                     obs_normalizer.update(torch.as_tensor(obs[None, :], device=device, dtype=torch.float32))
                     obs_normalizer.update(torch.as_tensor(next_obs[None, :], device=device, dtype=torch.float32))
                 if variant == "pvp":
@@ -1403,6 +1953,18 @@ def run_minimal_training(args) -> None:
                 force_end = bool(episode_cap > 0 and ep_steps >= episode_cap and not (terminated or truncated))
                 if terminated or truncated or force_end:
                     break
+            print(
+                json.dumps(
+                    {
+                        "train/prefill_episode": float(ep_idx + 1),
+                        "train/prefill_episode_steps": float(ep_steps),
+                        "train/prefill_steps_so_far": float(total_prefill_steps),
+                        "train/prefill_demo_steps_so_far": float(demo_steps),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
         prefill_steps = int(total_prefill_steps)
         prefill_logs = {
             "train/prefill_episodes": float(int(args.prefill_demo_episodes)),
@@ -1413,6 +1975,80 @@ def run_minimal_training(args) -> None:
         print(json.dumps(prefill_logs, sort_keys=True), flush=True)
         if wandb_run is not None:
             wandb_run.log(prefill_logs, step=0)
+
+    aux_pretrain_updates = int(max(0, getattr(args, "intervention_aux_pretrain_updates", 0)))
+    if aux_pretrain_updates > 0:
+        if not bool(getattr(args, "intervention_aux_head", False)) or getattr(sac.actor, "intervention_aux_head", None) is None:
+            raise ValueError("--intervention_aux_pretrain_updates requires --intervention_aux_head.")
+        aux_batch_size = int(getattr(args, "intervention_aux_pretrain_batch_size", 0)) or int(args.batch_size)
+        if main_rb.size < aux_batch_size:
+            raise ValueError(
+                "Intervention aux pretraining requires at least "
+                f"batch_size={aux_batch_size} labeled replay rows, got {int(main_rb.size)}. "
+                "Use --prefill_demo_episodes or load a replay dataset first."
+            )
+        frozen_actor = copy.deepcopy(sac.actor).to(device)
+        frozen_actor.eval()
+        for param in frozen_actor.parameters():
+            param.requires_grad_(False)
+        pretrain_lr = float(getattr(args, "intervention_aux_pretrain_lr", 0.0))
+        optimizer = (
+            torch.optim.Adam(sac.actor.parameters(), lr=pretrain_lr)
+            if pretrain_lr > 0.0
+            else sac.actor_optimizer
+        )
+        distill_weight = float(max(0.0, getattr(args, "intervention_aux_pretrain_distill_weight", 1.0)))
+        pos_weight_value = float(getattr(args, "intervention_aux_pos_weight", 0.0))
+        loss_sum = 0.0
+        aux_sum = 0.0
+        distill_sum = 0.0
+        acc_sum = 0.0
+        label_rate_sum = 0.0
+        pred_rate_sum = 0.0
+        for _update_idx in range(1, aux_pretrain_updates + 1):
+            batch = main_rb.sample(aux_batch_size)
+            obs_raw = batch["observations"].to(device=device, dtype=torch.float32)
+            obs_batch = obs_normalizer(obs_raw) if obs_normalizer is not None else obs_raw
+            labels = batch["teacher_intervened"].to(device=device, dtype=torch.float32).reshape(-1)
+            logits = sac.actor.intervention_logits(obs_batch)
+            pos_weight = (
+                torch.as_tensor(pos_weight_value, device=device, dtype=torch.float32)
+                if pos_weight_value > 0.0
+                else None
+            )
+            aux_loss = F.binary_cross_entropy_with_logits(logits, labels, pos_weight=pos_weight)
+            _, _, current_mean = sac.actor(obs_batch)
+            with torch.no_grad():
+                _, _, target_mean = frozen_actor(obs_batch)
+            distill_loss = F.mse_loss(current_mean, target_mean)
+            loss = aux_loss + distill_weight * distill_loss
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            if float(args.max_grad_norm) > 0.0:
+                torch.nn.utils.clip_grad_norm_(sac.actor.parameters(), float(args.max_grad_norm))
+            optimizer.step()
+            with torch.no_grad():
+                probs = torch.sigmoid(logits)
+                preds = probs >= 0.5
+                acc = (preds == labels.to(torch.bool)).to(torch.float32).mean()
+                loss_sum += float(loss.detach().cpu().item())
+                aux_sum += float(aux_loss.detach().cpu().item())
+                distill_sum += float(distill_loss.detach().cpu().item())
+                acc_sum += float(acc.detach().cpu().item())
+                label_rate_sum += float(labels.detach().mean().cpu().item())
+                pred_rate_sum += float(preds.to(torch.float32).mean().detach().cpu().item())
+        pretrain_logs = {
+            "train/intervention_aux_pretrain_updates": float(aux_pretrain_updates),
+            "train/intervention_aux_pretrain_loss": float(loss_sum / max(1, aux_pretrain_updates)),
+            "train/intervention_aux_pretrain_bce": float(aux_sum / max(1, aux_pretrain_updates)),
+            "train/intervention_aux_pretrain_distill": float(distill_sum / max(1, aux_pretrain_updates)),
+            "train/intervention_aux_pretrain_acc": float(acc_sum / max(1, aux_pretrain_updates)),
+            "train/intervention_aux_pretrain_label_rate": float(label_rate_sum / max(1, aux_pretrain_updates)),
+            "train/intervention_aux_pretrain_pred_rate": float(pred_rate_sum / max(1, aux_pretrain_updates)),
+        }
+        print(json.dumps(pretrain_logs, sort_keys=True), flush=True)
+        if wandb_run is not None:
+            wandb_run.log(pretrain_logs, step=0)
 
     if int(getattr(args, "demo_pretrain_updates", 0)) > 0 and demo_rb is not None:
         demo_batch_size = int(getattr(args, "demo_pretrain_batch_size", 0)) or int(args.batch_size)
@@ -1445,6 +2081,21 @@ def run_minimal_training(args) -> None:
                     action_high=high_t,
                     update_actor=(update_idx % int(max(1, args.policy_frequency)) == 0),
                     critic_loss_reduction=str(args.critic_loss_reduction),
+                    actor_bc_weight=float(getattr(args, "actor_bc_weight", 0.0)),
+                    actor_bc_teacher_only=bool(getattr(args, "actor_bc_teacher_only", True)),
+                    actor_bc_only=bool(int(getattr(args, "actor_bc_only_pretrain_updates", 0)) > 0),
+                    actor_bc_reward_weight_scale=float(getattr(args, "actor_bc_reward_weight_scale", 0.0)),
+                    actor_bc_reward_weight_max=float(getattr(args, "actor_bc_reward_weight_max", 10.0)),
+                    actor_bc_obstacle_lidar_weight_scale=float(
+                        getattr(args, "actor_bc_obstacle_lidar_weight_scale", 0.0)
+                    ),
+                    actor_bc_obstacle_lidar_weight_max=float(
+                        getattr(args, "actor_bc_obstacle_lidar_weight_max", 10.0)
+                    ),
+                    actor_bc_goal_block_weight_scale=float(getattr(args, "actor_bc_goal_block_weight_scale", 0.0)),
+                    actor_bc_goal_block_weight_max=float(getattr(args, "actor_bc_goal_block_weight_max", 10.0)),
+                    intervention_aux_weight=float(getattr(args, "intervention_aux_weight", 0.0)),
+                    intervention_aux_pos_weight=float(getattr(args, "intervention_aux_pos_weight", 0.0)),
                 )
             if bool(getattr(args, "critic_reset_after_pretrain", False)):
                 _reset_critic_stack(
@@ -1455,6 +2106,8 @@ def run_minimal_training(args) -> None:
                     hidden_critic=int(args.critic_hidden_dim),
                     use_layer_norm=bool(getattr(args, "use_layer_norm", False)),
                     layer_norm_eps=float(getattr(args, "layer_norm_eps", 1e-5)),
+                    temporal_encoder=str(getattr(args, "temporal_encoder", "none")),
+                    obs_frame_stack=int(getattr(args, "obs_frame_stack", 1)),
                     lr_critic=float(args.critic_learning_rate),
                     weight_decay=float(args.weight_decay),
                     device=device,
@@ -1506,7 +2159,11 @@ def run_minimal_training(args) -> None:
         pref_n = max(1, int(args.batch_size * float(getattr(args, "pref_sample_ratio", 0.0))))
         return _sample_pref_batch(pref_pairs, pref_n, device)
 
-    def _run_update_step(update_index: int) -> SACUpdateMetrics:
+    def _run_update_step(update_index: int, *, current_step: int = 0) -> SACUpdateMetrics:
+        actor_bc_only_until_step = int(max(0, getattr(args, "actor_bc_only_until_step", 0)))
+        actor_update_start_step = int(max(0, getattr(args, "actor_update_start_step", 0)))
+        actor_update_due = update_index % int(max(1, args.policy_frequency)) == 0
+        actor_update_due = bool(actor_update_due and int(current_step) >= actor_update_start_step)
         return sac_update_step(
             sac=sac,
             batch=_sample_training_batch(),
@@ -1526,13 +2183,40 @@ def run_minimal_training(args) -> None:
             pref_violation_clip=float(getattr(args, "pref_violation_clip", 10.0)),
             pref_violation_target=float(getattr(args, "pref_violation_target", 0.0)),
             pref_lagrangian_violation_type=str(getattr(args, "pref_lagrangian_violation_type", "hinge")),
+            pref_obs_noise_std=float(getattr(args, "pref_obs_noise_std", 0.0)),
+            pref_action_noise_std=float(getattr(args, "pref_action_noise_std", 0.0)),
+            pref_action_noise_copies=int(getattr(args, "pref_action_noise_copies", 1)),
+            pref_action_delta_min=float(getattr(args, "pref_action_delta_min", 0.0)),
+            pref_action_delta_weight_scale=float(getattr(args, "pref_action_delta_weight_scale", 0.0)),
+            pref_action_delta_weight_max=float(getattr(args, "pref_action_delta_weight_max", 10.0)),
+            algo_variant=variant,
+            pvp_proxy_value_bound=float(getattr(args, "pvp_proxy_value_bound", 1.0)),
+            eil_threshold=float(getattr(args, "eil_threshold", 0.0)),
+            eil_good_margin=float(getattr(args, "eil_good_margin", 0.0)),
+            eil_bad_margin=float(getattr(args, "eil_bad_margin", 0.01)),
+            eil_pair_margin=float(getattr(args, "eil_pair_margin", 0.01)),
             alpha_min=float(args.alpha_min),
             alpha_max=float(args.alpha_max),
             scale_actor_to_env_bounds=bool(args.scale_actor_to_env_bounds),
             action_low=low_t,
             action_high=high_t,
-            update_actor=(update_index % int(max(1, args.policy_frequency)) == 0),
+            update_actor=actor_update_due,
             critic_loss_reduction=str(args.critic_loss_reduction),
+            actor_bc_weight=float(getattr(args, "actor_bc_weight", 0.0)),
+            actor_bc_teacher_only=bool(getattr(args, "actor_bc_teacher_only", True)),
+            actor_bc_only=bool(actor_bc_only_until_step > 0 and int(current_step) <= actor_bc_only_until_step),
+            actor_bc_reward_weight_scale=float(getattr(args, "actor_bc_reward_weight_scale", 0.0)),
+            actor_bc_reward_weight_max=float(getattr(args, "actor_bc_reward_weight_max", 10.0)),
+            actor_bc_obstacle_lidar_weight_scale=float(
+                getattr(args, "actor_bc_obstacle_lidar_weight_scale", 0.0)
+            ),
+            actor_bc_obstacle_lidar_weight_max=float(getattr(args, "actor_bc_obstacle_lidar_weight_max", 10.0)),
+            actor_bc_goal_block_weight_scale=float(getattr(args, "actor_bc_goal_block_weight_scale", 0.0)),
+            actor_bc_goal_block_weight_max=float(getattr(args, "actor_bc_goal_block_weight_max", 10.0)),
+            actor_reference=actor_reference,
+            actor_reference_distill_weight=float(getattr(args, "actor_reference_distill_weight", 0.0)),
+            intervention_aux_weight=float(getattr(args, "intervention_aux_weight", 0.0)),
+            intervention_aux_pos_weight=float(getattr(args, "intervention_aux_pos_weight", 0.0)),
         )
 
     if bool(getattr(args, "offline_only", False)):
@@ -1549,7 +2233,7 @@ def run_minimal_training(args) -> None:
 
         for update_step in range(1, int(args.total_timesteps) + 1):
             total_updates += 1
-            last_update = _run_update_step(total_updates)
+            last_update = _run_update_step(total_updates, current_step=update_step)
             _accumulate_update_metrics(update_window, last_update)
             step = update_step
 
@@ -1593,6 +2277,7 @@ def run_minimal_training(args) -> None:
                     obs_normalizer=obs_normalizer,
                     log_dir=log_dir,
                     step_value=step,
+                    checkpoint_path=model_dir / f"step_{step}.pt",
                 )
                 eval_logs["eval/step"] = float(step)
                 print(json.dumps(eval_logs, sort_keys=True), flush=True)
@@ -1652,6 +2337,7 @@ def run_minimal_training(args) -> None:
             obs_normalizer=obs_normalizer,
             log_dir=log_dir,
             step_value=int(args.total_timesteps),
+            checkpoint_path=model_dir / "final.pt",
         )
         final_eval["eval/step"] = float(args.total_timesteps)
         print(json.dumps(final_eval, sort_keys=True), flush=True)
@@ -1723,6 +2409,10 @@ def run_minimal_training(args) -> None:
     ep_clearance_sum = 0.0
     ep_clearance_count = 0
     ep_min_clearance = float("inf")
+    ep_teacher_progress_score_sum = 0.0
+    ep_teacher_progress_clearance_potential_sum = 0.0
+    ep_teacher_progress_decoupled_sum = 0.0
+    ep_teacher_progress_count = 0
     ep_len = 0
     ep_goal_hit_count = 0
     ep_first_goal_hit_step: int | None = None
@@ -1733,7 +2423,26 @@ def run_minimal_training(args) -> None:
     last_update: SACUpdateMetrics | None = None
     update_window: dict[str, float] = defaultdict(float)
 
+    def _wait_while_controller_paused(current_step: int) -> None:
+        if controller is None or not hasattr(controller, "is_paused"):
+            return
+        while bool(controller.is_paused()):
+            if hasattr(controller, "pop_bc_eval_request") and bool(controller.pop_bc_eval_request()):
+                _run_hotkey_bc_eval(current_step=current_step)
+            if hasattr(controller, "get_action"):
+                try:
+                    controller.get_action(obs=obs)
+                except TypeError:
+                    try:
+                        controller.get_action()
+                    except TypeError:
+                        pass
+            time.sleep(0.05)
+
     for step in range(1, int(args.total_timesteps) + 1):
+        if controller is not None and hasattr(controller, "pop_bc_eval_request") and bool(controller.pop_bc_eval_request()):
+            _run_hotkey_bc_eval(current_step=max(0, step - 1))
+        _wait_while_controller_paused(max(0, step - 1))
         step_t0 = time.perf_counter()
         if step <= int(effective_learning_starts):
             student_action = env.action_space.sample().astype(np.float32)
@@ -1760,16 +2469,24 @@ def run_minimal_training(args) -> None:
             obs=obs,
             action=applied_action,
             next_obs=next_obs,
-            reward=float(reward),
+            reward=(
+                0.0
+                if variant == "pvp" and not bool(getattr(args, "pvp_include_env_reward_in_td", False))
+                else float(reward)
+            ),
             done=bool(terminated or truncated),
             truncated=bool(truncated),
             device=device,
             student_action=student_action,
             teacher_intervened=teacher_intervened,
         )
-        main_rb.extend(transition)
+        _store_main_transition(
+            transition,
+            teacher_now=teacher_intervened,
+            done_now=bool(terminated or truncated),
+        )
 
-        if bool(args.obs_normalization) and hasattr(obs_normalizer, "update"):
+        if bool(args.obs_normalization) and not freeze_obs_normalizer and hasattr(obs_normalizer, "update"):
             obs_normalizer.update(torch.as_tensor(obs[None, :], device=device, dtype=torch.float32))
             obs_normalizer.update(torch.as_tensor(next_obs[None, :], device=device, dtype=torch.float32))
 
@@ -1818,6 +2535,14 @@ def run_minimal_training(args) -> None:
             ep_clearance_sum += float(step_clearance)
             ep_clearance_count += 1
             ep_min_clearance = min(ep_min_clearance, float(step_clearance))
+        teacher_progress_score = float(info.get("teacher_progress_score", float("nan")) or float("nan"))
+        if np.isfinite(teacher_progress_score):
+            ep_teacher_progress_score_sum += teacher_progress_score
+            ep_teacher_progress_clearance_potential_sum += float(
+                info.get("teacher_progress_clearance_potential", 0.0)
+            )
+            ep_teacher_progress_decoupled_sum += float(info.get("teacher_progress_score_decoupled", 0.0))
+            ep_teacher_progress_count += 1
         ep_len += 1
         if bool(info.get("goal_met", False)) and ep_first_goal_hit_step is None:
             ep_first_goal_hit_step = int(ep_len)
@@ -1831,7 +2556,7 @@ def run_minimal_training(args) -> None:
         if step > int(effective_learning_starts) and rb_ready:
             for _ in range(int(args.num_updates)):
                 total_updates += 1
-                last_update = _run_update_step(total_updates)
+                last_update = _run_update_step(total_updates, current_step=step)
                 _accumulate_update_metrics(update_window, last_update)
 
         if terminated or truncated:
@@ -1875,6 +2600,15 @@ def run_minimal_training(args) -> None:
                     first_goal_dense_reward_sum=(
                         ep_first_goal_dense_reward_sum if ep_first_goal_hit_step is not None else float(ep_reward_dense)
                     ),
+                    ep_teacher_progress_score_mean=float(
+                        ep_teacher_progress_score_sum / max(1, ep_teacher_progress_count)
+                    ),
+                    ep_teacher_progress_clearance_potential_mean=float(
+                        ep_teacher_progress_clearance_potential_sum / max(1, ep_teacher_progress_count)
+                    ),
+                    ep_teacher_progress_decoupled_mean=float(
+                        ep_teacher_progress_decoupled_sum / max(1, ep_teacher_progress_count)
+                    ),
                 )
             )
             episode_idx += 1
@@ -1899,6 +2633,10 @@ def run_minimal_training(args) -> None:
             ep_clearance_sum = 0.0
             ep_clearance_count = 0
             ep_min_clearance = float("inf")
+            ep_teacher_progress_score_sum = 0.0
+            ep_teacher_progress_clearance_potential_sum = 0.0
+            ep_teacher_progress_decoupled_sum = 0.0
+            ep_teacher_progress_count = 0
             ep_len = 0
             ep_goal_hit_count = 0
             ep_first_goal_hit_step = None
@@ -1949,6 +2687,7 @@ def run_minimal_training(args) -> None:
                 obs_normalizer=obs_normalizer,
                 log_dir=log_dir,
                 step_value=step,
+                checkpoint_path=model_dir / f"step_{step}.pt",
             )
             eval_logs["eval/step"] = float(step)
             print(json.dumps(eval_logs, sort_keys=True), flush=True)
@@ -2003,6 +2742,11 @@ def run_minimal_training(args) -> None:
                     print(f"[Dataset] failed to save periodic SafetyGym replay snapshot: {exc}", flush=True)
             next_export_replay_step += export_replay_interval
 
+        while next_bc_eval_step is not None and step >= next_bc_eval_step:
+            print(f"[BC Eval] periodic trigger at step={step}", flush=True)
+            _run_hotkey_bc_eval(int(step))
+            next_bc_eval_step += bc_eval_interval
+
     final_checkpoint = model_dir / "final.pt"
     _save_checkpoint(
         path=final_checkpoint,
@@ -2032,6 +2776,7 @@ def run_minimal_training(args) -> None:
         obs_normalizer=obs_normalizer,
         log_dir=log_dir,
         step_value=int(args.total_timesteps),
+        checkpoint_path=model_dir / "final.pt",
     )
     final_eval["eval/step"] = float(args.total_timesteps)
     print(json.dumps(final_eval, sort_keys=True), flush=True)

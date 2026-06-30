@@ -668,6 +668,7 @@ def _run_demo_pretrain(
             pref_violation_clip=float(getattr(args, "pref_violation_clip", 10.0)),
             pref_violation_target=float(getattr(args, "pref_violation_target", 0.0)),
             pref_lagrangian_violation_type=str(getattr(args, "pref_lagrangian_violation_type", "hinge")),
+            pref_action_delta_min=float(getattr(args, "pref_action_delta_min", 0.0)),
             alpha_min=float(getattr(args, "alpha_min", 0.0)),
             alpha_max=float(getattr(args, "alpha_max", 1.0)),
         )
@@ -1592,6 +1593,7 @@ def run_training(args, *, variant: str) -> None:
                     pref_violation_clip=float(getattr(args, "pref_violation_clip", 10.0)),
                     pref_violation_target=float(getattr(args, "pref_violation_target", 0.0)),
                     pref_lagrangian_violation_type=str(getattr(args, "pref_lagrangian_violation_type", "hinge")),
+                    pref_action_delta_min=float(getattr(args, "pref_action_delta_min", 0.0)),
                     alpha_min=float(getattr(args, "alpha_min", 0.0)),
                     alpha_max=float(getattr(args, "alpha_max", 1.0)),
                     scale_actor_to_env_bounds=bool(getattr(args, "scale_actor_to_env_bounds", False)),

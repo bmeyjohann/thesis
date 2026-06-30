@@ -157,14 +157,25 @@ def _body_xy_and_yaw(task, body_name: str) -> tuple[np.ndarray, float] | None:
     return pos[:2].copy(), yaw
 
 
-def _overlay_world(ax: plt.Axes, *, task, overlay_specs: list[dict[str, Any]], goal_xy: np.ndarray) -> None:
+def _overlay_world(
+    ax: plt.Axes,
+    *,
+    task,
+    overlay_specs: list[dict[str, Any]],
+    goal_xy: np.ndarray,
+    overlay_poses: dict[str, tuple[np.ndarray, float]] | None = None,
+) -> None:
     color_map = {
         "hazard": ("#d65244", 0.45),
         "vase": ("#f1b24a", 0.55),
         "pillar": ("#8a6fd1", 0.55),
     }
     for spec in overlay_specs:
-        body_pose = _body_xy_and_yaw(task, spec["name"])
+        body_pose = None
+        if overlay_poses is not None and str(spec["name"]) in overlay_poses:
+            body_pose = overlay_poses[str(spec["name"])]
+        if body_pose is None:
+            body_pose = _body_xy_and_yaw(task, spec["name"])
         if body_pose is None:
             continue
         pos_xy, yaw = body_pose
@@ -199,6 +210,110 @@ def _overlay_world(ax: plt.Axes, *, task, overlay_specs: list[dict[str, Any]], g
     ax.scatter(float(goal_xy[0]), float(goal_xy[1]), marker="*", s=150, c="white", edgecolors="black", linewidths=0.8, zorder=6)
 
 
+def _signed_obstacle_clearance(
+    *,
+    xx: np.ndarray,
+    yy: np.ndarray,
+    pos_xy: np.ndarray,
+    yaw: float,
+    size: np.ndarray,
+    geom_type: str,
+) -> np.ndarray:
+    dx = xx - float(pos_xy[0])
+    dy = yy - float(pos_xy[1])
+    if geom_type in {"cylinder", "sphere"}:
+        radius = float(size[0]) if size.size >= 1 else 0.1
+        return np.sqrt(dx * dx + dy * dy) - radius
+    if geom_type == "box":
+        half_w = float(size[0]) if size.size >= 1 else 0.1
+        half_h = float(size[1]) if size.size >= 2 else half_w
+        cos_y = math.cos(-float(yaw))
+        sin_y = math.sin(-float(yaw))
+        local_x = cos_y * dx - sin_y * dy
+        local_y = sin_y * dx + cos_y * dy
+        qx = np.abs(local_x) - half_w
+        qy = np.abs(local_y) - half_h
+        outside = np.sqrt(np.maximum(qx, 0.0) ** 2 + np.maximum(qy, 0.0) ** 2)
+        inside = np.minimum(np.maximum(qx, qy), 0.0)
+        return outside + inside
+    radius = float(size[0]) if size.size >= 1 else 0.1
+    return np.sqrt(dx * dx + dy * dy) - radius
+
+
+def _clearance_potential_np(
+    clearance: np.ndarray,
+    *,
+    scale: float,
+    margin: float,
+    mode: str,
+    temperature: float,
+    power: float,
+) -> np.ndarray:
+    if float(scale) == 0.0:
+        return np.zeros_like(clearance, dtype=np.float64)
+    mode = str(mode).strip().lower()
+    if mode == "softplus":
+        temp = max(1e-6, float(temperature))
+        x = (float(margin) - clearance) / temp
+        return -float(scale) * temp * np.logaddexp(x, 0.0)
+    violation = np.maximum(0.0, float(margin) - clearance)
+    return -float(scale) * (violation ** max(1.0, float(power)))
+
+
+def _compute_reward_surface(
+    *,
+    task,
+    overlay_specs: list[dict[str, Any]],
+    bounds: tuple[float, float, float, float],
+    goal_xy: np.ndarray,
+    config: dict[str, Any],
+    overlay_poses: dict[str, tuple[np.ndarray, float]] | None = None,
+) -> tuple[np.ndarray, tuple[float, float, float, float]]:
+    resolution = int(max(16, config.get("resolution", 120)))
+    x_min, x_max, y_min, y_max = bounds
+    xs = np.linspace(x_min, x_max, resolution, dtype=np.float64)
+    ys = np.linspace(y_min, y_max, resolution, dtype=np.float64)
+    xx, yy = np.meshgrid(xs, ys)
+    goal_xy = np.asarray(goal_xy, dtype=np.float64).reshape(2)
+    dense_scale = float(config.get("dense_reward_scale", 1.0))
+    surface = -dense_scale * np.sqrt((xx - goal_xy[0]) ** 2 + (yy - goal_xy[1]) ** 2)
+
+    clearances: list[np.ndarray] = []
+    for spec in overlay_specs:
+        label = str(spec.get("name", "")).lower()
+        if not any(key in label for key in ("hazard", "vase", "pillar", "gremlin", "button", "wall")):
+            continue
+        body_pose = None
+        if overlay_poses is not None and str(spec["name"]) in overlay_poses:
+            body_pose = overlay_poses[str(spec["name"])]
+        if body_pose is None:
+            body_pose = _body_xy_and_yaw(task, str(spec["name"]))
+        if body_pose is None:
+            continue
+        pos_xy, yaw = body_pose
+        clearances.append(
+            _signed_obstacle_clearance(
+                xx=xx,
+                yy=yy,
+                pos_xy=pos_xy,
+                yaw=yaw,
+                size=np.asarray(spec.get("size", [0.1]), dtype=np.float64).reshape(-1),
+                geom_type=str(spec.get("geom_type", "sphere")).lower(),
+            )
+        )
+    if clearances:
+        min_clearance = np.minimum.reduce(clearances)
+        surface += _clearance_potential_np(
+            min_clearance,
+            scale=float(config.get("clearance_penalty_scale", 0.0)),
+            margin=float(config.get("clearance_margin", 0.0)),
+            mode=str(config.get("clearance_penalty_mode", "softplus")),
+            temperature=float(config.get("clearance_penalty_temperature", 0.001)),
+            power=float(config.get("clearance_penalty_power", 1.0)),
+        )
+    return surface, (x_min, x_max, y_min, y_max)
+
+
 def _build_networks(
     *,
     checkpoint: dict[str, Any],
@@ -215,6 +330,9 @@ def _build_networks(
         hidden_dim=int(train_args.get("actor_hidden_dim", 256)),
         use_layer_norm=bool(train_args.get("use_layer_norm", False)),
         layer_norm_eps=float(train_args.get("layer_norm_eps", 1e-5)),
+        temporal_encoder=str(train_args.get("temporal_encoder", "none")),
+        obs_frame_stack=int(train_args.get("obs_frame_stack", 1) or 1),
+        intervention_aux_head=bool(train_args.get("intervention_aux_head", False)),
         device=device,
     )
     actor.load_state_dict(checkpoint["actor_state_dict"])
@@ -227,6 +345,8 @@ def _build_networks(
         num_critics=int(train_args.get("num_critics", 2)),
         use_layer_norm=bool(train_args.get("use_layer_norm", False)),
         layer_norm_eps=float(train_args.get("layer_norm_eps", 1e-5)),
+        temporal_encoder=str(train_args.get("temporal_encoder", "none")),
+        obs_frame_stack=int(train_args.get("obs_frame_stack", 1) or 1),
         device=device,
     )
     critic.load_state_dict(checkpoint["critic_state_dict"])
@@ -238,6 +358,24 @@ def _build_networks(
         obs_preprocess.load_state_dict(obs_norm_state, strict=False)
         obs_preprocess.eval()
     return actor, critic, obs_preprocess
+
+
+def _obs_frame_stack_count(train_args: dict[str, Any]) -> int:
+    try:
+        return max(1, int(train_args.get("obs_frame_stack", 1) or 1))
+    except Exception:
+        return 1
+
+
+def _stack_static_obs(obs: np.ndarray, num_frames: int) -> np.ndarray:
+    obs = np.asarray(obs, dtype=np.float32).reshape(-1)
+    if int(num_frames) <= 1:
+        return obs
+    return np.tile(obs, int(num_frames)).astype(np.float32, copy=False)
+
+
+def _concat_frame_stack(frames: list[np.ndarray]) -> np.ndarray:
+    return np.concatenate([np.asarray(frame, dtype=np.float32).reshape(-1) for frame in frames], axis=0)
 
 
 def _compute_vector_field(
@@ -294,6 +432,7 @@ def _evaluate_heading_grid(
     state_template: dict[str, Any],
     agent_z: float,
     scale_actor_to_env_bounds: bool,
+    obs_frame_stack: int,
 ) -> dict[str, Any]:
     pts = np.stack(np.meshgrid(xs, ys), axis=-1).reshape(-1, 2)
     yaw_rad = math.radians(float(heading_deg))
@@ -301,7 +440,7 @@ def _evaluate_heading_grid(
     observations: list[np.ndarray] = []
     for xy in pts:
         _set_agent_pose(task, state_template, xy, yaw_rad, agent_z)
-        obs = np.asarray(task.obs(), dtype=np.float32).reshape(-1)
+        obs = _stack_static_obs(np.asarray(task.obs(), dtype=np.float32).reshape(-1), obs_frame_stack)
         observations.append(obs)
     obs_np = np.stack(observations, axis=0)
     obs_t = torch.as_tensor(obs_np, device=device, dtype=torch.float32)
@@ -461,10 +600,13 @@ def _run_rollout_eval(
     win = EpisodeWindow(size=max(10, int(num_episodes)))
     trajectories: list[dict[str, Any]] = []
     scale_actor_to_env_bounds = bool(train_args.get("scale_actor_to_env_bounds", False))
+    obs_frame_stack = _obs_frame_stack_count(train_args)
 
     for episode_idx in range(int(num_episodes)):
         obs, _ = env.reset(seed=int(seed + episode_idx))
         obs = np.asarray(obs, dtype=np.float32).reshape(-1)
+        obs_frames = [obs.copy() for _ in range(obs_frame_stack)]
+        policy_obs = _concat_frame_stack(obs_frames) if obs_frame_stack > 1 else obs
         goal_xy = np.asarray(task.goal.pos[:2], dtype=np.float64).copy()
         path = [np.asarray(task.agent.pos[:2], dtype=np.float64).copy()]
         ep_ret = 0.0
@@ -476,7 +618,7 @@ def _run_rollout_eval(
         ep_first_goal_dense_reward_sum = 0.0
         while ep_len < max_steps:
             with torch.no_grad():
-                obs_t = torch.as_tensor(obs[None, :], device=device, dtype=torch.float32)
+                obs_t = torch.as_tensor(policy_obs[None, :], device=device, dtype=torch.float32)
                 obs_t = obs_preprocess(obs_t)
                 _, _, mean_action = actor(obs_t)
                 action = mean_action[0].detach().cpu().numpy().astype(np.float32)
@@ -485,6 +627,12 @@ def _run_rollout_eval(
             action = clip_action_to_space(action, env.action_space)
             next_obs, reward, cost, terminated, truncated, info = env.step(action)
             obs = np.asarray(next_obs, dtype=np.float32).reshape(-1)
+            if obs_frame_stack > 1:
+                obs_frames.pop(0)
+                obs_frames.append(obs.copy())
+                policy_obs = _concat_frame_stack(obs_frames)
+            else:
+                policy_obs = obs
             path.append(np.asarray(task.agent.pos[:2], dtype=np.float64).copy())
             ep_ret += float(reward)
             ep_cost += float(cost)
@@ -599,6 +747,10 @@ def plot_eval_episode_trajectory(
     episode_reward: float,
     goals_reached: int,
     final_distance: float,
+    reward_surface_config: dict[str, Any] | None = None,
+    initial_goal_xy: np.ndarray | None = None,
+    overlay_poses: dict[str, tuple[np.ndarray, float]] | None = None,
+    cost_points: np.ndarray | None = None,
 ) -> Path:
     output_path = Path(output_path).resolve()
     fig, ax = plt.subplots(1, 1, figsize=(8, 8), constrained_layout=True)
@@ -607,8 +759,31 @@ def plot_eval_episode_trajectory(
     ax.set_ylim(y_min, y_max)
     ax.set_aspect("equal")
 
-    current_goal = np.asarray(task.goal.pos[:2], dtype=np.float64)
-    _overlay_world(ax, task=task, overlay_specs=overlay_specs, goal_xy=current_goal)
+    current_goal = (
+        np.asarray(initial_goal_xy, dtype=np.float64).reshape(2)
+        if initial_goal_xy is not None
+        else np.asarray(task.goal.pos[:2], dtype=np.float64)
+    )
+    if reward_surface_config:
+        surface, extent = _compute_reward_surface(
+            task=task,
+            overlay_specs=overlay_specs,
+            bounds=bounds,
+            goal_xy=current_goal,
+            config=reward_surface_config,
+            overlay_poses=overlay_poses,
+        )
+        im = ax.imshow(
+            surface,
+            origin="lower",
+            extent=extent,
+            cmap="viridis",
+            alpha=0.62,
+            zorder=0,
+        )
+        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label("state potential: -distance + clearance")
+    _overlay_world(ax, task=task, overlay_specs=overlay_specs, goal_xy=current_goal, overlay_poses=overlay_poses)
 
     path = np.asarray(path, dtype=np.float64)
     if path.ndim == 2 and path.shape[0] >= 2:
@@ -634,6 +809,35 @@ def plot_eval_episode_trajectory(
         hits = np.asarray(goal_hit_points, dtype=np.float64)
         if hits.size > 0:
             ax.scatter(hits[:, 0], hits[:, 1], color="#31a354", s=46, marker="P", edgecolors="black", linewidths=0.4, zorder=10)
+
+    if cost_points is not None:
+        costs = np.asarray(cost_points, dtype=np.float64)
+        if costs.ndim == 2 and costs.shape[0] > 0:
+            ax.scatter(
+                costs[:, 0],
+                costs[:, 1],
+                color="#ef3b2c",
+                s=78,
+                marker="X",
+                edgecolors="white",
+                linewidths=0.75,
+                alpha=0.96,
+                zorder=11,
+                label="cost step",
+            )
+            ax.plot(
+                costs[:, 0],
+                costs[:, 1],
+                linestyle="none",
+                marker="o",
+                markersize=12,
+                markerfacecolor="none",
+                markeredgecolor="#99000d",
+                markeredgewidth=1.1,
+                alpha=0.9,
+                zorder=10,
+            )
+            ax.legend(loc="upper right", framealpha=0.9, fontsize=8)
 
     ax.set_title(
         "SafetyGym eval episode\n"
@@ -725,10 +929,11 @@ def generate_safety_policy_maps(
         task.toggle_observation_space()
         obs = np.asarray(task.obs(), dtype=np.float32).reshape(-1)
     act_dim = int(np.prod(env.action_space.shape))
+    obs_frame_stack = _obs_frame_stack_count(train_args)
     actor, critic, obs_preprocess = _build_networks(
         checkpoint=checkpoint,
         train_args=train_args,
-        obs_dim=int(obs.shape[0]),
+        obs_dim=int(obs.shape[0]) * int(obs_frame_stack),
         act_dim=act_dim,
         device=device_t,
     )
@@ -761,6 +966,7 @@ def generate_safety_policy_maps(
             state_template=state_template,
             agent_z=agent_z,
             scale_actor_to_env_bounds=bool(train_args.get("scale_actor_to_env_bounds", False)),
+            obs_frame_stack=obs_frame_stack,
         )
         for heading in headings
     ]

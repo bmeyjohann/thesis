@@ -61,6 +61,12 @@ class PygameRGBArrayViewer:
         self._clock = None
         self._last_draw_ts = 0.0
         self._frame_shape: tuple[int, int] | None = None
+        self._intervention_active = False
+        self._intervention_label = ""
+
+    def set_intervention_status(self, *, active: bool, label: str = "") -> None:
+        self._intervention_active = bool(active)
+        self._intervention_label = str(label or "")
 
     def _ensure(self, frame: np.ndarray) -> bool:
         if self._pygame is not None:
@@ -118,6 +124,14 @@ class PygameRGBArrayViewer:
         if self.scale != 1.0 or surface.get_size() != screen.get_size():
             surface = pygame.transform.smoothscale(surface, screen.get_size())
         screen.blit(surface, (0, 0))
+        if self._intervention_active:
+            win_w, win_h = screen.get_size()
+            pygame.draw.rect(screen, (255, 30, 30), (0, 0, win_w, win_h), width=max(6, int(8 * self.scale)))
+            pygame.draw.rect(screen, (150, 0, 0), (0, 0, win_w, 42))
+            font = pygame.font.Font(None, 30)
+            suffix = f" ({self._intervention_label})" if self._intervention_label else ""
+            surf = font.render(f"TEACHER INTERVENTION{suffix}", True, (255, 245, 245))
+            screen.blit(surf, (14, 9))
         pygame.display.flip()
         clock.tick(120)
 
@@ -343,6 +357,29 @@ class PygameTopDownViewer:
         self._small_font = None
         self._last_draw_ts = 0.0
         self._trail: deque[tuple[float, float]] = deque(maxlen=200)
+        self._cost_trail: deque[tuple[float, float]] = deque(maxlen=80)
+        self._intervention_active = False
+        self._intervention_label = ""
+        self._cost_active = False
+        self._cost_label = ""
+        self._cost_flash_until = 0.0
+
+    def set_intervention_status(self, *, active: bool, label: str = "") -> None:
+        self._intervention_active = bool(active)
+        self._intervention_label = str(label or "")
+
+    def set_cost_status(self, *, active: bool, xy: tuple[float, float] | list[float] | np.ndarray | None = None, label: str = "") -> None:
+        self._cost_active = bool(active)
+        self._cost_label = str(label or "")
+        if active:
+            self._cost_flash_until = max(self._cost_flash_until, time.perf_counter() + 0.6)
+            if xy is not None:
+                try:
+                    arr = np.asarray(xy, dtype=np.float32).reshape(-1)
+                    if arr.size >= 2 and np.isfinite(arr[:2]).all():
+                        self._cost_trail.append((float(arr[0]), float(arr[1])))
+                except Exception:
+                    pass
 
     def _ensure(self) -> bool:
         if self._pygame is not None:
@@ -413,15 +450,40 @@ class PygameTopDownViewer:
             if event.type == pygame.QUIT:
                 pass
 
-        screen.fill((18, 20, 24))
+        cost_flash = self._cost_active or time.perf_counter() < self._cost_flash_until
+        if cost_flash:
+            bg = (48, 6, 6)
+        elif self._intervention_active:
+            bg = (36, 10, 12)
+        else:
+            bg = (18, 20, 24)
+        screen.fill(bg)
         win_w, win_h = screen.get_size()
         world_rect = (24, 64, max(100, win_w - 48), max(100, win_h - 96))
         bounds = tuple(float(v) for v in state["bounds"])
 
         pygame.draw.rect(screen, (38, 42, 50), world_rect)
-        pygame.draw.rect(screen, (92, 98, 112), world_rect, width=1)
+        if cost_flash:
+            border_color = (255, 0, 0)
+            border_width = 6
+        elif self._intervention_active:
+            border_color = (255, 40, 40)
+            border_width = 4
+        else:
+            border_color = (92, 98, 112)
+            border_width = 1
+        pygame.draw.rect(screen, border_color, world_rect, width=border_width)
 
-        title_surf = font.render("SafetyGym Top-Down", True, (232, 232, 232))
+        title_text = "SafetyGym Top-Down"
+        if cost_flash:
+            title_text += " - COST EVENT"
+            if self._cost_label:
+                title_text += f" ({self._cost_label})"
+        if self._intervention_active:
+            title_text += " - TEACHER INTERVENTION"
+            if self._intervention_label:
+                title_text += f" ({self._intervention_label})"
+        title_surf = font.render(title_text, True, (255, 235, 235) if (self._intervention_active or cost_flash) else (232, 232, 232))
         screen.blit(title_surf, (24, 18))
         dist_txt = f"goal_dist={float(state.get('goal_distance', float('nan'))):.3f}"
         goal_txt = f"goal_met={1 if bool(state.get('goal_met', False)) else 0}"
@@ -504,7 +566,18 @@ class PygameTopDownViewer:
             self._trail.append((float(agent_xy[0]), float(agent_xy[1])))
             if len(self._trail) >= 2:
                 pts = [self._to_screen(p, bounds=bounds, rect=world_rect) for p in self._trail]
-                pygame.draw.lines(screen, (90, 190, 255), False, pts, width=2)
+                trail_color = (255, 85, 85) if self._intervention_active else (90, 190, 255)
+                pygame.draw.lines(screen, trail_color, False, pts, width=3 if self._intervention_active else 2)
+
+            for idx, cost_xy in enumerate(self._cost_trail):
+                cost_center = self._to_screen(cost_xy, bounds=bounds, rect=world_rect)
+                radius = max(5, int(8 * self.scale))
+                alpha_scale = 0.45 + 0.55 * float(idx + 1) / max(1, len(self._cost_trail))
+                color = (255, int(35 * alpha_scale), int(35 * alpha_scale))
+                pygame.draw.circle(screen, color, cost_center, radius)
+                pygame.draw.circle(screen, (255, 245, 245), cost_center, radius + 2, width=2)
+                pygame.draw.line(screen, (120, 0, 0), (cost_center[0] - radius, cost_center[1] - radius), (cost_center[0] + radius, cost_center[1] + radius), width=2)
+                pygame.draw.line(screen, (120, 0, 0), (cost_center[0] - radius, cost_center[1] + radius), (cost_center[0] + radius, cost_center[1] - radius), width=2)
 
             forward = state.get("agent_forward", [0.0, 1.0])
             lateral = state.get("agent_lateral", [1.0, 0.0])
@@ -515,8 +588,8 @@ class PygameTopDownViewer:
                 0.1675,
                 lateral,
                 forward,
-                (235, 235, 245),
-                outline=(60, 120, 255),
+                (255, 0, 0) if cost_flash else ((255, 45, 45) if self._intervention_active else (235, 235, 245)),
+                outline=(255, 245, 245) if (self._intervention_active or cost_flash) else (60, 120, 255),
             )
             fwd = np.asarray(forward, dtype=np.float32)
             if np.linalg.norm(fwd) > 1e-6:
@@ -527,9 +600,15 @@ class PygameTopDownViewer:
             )
             center = self._to_screen(agent_xy, bounds=bounds, rect=world_rect)
             tip = self._to_screen(nose_xy, bounds=bounds, rect=world_rect)
-            pygame.draw.line(screen, (40, 110, 255), center, tip, width=3)
+            pygame.draw.line(screen, (255, 245, 245) if cost_flash else ((255, 235, 80) if self._intervention_active else (40, 110, 255)), center, tip, width=5 if cost_flash else (4 if self._intervention_active else 3))
 
-        screen.blit(small_font.render("blue line: forward, white box: car footprint", True, (170, 182, 210)), (24, win_h - 26))
+        if cost_flash:
+            legend = "RED FLASH / red X: cost event"
+        elif self._intervention_active:
+            legend = "red: teacher intervention active"
+        else:
+            legend = "blue line: forward, white box: car footprint"
+        screen.blit(small_font.render(legend, True, (255, 210, 210) if (self._intervention_active or cost_flash) else (170, 182, 210)), (24, win_h - 26))
         pygame.display.flip()
         clock.tick(120)
 
@@ -544,3 +623,4 @@ class PygameTopDownViewer:
         self._font = None
         self._small_font = None
         self._trail.clear()
+        self._cost_trail.clear()
