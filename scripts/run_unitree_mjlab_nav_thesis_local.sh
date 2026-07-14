@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_DIR="${REPO_ROOT:-$PWD}"
+if [[ ! -f "$ROOT_DIR/train_unitree_nav_thesis.py" ]]; then
+  ROOT_DIR="$SCRIPT_ROOT"
+fi
+if [[ ! -f "$ROOT_DIR/train_unitree_nav_thesis.py" ]]; then
+  echo "Could not resolve thesis repo root; set REPO_ROOT=/home/benjamin/thesis" >&2
+  exit 2
+fi
+PYTHON_BIN="${PYTHON_BIN:-/home/benjamin/miniconda3/envs/fasttd3/bin/python}"
+
+for arg in "$@"; do
+  if [[ "$arg" == *=* ]]; then
+    export "$arg"
+  else
+    echo "Unsupported positional argument: $arg" >&2
+    exit 2
+  fi
+done
+
+export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/mplconfig}"
+export WARP_CACHE_PATH="${WARP_CACHE_PATH:-/tmp/warp-cache}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/tmp/unitree-cache}"
+export MUJOCO_GL="${MUJOCO_GL:-egl}"
+
+mkdir -p "$MPLCONFIGDIR" "$WARP_CACHE_PATH" "$XDG_CACHE_HOME"
+
+TASK="${TASK:-Unitree-G1-Nav-Obstacles-Safe-Collision}"
+DEVICE="${DEVICE:-cuda:0}"
+NUM_ENVS="${NUM_ENVS:-16}"
+TOTAL_STEPS="${TOTAL_STEPS:-20000}"
+RUN_NAME="${RUN_NAME:-unitree_nav_thesis_$(date +%Y%m%d_%H%M%S)}"
+OUTPUT_DIR="${OUTPUT_DIR:-$ROOT_DIR/models/unitree_mjlab_nav_thesis}"
+LOW_LEVEL_POLICY_PATH="${LOW_LEVEL_POLICY_PATH:-$ROOT_DIR/external/unitree_rl_mjlab/logs/rsl_rl/g1_velocity/2026-07-12_10-35-19_omni_finetune_model1499_20260712}"
+
+ESCAPE_ALL_DIRECTIONS_FLAG=()
+if [[ "${TEACHER_ESCAPE_ALL_DIRECTIONS:-0}" == "1" ]]; then
+  ESCAPE_ALL_DIRECTIONS_FLAG=(--teacher-escape-all-directions)
+fi
+
+REQUIRE_BLOCKED_CORRIDOR_FLAG=()
+if [[ "${REQUIRE_BLOCKED_CORRIDOR:-0}" == "1" ]]; then
+  REQUIRE_BLOCKED_CORRIDOR_FLAG=(--require-blocked-corridor)
+fi
+
+DEBUG_GOAL_THROUGH_OBSTACLE_FLAG=()
+if [[ "${DEBUG_GOAL_THROUGH_OBSTACLE:-0}" == "1" ]]; then
+  DEBUG_GOAL_THROUGH_OBSTACLE_FLAG=(--debug-goal-through-obstacle)
+fi
+
+PREF_STOPGRAD_POSITIVE_FLAG=()
+if [[ "${PREF_STOPGRAD_POSITIVE:-1}" == "1" ]]; then
+  PREF_STOPGRAD_POSITIVE_FLAG=(--pref-stopgrad-positive)
+fi
+
+exec "$PYTHON_BIN" "$ROOT_DIR/train_unitree_nav_thesis.py" \
+  --task "$TASK" \
+  --device "$DEVICE" \
+  --seed "${SEED:-0}" \
+  --num-envs "$NUM_ENVS" \
+  --episode-length-s "${EPISODE_LENGTH_S:-16.0}" \
+  --low-level-policy-path "$LOW_LEVEL_POLICY_PATH" \
+  --output-dir "$OUTPUT_DIR" \
+  --run-name "$RUN_NAME" \
+  --wandb-project "${WANDB_PROJECT:-thesis-unitree-nav}" \
+  --wandb-group "${WANDB_GROUP:-}" \
+  --wandb-mode "${WANDB_MODE:-online}" \
+  --total-steps "$TOTAL_STEPS" \
+  --learning-starts "${LEARNING_STARTS:-1000}" \
+  --random-steps "${RANDOM_STEPS:-500}" \
+  --teacher-warmup-steps "${TEACHER_WARMUP_STEPS:-1000}" \
+  --batch-size "${BATCH_SIZE:-256}" \
+  --updates-per-step "${UPDATES_PER_STEP:-1}" \
+  --policy-frequency "${POLICY_FREQUENCY:-2}" \
+  --hidden-dim "${HIDDEN_DIM:-256}" \
+  --policy-encoder "${POLICY_ENCODER:-mlp}" \
+  --pad-obs-to-dim "${PAD_OBS_TO_DIM:-0}" \
+  --use-layer-norm \
+  --gamma "${GAMMA:-0.99}" \
+  --alpha-init "${ALPHA_INIT:-0.001}" \
+  --alpha-min "${ALPHA_MIN:-0.0}" \
+  --alpha-max "${ALPHA_MAX:-0.05}" \
+  --actor-bc-weight "${ACTOR_BC_WEIGHT:-0.2}" \
+  --init-actor-checkpoint "${INIT_ACTOR_CHECKPOINT:-}" \
+  --init-checkpoint "${INIT_CHECKPOINT:-}" \
+  --student-controller "${STUDENT_CONTROLLER:-actor}" \
+  --learner-reward-mode "${LEARNER_REWARD_MODE:-dense_progress}" \
+  --dense-progress-scale "${DENSE_PROGRESS_SCALE:-1.0}" \
+  --success-bonus "${SUCCESS_BONUS:-1.0}" \
+  --teacher-type "${TEACHER_TYPE:-geom_scan}" \
+  --intervention-gate-mode "${INTERVENTION_GATE_MODE:-clearance_or_stall}" \
+  --intervention-clearance-threshold "${INTERVENTION_CLEARANCE_THRESHOLD:-0.65}" \
+  --intervention-release-clearance "${INTERVENTION_RELEASE_CLEARANCE:-0.8}" \
+  --intervention-stall-steps "${INTERVENTION_STALL_STEPS:-30}" \
+  --intervention-progress-epsilon "${INTERVENTION_PROGRESS_EPSILON:-0.04}" \
+  --intervention-release-steps "${INTERVENTION_RELEASE_STEPS:-8}" \
+  --intervention-release-progress-tolerance "${INTERVENTION_RELEASE_PROGRESS_TOLERANCE:-0.005}" \
+  --intervention-release-action-delta-max "${INTERVENTION_RELEASE_ACTION_DELTA_MAX:-0.35}" \
+  --pref-rank-weight "${PREF_RANK_WEIGHT:-1.0}" \
+  --pref-rank-margin "${PREF_RANK_MARGIN:-0.05}" \
+  --pref-loss-type "${PREF_LOSS_TYPE:-lagrangian}" \
+  --pref-lambda-lr "${PREF_LAMBDA_LR:-0.01}" \
+  --pref-lambda-max "${PREF_LAMBDA_MAX:-10.0}" \
+  --pref-action-delta-min "${PREF_ACTION_DELTA_MIN:-0.05}" \
+  --teacher-scan-block-threshold "${TEACHER_SCAN_BLOCK_THRESHOLD:-0.12}" \
+  --teacher-scan-block-delta "${TEACHER_SCAN_BLOCK_DELTA:-0.0}" \
+  --teacher-scan-planner "${TEACHER_SCAN_PLANNER:-heuristic}" \
+  --teacher-scan-astar-clearance "${TEACHER_SCAN_ASTAR_CLEARANCE:-0.6}" \
+  --teacher-scan-astar-cell-padding "${TEACHER_SCAN_ASTAR_CELL_PADDING:-0.35}" \
+  --teacher-scan-astar-resolution "${TEACHER_SCAN_ASTAR_RESOLUTION:-0.25}" \
+  --teacher-scan-astar-waypoint-index "${TEACHER_SCAN_ASTAR_WAYPOINT_INDEX:-3}" \
+  --teacher-scan-astar-side-penalty "${TEACHER_SCAN_ASTAR_SIDE_PENALTY:-8.0}" \
+  --teacher-scan-astar-commit-steps "${TEACHER_SCAN_ASTAR_COMMIT_STEPS:-30}" \
+  --teacher-sector-half-width "${TEACHER_SECTOR_HALF_WIDTH:-0.35}" \
+  --teacher-align-angle "${TEACHER_ALIGN_ANGLE:-0.55}" \
+  --teacher-max-vx "${TEACHER_MAX_VX:-0.95}" \
+  --teacher-max-vy "${TEACHER_MAX_VY:-0.45}" \
+  --teacher-yaw-gain "${TEACHER_YAW_GAIN:-1.2}" \
+  --teacher-clearance-weight "${TEACHER_CLEARANCE_WEIGHT:-0.0}" \
+  --teacher-clearance-power "${TEACHER_CLEARANCE_POWER:-2.0}" \
+  --teacher-speed-clearance-scale "${TEACHER_SPEED_CLEARANCE_SCALE:-0.0}" \
+  --teacher-num-sectors "${TEACHER_NUM_SECTORS:-13}" \
+  --teacher-min-forward-scale "${TEACHER_MIN_FORWARD_SCALE:-0.12}" \
+  --teacher-escape-risk-threshold "${TEACHER_ESCAPE_RISK_THRESHOLD:-0.0}" \
+  --teacher-escape-forward-scale "${TEACHER_ESCAPE_FORWARD_SCALE:-0.0}" \
+  --teacher-escape-lateral-scale "${TEACHER_ESCAPE_LATERAL_SCALE:-1.0}" \
+  --teacher-escape-radius "${TEACHER_ESCAPE_RADIUS:-1.0}" \
+  --teacher-bypass-angle "${TEACHER_BYPASS_ANGLE:-0.0}" \
+  --teacher-goal-stop-dist "${TEACHER_GOAL_STOP_DIST:-0.40}" \
+  --teacher-wall-follow-steps "${TEACHER_WALL_FOLLOW_STEPS:-0}" \
+  --teacher-wall-follow-angle "${TEACHER_WALL_FOLLOW_ANGLE:-0.9}" \
+  --teacher-wall-follow-clear-risk "${TEACHER_WALL_FOLLOW_CLEAR_RISK:-0.15}" \
+  --teacher-rollout-horizon "${TEACHER_ROLLOUT_HORIZON:-0.0}" \
+  --teacher-rollout-clearance "${TEACHER_ROLLOUT_CLEARANCE:-0.65}" \
+  --teacher-rollout-samples "${TEACHER_ROLLOUT_SAMPLES:-8}" \
+  --teacher-rollout-clearance-weight "${TEACHER_ROLLOUT_CLEARANCE_WEIGHT:-20.0}" \
+  --teacher-rollout-forward-bias "${TEACHER_ROLLOUT_FORWARD_BIAS:-0.05}" \
+  --teacher-emergency-radius "${TEACHER_EMERGENCY_RADIUS:-0.0}" \
+  --teacher-emergency-hard-radius "${TEACHER_EMERGENCY_HARD_RADIUS:-0.0}" \
+  --teacher-emergency-speed-scale "${TEACHER_EMERGENCY_SPEED_SCALE:-0.75}" \
+  --teacher-emergency-repulsion-weight "${TEACHER_EMERGENCY_REPULSION_WEIGHT:-0.8}" \
+  --teacher-emergency-tangent-weight "${TEACHER_EMERGENCY_TANGENT_WEIGHT:-1.2}" \
+  --teacher-emergency-goal-weight "${TEACHER_EMERGENCY_GOAL_WEIGHT:-0.4}" \
+  --teacher-geom-planner "${TEACHER_GEOM_PLANNER:-astar}" \
+  --teacher-geom-scan-margin "${TEACHER_GEOM_SCAN_MARGIN:-0.15}" \
+  --teacher-geom-back-margin "${TEACHER_GEOM_BACK_MARGIN:-0.35}" \
+  --teacher-geom-max-forward "${TEACHER_GEOM_MAX_FORWARD:-1.75}" \
+  --teacher-geom-max-lateral "${TEACHER_GEOM_MAX_LATERAL:-1.75}" \
+  --teacher-geom-lookahead "${TEACHER_GEOM_LOOKAHEAD:-1.6}" \
+  --teacher-geom-clearance "${TEACHER_GEOM_CLEARANCE:-0.5}" \
+  --teacher-geom-grid-resolution "${TEACHER_GEOM_GRID_RESOLUTION:-0.15}" \
+  --teacher-geom-waypoint-index "${TEACHER_GEOM_WAYPOINT_INDEX:-3}" \
+  --teacher-geom-side-penalty "${TEACHER_GEOM_SIDE_PENALTY:-8.0}" \
+  --teacher-geom-side-frame "${TEACHER_GEOM_SIDE_FRAME:-body}" \
+  --teacher-geom-disengage-clear-steps "${TEACHER_GEOM_DISENGAGE_CLEAR_STEPS:-20}" \
+  --teacher-geom-emergency-radius "${TEACHER_GEOM_EMERGENCY_RADIUS:-0.8}" \
+  --intervention-delta "${INTERVENTION_DELTA:-0.35}" \
+  --intervene-on-blocked-goal \
+  --success-dist "${SUCCESS_DIST:-0.5}" \
+  --goal-distance-min "${GOAL_DISTANCE_MIN:-2.8}" \
+  --goal-distance-max "${GOAL_DISTANCE_MAX:-4.0}" \
+  --resample-terrain-tiles \
+  --min-goal-obstacle-clearance "${MIN_GOAL_OBSTACLE_CLEARANCE:-0.9}" \
+  --goal-clearance-resample-attempts "${GOAL_CLEARANCE_RESAMPLE_ATTEMPTS:-50}" \
+  --min-start-obstacle-clearance "${MIN_START_OBSTACLE_CLEARANCE:-0.0}" \
+  --start-clearance-resample-attempts "${START_CLEARANCE_RESAMPLE_ATTEMPTS:-20}" \
+  --blocked-corridor-radius "${BLOCKED_CORRIDOR_RADIUS:-0.45}" \
+  --blocked-corridor-ignore-end-radius "${BLOCKED_CORRIDOR_IGNORE_END_RADIUS:-0.75}" \
+  --blocked-corridor-min-cells "${BLOCKED_CORRIDOR_MIN_CELLS:-1}" \
+  --blocked-corridor-resample-attempts "${BLOCKED_CORRIDOR_RESAMPLE_ATTEMPTS:-100}" \
+  --debug-obstacle-width-min "${DEBUG_OBSTACLE_WIDTH_MIN:-1.0}" \
+  --debug-obstacle-width-max "${DEBUG_OBSTACLE_WIDTH_MAX:-1.4}" \
+  --debug-obstacle-height-min "${DEBUG_OBSTACLE_HEIGHT_MIN:-1.0}" \
+  --debug-obstacle-height-max "${DEBUG_OBSTACLE_HEIGHT_MAX:-1.0}" \
+  --debug-num-obstacles "${DEBUG_NUM_OBSTACLES:-6}" \
+  --debug-platform-width "${DEBUG_PLATFORM_WIDTH:-2.0}" \
+  --debug-obstacle-border-width "${DEBUG_OBSTACLE_BORDER_WIDTH:-0.0}" \
+  --debug-terrain-rows "${DEBUG_TERRAIN_ROWS:-5}" \
+  --debug-terrain-cols "${DEBUG_TERRAIN_COLS:-10}" \
+  --debug-goal-distance "${DEBUG_GOAL_DISTANCE:-3.2}" \
+  --debug-goal-obstacle-min-dist "${DEBUG_GOAL_OBSTACLE_MIN_DIST:-0.8}" \
+  --debug-goal-obstacle-max-dist "${DEBUG_GOAL_OBSTACLE_MAX_DIST:-2.2}" \
+  --goal-through-obstacle-prob "${GOAL_THROUGH_OBSTACLE_PROB:-0.7}" \
+  --log-interval "${LOG_INTERVAL:-200}" \
+  --checkpoint-interval "${CHECKPOINT_INTERVAL:-5000}" \
+  "${ESCAPE_ALL_DIRECTIONS_FLAG[@]}" \
+  "${REQUIRE_BLOCKED_CORRIDOR_FLAG[@]}" \
+  "${DEBUG_GOAL_THROUGH_OBSTACLE_FLAG[@]}" \
+  "${PREF_STOPGRAD_POSITIVE_FLAG[@]}" \
+  ${EXTRA_ARGS:-}
