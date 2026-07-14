@@ -68,6 +68,43 @@ class _TemporalFrameEncoder(nn.Module):
         return F.relu(x[:, -1, :])
 
 
+class _UnitreeScanEncoder(nn.Module):
+    """Fuse Unitree navigation proprio/goal features with a spatial 7x7 scan."""
+
+    def __init__(
+        self,
+        *,
+        n_obs: int,
+        embed_dim: int,
+        use_layer_norm: bool,
+        layer_norm_eps: float,
+        device: torch.device | None,
+    ):
+        super().__init__()
+        if int(n_obs) != 58:
+            raise ValueError(f"unitree_scan_cnn requires n_obs=58, got {n_obs}")
+        scan_channels = max(8, int(embed_dim) // 16)
+        self.scan_net = nn.Sequential(
+            nn.Conv2d(1, scan_channels, kernel_size=3, padding=1, device=device),
+            nn.ReLU(),
+            nn.Conv2d(scan_channels, scan_channels, kernel_size=3, padding=1, device=device),
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(scan_channels * 7 * 7, int(embed_dim), device=device),
+        )
+        self.context_proj = nn.Linear(9, int(embed_dim), device=device)
+        self.norm = (
+            nn.LayerNorm(int(embed_dim), eps=float(layer_norm_eps), device=device)
+            if use_layer_norm
+            else nn.Identity()
+        )
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        context = self.context_proj(obs[:, :9])
+        scan = obs[:, 9:58].reshape(obs.shape[0], 1, 7, 7)
+        return F.relu(self.norm(context + self.scan_net(scan)))
+
+
 def _maybe_temporal_encoder(
     *,
     temporal_encoder: str,
@@ -81,6 +118,15 @@ def _maybe_temporal_encoder(
     encoder = str(temporal_encoder or "none").strip().lower()
     if encoder in {"", "none", "mlp"}:
         return None, int(n_obs)
+    if encoder == "unitree_scan_cnn":
+        module = _UnitreeScanEncoder(
+            n_obs=int(n_obs),
+            embed_dim=int(embed_dim),
+            use_layer_norm=use_layer_norm,
+            layer_norm_eps=layer_norm_eps,
+            device=device,
+        )
+        return module, int(embed_dim)
     if encoder != "attention":
         raise ValueError(f"Unsupported temporal_encoder: {temporal_encoder!r}")
     module = _TemporalFrameEncoder(

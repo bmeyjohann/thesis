@@ -29,3 +29,6 @@
 [submodule "safety-gymnasium"]
 	path = safety-gymnasium
 	url = git@github.com:bmeyjohann/safety-gymnasium.git
+[submodule "external/unitree_rl_mjlab"]
+	path = external/unitree_rl_mjlab
+	url = git@github.com:karamdaaboul/unitree_rl_mjlab.git
