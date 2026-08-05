@@ -410,6 +410,10 @@ class GamepadStateClient:
                     self.latest_state = dict(state)
                     self.latest_state["connected"] = True
                     self.latest_state["_transport_peer"] = self.last_peer
+                    # Sender wall clocks can differ from WSL/Windows by more
+                    # than the stale timeout. Freshness must use local receipt
+                    # time, not the remote input-sampling timestamp.
+                    self.latest_state["_transport_received_at"] = time.time()
             except Exception as exc:
                 self.connected = False
                 self.last_error = str(exc)
