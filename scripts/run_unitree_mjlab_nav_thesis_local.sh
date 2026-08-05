@@ -51,13 +51,78 @@ if [[ "${DEBUG_GOAL_THROUGH_OBSTACLE:-0}" == "1" ]]; then
   DEBUG_GOAL_THROUGH_OBSTACLE_FLAG=(--debug-goal-through-obstacle)
 fi
 
+RESAMPLE_TERRAIN_TILES_FLAG=()
+if [[ "${RESAMPLE_TERRAIN_TILES:-1}" == "1" ]]; then
+  RESAMPLE_TERRAIN_TILES_FLAG=(--resample-terrain-tiles)
+fi
+
 PREF_STOPGRAD_POSITIVE_FLAG=()
 if [[ "${PREF_STOPGRAD_POSITIVE:-1}" == "1" ]]; then
   PREF_STOPGRAD_POSITIVE_FLAG=(--pref-stopgrad-positive)
 fi
 
+MASK_GOAL_HEADING_FLAG=()
+if [[ "${MASK_GOAL_HEADING:-1}" == "1" ]]; then
+  MASK_GOAL_HEADING_FLAG=(--mask-goal-heading)
+fi
+
+MASK_HEIGHT_SCAN_FLAG=()
+if [[ "${MASK_HEIGHT_SCAN:-0}" == "1" ]]; then
+  MASK_HEIGHT_SCAN_FLAG=(--mask-height-scan)
+fi
+
+MASK_PROPRIOCEPTION_FLAG=()
+if [[ "${MASK_PROPRIOCEPTION:-0}" == "1" ]]; then
+  MASK_PROPRIOCEPTION_FLAG=(--mask-proprioception)
+fi
+
+STRICT_MIN_SIZE_OBSTACLES_FLAG=()
+if [[ "${STRICT_MIN_SIZE_OBSTACLES:-1}" == "1" ]]; then
+  STRICT_MIN_SIZE_OBSTACLES_FLAG=(--strict-min-size-obstacles)
+fi
+
+DISABLE_OBSTACLES_FLAG=()
+if [[ "${DISABLE_OBSTACLES:-0}" == "1" ]]; then
+  DISABLE_OBSTACLES_FLAG=(--disable-obstacles)
+fi
+
+EVAL_AT_END_FLAG=(--eval-at-end)
+if [[ "${EVAL_AT_END:-1}" != "1" ]]; then
+  EVAL_AT_END_FLAG=(--no-eval-at-end)
+fi
+
+EVAL_FAIL_FAST_FLAG=()
+if [[ "${EVAL_FAIL_FAST:-0}" == "1" ]]; then
+  EVAL_FAIL_FAST_FLAG=(--eval-fail-fast)
+fi
+
+ACTOR_BC_ONLY_FLAG=()
+if [[ "${ACTOR_BC_ONLY:-0}" == "1" ]]; then
+  ACTOR_BC_ONLY_FLAG=(--actor-bc-only)
+fi
+
+DETERMINISTIC_STUDENT_FLAG=()
+if [[ "${DETERMINISTIC_STUDENT:-0}" == "1" ]]; then
+  DETERMINISTIC_STUDENT_FLAG=(--deterministic-student)
+fi
+
+PVP_ENV_REWARD_FLAG=()
+if [[ "${PVP_INCLUDE_ENV_REWARD_IN_TD:-0}" == "1" ]]; then
+  PVP_ENV_REWARD_FLAG=(--pvp-include-env-reward-in-td)
+fi
+
+PVP_TD_START_FLAG=(--pvp-stop-td-on-intervention-start)
+if [[ "${PVP_STOP_TD_ON_INTERVENTION_START:-1}" != "1" ]]; then
+  PVP_TD_START_FLAG=(--no-pvp-stop-td-on-intervention-start)
+fi
+
+# Every standard training run should expose teacher-free policy quality. Set
+# EVAL_INTERVAL=0 explicitly only for short infrastructure smoke tests.
+EVAL_INTERVAL_RESOLVED="${EVAL_INTERVAL:-${CHECKPOINT_INTERVAL:-5000}}"
+
 exec "$PYTHON_BIN" "$ROOT_DIR/train_unitree_nav_thesis.py" \
   --task "$TASK" \
+  --method "${METHOD:-thesis}" \
   --device "$DEVICE" \
   --seed "${SEED:-0}" \
   --num-envs "$NUM_ENVS" \
@@ -69,31 +134,67 @@ exec "$PYTHON_BIN" "$ROOT_DIR/train_unitree_nav_thesis.py" \
   --wandb-group "${WANDB_GROUP:-}" \
   --wandb-mode "${WANDB_MODE:-online}" \
   --total-steps "$TOTAL_STEPS" \
+  --replay-capacity "${REPLAY_CAPACITY:-500000}" \
   --learning-starts "${LEARNING_STARTS:-1000}" \
   --random-steps "${RANDOM_STEPS:-500}" \
   --teacher-warmup-steps "${TEACHER_WARMUP_STEPS:-1000}" \
   --batch-size "${BATCH_SIZE:-256}" \
   --updates-per-step "${UPDATES_PER_STEP:-1}" \
+  --n-step "${N_STEP:-1}" \
   --policy-frequency "${POLICY_FREQUENCY:-2}" \
   --hidden-dim "${HIDDEN_DIM:-256}" \
   --policy-encoder "${POLICY_ENCODER:-mlp}" \
+  --height-scan-resolution "${HEIGHT_SCAN_RESOLUTION:-0.5}" \
+  --scan-history "${SCAN_HISTORY:-1}" \
+  --action-history "${ACTION_HISTORY:-0}" \
+  "${MASK_HEIGHT_SCAN_FLAG[@]}" \
+  "${MASK_PROPRIOCEPTION_FLAG[@]}" \
+  "${MASK_GOAL_HEADING_FLAG[@]}" \
+  --student-action-smoothing "${STUDENT_ACTION_SMOOTHING:-0.0}" \
   --pad-obs-to-dim "${PAD_OBS_TO_DIM:-0}" \
   --use-layer-norm \
+  --lr-actor "${LR_ACTOR:-0.0003}" \
+  --lr-critic "${LR_CRITIC:-0.0003}" \
   --gamma "${GAMMA:-0.99}" \
+  --tau "${TAU:-0.005}" \
+  --max-grad-norm "${MAX_GRAD_NORM:-10.0}" \
   --alpha-init "${ALPHA_INIT:-0.001}" \
   --alpha-min "${ALPHA_MIN:-0.0}" \
   --alpha-max "${ALPHA_MAX:-0.05}" \
   --actor-bc-weight "${ACTOR_BC_WEIGHT:-0.2}" \
+  "${ACTOR_BC_ONLY_FLAG[@]}" \
+  --hilserl-demo-ratio "${HILSERL_DEMO_RATIO:-0.5}" \
+  --eil-threshold "${EIL_THRESHOLD:-0.0}" \
+  --eil-good-margin "${EIL_GOOD_MARGIN:-0.01}" \
+  --eil-bad-margin "${EIL_BAD_MARGIN:-0.01}" \
+  --eil-pair-margin "${EIL_PAIR_MARGIN:-0.05}" \
+  --eil-bad-pre-steps "${EIL_BAD_PRE_STEPS:-8}" \
+  --pvp-proxy-value-bound "${PVP_PROXY_VALUE_BOUND:-1.0}" \
+  --pvp-cql-coefficient "${PVP_CQL_COEFFICIENT:-1.0}" \
+  --pvp-policy-delay "${PVP_POLICY_DELAY:-2}" \
+  --pvp-target-policy-noise "${PVP_TARGET_POLICY_NOISE:-0.2}" \
+  --pvp-target-noise-clip "${PVP_TARGET_NOISE_CLIP:-0.5}" \
+  --hg-ensemble-size "${HG_ENSEMBLE_SIZE:-5}" \
   --init-actor-checkpoint "${INIT_ACTOR_CHECKPOINT:-}" \
   --init-checkpoint "${INIT_CHECKPOINT:-}" \
   --student-controller "${STUDENT_CONTROLLER:-actor}" \
+  "${DETERMINISTIC_STUDENT_FLAG[@]}" \
   --learner-reward-mode "${LEARNER_REWARD_MODE:-dense_progress}" \
   --dense-progress-scale "${DENSE_PROGRESS_SCALE:-1.0}" \
+  --dense-progress-exp-scale "${DENSE_PROGRESS_EXP_SCALE:-1.0}" \
+  --dense-progress-exp-temperature "${DENSE_PROGRESS_EXP_TEMPERATURE:-1.0}" \
+  --goal-turn-alignment-scale "${GOAL_TURN_ALIGNMENT_SCALE:-0.0}" \
+  --reverse-action-penalty "${REVERSE_ACTION_PENALTY:-0.0}" \
+  --lateral-action-penalty "${LATERAL_ACTION_PENALTY:-0.0}" \
   --success-bonus "${SUCCESS_BONUS:-1.0}" \
+  --failure-penalty "${FAILURE_PENALTY:-0.0}" \
   --teacher-type "${TEACHER_TYPE:-geom_scan}" \
   --intervention-gate-mode "${INTERVENTION_GATE_MODE:-clearance_or_stall}" \
   --intervention-clearance-threshold "${INTERVENTION_CLEARANCE_THRESHOLD:-0.65}" \
   --intervention-release-clearance "${INTERVENTION_RELEASE_CLEARANCE:-0.8}" \
+  --intervention-clearance-mode "${INTERVENTION_CLEARANCE_MODE:-teacher_ratio}" \
+  --intervention-clearance-trigger-ratio "${INTERVENTION_CLEARANCE_TRIGGER_RATIO:-1.25}" \
+  --intervention-clearance-release-ratio "${INTERVENTION_CLEARANCE_RELEASE_RATIO:-1.4166666667}" \
   --intervention-stall-steps "${INTERVENTION_STALL_STEPS:-30}" \
   --intervention-progress-epsilon "${INTERVENTION_PROGRESS_EPSILON:-0.04}" \
   --intervention-release-steps "${INTERVENTION_RELEASE_STEPS:-8}" \
@@ -156,6 +257,9 @@ exec "$PYTHON_BIN" "$ROOT_DIR/train_unitree_nav_thesis.py" \
   --teacher-geom-side-penalty "${TEACHER_GEOM_SIDE_PENALTY:-8.0}" \
   --teacher-geom-side-frame "${TEACHER_GEOM_SIDE_FRAME:-body}" \
   --teacher-geom-disengage-clear-steps "${TEACHER_GEOM_DISENGAGE_CLEAR_STEPS:-20}" \
+  --teacher-geom-command-smoothing "${TEACHER_GEOM_COMMAND_SMOOTHING:-0.0}" \
+  --teacher-geom-waypoint-commit-distance "${TEACHER_GEOM_WAYPOINT_COMMIT_DISTANCE:-0.0}" \
+  --teacher-geom-waypoint-reach-dist "${TEACHER_GEOM_WAYPOINT_REACH_DIST:-0.25}" \
   --teacher-geom-emergency-radius "${TEACHER_GEOM_EMERGENCY_RADIUS:-0.8}" \
   --intervention-delta "${INTERVENTION_DELTA:-0.35}" \
   --intervene-on-blocked-goal \
@@ -171,8 +275,15 @@ exec "$PYTHON_BIN" "$ROOT_DIR/train_unitree_nav_thesis.py" \
   --blocked-corridor-ignore-end-radius "${BLOCKED_CORRIDOR_IGNORE_END_RADIUS:-0.75}" \
   --blocked-corridor-min-cells "${BLOCKED_CORRIDOR_MIN_CELLS:-1}" \
   --blocked-corridor-resample-attempts "${BLOCKED_CORRIDOR_RESAMPLE_ATTEMPTS:-100}" \
+  --blocked-goal-max-distance "${BLOCKED_GOAL_MAX_DISTANCE:-0.0}" \
+  --blocked-goal-distance-sampling "${BLOCKED_GOAL_DISTANCE_SAMPLING:-nearest}" \
+  --blocked-goal-placement-mode "${BLOCKED_GOAL_PLACEMENT_MODE:-obstacle_multiplier}" \
+  --blocked-goal-distance-multiplier-min "${BLOCKED_GOAL_DISTANCE_MULTIPLIER_MIN:-1.0}" \
+  --blocked-goal-distance-multiplier-max "${BLOCKED_GOAL_DISTANCE_MULTIPLIER_MAX:-2.0}" \
+  --blocked-goal-candidate-attempts "${BLOCKED_GOAL_CANDIDATE_ATTEMPTS:-64}" \
   --debug-obstacle-width-min "${DEBUG_OBSTACLE_WIDTH_MIN:-1.0}" \
   --debug-obstacle-width-max "${DEBUG_OBSTACLE_WIDTH_MAX:-1.4}" \
+  "${STRICT_MIN_SIZE_OBSTACLES_FLAG[@]}" \
   --debug-obstacle-height-min "${DEBUG_OBSTACLE_HEIGHT_MIN:-1.0}" \
   --debug-obstacle-height-max "${DEBUG_OBSTACLE_HEIGHT_MAX:-1.0}" \
   --debug-num-obstacles "${DEBUG_NUM_OBSTACLES:-6}" \
@@ -186,8 +297,20 @@ exec "$PYTHON_BIN" "$ROOT_DIR/train_unitree_nav_thesis.py" \
   --goal-through-obstacle-prob "${GOAL_THROUGH_OBSTACLE_PROB:-0.7}" \
   --log-interval "${LOG_INTERVAL:-200}" \
   --checkpoint-interval "${CHECKPOINT_INTERVAL:-5000}" \
+  --eval-interval "$EVAL_INTERVAL_RESOLVED" \
+  --eval-num-envs "${EVAL_NUM_ENVS:-8}" \
+  --eval-num-episodes "${EVAL_NUM_EPISODES:-16}" \
+  --eval-seed "${EVAL_SEED:-941}" \
+  --eval-layout-manifest "${EVAL_LAYOUT_MANIFEST:-}" \
+  --eval-timeout-s "${EVAL_TIMEOUT_S:-3600}" \
+  "${EVAL_AT_END_FLAG[@]}" \
+  "${EVAL_FAIL_FAST_FLAG[@]}" \
   "${ESCAPE_ALL_DIRECTIONS_FLAG[@]}" \
   "${REQUIRE_BLOCKED_CORRIDOR_FLAG[@]}" \
   "${DEBUG_GOAL_THROUGH_OBSTACLE_FLAG[@]}" \
+  "${RESAMPLE_TERRAIN_TILES_FLAG[@]}" \
   "${PREF_STOPGRAD_POSITIVE_FLAG[@]}" \
+  "${PVP_ENV_REWARD_FLAG[@]}" \
+  "${PVP_TD_START_FLAG[@]}" \
+  "${DISABLE_OBSTACLES_FLAG[@]}" \
   ${EXTRA_ARGS:-}

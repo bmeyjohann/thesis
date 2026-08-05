@@ -42,6 +42,7 @@ class _TemporalFrameEncoder(nn.Module):
         *,
         n_obs: int,
         num_frames: int,
+        action_history: int,
         embed_dim: int,
         use_layer_norm: bool,
         layer_norm_eps: float,
@@ -69,30 +70,40 @@ class _TemporalFrameEncoder(nn.Module):
 
 
 class _UnitreeScanEncoder(nn.Module):
-    """Fuse Unitree navigation proprio/goal features with a spatial 7x7 scan."""
+    """Fuse current Unitree context with one or more square height scans."""
 
     def __init__(
         self,
         *,
         n_obs: int,
+        num_frames: int,
+        action_history: int,
         embed_dim: int,
         use_layer_norm: bool,
         layer_norm_eps: float,
         device: torch.device | None,
     ):
         super().__init__()
-        if int(n_obs) != 58:
-            raise ValueError(f"unitree_scan_cnn requires n_obs=58, got {n_obs}")
+        self.num_frames = max(1, int(num_frames))
+        self.action_history = max(0, int(action_history))
+        self.context_dim = 9 + 3 * self.action_history
+        scan_values = int(n_obs) - self.context_dim
+        if scan_values <= 0 or scan_values % self.num_frames != 0:
+            raise ValueError(f"unitree_scan_cnn cannot split n_obs={n_obs} into {self.num_frames} scans")
+        self.scan_dim = scan_values // self.num_frames
+        self.scan_side = int(round(self.scan_dim ** 0.5))
+        if self.scan_side * self.scan_side != self.scan_dim:
+            raise ValueError(f"unitree_scan_cnn requires square scans, got {self.scan_dim} values")
         scan_channels = max(8, int(embed_dim) // 16)
         self.scan_net = nn.Sequential(
-            nn.Conv2d(1, scan_channels, kernel_size=3, padding=1, device=device),
+            nn.Conv2d(self.num_frames, scan_channels, kernel_size=3, padding=1, device=device),
             nn.ReLU(),
             nn.Conv2d(scan_channels, scan_channels, kernel_size=3, padding=1, device=device),
             nn.ReLU(),
             nn.Flatten(),
-            nn.Linear(scan_channels * 7 * 7, int(embed_dim), device=device),
+            nn.Linear(scan_channels * self.scan_side * self.scan_side, int(embed_dim), device=device),
         )
-        self.context_proj = nn.Linear(9, int(embed_dim), device=device)
+        self.context_proj = nn.Linear(self.context_dim, int(embed_dim), device=device)
         self.norm = (
             nn.LayerNorm(int(embed_dim), eps=float(layer_norm_eps), device=device)
             if use_layer_norm
@@ -100,8 +111,10 @@ class _UnitreeScanEncoder(nn.Module):
         )
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        context = self.context_proj(obs[:, :9])
-        scan = obs[:, 9:58].reshape(obs.shape[0], 1, 7, 7)
+        context = self.context_proj(torch.cat((obs[:, :9], obs[:, 9 + self.num_frames * self.scan_dim :]), dim=-1))
+        scan = obs[:, 9 : 9 + self.num_frames * self.scan_dim].reshape(
+            obs.shape[0], self.num_frames, self.scan_side, self.scan_side
+        )
         return F.relu(self.norm(context + self.scan_net(scan)))
 
 
@@ -110,6 +123,7 @@ def _maybe_temporal_encoder(
     temporal_encoder: str,
     n_obs: int,
     obs_frame_stack: int,
+    unitree_action_history: int,
     embed_dim: int,
     use_layer_norm: bool,
     layer_norm_eps: float,
@@ -121,6 +135,8 @@ def _maybe_temporal_encoder(
     if encoder == "unitree_scan_cnn":
         module = _UnitreeScanEncoder(
             n_obs=int(n_obs),
+            num_frames=int(obs_frame_stack),
+            action_history=int(unitree_action_history),
             embed_dim=int(embed_dim),
             use_layer_norm=use_layer_norm,
             layer_norm_eps=layer_norm_eps,
@@ -153,6 +169,7 @@ class SafetyActor(nn.Module):
         layer_norm_eps: float = 1e-5,
         temporal_encoder: str = "none",
         obs_frame_stack: int = 1,
+        unitree_action_history: int = 0,
         intervention_aux_head: bool = False,
         device: torch.device | None = None,
     ):
@@ -162,6 +179,7 @@ class SafetyActor(nn.Module):
             temporal_encoder=temporal_encoder,
             n_obs=n_obs,
             obs_frame_stack=obs_frame_stack,
+            unitree_action_history=unitree_action_history,
             embed_dim=h1,
             use_layer_norm=use_layer_norm,
             layer_norm_eps=layer_norm_eps,
@@ -243,6 +261,7 @@ class _QNetwork(nn.Module):
         layer_norm_eps: float = 1e-5,
         temporal_encoder: str = "none",
         obs_frame_stack: int = 1,
+        unitree_action_history: int = 0,
         device: torch.device | None = None,
     ):
         super().__init__()
@@ -251,6 +270,7 @@ class _QNetwork(nn.Module):
             temporal_encoder=temporal_encoder,
             n_obs=n_obs,
             obs_frame_stack=obs_frame_stack,
+            unitree_action_history=unitree_action_history,
             embed_dim=h1,
             use_layer_norm=use_layer_norm,
             layer_norm_eps=layer_norm_eps,
@@ -305,6 +325,7 @@ class SafetyCritic(nn.Module):
         layer_norm_eps: float = 1e-5,
         temporal_encoder: str = "none",
         obs_frame_stack: int = 1,
+        unitree_action_history: int = 0,
         device: torch.device | None = None,
     ):
         super().__init__()
@@ -317,6 +338,7 @@ class SafetyCritic(nn.Module):
             layer_norm_eps=layer_norm_eps,
             temporal_encoder=temporal_encoder,
             obs_frame_stack=obs_frame_stack,
+            unitree_action_history=unitree_action_history,
             device=device,
         )
         self.qnet2 = (
@@ -328,6 +350,7 @@ class SafetyCritic(nn.Module):
                 layer_norm_eps=layer_norm_eps,
                 temporal_encoder=temporal_encoder,
                 obs_frame_stack=obs_frame_stack,
+                unitree_action_history=unitree_action_history,
                 device=device,
             )
             if self.num_critics >= 2
@@ -343,6 +366,7 @@ class SafetyCritic(nn.Module):
                     layer_norm_eps=layer_norm_eps,
                     temporal_encoder=temporal_encoder,
                     obs_frame_stack=obs_frame_stack,
+                    unitree_action_history=unitree_action_history,
                     device=device,
                 )
                 for _ in range(max(0, self.num_critics - 2))
@@ -480,6 +504,7 @@ def build_sac(
     alpha_init: float = 1e-3,
     temporal_encoder: str = "none",
     obs_frame_stack: int = 1,
+    unitree_action_history: int = 0,
     intervention_aux_head: bool = False,
 ) -> SACTensors:
     actor = SafetyActor(
@@ -492,6 +517,7 @@ def build_sac(
         layer_norm_eps=layer_norm_eps,
         temporal_encoder=temporal_encoder,
         obs_frame_stack=obs_frame_stack,
+        unitree_action_history=unitree_action_history,
         intervention_aux_head=intervention_aux_head,
         device=device,
     )
@@ -504,6 +530,7 @@ def build_sac(
         layer_norm_eps=layer_norm_eps,
         temporal_encoder=temporal_encoder,
         obs_frame_stack=obs_frame_stack,
+        unitree_action_history=unitree_action_history,
         device=device,
     )
     critic_target = SafetyCritic(
@@ -515,6 +542,7 @@ def build_sac(
         layer_norm_eps=layer_norm_eps,
         temporal_encoder=temporal_encoder,
         obs_frame_stack=obs_frame_stack,
+        unitree_action_history=unitree_action_history,
         device=device,
     )
     critic_target.load_state_dict(critic.state_dict())
@@ -672,7 +700,14 @@ def sac_update_step(
     rewards = batch["next"]["rewards"].unsqueeze(-1)
     dones = batch["next"]["dones"].bool().unsqueeze(-1)
     trunc = batch["next"]["truncations"].bool().unsqueeze(-1)
-    discount = torch.as_tensor(gamma, device=obs.device, dtype=torch.float32)
+    effective_n_steps = batch["next"].get("effective_n_steps")
+    if effective_n_steps is None:
+        discount = torch.as_tensor(gamma, device=obs.device, dtype=torch.float32)
+    else:
+        discount = torch.pow(
+            torch.as_tensor(gamma, device=obs.device, dtype=torch.float32),
+            effective_n_steps.to(device=obs.device, dtype=torch.float32).unsqueeze(-1),
+        )
     bootstrap = (trunc | ~dones).float()
 
     def _scale_actions(actions: torch.Tensor) -> torch.Tensor:

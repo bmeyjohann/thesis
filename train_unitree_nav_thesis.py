@@ -9,9 +9,11 @@ computed from the same actor observation used by the student policy
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import json
 import math
 import os
+import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass
@@ -66,6 +68,7 @@ class InterventionGateState:
         self.progress_reference = torch.full((num_envs,), float("inf"), device=device)
         self.bad_steps = torch.zeros(num_envs, dtype=torch.long, device=device)
         self.good_steps = torch.zeros(num_envs, dtype=torch.long, device=device)
+        self.active_steps = torch.zeros(num_envs, dtype=torch.long, device=device)
 
     def reset(self, mask: torch.Tensor | None = None) -> None:
         if mask is None:
@@ -76,6 +79,7 @@ class InterventionGateState:
         self.progress_reference[mask] = float("inf")
         self.bad_steps[mask] = 0
         self.good_steps[mask] = 0
+        self.active_steps[mask] = 0
 
     def update(
         self,
@@ -91,7 +95,7 @@ class InterventionGateState:
         release_progress_tolerance: float,
         release_action_delta_max: float,
         goal_tolerance: float,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, ...]:
         distance = distance.reshape(-1)
         clearance = clearance.reshape(-1)
         first = ~torch.isfinite(self.last_distance)
@@ -108,13 +112,18 @@ class InterventionGateState:
         clearance_trigger &= ~at_goal
         stall_trigger &= ~at_goal
         engage = (~self.active) & (clearance_trigger | stall_trigger)
+        engage_clearance = engage & clearance_trigger
+        engage_stall = engage & stall_trigger & ~clearance_trigger
         self.active |= engage
 
-        release_good = (
-            (clearance >= float(release_clearance))
-            & (step_progress >= -float(release_progress_tolerance))
-            & (action_delta.reshape(-1) <= float(release_action_delta_max))
-        )
+        clearance_ok = clearance >= float(release_clearance)
+        progress_ok = step_progress >= -float(release_progress_tolerance)
+        action_delta_ok = action_delta.reshape(-1) <= float(release_action_delta_max)
+        release_good = clearance_ok & progress_ok & action_delta_ok
+        release_blocked_clearance = self.active & ~clearance_ok
+        release_blocked_progress = self.active & ~progress_ok
+        release_blocked_action_delta = self.active & ~action_delta_ok
+        self.active_steps = torch.where(self.active, self.active_steps + 1, self.active_steps)
         self.good_steps = torch.where(
             self.active & release_good,
             self.good_steps + 1,
@@ -122,14 +131,45 @@ class InterventionGateState:
         )
         release = self.active & (self.good_steps >= max(1, int(release_steps)))
         release |= self.active & at_goal
+        released_duration = torch.where(release, self.active_steps, torch.zeros_like(self.active_steps))
         self.active &= ~release
         self.good_steps[release] = 0
         self.bad_steps[release] = 0
         self.progress_reference[release] = distance[release]
+        self.active_steps[release] = 0
         self.bad_steps[at_goal] = 0
         self.progress_reference[at_goal] = distance[at_goal]
         self.last_distance = distance.clone()
-        return self.active.clone(), clearance_trigger, stall_trigger, release
+        return (
+            self.active.clone(),
+            clearance_trigger,
+            stall_trigger,
+            release,
+            engage_clearance,
+            engage_stall,
+            release_blocked_clearance,
+            release_blocked_progress,
+            release_blocked_action_delta,
+            released_duration,
+        )
+
+
+def resolve_intervention_clearances(args: argparse.Namespace) -> tuple[float, float]:
+    mode = str(getattr(args, "intervention_clearance_mode", "fixed"))
+    if mode == "fixed":
+        engage = float(args.intervention_clearance_threshold)
+        release = float(args.intervention_release_clearance)
+    elif mode == "teacher_ratio":
+        if str(getattr(args, "teacher_type", "geom_scan")) != "geom_scan":
+            raise ValueError("teacher_ratio clearance currently requires teacher_type=geom_scan")
+        reference = float(args.teacher_geom_clearance)
+        engage = reference * float(args.intervention_clearance_trigger_ratio)
+        release = reference * float(args.intervention_clearance_release_ratio)
+    else:
+        raise ValueError(f"Unsupported intervention_clearance_mode={mode!r}")
+    if engage <= 0.0 or release <= engage:
+        raise ValueError(f"Intervention clearances must satisfy 0 < engage < release, got {engage}, {release}")
+    return engage, release
 
 
 class UnitreeReplayBuffer:
@@ -143,7 +183,12 @@ class UnitreeReplayBuffer:
         self.rewards = torch.empty((capacity,), device=device)
         self.dones = torch.empty((capacity,), dtype=torch.bool, device=device)
         self.truncations = torch.empty((capacity,), dtype=torch.bool, device=device)
+        self.effective_n_steps = torch.empty((capacity,), dtype=torch.float32, device=device)
         self.teacher_intervened = torch.empty((capacity,), dtype=torch.bool, device=device)
+        self.intervention_start = torch.empty((capacity,), dtype=torch.bool, device=device)
+        self.eil_good = torch.empty((capacity,), dtype=torch.bool, device=device)
+        self.eil_bad = torch.empty((capacity,), dtype=torch.bool, device=device)
+        self.env_ids = torch.empty((capacity,), dtype=torch.long, device=device)
         self.pos = 0
         self.size = 0
 
@@ -157,8 +202,13 @@ class UnitreeReplayBuffer:
         rewards: torch.Tensor,
         dones: torch.Tensor,
         truncations: torch.Tensor,
+        effective_n_steps: torch.Tensor,
         teacher_intervened: torch.Tensor,
-    ) -> None:
+        intervention_start: torch.Tensor | None = None,
+        eil_good: torch.Tensor | None = None,
+        eil_bad: torch.Tensor | None = None,
+        env_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         n = int(obs.shape[0])
         idx = (torch.arange(n, device=self.device) + self.pos) % self.capacity
         self.obs[idx] = obs
@@ -168,9 +218,26 @@ class UnitreeReplayBuffer:
         self.rewards[idx] = rewards.reshape(-1)
         self.dones[idx] = dones.reshape(-1).bool()
         self.truncations[idx] = truncations.reshape(-1).bool()
+        self.effective_n_steps[idx] = effective_n_steps.reshape(-1).float()
         self.teacher_intervened[idx] = teacher_intervened.reshape(-1).bool()
+        self.intervention_start[idx] = (
+            intervention_start.reshape(-1).bool() if intervention_start is not None else False
+        )
+        self.eil_good[idx] = eil_good.reshape(-1).bool() if eil_good is not None else True
+        self.eil_bad[idx] = eil_bad.reshape(-1).bool() if eil_bad is not None else False
+        self.env_ids[idx] = (
+            env_ids.reshape(-1).long() if env_ids is not None else torch.arange(n, device=self.device)
+        )
         self.pos = (self.pos + n) % self.capacity
         self.size = min(self.capacity, self.size + n)
+        return idx
+
+    def mark_eil_bad(self, indices: list[int]) -> None:
+        if not indices:
+            return
+        idx = torch.as_tensor(indices, dtype=torch.long, device=self.device)
+        self.eil_good[idx] = False
+        self.eil_bad[idx] = True
 
     def sample(self, batch_size: int) -> dict[str, Any]:
         if self.size <= 0:
@@ -181,13 +248,62 @@ class UnitreeReplayBuffer:
             "actions": self.actions[idx],
             "student_actions": self.student_actions[idx],
             "teacher_intervened": self.teacher_intervened[idx],
+            "intervention_start": self.intervention_start[idx],
+            "eil_good": self.eil_good[idx],
+            "eil_bad": self.eil_bad[idx],
+            "env_ids": self.env_ids[idx],
             "next": {
                 "observations": self.next_obs[idx],
                 "rewards": self.rewards[idx],
                 "dones": self.dones[idx],
                 "truncations": self.truncations[idx],
-                "effective_n_steps": torch.ones_like(self.rewards[idx]),
+                "effective_n_steps": self.effective_n_steps[idx],
             },
+        }
+
+
+class UnitreeNStepAccumulator:
+    """Build reset-safe n-step replay rows independently for each vector env."""
+
+    def __init__(self, *, num_envs: int, n_step: int, gamma: float):
+        self.n_step = max(1, int(n_step))
+        self.gamma = float(gamma)
+        self.queues: list[list[dict[str, torch.Tensor]]] = [[] for _ in range(int(num_envs))]
+
+    def add(self, **transition: torch.Tensor) -> dict[str, torch.Tensor] | None:
+        emitted: list[dict[str, torch.Tensor]] = []
+        num_envs = int(transition["obs"].shape[0])
+        for env_idx in range(num_envs):
+            queue = self.queues[env_idx]
+            queue.append({key: value[env_idx].detach().clone() for key, value in transition.items()})
+            if bool(transition["dones"][env_idx].item()):
+                while queue:
+                    emitted.append(self._aggregate(queue[: self.n_step]))
+                    queue.pop(0)
+            elif len(queue) >= self.n_step:
+                emitted.append(self._aggregate(queue[: self.n_step]))
+                queue.pop(0)
+        if not emitted:
+            return None
+        return {key: torch.stack([row[key] for row in emitted], dim=0) for key in emitted[0]}
+
+    def _aggregate(self, rows: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+        first, last = rows[0], rows[-1]
+        reward = torch.zeros_like(first["rewards"])
+        for offset, row in enumerate(rows):
+            reward = reward + (self.gamma**offset) * row["rewards"]
+        return {
+            "obs": first["obs"],
+            "actions": first["actions"],
+            "student_actions": first["student_actions"],
+            "next_obs": last["next_obs"],
+            "rewards": reward,
+            "dones": last["dones"],
+            "truncations": last["truncations"],
+            "effective_n_steps": torch.as_tensor(float(len(rows)), device=reward.device),
+            "teacher_intervened": first["teacher_intervened"],
+            "intervention_start": first.get("intervention_start", torch.zeros_like(first["teacher_intervened"])),
+            "env_ids": first.get("env_ids", torch.as_tensor(0, device=reward.device, dtype=torch.long)),
         }
 
 
@@ -223,6 +339,8 @@ def _extract_actor_obs(obs: Any) -> torch.Tensor:
 
 
 def _prepare_actor_obs(obs: Any, args: argparse.Namespace) -> torch.Tensor:
+    from unitree_nav_observation import prepare_unitree_actor_obs
+
     value = _extract_actor_obs(obs).to(args.device, dtype=torch.float32)
     target_dim = int(getattr(args, "pad_obs_to_dim", 0))
     if target_dim > 0:
@@ -233,10 +351,12 @@ def _prepare_actor_obs(obs: Any, args: argparse.Namespace) -> torch.Tensor:
                 [value, torch.zeros((value.shape[0], target_dim - value.shape[1]), device=value.device)],
                 dim=1,
             )
-    if bool(getattr(args, "mask_height_scan", False)) and value.shape[1] >= 58:
-        value = value.clone()
-        value[:, 9:58] = 0.0
-    return value
+    return prepare_unitree_actor_obs(
+        value,
+        mask_proprioception=bool(getattr(args, "mask_proprioception", False)),
+        mask_goal_heading=bool(getattr(args, "mask_goal_heading", False)),
+        mask_height_scan=bool(getattr(args, "mask_height_scan", False)),
+    )
 
 
 def _extract_cost(extras: Any, num_envs: int, device: torch.device) -> torch.Tensor:
@@ -293,20 +413,24 @@ def _scan_astar_teacher_action(
     side_penalty: float,
     commit_steps: int,
 ) -> tuple[torch.Tensor, torch.Tensor, TeacherDiagnostics]:
-    """Plan over the exact 7x7 scan supplied to the student policy."""
+    """Plan over the exact square scan supplied to the student policy."""
     from unitree_nav_geom_teacher import _astar_local_target
 
     device = obs.device
     goal_xy = obs[:, 6:8]
     goal_dist = torch.linalg.norm(goal_xy, dim=1)
-    scan = torch.nan_to_num(obs[:, 9:58].reshape(-1, 7, 7), nan=1.0)
-    flat_scan = scan.reshape(-1, 49)
+    scan_dim = obs.shape[1] - 9
+    side = int(round(scan_dim ** 0.5))
+    if side * side != scan_dim:
+        raise ValueError(f"Expected square current scan, got {scan_dim} values")
+    scan = torch.nan_to_num(obs[:, 9:].reshape(-1, side, side), nan=1.0)
+    flat_scan = scan.reshape(-1, scan_dim)
     reference = torch.quantile(flat_scan, 0.9, dim=1, keepdim=True)
     blocked = flat_scan < float(scan_block_threshold)
     if float(scan_block_delta) > 0.0:
         blocked |= flat_scan < (reference - float(scan_block_delta))
 
-    coords = np.linspace(-1.5, 1.5, 7, dtype=np.float64)
+    coords = np.linspace(-1.5, 1.5, side, dtype=np.float64)
     forward, lateral = np.meshgrid(coords, coords, indexing="xy")
     # meshgrid(x=forward, y=lateral) yields rows=lateral, columns=forward,
     # matching the actor observation flattening verified against hit_pos_w.
@@ -466,17 +590,21 @@ def scan_teacher_action(
     goal_xy = obs[:, 6:8]
     goal_dist = torch.linalg.norm(goal_xy, dim=1)
     goal_angle = torch.atan2(goal_xy[:, 1], goal_xy[:, 0])
-    scan = obs[:, 9:58].reshape(n, 7, 7)
+    scan_dim = obs.shape[1] - 9
+    side = int(round(scan_dim ** 0.5))
+    if side * side != scan_dim:
+        raise ValueError(f"Expected square current scan, got {scan_dim} values")
+    scan = obs[:, 9:].reshape(n, side, side)
     min_scan = torch.nan_to_num(scan, nan=1.0).amin(dim=(1, 2))
 
-    coords = torch.linspace(-1.5, 1.5, 7, device=device)
+    coords = torch.linspace(-1.5, 1.5, side, device=device)
     # Isaac's grid flattens with row=lateral and column=forward.  This was
     # verified against terrain_scan.data.hit_pos_w; do not swap these axes.
-    forward = coords.view(1, 7).expand(7, 7)
-    lateral = coords.view(7, 1).expand(7, 7)
+    forward = coords.view(1, side).expand(side, side)
+    lateral = coords.view(side, 1).expand(side, side)
     cell_angle = torch.atan2(lateral.reshape(-1), forward.reshape(-1).clamp_min(1e-4))
     front_mask = forward.reshape(-1) > 0.0
-    flat_scan = scan.reshape(n, 49)
+    flat_scan = scan.reshape(n, scan_dim)
     threshold = float(scan_block_threshold)
     if float(scan_block_delta) > 0.0:
         flat_ref = torch.quantile(flat_scan, 0.9, dim=1, keepdim=True)
@@ -705,7 +833,7 @@ def scan_teacher_action(
 
 def make_env(args: argparse.Namespace, *, render: bool = False):
     _setup_unitree_imports(Path(args.low_level_policy_path).resolve())
-    from eval_unitree_nav_baselines import _apply_debug_obstacle_overrides
+    from eval_unitree_nav_baselines import _apply_debug_obstacle_overrides, _apply_scan_and_goal_overrides
 
     import mjlab.tasks  # noqa: F401
     import src.tasks  # noqa: F401
@@ -719,6 +847,7 @@ def make_env(args: argparse.Namespace, *, render: bool = False):
     from unitree_nav_layout import configure_terrain_tile_resets
 
     _apply_debug_obstacle_overrides(args, env_cfg)
+    _apply_scan_and_goal_overrides(args, env_cfg)
     terrain_generator = getattr(getattr(env_cfg.scene, "terrain", None), "terrain_generator", None)
     if terrain_generator is not None and hasattr(terrain_generator, "seed"):
         terrain_generator.seed = int(args.seed)
@@ -775,33 +904,174 @@ def _reset_train_env(args: argparse.Namespace, env):
     return obs_raw
 
 
-def save_checkpoint(path: Path, *, sac, args: argparse.Namespace, step: int, obs_dim: int, act_dim: int) -> None:
+def save_checkpoint(
+    path: Path,
+    *,
+    sac,
+    args: argparse.Namespace,
+    step: int,
+    obs_dim: int,
+    act_dim: int,
+    policy_actor=None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "step": int(step),
-            "args": vars(args),
-            "obs_dim": int(obs_dim),
-            "act_dim": int(act_dim),
-            "actor_state_dict": sac.actor.state_dict(),
+    actor = policy_actor if policy_actor is not None else sac.actor
+    payload = {
+        "step": int(step),
+        "args": vars(args),
+        "obs_dim": int(obs_dim),
+        "act_dim": int(act_dim),
+        "policy_family": "hg_dagger" if str(getattr(args, "method", "thesis")) == "hg_dagger" else "sac_actor",
+        "actor_state_dict": actor.state_dict(),
+    }
+    if sac is not None:
+        payload.update(
+            {
             "critic_state_dict": sac.critic.state_dict(),
             "critic_target_state_dict": sac.critic_target.state_dict(),
             "log_alpha": sac.log_alpha.detach().cpu(),
             "pref_lambda": float(sac.pref_lambda),
             "pref_violation_ema": float(sac.pref_violation_ema),
-        },
-        path,
+            }
+        )
+    torch.save(payload, path)
+
+
+def run_checkpoint_evaluation(
+    checkpoint_path: Path,
+    *,
+    args: argparse.Namespace,
+    step: int,
+    run_dir: Path,
+) -> dict[str, float] | None:
+    """Run deterministic policy-only evaluation in an isolated subprocess."""
+    eval_root = run_dir / "eval"
+    eval_name = f"step_{int(step)}"
+    eval_root.mkdir(parents=True, exist_ok=True)
+    log_path = eval_root / f"{eval_name}.log"
+    cmd = [
+        sys.executable,
+        str(ROOT / "eval_unitree_nav_baselines.py"),
+        "--controller",
+        "policy",
+        "--model-path",
+        str(checkpoint_path.resolve()),
+        "--checkpoint-env-config",
+        "--device",
+        str(args.device),
+        "--seed",
+        str(int(args.eval_seed)),
+        "--num-envs",
+        str(int(args.eval_num_envs)),
+        "--num-episodes",
+        str(int(args.eval_num_episodes)),
+        "--output-dir",
+        str(eval_root.resolve()),
+        "--run-name",
+        eval_name,
+    ]
+    if str(getattr(args, "eval_layout_manifest", "")):
+        cmd.extend(["--layout-manifest", str(Path(args.eval_layout_manifest).resolve())])
+    print(
+        f"[periodic-eval] starting step={step} episodes={args.eval_num_episodes} "
+        f"num_envs={args.eval_num_envs} seed={args.eval_seed}",
+        flush=True,
     )
+    env = os.environ.copy()
+    env.setdefault("MPLCONFIGDIR", "/tmp/mplconfig")
+    env.setdefault("WARP_CACHE_PATH", "/tmp/warp-cache")
+    env.setdefault("XDG_CACHE_HOME", "/tmp/unitree-cache")
+    try:
+        with log_path.open("w", encoding="utf-8") as log_file:
+            completed = subprocess.run(
+                cmd,
+                cwd=str(ROOT),
+                env=env,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=float(args.eval_timeout_s),
+                check=False,
+            )
+    except subprocess.TimeoutExpired:
+        print(f"[periodic-eval] timed out at step={step}; see {log_path}", flush=True)
+        if args.eval_fail_fast:
+            raise
+        return None
+    if completed.returncode != 0:
+        message = f"periodic evaluation failed at step={step} exit={completed.returncode}; see {log_path}"
+        if args.eval_fail_fast:
+            raise RuntimeError(message)
+        print(f"[periodic-eval] WARNING: {message}", flush=True)
+        return None
+    metrics_path = eval_root / eval_name / "policy_metrics.json"
+    if not metrics_path.exists():
+        message = f"periodic evaluation did not produce {metrics_path}"
+        if args.eval_fail_fast:
+            raise RuntimeError(message)
+        print(f"[periodic-eval] WARNING: {message}", flush=True)
+        return None
+    summary = json.loads(metrics_path.read_text(encoding="utf-8"))
+    episodes = list(summary.get("episodes", []))
+    safe_success_rate = sum(
+        bool(episode.get("success")) and float(episode.get("cost_sum", 0.0)) == 0.0
+        for episode in episodes
+    ) / max(1, len(episodes))
+    row = {
+        "step": float(step),
+        "transitions": float(step * int(args.num_envs)),
+        "episodes": float(summary.get("num_episodes", len(episodes))),
+        "success_rate": float(summary.get("success_rate", 0.0)),
+        "safe_success_rate": float(safe_success_rate),
+        "mean_cost_sum": float(summary.get("mean_cost_sum", 0.0)),
+        "costful_episode_rate": float(summary.get("costful_episode_rate", 0.0)),
+        "mean_costful_steps": float(summary.get("mean_costful_steps", 0.0)),
+        "mean_collision_steps": float(summary.get("mean_collision_steps", 0.0)),
+        "mean_time_to_success_s": float(summary.get("mean_time_to_success_s_success_only", 0.0)),
+        "mean_episode_length_s": float(summary.get("mean_episode_length_s", 0.0)),
+        "mean_action_delta": float(summary.get("mean_action_delta", 0.0)),
+        "mean_action_sign_flips": float(summary.get("mean_action_sign_flips", 0.0)),
+        "mean_min_goal_distance": float(summary.get("mean_min_goal_distance", 0.0)),
+    }
+    with (run_dir / "eval_metrics.jsonl").open("a", encoding="utf-8") as eval_file:
+        eval_file.write(json.dumps(row) + "\n")
+    print(f"[periodic-eval] {json.dumps(row, sort_keys=True)}", flush=True)
+    return row
 
 
 def run_training(args: argparse.Namespace) -> Path:
     from safetygym_utils.sac import build_sac, sac_update_step
+    from unitree_nav_competitors import (
+        UnitreeExpertBuffer,
+        build_hg_dagger,
+        build_pvp_state,
+        concat_replay_batches,
+        hg_dagger_update,
+        pvp_update_step,
+    )
+    method = str(args.method).strip().lower()
+    print(
+        "[learner] "
+        f"method={method} num_envs={args.num_envs} n_step={args.n_step} "
+        f"updates_per_step={args.updates_per_step} init_actor={args.init_actor_checkpoint or '<none>'}",
+        flush=True,
+    )
+    intervention_clearance, intervention_release_clearance = resolve_intervention_clearances(args)
+    args.intervention_clearance_threshold_effective = intervention_clearance
+    args.intervention_release_clearance_effective = intervention_release_clearance
+    print(
+        "[intervention-gate] "
+        f"mode={args.intervention_clearance_mode} engage={intervention_clearance:.3f}m "
+        f"release={intervention_release_clearance:.3f}m teacher_clearance={args.teacher_geom_clearance:.3f}m",
+        flush=True,
+    )
     from eval_unitree_nav_baselines import (
         _robot_clearances,
         _terrain_obstacle_cells_by_env,
         _layout_blocked_corridor_stats,
         _resample_close_goals,
         _set_goal_through_obstacle,
+        _validate_required_blocked_corridors,
         direct_goal_action,
     )
     from unitree_nav_geom_teacher import GeomTeacherState, local_geometry_scan_teacher_action
@@ -836,7 +1106,11 @@ def run_training(args: argparse.Namespace) -> Path:
     clearance_obs, _ = _resample_close_goals(args, env, obstacle_cells)
     if clearance_obs is not None:
         obs_raw = clearance_obs
-    obs = _prepare_actor_obs(obs_raw, args)
+    _validate_required_blocked_corridors(args, env, obstacle_cells)
+    from unitree_nav_observation import UnitreeScanHistory, current_unitree_scan_obs
+
+    scan_history = UnitreeScanHistory(args.scan_history, args.action_history, int(env.action_space.shape[-1]))
+    obs = scan_history.reset(_prepare_actor_obs(obs_raw, args))
     num_envs, obs_dim = int(obs.shape[0]), int(obs.shape[1])
     act_dim = int(env.action_space.shape[-1])
     device = torch.device(args.device)
@@ -857,6 +1131,8 @@ def run_training(args: argparse.Namespace) -> Path:
         device=device,
         alpha_init=args.alpha_init,
         temporal_encoder="unitree_scan_cnn" if args.policy_encoder == "scan_cnn" else "none",
+        obs_frame_stack=args.scan_history,
+        unitree_action_history=args.action_history,
     )
     if args.init_checkpoint:
         init_checkpoint = torch.load(args.init_checkpoint, map_location=device, weights_only=False)
@@ -874,7 +1150,47 @@ def run_training(args: argparse.Namespace) -> Path:
         init_checkpoint = torch.load(args.init_actor_checkpoint, map_location=device, weights_only=False)
         sac.actor.load_state_dict(init_checkpoint["actor_state_dict"])
         print(f"[init] loaded actor from {args.init_actor_checkpoint}", flush=True)
+    hg_state = None
+    pvp_state = None
+    if method == "hg_dagger":
+        hg_state = build_hg_dagger(
+            obs_dim=obs_dim,
+            act_dim=act_dim,
+            num_envs=num_envs,
+            hidden_dim=args.hidden_dim,
+            ensemble_size=args.hg_ensemble_size,
+            use_layer_norm=args.use_layer_norm,
+            policy_encoder=args.policy_encoder,
+            scan_history=args.scan_history,
+            action_history=args.action_history,
+            lr=args.lr_actor,
+            device=device,
+        )
+        for member in hg_state.actor.members:
+            member.load_state_dict(sac.actor.state_dict())
+        policy_actor = hg_state.actor
+    else:
+        policy_actor = sac.actor
+    if method == "pvp":
+        pvp_state = build_pvp_state(sac)
     buffer = UnitreeReplayBuffer(capacity=args.replay_capacity, obs_dim=obs_dim, act_dim=act_dim, device=device)
+    human_buffer = (
+        UnitreeReplayBuffer(capacity=args.replay_capacity, obs_dim=obs_dim, act_dim=act_dim, device=device)
+        if method in {"hilserl", "pvp"}
+        else None
+    )
+    novice_buffer = (
+        UnitreeReplayBuffer(capacity=args.replay_capacity, obs_dim=obs_dim, act_dim=act_dim, device=device)
+        if method == "pvp"
+        else None
+    )
+    expert_buffer = (
+        UnitreeExpertBuffer(capacity=args.replay_capacity, obs_dim=obs_dim, act_dim=act_dim, device=device)
+        if method == "hg_dagger"
+        else None
+    )
+    eil_recent_indices = [deque(maxlen=max(1, int(args.eil_bad_pre_steps))) for _ in range(num_envs)]
+    nstep_accumulator = UnitreeNStepAccumulator(num_envs=num_envs, n_step=args.n_step, gamma=args.gamma)
 
     start_time = time.time()
     episode_return = torch.zeros(num_envs, device=device)
@@ -899,18 +1215,32 @@ def run_training(args: argparse.Namespace) -> Path:
     interval_clearance_triggers = 0
     interval_stall_triggers = 0
     interval_releases = 0
+    interval_clearance_engagements = 0
+    interval_stall_engagements = 0
+    interval_release_blocked_clearance = 0
+    interval_release_blocked_progress = 0
+    interval_release_blocked_action_delta = 0
+    interval_released_duration_sum = 0
+    interval_released_duration_count = 0
     interval_teacher_cost = 0.0
     interval_student_cost = 0.0
     interval_teacher_costful_steps = 0
     interval_student_costful_steps = 0
     interval_teacher_rows = 0
     interval_student_rows = 0
+    interval_reverse_action_sum = 0.0
+    interval_lateral_action_abs_sum = 0.0
+    interval_goal_turn_alignment_sum = 0.0
+    previous_student_action = torch.zeros(num_envs, act_dim, device=device)
+    previous_teacher_intervened = torch.zeros(num_envs, dtype=torch.bool, device=device)
 
     for global_step in range(1, int(args.total_steps) + 1):
         with torch.no_grad():
             if args.student_controller == "direct_goal":
                 student_action = direct_goal_action(
-                    obs,
+                    current_unitree_scan_obs(
+                        obs, scan_history=args.scan_history, action_history=args.action_history
+                    ),
                     max_vx=args.student_direct_goal_max_vx,
                     max_vy=args.student_direct_goal_max_vy,
                     yaw_gain=args.student_direct_goal_yaw_gain,
@@ -919,12 +1249,27 @@ def run_training(args: argparse.Namespace) -> Path:
             elif global_step <= args.random_steps:
                 student_action = torch.empty((num_envs, act_dim), device=device).uniform_(-1.0, 1.0)
             else:
-                student_action, _, student_mean = sac.actor(obs)
+                student_action, _, student_mean = policy_actor(obs)
                 if args.deterministic_student:
                     student_action = student_mean
-            if args.teacher_type == "geom_scan":
+            if float(args.student_action_smoothing) > 0.0:
+                keep = float(args.student_action_smoothing)
+                student_action = keep * previous_student_action + (1.0 - keep) * student_action
+            previous_student_action.copy_(student_action)
+            teacher_disabled = args.intervention_gate_mode == "none" and int(args.teacher_warmup_steps) <= 0
+            if teacher_disabled:
+                teacher_action = student_action
+                blocked_gate = torch.zeros(num_envs, dtype=torch.bool, device=device)
+                goal_blocked_fraction = 0.0
+                teacher_obs = current_unitree_scan_obs(
+                    obs, scan_history=args.scan_history, action_history=args.action_history
+                )
+                min_scan_mean = float(torch.nan_to_num(teacher_obs[:, 9:], nan=1.0).amin(dim=1).mean().cpu().item())
+            elif args.teacher_type == "geom_scan":
                 teacher_action = local_geometry_scan_teacher_action(
-                    obs,
+                    current_unitree_scan_obs(
+                        obs, scan_history=args.scan_history, action_history=args.action_history
+                    ),
                     env=env,
                     obstacle_cells=obstacle_cells,
                     args=args,
@@ -932,10 +1277,15 @@ def run_training(args: argparse.Namespace) -> Path:
                 )
                 blocked_gate = torch.zeros(num_envs, dtype=torch.bool, device=device)
                 goal_blocked_fraction = 0.0
-                min_scan_mean = float(torch.nan_to_num(obs[:, 9:58], nan=1.0).amin(dim=1).mean().cpu().item())
+                teacher_obs = current_unitree_scan_obs(
+                    obs, scan_history=args.scan_history, action_history=args.action_history
+                )
+                min_scan_mean = float(torch.nan_to_num(teacher_obs[:, 9:], nan=1.0).amin(dim=1).mean().cpu().item())
             else:
                 teacher_action, blocked_gate, diag = scan_teacher_action(
-                    obs,
+                    current_unitree_scan_obs(
+                        obs, scan_history=args.scan_history, action_history=args.action_history
+                    ),
                     scan_block_threshold=args.teacher_scan_block_threshold,
                     scan_block_delta=args.teacher_scan_block_delta,
                     goal_sector_half_width=args.teacher_sector_half_width,
@@ -987,12 +1337,23 @@ def run_training(args: argparse.Namespace) -> Path:
             clearance = _robot_clearances(env, obstacle_cells)
             goal_distance = torch.linalg.norm(obs[:, 6:8], dim=-1)
             if args.intervention_gate_mode == "clearance_or_stall":
-                clearance_gate, clearance_trigger, stall_trigger, release = gate_state.update(
+                (
+                    clearance_gate,
+                    clearance_trigger,
+                    stall_trigger,
+                    release,
+                    engage_clearance,
+                    engage_stall,
+                    release_blocked_clearance,
+                    release_blocked_progress,
+                    release_blocked_action_delta,
+                    released_duration,
+                ) = gate_state.update(
                     distance=goal_distance,
                     clearance=clearance,
                     action_delta=delta,
-                    clearance_threshold=args.intervention_clearance_threshold,
-                    release_clearance=args.intervention_release_clearance,
+                    clearance_threshold=intervention_clearance,
+                    release_clearance=intervention_release_clearance,
                     stall_steps=args.intervention_stall_steps,
                     progress_epsilon=args.intervention_progress_epsilon,
                     release_steps=args.intervention_release_steps,
@@ -1005,6 +1366,12 @@ def run_training(args: argparse.Namespace) -> Path:
                 clearance_trigger = torch.zeros_like(delta_gate)
                 stall_trigger = torch.zeros_like(delta_gate)
                 release = torch.zeros_like(delta_gate)
+                engage_clearance = torch.zeros_like(delta_gate)
+                engage_stall = torch.zeros_like(delta_gate)
+                release_blocked_clearance = torch.zeros_like(delta_gate)
+                release_blocked_progress = torch.zeros_like(delta_gate)
+                release_blocked_action_delta = torch.zeros_like(delta_gate)
+                released_duration = torch.zeros_like(gate_state.bad_steps)
                 gate_state.reset()
                 if args.intervention_gate_mode == "action_delta":
                     base_gate = blocked_gate | delta_gate
@@ -1014,7 +1381,22 @@ def run_training(args: argparse.Namespace) -> Path:
                     base_gate = torch.zeros_like(delta_gate)
             warmup_gate = torch.full_like(delta_gate, global_step <= int(args.teacher_warmup_steps))
             teacher_intervened = warmup_gate | base_gate
-            action = torch.where(teacher_intervened.unsqueeze(-1), teacher_action, student_action).clamp(-1.0, 1.0)
+        intervention_start = teacher_intervened & ~previous_teacher_intervened
+        action = torch.where(teacher_intervened.unsqueeze(-1), teacher_action, student_action).clamp(-1.0, 1.0)
+
+        # Goal-only pretraining should learn to turn and walk forward rather
+        # than exploit backwards or lateral locomotion for Euclidean progress.
+        goal_angle = torch.atan2(obs[:, 7], obs[:, 6])
+        reverse_action = torch.relu(-action[:, 0])
+        lateral_action_abs = action[:, 1].abs()
+        goal_turn_alignment = torch.sign(goal_angle) * action[:, 2]
+        interval_reverse_action_sum += float(reverse_action.sum().detach().cpu().item())
+        interval_lateral_action_abs_sum += float(lateral_action_abs.sum().detach().cpu().item())
+        interval_goal_turn_alignment_sum += float(goal_turn_alignment.sum().detach().cpu().item())
+
+        if expert_buffer is not None and bool(teacher_intervened.any().item()):
+            expert_buffer.add(obs[teacher_intervened], teacher_action[teacher_intervened])
+        previous_teacher_intervened.copy_(teacher_intervened)
 
         intervention_count = int(teacher_intervened.sum().cpu().item())
         total_interventions += intervention_count
@@ -1024,11 +1406,24 @@ def run_training(args: argparse.Namespace) -> Path:
         interval_clearance_triggers += int(clearance_trigger.sum().cpu().item())
         interval_stall_triggers += int(stall_trigger.sum().cpu().item())
         interval_releases += int(release.sum().cpu().item())
+        interval_clearance_engagements += int(engage_clearance.sum().cpu().item())
+        interval_stall_engagements += int(engage_stall.sum().cpu().item())
+        interval_release_blocked_clearance += int(release_blocked_clearance.sum().cpu().item())
+        interval_release_blocked_progress += int(release_blocked_progress.sum().cpu().item())
+        interval_release_blocked_action_delta += int(release_blocked_action_delta.sum().cpu().item())
+        interval_released_duration_sum += int(released_duration.sum().cpu().item())
+        interval_released_duration_count += int(release.sum().cpu().item())
 
         next_raw, env_reward, done, extras = env.step(action)
-        next_obs = _prepare_actor_obs(next_raw, args)
+        from eval_unitree_nav_baselines import _goal_termination_mask
+
+        terminal_success = _goal_termination_mask(env, num_envs, device)
+        next_current_obs = _prepare_actor_obs(next_raw, args)
         env_reward = env_reward.to(device=device, dtype=torch.float32).reshape(num_envs)
         done = done.to(device=device).reshape(num_envs).bool()
+        next_obs = scan_history.step(next_current_obs, done, action=action)
+        previous_student_action[done] = 0.0
+        previous_teacher_intervened[done] = False
         cost = _extract_cost(extras, num_envs, device)
         costful = cost > 0.0
         interval_teacher_cost += float(cost[teacher_intervened].sum().detach().cpu().item())
@@ -1037,19 +1432,31 @@ def run_training(args: argparse.Namespace) -> Path:
         interval_student_costful_steps += int((costful & ~teacher_intervened).sum().detach().cpu().item())
         interval_teacher_rows += int(teacher_intervened.sum().detach().cpu().item())
         interval_student_rows += int((~teacher_intervened).sum().detach().cpu().item())
-        success = _goal_success(next_obs, args.success_dist)
+        success = _goal_success(next_obs, args.success_dist) | terminal_success
         first_success = success & ~episode_success
-        if args.learner_reward_mode == "dense_progress":
+        if args.learner_reward_mode in {"dense_progress", "dense_progress_exp"}:
             pre_distance = torch.linalg.norm(obs[:, 6:8], dim=-1)
             post_distance = torch.linalg.norm(next_obs[:, 6:8], dim=-1)
             post_distance = torch.where(done, pre_distance, post_distance)
             reward = float(args.dense_progress_scale) * (pre_distance - post_distance)
+            if args.learner_reward_mode == "dense_progress_exp":
+                temperature = max(float(args.dense_progress_exp_temperature), 1e-6)
+                pre_potential = torch.exp(-pre_distance / temperature)
+                post_potential = torch.exp(-post_distance / temperature)
+                reward += float(args.dense_progress_exp_scale) * (post_potential - pre_potential)
+            reward += float(args.goal_turn_alignment_scale) * goal_turn_alignment
+            reward -= float(args.reverse_action_penalty) * reverse_action
+            reward -= float(args.lateral_action_penalty) * lateral_action_abs
             reward += float(args.success_bonus) * first_success.float()
+            reward += float(args.failure_penalty) * (done & ~success).float()
         else:
             reward = env_reward
-        trunc = done & ~success
+        # The vector environment auto-resets before returning next_obs, so a
+        # timeout/fall transition does not contain the terminal observation.
+        # Bootstrapping it would connect the old episode to a new random goal.
+        trunc = torch.zeros_like(done)
 
-        buffer.add(
+        replay_rows = nstep_accumulator.add(
             obs=obs,
             actions=action,
             student_actions=student_action,
@@ -1058,7 +1465,28 @@ def run_training(args: argparse.Namespace) -> Path:
             dones=done,
             truncations=trunc,
             teacher_intervened=teacher_intervened,
+            intervention_start=intervention_start,
+            env_ids=torch.arange(num_envs, device=device, dtype=torch.long),
         )
+        if replay_rows is not None:
+            added_indices = buffer.add(**replay_rows)
+            if method == "eil":
+                for row_idx, buffer_idx in enumerate(added_indices.detach().cpu().tolist()):
+                    env_idx = int(replay_rows["env_ids"][row_idx].item())
+                    if bool(replay_rows["intervention_start"][row_idx].item()):
+                        buffer.mark_eil_bad(list(eil_recent_indices[env_idx]))
+                    if bool(replay_rows["teacher_intervened"][row_idx].item()):
+                        eil_recent_indices[env_idx].clear()
+                    else:
+                        eil_recent_indices[env_idx].append(int(buffer_idx))
+            if human_buffer is not None:
+                human_mask = replay_rows["teacher_intervened"].bool()
+                if bool(human_mask.any().item()):
+                    human_buffer.add(**{key: value[human_mask] for key, value in replay_rows.items()})
+            if novice_buffer is not None:
+                novice_mask = ~replay_rows["teacher_intervened"].bool()
+                if bool(novice_mask.any().item()):
+                    novice_buffer.add(**{key: value[novice_mask] for key, value in replay_rows.items()})
 
         episode_return += reward
         episode_env_return += env_reward
@@ -1079,40 +1507,102 @@ def run_training(args: argparse.Namespace) -> Path:
             obstacle_cells = _terrain_obstacle_cells_by_env(env)
             adjusted_obs = _set_goal_through_obstacle(args, env, obstacle_cells, env_ids=done_idx)
             if adjusted_obs is not None:
-                next_obs = _prepare_actor_obs(adjusted_obs, args)
+                next_obs = scan_history.reset(_prepare_actor_obs(adjusted_obs, args), done_idx)
             clearance_obs, _ = _resample_close_goals(args, env, obstacle_cells, env_ids=done_idx)
             if clearance_obs is not None:
-                next_obs = _prepare_actor_obs(clearance_obs, args)
+                next_obs = scan_history.reset(_prepare_actor_obs(clearance_obs, args), done_idx)
+            _validate_required_blocked_corridors(args, env, obstacle_cells, done_idx)
             if _needs_feasible_reset(args):
-                obs = _prepare_actor_obs(_reset_train_env(args, env), args)
+                obs = scan_history.reset(_prepare_actor_obs(_reset_train_env(args, env), args))
                 continue
 
         obs = next_obs
 
-        if buffer.size >= args.learning_starts:
+        learner_ready = buffer.size >= args.learning_starts
+        if method == "hg_dagger":
+            learner_ready = (
+                expert_buffer is not None
+                and expert_buffer.size >= args.batch_size
+                and total_rows >= args.learning_starts
+            )
+        if learner_ready:
             for _ in range(args.updates_per_step):
-                batch = buffer.sample(args.batch_size)
-                metrics = sac_update_step(
-                    sac=sac,
-                    batch=batch,
-                    gamma=args.gamma,
-                    tau=args.tau,
-                    max_grad_norm=args.max_grad_norm,
-                    pref_sampling_mode="linked",
-                    pref_rank_weight=args.pref_rank_weight,
-                    pref_rank_margin=args.pref_rank_margin,
-                    pref_loss_type=args.pref_loss_type,
-                    pref_stopgrad_positive=args.pref_stopgrad_positive,
-                    pref_lambda_lr=args.pref_lambda_lr,
-                    pref_lambda_max=args.pref_lambda_max,
-                    pref_action_delta_min=args.pref_action_delta_min,
-                    actor_bc_weight=args.actor_bc_weight,
-                    actor_bc_teacher_only=True,
-                    alpha_min=args.alpha_min,
-                    alpha_max=args.alpha_max,
-                    update_actor=(global_step % args.policy_frequency == 0),
-                )
-                update_metrics.append(asdict(metrics))
+                if method == "hg_dagger":
+                    metrics_dict = hg_dagger_update(
+                        hg_state,
+                        expert_buffer,
+                        batch_size=args.batch_size,
+                        max_grad_norm=args.max_grad_norm,
+                    )
+                else:
+                    batch = buffer.sample(args.batch_size)
+                    if method == "hilserl" and human_buffer is not None and human_buffer.size > 0:
+                        human_n = min(args.batch_size - 1, max(1, int(round(args.batch_size * args.hilserl_demo_ratio))))
+                        batch = concat_replay_batches(
+                            buffer.sample(args.batch_size - human_n),
+                            human_buffer.sample(human_n),
+                        )
+                    elif method == "pvp" and human_buffer is not None and novice_buffer is not None:
+                        half = max(1, args.batch_size // 2)
+                        if human_buffer.size >= half and novice_buffer.size >= args.batch_size - half:
+                            batch = concat_replay_batches(
+                                novice_buffer.sample(args.batch_size - half),
+                                human_buffer.sample(half),
+                            )
+                        elif human_buffer.size >= args.batch_size:
+                            batch = human_buffer.sample(args.batch_size)
+                        elif novice_buffer.size >= args.batch_size:
+                            batch = novice_buffer.sample(args.batch_size)
+                        else:
+                            # Do not silently fall back to the shared replay;
+                            # PVP's comparison contract is its two-buffer data path.
+                            continue
+                    if method == "pvp":
+                        metrics_dict = pvp_update_step(
+                            sac=sac,
+                            state=pvp_state,
+                            batch=batch,
+                            gamma=args.gamma,
+                            tau=args.tau,
+                            max_grad_norm=args.max_grad_norm,
+                            proxy_value_bound=args.pvp_proxy_value_bound,
+                            cql_coefficient=args.pvp_cql_coefficient,
+                            policy_delay=args.pvp_policy_delay,
+                            target_policy_noise=args.pvp_target_policy_noise,
+                            target_noise_clip=args.pvp_target_noise_clip,
+                            include_env_reward=args.pvp_include_env_reward_in_td,
+                            stop_td_on_intervention_start=args.pvp_stop_td_on_intervention_start,
+                        )
+                    else:
+                        is_thesis = method == "thesis"
+                        metrics = sac_update_step(
+                            sac=sac,
+                            batch=batch,
+                            gamma=args.gamma,
+                            tau=args.tau,
+                            max_grad_norm=args.max_grad_norm,
+                            pref_sampling_mode="linked" if is_thesis else "separate",
+                            pref_rank_weight=args.pref_rank_weight if is_thesis else 0.0,
+                            pref_rank_margin=args.pref_rank_margin,
+                            pref_loss_type=args.pref_loss_type,
+                            pref_stopgrad_positive=args.pref_stopgrad_positive,
+                            pref_lambda_lr=args.pref_lambda_lr,
+                            pref_lambda_max=args.pref_lambda_max,
+                            pref_action_delta_min=args.pref_action_delta_min,
+                            actor_bc_weight=args.actor_bc_weight if is_thesis else 0.0,
+                            actor_bc_teacher_only=True,
+                            actor_bc_only=args.actor_bc_only if is_thesis else False,
+                            algo_variant="eil" if method == "eil" else "plain",
+                            eil_threshold=args.eil_threshold,
+                            eil_good_margin=args.eil_good_margin,
+                            eil_bad_margin=args.eil_bad_margin,
+                            eil_pair_margin=args.eil_pair_margin,
+                            alpha_min=args.alpha_min,
+                            alpha_max=args.alpha_max,
+                            update_actor=(global_step % args.policy_frequency == 0),
+                        )
+                        metrics_dict = asdict(metrics)
+                update_metrics.append(metrics_dict)
                 if len(update_metrics) > 100:
                     update_metrics.pop(0)
 
@@ -1129,11 +1619,20 @@ def run_training(args: argparse.Namespace) -> Path:
             layout_stats = _layout_blocked_corridor_stats(args, env, obstacle_cells)
             blocked_fraction = sum(float(bool(item["blocked"])) for item in layout_stats) / max(1, len(layout_stats))
             blocked_cells_mean = sum(float(item["blocked_cell_count"]) for item in layout_stats) / max(1, len(layout_stats))
+            blocking_components_mean = sum(
+                float(item["blocking_component_count"]) for item in layout_stats
+            ) / max(1, len(layout_stats))
+            straight_path_length_mean = sum(float(item["path_length"]) for item in layout_stats) / max(1, len(layout_stats))
             row = {
+                "method": method,
                 "step": global_step,
                 "transitions": global_step * num_envs,
                 "fps": global_step * num_envs / max(1e-6, time.time() - start_time),
                 "replay_size": buffer.size,
+                "human_buffer_size": 0 if human_buffer is None else human_buffer.size,
+                "novice_buffer_size": 0 if novice_buffer is None else novice_buffer.size,
+                "expert_buffer_size": 0 if expert_buffer is None else expert_buffer.size,
+                "updates_per_transition": float(args.updates_per_step) / float(num_envs),
                 "episode_return_mean": float(sum(recent_returns) / max(1, len(recent_returns))) if recent_returns else 0.0,
                 "episode_env_return_mean": float(sum(recent_env_returns) / max(1, len(recent_env_returns))) if recent_env_returns else 0.0,
                 "episode_cost_mean": float(sum(recent_costs) / max(1, len(recent_costs))) if recent_costs else 0.0,
@@ -1141,11 +1640,19 @@ def run_training(args: argparse.Namespace) -> Path:
                 "ongoing_episode_cost_mean": float(episode_cost.mean().cpu().item()),
                 "ongoing_episode_cost_max": float(episode_cost.max().cpu().item()),
                 "ongoing_success_fraction": float(episode_success.float().mean().cpu().item()),
+                "layout_blocked_component_count_mean": blocking_components_mean,
+                "layout_straight_path_length_mean": straight_path_length_mean,
                 "teacher_fraction_interval": interval_interventions / max(1, interval_rows),
                 "teacher_fraction_cumulative": total_interventions / max(1, total_rows),
                 "intervention_clearance_trigger_fraction": interval_clearance_triggers / max(1, interval_rows),
                 "intervention_stall_trigger_fraction": interval_stall_triggers / max(1, interval_rows),
                 "intervention_release_fraction": interval_releases / max(1, interval_rows),
+                "intervention_clearance_engagement_rate": interval_clearance_engagements / max(1, interval_rows),
+                "intervention_stall_engagement_rate": interval_stall_engagements / max(1, interval_rows),
+                "intervention_release_blocked_clearance_fraction": interval_release_blocked_clearance / max(1, interval_rows),
+                "intervention_release_blocked_progress_fraction": interval_release_blocked_progress / max(1, interval_rows),
+                "intervention_release_blocked_action_delta_fraction": interval_release_blocked_action_delta / max(1, interval_rows),
+                "intervention_released_duration_mean": interval_released_duration_sum / max(1, interval_released_duration_count),
                 "teacher_executed_cost_sum_interval": interval_teacher_cost,
                 "student_executed_cost_sum_interval": interval_student_cost,
                 "teacher_executed_costful_step_rate": interval_teacher_costful_steps / max(1, interval_teacher_rows),
@@ -1159,19 +1666,43 @@ def run_training(args: argparse.Namespace) -> Path:
                 "goal_blocked_fraction": goal_blocked_fraction,
                 "action_delta_mean": float(delta.mean().detach().cpu().item()),
                 "min_scan_mean": min_scan_mean,
+                "reverse_action_mean": interval_reverse_action_sum / max(1, interval_rows),
+                "lateral_action_abs_mean": interval_lateral_action_abs_sum / max(1, interval_rows),
+                "goal_turn_alignment_mean": interval_goal_turn_alignment_sum / max(1, interval_rows),
             }
             for k, v in avg_update.items():
                 if k in {
                     "critic_loss_total",
+                    "critic_loss_replay",
                     "actor_loss",
                     "actor_loss_bc",
                     "alpha",
+                    "target_q_mean",
+                    "replay_reward_mean",
+                    "replay_reward_abs_mean",
                     "batch_teacher_fraction",
                     "pref_linked_rows",
                     "pref_lambda",
+                    "pref_lambda_delta",
                     "pref_q_delta",
+                    "pref_dual_violation",
+                    "pref_dual_signal",
+                    "pref_violation",
+                    "pref_violation_ema",
                     "q_min_data_mean",
                     "q_min_pi_mean",
+                    "q_disagreement_data_mean",
+                    "q_disagreement_pi_mean",
+                    "pvp_proxy_teacher_loss",
+                    "pvp_proxy_student_loss",
+                    "pvp_intervened_batch_fraction",
+                    "eil_good_loss",
+                    "eil_bad_loss",
+                    "eil_pair_loss",
+                    "eil_good_batch_fraction",
+                    "eil_bad_batch_fraction",
+                    "hg_doubt_mean",
+                    "hg_expert_buffer_size",
                 }:
                     row[k] = float(v)
             print(json.dumps(row), flush=True)
@@ -1184,25 +1715,71 @@ def run_training(args: argparse.Namespace) -> Path:
             interval_clearance_triggers = 0
             interval_stall_triggers = 0
             interval_releases = 0
+            interval_clearance_engagements = 0
+            interval_stall_engagements = 0
+            interval_release_blocked_clearance = 0
+            interval_release_blocked_progress = 0
+            interval_release_blocked_action_delta = 0
+            interval_released_duration_sum = 0
+            interval_released_duration_count = 0
             interval_teacher_cost = 0.0
             interval_student_cost = 0.0
             interval_teacher_costful_steps = 0
             interval_student_costful_steps = 0
             interval_teacher_rows = 0
             interval_student_rows = 0
+            interval_reverse_action_sum = 0.0
+            interval_lateral_action_abs_sum = 0.0
+            interval_goal_turn_alignment_sum = 0.0
 
-        if global_step % args.checkpoint_interval == 0:
+        checkpoint_due = global_step % args.checkpoint_interval == 0
+        eval_due = args.eval_interval > 0 and global_step % args.eval_interval == 0
+        checkpoint_path = run_dir / f"step_{global_step}.pt"
+        if checkpoint_due or eval_due:
             save_checkpoint(
-                run_dir / f"step_{global_step}.pt",
+                checkpoint_path,
                 sac=sac,
                 args=args,
                 step=global_step,
                 obs_dim=obs_dim,
                 act_dim=act_dim,
+                policy_actor=policy_actor,
             )
+        if eval_due:
+            eval_row = run_checkpoint_evaluation(
+                checkpoint_path,
+                args=args,
+                step=global_step,
+                run_dir=run_dir,
+            )
+            if eval_row is not None and wandb_run is not None:
+                wandb_run.log(
+                    {f"eval/{key}": value for key, value in eval_row.items() if key not in {"step", "transitions"}},
+                    step=global_step * num_envs,
+                )
 
     final_path = run_dir / "final.pt"
-    save_checkpoint(final_path, sac=sac, args=args, step=args.total_steps, obs_dim=obs_dim, act_dim=act_dim)
+    save_checkpoint(
+        final_path,
+        sac=sac,
+        args=args,
+        step=args.total_steps,
+        obs_dim=obs_dim,
+        act_dim=act_dim,
+        policy_actor=policy_actor,
+    )
+    if args.eval_interval > 0 and args.eval_at_end and args.total_steps % args.eval_interval != 0:
+        eval_row = run_checkpoint_evaluation(
+            final_path,
+            args=args,
+            step=args.total_steps,
+            run_dir=run_dir,
+        )
+        if eval_row is not None and wandb_run is not None:
+            wandb_run.log(
+                {f"eval/{key}": value for key, value in eval_row.items() if key not in {"step", "transitions"}},
+                step=args.total_steps * num_envs,
+            )
     env.close()
     if args.eval_video:
         render_policy(final_path, args)
@@ -1212,8 +1789,6 @@ def run_training(args: argparse.Namespace) -> Path:
 
 
 def render_policy(checkpoint_path: Path, args: argparse.Namespace) -> None:
-    from safetygym_utils.sac import build_sac
-
     checkpoint = torch.load(checkpoint_path, map_location=args.device, weights_only=False)
     eval_args = argparse.Namespace(**checkpoint.get("args", vars(args)))
     eval_args.device = args.device
@@ -1222,39 +1797,39 @@ def render_policy(checkpoint_path: Path, args: argparse.Namespace) -> None:
     eval_args.video_length = args.video_length
     env = make_env(eval_args, render=True)
     obs_raw = _reset_train_env(eval_args, env)
-    obs = _prepare_actor_obs(obs_raw, eval_args)
-    sac = build_sac(
-        obs_dim=int(checkpoint["obs_dim"]),
-        act_dim=int(checkpoint["act_dim"]),
-        hidden_actor=eval_args.hidden_dim,
-        hidden_critic=eval_args.hidden_dim,
-        num_critics=2,
-        use_layer_norm=eval_args.use_layer_norm,
-        layer_norm_eps=1e-5,
-        init_scale=0.01,
-        lr_actor=eval_args.lr_actor,
-        lr_critic=eval_args.lr_critic,
-        weight_decay=0.0,
-        num_envs=1,
-        device=torch.device(args.device),
-        alpha_init=eval_args.alpha_init,
+    from unitree_nav_observation import UnitreeScanHistory
+
+    scan_history = UnitreeScanHistory(
+        getattr(eval_args, "scan_history", 1),
+        getattr(eval_args, "action_history", 0),
+        int(env.action_space.shape[-1]),
     )
-    sac.actor.load_state_dict(checkpoint["actor_state_dict"])
-    sac.actor.eval()
+    obs = scan_history.reset(_prepare_actor_obs(obs_raw, eval_args))
+    from eval_unitree_nav_baselines import _load_policy_actor
+
+    eval_args.model_path = str(checkpoint_path)
+    actor = _load_policy_actor(eval_args, obs_dim=int(checkpoint["obs_dim"]), act_dim=int(checkpoint["act_dim"]))
     for _ in range(int(args.video_length) + 10):
         with torch.no_grad():
-            _, _, mean = sac.actor(obs)
+            _, _, mean = actor(obs)
         obs_raw, _, done, _ = env.step(mean.clamp(-1.0, 1.0))
-        obs = _prepare_actor_obs(obs_raw, eval_args)
+        current_obs = _prepare_actor_obs(obs_raw, eval_args)
+        done_mask = done.to(eval_args.device).reshape(-1).bool()
+        obs = scan_history.step(current_obs, done_mask, action=mean.clamp(-1.0, 1.0))
         if bool(done.reshape(-1)[0].item()):
             obs_raw = _reset_train_env(eval_args, env)
-            obs = _prepare_actor_obs(obs_raw, eval_args)
+            obs = scan_history.reset(_prepare_actor_obs(obs_raw, eval_args))
     env.close()
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", default="Unitree-G1-Nav-Obstacles-Safe-Collision")
+    parser.add_argument(
+        "--method",
+        choices=["thesis", "hilserl", "eil", "pvp", "hg_dagger", "sac"],
+        default="thesis",
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--num-envs", type=int, default=16)
@@ -1276,12 +1851,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--policy-frequency", type=int, default=2)
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--policy-encoder", choices=["mlp", "scan_cnn"], default="mlp")
+    parser.add_argument("--height-scan-resolution", type=float, default=0.5)
+    parser.add_argument("--height-scan-forward-size", type=float, default=0.0)
+    parser.add_argument("--height-scan-lateral-size", type=float, default=0.0)
+    parser.add_argument("--scan-history", type=int, default=1)
+    parser.add_argument("--action-history", type=int, default=0)
+    parser.add_argument("--student-action-smoothing", type=float, default=0.0)
     parser.add_argument("--pad-obs-to-dim", type=int, default=0)
     parser.add_argument("--mask-height-scan", action="store_true")
+    parser.add_argument("--mask-proprioception", action="store_true")
+    parser.add_argument("--mask-goal-heading", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--use-layer-norm", action="store_true")
     parser.add_argument("--lr-actor", type=float, default=3e-4)
     parser.add_argument("--lr-critic", type=float, default=3e-4)
     parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--n-step", type=int, default=1)
     parser.add_argument("--tau", type=float, default=0.005)
     parser.add_argument("--max-grad-norm", type=float, default=10.0)
     parser.add_argument("--alpha-init", type=float, default=0.001)
@@ -1295,6 +1879,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pref-lambda-max", type=float, default=10.0)
     parser.add_argument("--pref-action-delta-min", type=float, default=0.05)
     parser.add_argument("--actor-bc-weight", type=float, default=0.2)
+    parser.add_argument("--actor-bc-only", action="store_true")
+    parser.add_argument("--hilserl-demo-ratio", type=float, default=0.5)
+    parser.add_argument("--eil-threshold", type=float, default=0.0)
+    parser.add_argument("--eil-good-margin", type=float, default=0.01)
+    parser.add_argument("--eil-bad-margin", type=float, default=0.01)
+    parser.add_argument("--eil-pair-margin", type=float, default=0.05)
+    parser.add_argument("--eil-bad-pre-steps", type=int, default=8)
+    parser.add_argument("--pvp-proxy-value-bound", type=float, default=1.0)
+    parser.add_argument("--pvp-cql-coefficient", type=float, default=1.0)
+    parser.add_argument("--pvp-policy-delay", type=int, default=2)
+    parser.add_argument("--pvp-target-policy-noise", type=float, default=0.2)
+    parser.add_argument("--pvp-target-noise-clip", type=float, default=0.5)
+    parser.add_argument("--pvp-include-env-reward-in-td", action="store_true")
+    parser.add_argument(
+        "--pvp-stop-td-on-intervention-start",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--hg-ensemble-size", type=int, default=5)
     parser.add_argument("--init-actor-checkpoint", default="")
     parser.add_argument("--init-checkpoint", default="")
     parser.add_argument("--student-controller", choices=["actor", "direct_goal"], default="actor")
@@ -1302,9 +1905,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--student-direct-goal-max-vy", type=float, default=0.45)
     parser.add_argument("--student-direct-goal-yaw-gain", type=float, default=1.2)
     parser.add_argument("--student-direct-goal-align-angle", type=float, default=0.55)
-    parser.add_argument("--learner-reward-mode", choices=["dense_progress", "env"], default="dense_progress")
+    parser.add_argument(
+        "--learner-reward-mode",
+        choices=["dense_progress", "dense_progress_exp", "env"],
+        default="dense_progress",
+    )
     parser.add_argument("--dense-progress-scale", type=float, default=1.0)
+    parser.add_argument("--dense-progress-exp-scale", type=float, default=1.0)
+    parser.add_argument("--dense-progress-exp-temperature", type=float, default=1.0)
+    parser.add_argument("--goal-turn-alignment-scale", type=float, default=0.0)
+    parser.add_argument("--reverse-action-penalty", type=float, default=0.0)
+    parser.add_argument("--lateral-action-penalty", type=float, default=0.0)
     parser.add_argument("--success-bonus", type=float, default=1.0)
+    parser.add_argument("--failure-penalty", type=float, default=0.0)
     parser.add_argument("--teacher-type", choices=["scan", "geom_scan"], default="geom_scan")
     parser.add_argument(
         "--intervention-gate-mode",
@@ -1313,6 +1926,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--intervention-clearance-threshold", type=float, default=0.65)
     parser.add_argument("--intervention-release-clearance", type=float, default=0.8)
+    parser.add_argument("--intervention-clearance-mode", choices=["fixed", "teacher_ratio"], default="fixed")
+    parser.add_argument("--intervention-clearance-trigger-ratio", type=float, default=2.0 / 3.0)
+    parser.add_argument("--intervention-clearance-release-ratio", type=float, default=5.0 / 6.0)
     parser.add_argument("--intervention-stall-steps", type=int, default=30)
     parser.add_argument("--intervention-progress-epsilon", type=float, default=0.04)
     parser.add_argument("--intervention-release-steps", type=int, default=8)
@@ -1396,6 +2012,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--intervene-on-blocked-goal", action="store_true")
     parser.add_argument("--deterministic-student", action="store_true")
     parser.add_argument("--success-dist", type=float, default=0.5)
+    parser.add_argument("--terminate-on-goal", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--goal-distance-min", type=float, default=0.0)
     parser.add_argument("--goal-distance-max", type=float, default=0.0)
     parser.add_argument("--min-goal-obstacle-clearance", type=float, default=0.0)
@@ -1407,11 +2024,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--blocked-corridor-ignore-end-radius", type=float, default=0.75)
     parser.add_argument("--blocked-corridor-min-cells", type=int, default=1)
     parser.add_argument("--blocked-corridor-resample-attempts", type=int, default=100)
+    parser.add_argument("--blocked-goal-max-distance", type=float, default=0.0)
+    parser.add_argument(
+        "--blocked-goal-distance-sampling",
+        choices=["nearest", "uniform", "farthest"],
+        default="nearest",
+    )
+    parser.add_argument("--blocked-goal-placement-mode", choices=["obstacle_multiplier", "distance_grid"], default="obstacle_multiplier")
+    parser.add_argument("--blocked-goal-distance-multiplier-min", type=float, default=1.0)
+    parser.add_argument("--blocked-goal-distance-multiplier-max", type=float, default=2.0)
+    parser.add_argument("--blocked-goal-candidate-attempts", type=int, default=64)
     parser.add_argument("--debug-obstacle-width-min", type=float, default=1.0)
     parser.add_argument("--debug-obstacle-width-max", type=float, default=1.4)
+    parser.add_argument("--strict-min-size-obstacles", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--debug-obstacle-height-min", type=float, default=1.0)
     parser.add_argument("--debug-obstacle-height-max", type=float, default=1.0)
     parser.add_argument("--debug-num-obstacles", type=int, default=6)
+    parser.add_argument("--disable-obstacles", action="store_true")
     parser.add_argument("--debug-platform-width", type=float, default=2.0)
     parser.add_argument("--debug-obstacle-border-width", type=float, default=0.0)
     parser.add_argument("--debug-terrain-rows", type=int, default=0)
@@ -1423,6 +2052,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--debug-goal-obstacle-max-dist", type=float, default=2.2)
     parser.add_argument("--log-interval", type=int, default=200)
     parser.add_argument("--checkpoint-interval", type=int, default=5000)
+    parser.add_argument("--eval-interval", type=int, default=0)
+    parser.add_argument("--eval-num-envs", type=int, default=8)
+    parser.add_argument("--eval-num-episodes", type=int, default=16)
+    parser.add_argument("--eval-seed", type=int, default=941)
+    parser.add_argument("--eval-layout-manifest", default="")
+    parser.add_argument("--eval-timeout-s", type=float, default=3600.0)
+    parser.add_argument("--eval-at-end", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--eval-fail-fast", action="store_true")
     parser.add_argument("--eval-video", action="store_true")
     parser.add_argument("--video-dir", default="")
     parser.add_argument("--video-length", type=int, default=300)
