@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT=/home/benjamin/thesis
+VARIANT="${1:?expected regression variant}"
+MODEL="$ROOT/models/unitree_mjlab_nav_thesis/unitree_oat_${VARIANT}_2500_20260714/step_2500.pt"
+
+MASK_GOAL_HEADING=0
+if [[ "$VARIANT" == heading_mask ]]; then
+  MASK_GOAL_HEADING=1
+fi
+
+exec "$ROOT/scripts/run_unitree_mjlab_nav_baseline_eval_local.sh" \
+  CONTROLLER=policy \
+  MODEL_PATH="$MODEL" \
+  RUN_NAME="unitree_oat_${VARIANT}_common_eval" \
+  OUTPUT_DIR="$ROOT/logs/unitree_mjlab/one_factor_regression_20260714/$VARIANT" \
+  RECORD_VIDEO=0 \
+  CHECKPOINT_ENV_CONFIG=0 \
+  MASK_GOAL_HEADING="$MASK_GOAL_HEADING" \
+  STRICT_MIN_SIZE_OBSTACLES=0 \
+  TASK=Unitree-G1-Nav-Obstacles-Safe-Collision \
+  DEVICE=cuda:0 \
+  SEED=941 \
+  NUM_ENVS=8 \
+  NUM_EPISODES=40 \
+  EPISODE_LENGTH_S=60 \
+  SUCCESS_DIST=0.25 \
+  HEIGHT_SCAN_RESOLUTION=0.25 \
+  SCAN_HISTORY=5 \
+  ACTION_HISTORY=4 \
+  POLICY_ACTION_SMOOTHING=0.0 \
+  GOAL_DISTANCE_MIN=2.8 \
+  GOAL_DISTANCE_MAX=4.0 \
+  MIN_GOAL_OBSTACLE_CLEARANCE=0.9 \
+  MIN_START_OBSTACLE_CLEARANCE=0.0 \
+  REQUIRE_BLOCKED_CORRIDOR=0 \
+  DEBUG_GOAL_THROUGH_OBSTACLE=0 \
+  RESAMPLE_TERRAIN_TILES=1 \
+  DEBUG_OBSTACLE_WIDTH_MIN=1.0 \
+  DEBUG_OBSTACLE_WIDTH_MAX=1.4 \
+  DEBUG_OBSTACLE_HEIGHT_MIN=1.0 \
+  DEBUG_OBSTACLE_HEIGHT_MAX=1.0 \
+  DEBUG_NUM_OBSTACLES=6 \
+  DEBUG_PLATFORM_WIDTH=2.0 \
+  DEBUG_TERRAIN_ROWS=5 \
+  DEBUG_TERRAIN_COLS=10 \
+  LOW_LEVEL_POLICY_PATH="$ROOT/external/unitree_rl_mjlab/logs/rsl_rl/g1_velocity/2026-07-12_10-35-19_omni_finetune_model1499_20260712"

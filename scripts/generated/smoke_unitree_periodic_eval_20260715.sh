@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT=/home/benjamin/thesis
+
+exec "$ROOT/scripts/run_unitree_mjlab_nav_thesis_local.sh" \
+  RUN_NAME=unitree_periodic_eval_smoke_goalfix_20260715 \
+  WANDB_MODE=disabled \
+  DEVICE=cuda:0 \
+  SEED=71 \
+  NUM_ENVS=2 \
+  TOTAL_STEPS=10 \
+  EPISODE_LENGTH_S=2 \
+  LEARNING_STARTS=100 \
+  RANDOM_STEPS=10 \
+  TEACHER_WARMUP_STEPS=0 \
+  INTERVENTION_GATE_MODE=none \
+  ACTOR_BC_WEIGHT=0 \
+  PREF_RANK_WEIGHT=0 \
+  DISABLE_OBSTACLES=1 \
+  STRICT_MIN_SIZE_OBSTACLES=0 \
+  MASK_GOAL_HEADING=0 \
+  GOAL_THROUGH_OBSTACLE_PROB=0 \
+  MIN_GOAL_OBSTACLE_CLEARANCE=0 \
+  CHECKPOINT_INTERVAL=10 \
+  EVAL_INTERVAL=10 \
+  EVAL_NUM_ENVS=1 \
+  EVAL_NUM_EPISODES=1 \
+  EVAL_SEED=971 \
+  EVAL_TIMEOUT_S=600 \
+  EVAL_FAIL_FAST=1 \
+  LOG_INTERVAL=5
