@@ -49,6 +49,33 @@ if [[ "${RESAMPLE_TERRAIN_TILES:-1}" == "1" ]]; then
   RESAMPLE_TERRAIN_TILES_FLAG=(--resample-terrain-tiles)
 fi
 
+POLICY_TEACHER_GATE_FLAG=()
+if [[ "${POLICY_TEACHER_GATE:-0}" == "1" ]]; then
+  POLICY_TEACHER_GATE_FLAG=(--policy-teacher-gate)
+fi
+
+MASK_GOAL_HEADING_FLAG=()
+if [[ "${MASK_GOAL_HEADING:-0}" == "1" ]]; then
+  MASK_GOAL_HEADING_FLAG=(--mask-goal-heading)
+else
+  MASK_GOAL_HEADING_FLAG=(--no-mask-goal-heading)
+fi
+
+MASK_HEIGHT_SCAN_FLAG=()
+if [[ "${MASK_HEIGHT_SCAN:-0}" == "1" ]]; then
+  MASK_HEIGHT_SCAN_FLAG=(--mask-height-scan)
+fi
+
+CHECKPOINT_ENV_CONFIG_FLAG=(--checkpoint-env-config)
+if [[ "${CHECKPOINT_ENV_CONFIG:-1}" == "0" ]]; then
+  CHECKPOINT_ENV_CONFIG_FLAG=(--no-checkpoint-env-config)
+fi
+
+STRICT_MIN_SIZE_OBSTACLES_FLAG=()
+if [[ "${STRICT_MIN_SIZE_OBSTACLES:-0}" == "1" ]]; then
+  STRICT_MIN_SIZE_OBSTACLES_FLAG=(--strict-min-size-obstacles)
+fi
+
 exec "$PYTHON_BIN" "$ROOT_DIR/plot_unitree_nav_rollout.py" \
   --controller "${CONTROLLER:-scan_teacher}" \
   --model-path "${MODEL_PATH:-}" \
@@ -60,6 +87,24 @@ exec "$PYTHON_BIN" "$ROOT_DIR/plot_unitree_nav_rollout.py" \
   --num-rollouts "${NUM_ROLLOUTS:-1}" \
   --layout-generation-attempts "${LAYOUT_GENERATION_ATTEMPTS:-20}" \
   --success-dist "${SUCCESS_DIST:-0.5}" \
+  --height-scan-resolution "${HEIGHT_SCAN_RESOLUTION:-0.5}" \
+  --scan-history "${SCAN_HISTORY:-1}" \
+  --action-history "${ACTION_HISTORY:-0}" \
+  "${MASK_HEIGHT_SCAN_FLAG[@]}" \
+  "${MASK_GOAL_HEADING_FLAG[@]}" \
+  "${CHECKPOINT_ENV_CONFIG_FLAG[@]}" \
+  --policy-action-smoothing "${POLICY_ACTION_SMOOTHING:-0.0}" \
+  "${POLICY_TEACHER_GATE_FLAG[@]}" \
+  --intervention-clearance-threshold "${INTERVENTION_CLEARANCE_THRESHOLD:-0.75}" \
+  --intervention-release-clearance "${INTERVENTION_RELEASE_CLEARANCE:-0.85}" \
+  --intervention-clearance-mode "${INTERVENTION_CLEARANCE_MODE:-fixed}" \
+  --intervention-clearance-trigger-ratio "${INTERVENTION_CLEARANCE_TRIGGER_RATIO:-0.6666666667}" \
+  --intervention-clearance-release-ratio "${INTERVENTION_CLEARANCE_RELEASE_RATIO:-0.8333333333}" \
+  --intervention-stall-steps "${INTERVENTION_STALL_STEPS:-60}" \
+  --intervention-progress-epsilon "${INTERVENTION_PROGRESS_EPSILON:-0.04}" \
+  --intervention-release-steps "${INTERVENTION_RELEASE_STEPS:-4}" \
+  --intervention-release-progress-tolerance "${INTERVENTION_RELEASE_PROGRESS_TOLERANCE:-0.005}" \
+  --intervention-release-action-delta-max "${INTERVENTION_RELEASE_ACTION_DELTA_MAX:-0.8}" \
   --low-level-policy-path "${LOW_LEVEL_POLICY_PATH:-$ROOT_DIR/external/unitree_rl_mjlab/logs/rsl_rl/g1_velocity/2026-07-12_10-35-19_omni_finetune_model1499_20260712}" \
   --output-dir "${OUTPUT_DIR:-$ROOT_DIR/visualizations/unitree_nav_debug}" \
   --teacher-scan-block-threshold "${TEACHER_SCAN_BLOCK_THRESHOLD:-0.12}" \
@@ -116,8 +161,15 @@ exec "$PYTHON_BIN" "$ROOT_DIR/plot_unitree_nav_rollout.py" \
   --blocked-corridor-ignore-end-radius "${BLOCKED_CORRIDOR_IGNORE_END_RADIUS:-0.75}" \
   --blocked-corridor-min-cells "${BLOCKED_CORRIDOR_MIN_CELLS:-1}" \
   --blocked-corridor-resample-attempts "${BLOCKED_CORRIDOR_RESAMPLE_ATTEMPTS:-100}" \
+  --blocked-goal-max-distance "${BLOCKED_GOAL_MAX_DISTANCE:-0.0}" \
+  --blocked-goal-distance-sampling "${BLOCKED_GOAL_DISTANCE_SAMPLING:-nearest}" \
+  --blocked-goal-placement-mode "${BLOCKED_GOAL_PLACEMENT_MODE:-obstacle_multiplier}" \
+  --blocked-goal-distance-multiplier-min "${BLOCKED_GOAL_DISTANCE_MULTIPLIER_MIN:-1.0}" \
+  --blocked-goal-distance-multiplier-max "${BLOCKED_GOAL_DISTANCE_MULTIPLIER_MAX:-2.0}" \
+  --blocked-goal-candidate-attempts "${BLOCKED_GOAL_CANDIDATE_ATTEMPTS:-64}" \
   --debug-obstacle-width-min "${DEBUG_OBSTACLE_WIDTH_MIN:-1.0}" \
   --debug-obstacle-width-max "${DEBUG_OBSTACLE_WIDTH_MAX:-1.4}" \
+  "${STRICT_MIN_SIZE_OBSTACLES_FLAG[@]}" \
   --debug-obstacle-height-min "${DEBUG_OBSTACLE_HEIGHT_MIN:-1.0}" \
   --debug-obstacle-height-max "${DEBUG_OBSTACLE_HEIGHT_MAX:-1.0}" \
   --debug-num-obstacles "${DEBUG_NUM_OBSTACLES:-6}" \
