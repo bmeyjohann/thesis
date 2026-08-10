@@ -40,6 +40,8 @@
 - Use fixed per-environment episode quotas in vectorized eval; first-N-completions biases results toward fast failures.
 - Always include the relevant no-safety/goal-only baseline in method-comparison reports.
 - Reports should include learning curves, final metrics, trajectory plots with cost markers, checkpoint paths, and interactive eval commands.
+- Human/intervention-method reports must plot cumulative intervention frequency and sampled-batch teacher fraction over training; final policy metrics alone are incomplete.
+- Unitree loss ablations use literal names: `pref_only` has anchored preference learning but no environmental TD/RL or BC; `pref_rl` is the original thesis objective; `bc_rl` and `bc_only` disable preference learning.
 
 ## Debugging Invariants
 
@@ -88,13 +90,17 @@
 - Supervisor velocity checkpoints may use split `actor_state_dict`/`critic_state_dict` format; adapt them in memory for the installed legacy RSL-RL runner and preserve the original checkpoint bytes.
 - When inspecting a legacy scan-blind velocity checkpoint on rough terrain, preserve rough physics but remove the task height-scan terms to match the checkpoint observation space; do not infer its original training terrain from dimensions alone.
 - Rough/Rough2/Parkour are low-level velocity-tracking tasks. Terrain avoidance requires a later high-level route/command policy rather than relabeling the low-level locomotion objective.
+- The G1 asset has no articulated head or neck; head-mounted RGB-D inspection uses a rigid `robot/torso_link` camera with configurable pitch/FOV and must not alter the low-level checkpoint observation shape unless a new vision policy is trained.
 - Core files are `train_unitree_nav_thesis.py`, `unitree_nav_layout.py`, `unitree_nav_eval_manifest.py`, `unitree_nav_geom_teacher.py`, `eval_unitree_nav_baselines.py`, `plot_unitree_nav_rollout.py`, and `eval_interactive_unitree_nav.py`.
 - Local launchers are `scripts/run_unitree_mjlab_nav_{smoke,baseline_eval,plot,thesis,interactive}_local.sh`.
 - Use the same low-level locomotion checkpoint across train, batch eval, plots, and interactive eval. The current default is the omni-finetuned G1 run under `external/unitree_rl_mjlab/logs/rsl_rl/g1_velocity/2026-07-12_10-35-19_omni_finetune_model1499_20260712`.
 - Navigation diversity uses a persistent pre-generated terrain tile bank plus randomized tile assignment and bounded radial goals. Do not rebuild the full terrain on every reset or Next action.
+- Do not describe tile/start/goal resampling as novel terrain generation. Report bank size, unique tile IDs or geometry hashes, and held-out generator seeds when assessing Unitree layout diversity.
 - All-blocked Unitree benchmarks must force a goal behind a sampled obstacle and validate the blocked-corridor postcondition for every initial and partial vector reset; probability alone is not sufficient.
 - Random multi-obstacle Unitree benchmarks must not silently choose only the nearest feasible blocked goal; record goal-path length and distinct blocking-component counts to verify layout diversity.
+- Before new human ablations, audit tile, start-position, goal-distance, and blocking-component diversity; repeated finite-bank layouts or obstacle-relative goal templates must not be presented as independent environment randomization.
 - The canonical persistent benchmark uses 6 obstacles, width 1.0-1.4 m, height 1.0 m, platform width 2.0 m, and a 5x10 tile bank.
+- The revised human-ablation benchmark uses a persistent 10x20 tile bank; historical scripted-teacher comparisons remain on their saved 5x10 checkpoint manifests.
 - Set both `env_cfg.seed` and `env_cfg.scene.terrain.terrain_generator.seed`; forced blocked-goal selection also requires NumPy and Torch seeding.
 - Apply goal-obstacle clearance repair after forced goal-through-obstacle placement in train and eval.
 - On partial vector resets, update goals and layout metadata only for `done_idx`.
@@ -108,6 +114,7 @@
 - Teacher state includes bypass-side commitment and optional command smoothing. Keep `teacher_geom_side_frame=body` as the conservative default unless a matched audit supports another mode.
 - `teacher_goal_stop_dist` must be strictly inside `success_dist`; with success 0.50, use stop distance 0.40.
 - Goal arrival is a successful terminal event. Configure `goal_reached` as a timeout-class termination so the environment's generic failure-termination reward does not penalize successful episodes, while tracking success from the explicit goal term.
+- `navigation_episode_mode=continuous_goals` must preserve simulator state on success, sample the next goal with a verified obstacle-clearance postcondition, and terminate only the learning segment so replay returns never span two goals; `episodic` retains full reset-on-goal behavior.
 - Clearance-or-stall gating must suppress/release stall intervention inside success distance.
 - Audit teachers on the exact student-training layout distribution before producing labels.
 - `policy_encoder=scan_cnn` infers the square scan side and accepts stacked scan channels; checkpoint eval must reconstruct resolution and history from saved args.
