@@ -11,6 +11,10 @@ MODE="${MODE:-interactive}"
 VIEWER="${VIEWER:-native}"
 DEVICE="${DEVICE:-cuda:0}"
 NCONMAX="${NCONMAX:-256}"
+HEAD_CAMERA="${HEAD_CAMERA:-0}"
+CAMERA_PITCH_DOWN_DEG="${CAMERA_PITCH_DOWN_DEG:-25}"
+CAMERA_FOVY="${CAMERA_FOVY:-70}"
+EGOCENTRIC_VIDEO="${EGOCENTRIC_VIDEO:-}"
 NUM_ENVS="${NUM_ENVS:-1}"
 SEED="${SEED:-0}"
 STEPS="${STEPS:-300}"
@@ -40,6 +44,19 @@ echo "device:     $DEVICE"
 echo "num envs:   $NUM_ENVS"
 echo "seed:       $SEED"
 echo "nconmax:    $NCONMAX"
+echo "head cam:   $HEAD_CAMERA (pitch=${CAMERA_PITCH_DOWN_DEG}deg fovy=${CAMERA_FOVY}deg)"
+
+CAMERA_ARGS=()
+if [[ "$HEAD_CAMERA" == "1" ]]; then
+  CAMERA_ARGS+=(
+    --head-camera
+    --camera-pitch-down-deg "$CAMERA_PITCH_DOWN_DEG"
+    --camera-fovy "$CAMERA_FOVY"
+  )
+fi
+if [[ -n "$EGOCENTRIC_VIDEO" ]]; then
+  CAMERA_ARGS+=(--egocentric-video "$EGOCENTRIC_VIDEO")
+fi
 
 case "$MODE" in
   interactive)
@@ -50,7 +67,8 @@ case "$MODE" in
       --viewer "$VIEWER" \
       --device "$DEVICE" \
       --num-envs "$NUM_ENVS" \
-      --nconmax "$NCONMAX"
+      --nconmax "$NCONMAX" \
+      "${CAMERA_ARGS[@]}"
     ;;
   smoke)
     exec "$PYTHON_BIN" -u "$ROOT_DIR/eval_unitree_velocity_policy.py" \
@@ -61,7 +79,8 @@ case "$MODE" in
       --steps "$STEPS" \
       --seed "$SEED" \
       --nconmax "$NCONMAX" \
-      --checkpoint-observation-mode "$CHECKPOINT_OBSERVATION_MODE"
+      --checkpoint-observation-mode "$CHECKPOINT_OBSERVATION_MODE" \
+      "${CAMERA_ARGS[@]}"
     ;;
   video)
     export MUJOCO_GL="${MUJOCO_GL:-egl}"
@@ -76,7 +95,8 @@ case "$MODE" in
       --checkpoint-observation-mode "$CHECKPOINT_OBSERVATION_MODE" \
       --video \
       --video-length "$VIDEO_LENGTH" \
-      --video-dir "$VIDEO_DIR"
+      --video-dir "$VIDEO_DIR" \
+      "${CAMERA_ARGS[@]}"
     ;;
   *)
     echo "Unsupported MODE=$MODE; expected interactive, smoke, or video" >&2

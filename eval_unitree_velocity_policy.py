@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import math
 import os
 import re
 import sys
@@ -22,6 +23,34 @@ ROOT = Path(__file__).resolve().parent
 UNITREE_REPO = ROOT / "external" / "unitree_rl_mjlab"
 if str(UNITREE_REPO) not in sys.path:
     sys.path.insert(0, str(UNITREE_REPO))
+
+
+def _head_camera_quat(pitch_down_deg: float, yaw_deg: float = 0.0) -> tuple[float, ...]:
+    """Orient a MuJoCo camera along body +X with body +Z as image up."""
+    import numpy as np
+    from scipy.spatial.transform import Rotation
+
+    pitch = math.radians(float(pitch_down_deg))
+    yaw = math.radians(float(yaw_deg))
+    forward = np.array([math.cos(pitch), 0.0, -math.sin(pitch)])
+    right = np.array([0.0, -1.0, 0.0])
+    up = np.cross(right, forward)
+    yaw_rotation = Rotation.from_euler("z", yaw).as_matrix()
+    rotation = yaw_rotation @ np.column_stack((right, up, -forward))
+    x, y, z, w = Rotation.from_matrix(rotation).as_quat()
+    return (float(w), float(x), float(y), float(z))
+
+
+def _camera_frame(rgb, depth, max_depth: float):
+    import numpy as np
+
+    rgb_np = rgb[0].detach().cpu().numpy()
+    depth_np = depth[0, ..., 0].detach().cpu().numpy()
+    depth_np = np.nan_to_num(depth_np, nan=max_depth, posinf=max_depth, neginf=0.0)
+    normalized = np.clip(depth_np / max_depth, 0.0, 1.0)
+    inverse_depth = ((1.0 - normalized) * 255).astype(np.uint8)
+    depth_rgb = np.repeat(inverse_depth[..., None], 3, axis=2)
+    return np.concatenate((rgb_np, depth_rgb), axis=1), depth_np
 
 
 def _actor_linear_shapes(checkpoint_path: Path) -> tuple[int, int]:
@@ -143,6 +172,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video-width", type=int, default=1280)
     parser.add_argument("--video-height", type=int, default=720)
     parser.add_argument("--viewer", choices=("none", "native", "viser"), default="none")
+    parser.add_argument("--head-camera", action="store_true")
+    parser.add_argument("--camera-pitch-down-deg", type=float, default=25.0)
+    parser.add_argument("--camera-yaw-deg", type=float, default=0.0)
+    parser.add_argument("--camera-fovy", type=float, default=70.0)
+    parser.add_argument("--camera-width", type=int, default=320)
+    parser.add_argument("--camera-height", type=int, default=240)
+    parser.add_argument("--camera-max-depth", type=float, default=5.0)
+    parser.add_argument(
+        "--egocentric-video",
+        type=Path,
+        default=None,
+        help="Write side-by-side head RGB and inverse-depth MP4.",
+    )
     parser.add_argument(
         "--nconmax",
         type=int,
@@ -177,6 +219,7 @@ def main() -> int:
     import src.tasks  # noqa: F401
     from mjlab.envs import ManagerBasedRlEnv
     from mjlab.rl import MjlabOnPolicyRunner, RslRlVecEnvWrapper
+    from mjlab.sensor import CameraSensorCfg
     from mjlab.tasks.registry import load_env_cfg, load_rl_cfg, load_runner_cls
     from mjlab.utils.torch import configure_torch_backends
     from mjlab.utils.wrappers import VideoRecorder
@@ -209,6 +252,33 @@ def main() -> int:
     )
     if terrain_generator is not None and hasattr(terrain_generator, "seed"):
         terrain_generator.seed = int(args.seed)
+
+    camera_enabled = bool(args.head_camera or args.egocentric_video is not None)
+    if camera_enabled:
+        if args.num_envs != 1:
+            raise ValueError("Head-camera inspection currently requires --num-envs 1")
+        if args.camera_width < 1 or args.camera_height < 1 or args.camera_max_depth <= 0:
+            raise ValueError("Camera dimensions and maximum depth must be positive")
+        camera_cfg = CameraSensorCfg(
+            name="head_rgbd",
+            parent_body="robot/torso_link",
+            pos=(0.08, 0.0, 0.42),
+            quat=_head_camera_quat(args.camera_pitch_down_deg, args.camera_yaw_deg),
+            fovy=float(args.camera_fovy),
+            width=int(args.camera_width),
+            height=int(args.camera_height),
+            data_types=("rgb", "depth"),
+            use_textures=True,
+            use_shadows=False,
+            clone_data=True,
+        )
+        env_cfg.scene.sensors = (env_cfg.scene.sensors or ()) + (camera_cfg,)
+        print(
+            "[velocity-eval] head_camera="
+            f"parent=robot/torso_link pos={camera_cfg.pos} "
+            f"pitch_down_deg={args.camera_pitch_down_deg} yaw_deg={args.camera_yaw_deg} "
+            f"fovy={args.camera_fovy} resolution={args.camera_width}x{args.camera_height}"
+        )
 
     render_mode = "rgb_array" if args.video else None
     env = ManagerBasedRlEnv(cfg=env_cfg, device=args.device, render_mode=render_mode)
@@ -249,6 +319,9 @@ def main() -> int:
         return 0
 
     obs, _ = env.reset()
+    camera_sensor = env.unwrapped.scene.sensors.get("head_rgbd") if camera_enabled else None
+    camera_frames = []
+    last_depth = None
     reward_sum = torch.zeros(args.num_envs, device=args.device)
     action_abs_sum = 0.0
     action_samples = 0
@@ -262,6 +335,14 @@ def main() -> int:
         action_abs_sum += float(actions.abs().mean().item())
         action_samples += 1
         obs, rewards, dones, _ = env.step(actions)
+        if camera_sensor is not None and args.egocentric_video is not None:
+            camera_data = camera_sensor.data
+            if camera_data.rgb is None or camera_data.depth is None:
+                raise RuntimeError("Head RGB-D camera did not produce both modalities")
+            frame, last_depth = _camera_frame(
+                camera_data.rgb, camera_data.depth, float(args.camera_max_depth)
+            )
+            camera_frames.append(frame)
         reward_sum += rewards
         termination_count += int(dones.sum().item())
 
@@ -279,12 +360,24 @@ def main() -> int:
         "termination_count": termination_count,
         "nonfinite_action_count": nonfinite_action_count,
         "video_dir": str(args.video_dir.resolve()) if args.video else None,
+        "head_camera": camera_enabled,
     }
     print("[velocity-eval] " + json.dumps(summary, sort_keys=True))
     if args.video:
         summary_path = args.video_dir / "summary.json"
         summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
         print(f"[velocity-eval] summary={summary_path.resolve()}")
+    if args.egocentric_video is not None:
+        import imageio.v2 as imageio
+        import numpy as np
+
+        args.egocentric_video.parent.mkdir(parents=True, exist_ok=True)
+        imageio.mimsave(args.egocentric_video, camera_frames, fps=50, macro_block_size=1)
+        if last_depth is not None:
+            depth_path = args.egocentric_video.with_suffix(".depth_sample.npy")
+            np.save(depth_path, last_depth)
+            print(f"[velocity-eval] depth_sample={depth_path.resolve()}")
+        print(f"[velocity-eval] egocentric_video={args.egocentric_video.resolve()}")
     env.close()
     return 0
 
