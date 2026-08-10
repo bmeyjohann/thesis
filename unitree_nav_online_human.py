@@ -30,6 +30,7 @@ class UnitreeOnlineHumanLearner:
         if int(args.num_envs) != 1:
             raise ValueError("Online human intervention training requires --num-envs 1")
         self.args = args
+        self.objective = self._resolve_objective(str(args.online_objective_mode))
         self.device = torch.device(args.device)
         self.obs_dim = int(obs_dim)
         self.act_dim = int(act_dim)
@@ -43,6 +44,7 @@ class UnitreeOnlineHumanLearner:
             )
         args.online_run_name = resolved_name
         print(f"[online-human] run directory: {self.run_dir}", flush=True)
+        print(f"[online-human] objective: {json.dumps(self.objective, sort_keys=True)}", flush=True)
         (self.run_dir / "args.json").write_text(
             json.dumps(vars(args), indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
@@ -112,6 +114,21 @@ class UnitreeOnlineHumanLearner:
     def actor(self):
         return self.sac.actor
 
+    @staticmethod
+    def _resolve_objective(mode: str) -> dict[str, object]:
+        objectives = {
+            "pref_bc_rl": dict(td_weight=1.0, pref=True, bc=True, bc_only=False, proxy=False, q_only=False),
+            "pref_only": dict(td_weight=0.0, pref=True, bc=False, bc_only=False, proxy=True, q_only=True),
+            "pref_rl": dict(td_weight=1.0, pref=True, bc=False, bc_only=False, proxy=False, q_only=False),
+            "bc_rl": dict(td_weight=1.0, pref=False, bc=True, bc_only=False, proxy=False, q_only=False),
+            "bc_only": dict(td_weight=0.0, pref=False, bc=True, bc_only=True, proxy=False, q_only=False),
+            "rl_only": dict(td_weight=1.0, pref=False, bc=False, bc_only=False, proxy=False, q_only=False),
+        }
+        try:
+            return {"mode": mode, **objectives[mode]}
+        except KeyError as exc:
+            raise ValueError(f"Unsupported online objective mode: {mode}") from exc
+
     def observe(
         self,
         *,
@@ -162,16 +179,24 @@ class UnitreeOnlineHumanLearner:
                     tau=float(self.args.online_tau),
                     max_grad_norm=float(self.args.online_max_grad_norm),
                     pref_sampling_mode="linked",
-                    pref_rank_weight=float(self.args.online_pref_rank_weight),
+                    pref_rank_weight=(
+                        float(self.args.online_pref_rank_weight) if bool(self.objective["pref"]) else 0.0
+                    ),
                     pref_rank_margin=float(self.args.online_pref_rank_margin),
                     pref_loss_type="lagrangian",
                     pref_stopgrad_positive=bool(self.args.online_pref_stopgrad_positive),
                     pref_lambda_lr=float(self.args.online_pref_lambda_lr),
                     pref_lambda_max=float(self.args.online_pref_lambda_max),
                     pref_action_delta_min=float(self.args.online_pref_action_delta_min),
-                    actor_bc_weight=float(self.args.online_actor_bc_weight),
+                    algo_variant="pvp" if bool(self.objective["proxy"]) else "plain",
+                    pvp_proxy_value_bound=float(self.args.online_pref_proxy_value_bound),
+                    critic_td_weight=float(self.objective["td_weight"]),
+                    actor_q_only=bool(self.objective["q_only"]),
+                    actor_bc_weight=(
+                        float(self.args.online_actor_bc_weight) if bool(self.objective["bc"]) else 0.0
+                    ),
                     actor_bc_teacher_only=True,
-                    actor_bc_only=False,
+                    actor_bc_only=bool(self.objective["bc_only"]),
                     alpha_min=float(self.args.online_alpha),
                     alpha_max=float(self.args.online_alpha),
                     update_actor=(self.step % int(self.args.online_policy_frequency) == 0),
@@ -187,6 +212,10 @@ class UnitreeOnlineHumanLearner:
                 "last_intervened": float(intervened),
                 "last_cost": float(cost),
                 "last_reward": reward_value,
+                "objective_mode": str(self.objective["mode"]),
+                "environmental_td_enabled": float(float(self.objective["td_weight"]) > 0.0),
+                "preference_enabled": float(bool(self.objective["pref"])),
+                "behavior_cloning_enabled": float(bool(self.objective["bc"])),
             }
             if latest is not None:
                 row.update({key: float(value) for key, value in latest.items()})

@@ -127,6 +127,12 @@ exec "$PYTHON_BIN" "$ROOT_DIR/train_unitree_nav_thesis.py" \
   --seed "${SEED:-0}" \
   --num-envs "$NUM_ENVS" \
   --episode-length-s "${EPISODE_LENGTH_S:-16.0}" \
+  --navigation-episode-mode "${NAVIGATION_EPISODE_MODE:-episodic}" \
+  --continuous-environment-horizon-s "${CONTINUOUS_ENVIRONMENT_HORIZON_S:-3600}" \
+  --continuous-goal-distance-min "${CONTINUOUS_GOAL_DISTANCE_MIN:-0.0}" \
+  --continuous-goal-distance-max "${CONTINUOUS_GOAL_DISTANCE_MAX:-0.0}" \
+  --continuous-goal-resample-attempts "${CONTINUOUS_GOAL_RESAMPLE_ATTEMPTS:-256}" \
+  --continuous-goal-boundary-margin "${CONTINUOUS_GOAL_BOUNDARY_MARGIN:-0.5}" \
   --low-level-policy-path "$LOW_LEVEL_POLICY_PATH" \
   --output-dir "$OUTPUT_DIR" \
   --run-name "$RUN_NAME" \

@@ -73,7 +73,7 @@ def _apply_strict_blocked_obstacle_profile(args: argparse.Namespace) -> None:
         "success_dist": 0.40,
         "goal_distance_min": 4.5,
         "goal_distance_max": 8.0,
-        "min_goal_obstacle_clearance": 0.90,
+        "min_goal_obstacle_clearance": 1.00,
         "goal_clearance_resample_attempts": 100,
         "min_start_obstacle_clearance": 1.00,
         "start_clearance_resample_attempts": 100,
@@ -98,8 +98,8 @@ def _apply_strict_blocked_obstacle_profile(args: argparse.Namespace) -> None:
         "debug_obstacle_height_max": 1.0,
         "strict_min_size_obstacles": True,
         "debug_platform_width": 2.0,
-        "debug_terrain_rows": 5,
-        "debug_terrain_cols": 10,
+        "debug_terrain_rows": 10,
+        "debug_terrain_cols": 20,
     }
     for key, value in values.items():
         setattr(args, key, value)
@@ -819,6 +819,10 @@ def run(args: argparse.Namespace) -> int:
             current_obs = _prepare_policy_obs(obs_raw, args)
             done_mask = done.to(args.device).reshape(-1).bool()
             obs = scan_history.step(current_obs, done_mask, action=action)
+            next_goal_distance = float(torch.linalg.norm(obs[0, 6:8]).detach().cpu().item())
+            reached_goal = bool(terminal_success or next_goal_distance <= args.success_dist)
+            continuous_goals = str(args.navigation_episode_mode) == "continuous_goals"
+            learning_boundary = bool(done_mask[0].item() or (continuous_goals and reached_goal))
             cost = float(_extract_cost(extras, 1, torch.device(args.device))[0].detach().cpu().item())
             total_cost += cost
             if cost > 0.0:
@@ -830,7 +834,7 @@ def run(args: argparse.Namespace) -> int:
                     frame = None
             if success_step is None and (
                 terminal_success
-                or float(torch.linalg.norm(obs[0, 6:8]).detach().cpu().item()) <= args.success_dist
+                or next_goal_distance <= args.success_dist
             ):
                 success_step = step + 1
             if dataset_writer is not None:
@@ -845,8 +849,8 @@ def run(args: argparse.Namespace) -> int:
                     next_base_observations=next_base_obs,
                     reward=float(reward.reshape(-1)[0].detach().cpu().item()),
                     cost=cost,
-                    done=bool(done_mask[0].item()),
-                    terminal_success=terminal_success,
+                    done=learning_boundary,
+                    terminal_success=reached_goal,
                     intervened=human_active,
                     intervention_start=human_active and not previous_human_active,
                     intervention_end=previous_human_active and not human_active,
@@ -856,7 +860,7 @@ def run(args: argparse.Namespace) -> int:
                     gamepad_command_norm=(float(gamepad_sample.command_norm) if gamepad_sample is not None else 0.0),
                     action_delta_to_policy=float(np.linalg.norm(record_executed_action - record_student_action)),
                     goal_distance=live_dist,
-                    next_goal_distance=float(torch.linalg.norm(obs[0, 6:8]).detach().cpu().item()),
+                    next_goal_distance=next_goal_distance,
                     episode_index=episode_idx,
                     step_index=step,
                     wall_time_unix_s=time.time(),
@@ -871,12 +875,12 @@ def run(args: argparse.Namespace) -> int:
                         record_executed_action, dtype=torch.float32, device=args.device
                     ).reshape(1, -1),
                     next_obs=obs.detach(),
-                    done=bool(done_mask[0].item()),
-                    terminal_success=terminal_success,
+                    done=learning_boundary,
+                    terminal_success=reached_goal,
                     intervened=human_active,
                     intervention_start=human_active and not previous_human_active,
                     goal_distance=live_dist,
-                    next_goal_distance=float(torch.linalg.norm(obs[0, 6:8]).detach().cpu().item()),
+                    next_goal_distance=next_goal_distance,
                     cost=cost,
                 )
                 if int(args.online_total_steps) > 0 and online_learner.step >= int(args.online_total_steps):
@@ -885,7 +889,33 @@ def run(args: argparse.Namespace) -> int:
             previous_human_active = human_active
             step += 1
             single_step = False
-            if bool(done.reshape(-1)[0].item()) or step >= int(args.max_steps):
+            if continuous_goals and reached_goal and not bool(done_mask[0].item()):
+                from eval_unitree_nav_baselines import _resample_continuous_goals
+
+                next_raw, goal_clearances, _ = _resample_continuous_goals(
+                    args,
+                    env,
+                    obstacle_cells,
+                    torch.zeros(1, dtype=torch.long, device=args.device),
+                )
+                obs = scan_history.reset(_prepare_policy_obs(next_raw, args))
+                if teacher_state is not None:
+                    teacher_state.reset()
+                episode_idx += 1
+                trajectory = []
+                cost_points = []
+                total_cost = 0.0
+                success_step = None
+                step = 0
+                previous_policy_action.zero_()
+                previous_human_active = False
+                previous_note = (
+                    f"goal reached; continuing from current pose | next clearance="
+                    f"{float(goal_clearances[0].item()):.2f}m"
+                )
+            elif bool(done.reshape(-1)[0].item()) or (
+                str(args.navigation_episode_mode) == "episodic" and step >= int(args.max_steps)
+            ):
                 if bool(args.auto_reset):
                     episode_idx += 1
                     reset_episode("auto-reset after done/timeout")
@@ -1043,6 +1073,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-envs", type=int, default=1)
     p.add_argument("--episode-length-s", type=float, default=16.0)
     p.add_argument("--max-steps", type=int, default=320)
+    p.add_argument(
+        "--navigation-episode-mode",
+        choices=["episodic", "continuous_goals"],
+        default="episodic",
+    )
+    p.add_argument("--continuous-environment-horizon-s", type=float, default=3600.0)
+    p.add_argument("--continuous-goal-distance-min", type=float, default=0.0)
+    p.add_argument("--continuous-goal-distance-max", type=float, default=0.0)
+    p.add_argument("--continuous-goal-resample-attempts", type=int, default=256)
+    p.add_argument("--continuous-goal-boundary-margin", type=float, default=0.5)
+    p.add_argument("--continuous-goal-require-blocked-corridor", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--success-dist", type=float, default=0.5)
     p.add_argument("--terminate-on-goal", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--height-scan-resolution", type=float, default=0.5)
@@ -1105,6 +1146,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--human-dataset-dir", default="")
     p.add_argument("--human-dataset-chunk-size", type=int, default=1024)
     p.add_argument("--online-train", action="store_true")
+    p.add_argument(
+        "--online-objective-mode",
+        choices=["pref_bc_rl", "pref_only", "pref_rl", "bc_rl", "bc_only", "rl_only"],
+        default="pref_bc_rl",
+    )
     p.add_argument("--online-output-dir", default=str(ROOT / "models" / "unitree_mjlab_nav_human"))
     p.add_argument("--online-run-name", default=f"unitree_human_{time.strftime('%Y%m%d_%H%M%S')}")
     p.add_argument("--online-restore-full-state", action=argparse.BooleanOptionalAction, default=False)
@@ -1128,6 +1174,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--online-pref-lambda-lr", type=float, default=0.01)
     p.add_argument("--online-pref-lambda-max", type=float, default=10.0)
     p.add_argument("--online-pref-action-delta-min", type=float, default=0.05)
+    p.add_argument("--online-pref-proxy-value-bound", type=float, default=1.0)
     p.add_argument("--online-pref-stopgrad-positive", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--online-actor-bc-weight", type=float, default=0.2)
     p.add_argument("--online-log-interval", type=int, default=100)
@@ -1215,6 +1262,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min-goal-obstacle-clearance", type=float, default=1.0)
     p.add_argument("--goal-clearance-resample-attempts", type=int, default=100)
     p.add_argument("--min-start-obstacle-clearance", type=float, default=0.75)
+    p.add_argument("--start-position-range", type=float, default=0.0)
     p.add_argument("--start-clearance-resample-attempts", type=int, default=100)
     p.add_argument("--require-blocked-corridor", action="store_true")
     p.add_argument("--blocked-corridor-radius", type=float, default=0.55)

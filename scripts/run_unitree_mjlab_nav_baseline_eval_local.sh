@@ -45,6 +45,11 @@ if [[ "${RECORD_VIDEO:-1}" == "1" ]]; then
   VIDEO_FLAG=(--record-video)
 fi
 
+VIDEO_STOP_FLAG=(--no-video-stop-on-done)
+if [[ "${VIDEO_STOP_ON_DONE:-0}" == "1" ]]; then
+  VIDEO_STOP_FLAG=(--video-stop-on-done)
+fi
+
 SKIP_METRICS_FLAG=()
 if [[ "${SKIP_METRICS:-0}" == "1" ]]; then
   SKIP_METRICS_FLAG=(--skip-metrics)
@@ -101,6 +106,12 @@ exec "$PYTHON_BIN" -u "$ROOT_DIR/eval_unitree_nav_baselines.py" \
   --num-envs "$NUM_ENVS" \
   --num-episodes "$NUM_EPISODES" \
   --episode-length-s "${EPISODE_LENGTH_S:-16.0}" \
+  --navigation-episode-mode "${NAVIGATION_EPISODE_MODE:-episodic}" \
+  --continuous-environment-horizon-s "${CONTINUOUS_ENVIRONMENT_HORIZON_S:-3600}" \
+  --continuous-goal-distance-min "${CONTINUOUS_GOAL_DISTANCE_MIN:-0.0}" \
+  --continuous-goal-distance-max "${CONTINUOUS_GOAL_DISTANCE_MAX:-0.0}" \
+  --continuous-goal-resample-attempts "${CONTINUOUS_GOAL_RESAMPLE_ATTEMPTS:-256}" \
+  --continuous-goal-boundary-margin "${CONTINUOUS_GOAL_BOUNDARY_MARGIN:-0.5}" \
   --success-dist "${SUCCESS_DIST:-0.5}" \
   --height-scan-resolution "${HEIGHT_SCAN_RESOLUTION:-0.5}" \
   --height-scan-forward-size "${HEIGHT_SCAN_FORWARD_SIZE:-3.0}" \
@@ -121,6 +132,13 @@ exec "$PYTHON_BIN" -u "$ROOT_DIR/eval_unitree_nav_baselines.py" \
   --video-dir "$VIDEO_DIR" \
   --video-length "${VIDEO_LENGTH:-480}" \
   --video-fps "${VIDEO_FPS:-30}" \
+  --video-manifest-index "${VIDEO_MANIFEST_INDEX:--1}" \
+  --video-camera-distance "${VIDEO_CAMERA_DISTANCE:-5.0}" \
+  --video-camera-elevation "${VIDEO_CAMERA_ELEVATION:--10.0}" \
+  --video-camera-azimuth "${VIDEO_CAMERA_AZIMUTH:-90.0}" \
+  --video-width "${VIDEO_WIDTH:-640}" \
+  --video-height "${VIDEO_HEIGHT:-640}" \
+  "${VIDEO_STOP_FLAG[@]}" \
   --teacher-scan-block-threshold "${TEACHER_SCAN_BLOCK_THRESHOLD:-0.12}" \
   --teacher-scan-block-delta "${TEACHER_SCAN_BLOCK_DELTA:-0.0}" \
   --teacher-scan-planner "${TEACHER_SCAN_PLANNER:-heuristic}" \
@@ -173,9 +191,10 @@ exec "$PYTHON_BIN" -u "$ROOT_DIR/eval_unitree_nav_baselines.py" \
   --teacher-geom-side-frame "${TEACHER_GEOM_SIDE_FRAME:-body}" \
   --teacher-geom-disengage-clear-steps "${TEACHER_GEOM_DISENGAGE_CLEAR_STEPS:-20}" \
   --teacher-geom-emergency-radius "${TEACHER_GEOM_EMERGENCY_RADIUS:-0.8}" \
-  --min-goal-obstacle-clearance "${MIN_GOAL_OBSTACLE_CLEARANCE:-0.9}" \
+  --min-goal-obstacle-clearance "${MIN_GOAL_OBSTACLE_CLEARANCE:-1.0}" \
   --goal-clearance-resample-attempts "${GOAL_CLEARANCE_RESAMPLE_ATTEMPTS:-50}" \
   --min-start-obstacle-clearance "${MIN_START_OBSTACLE_CLEARANCE:-0.0}" \
+  --start-position-range "${START_POSITION_RANGE:-0.0}" \
   --start-clearance-resample-attempts "${START_CLEARANCE_RESAMPLE_ATTEMPTS:-20}" \
   --blocked-corridor-radius "${BLOCKED_CORRIDOR_RADIUS:-0.45}" \
   --blocked-corridor-ignore-end-radius "${BLOCKED_CORRIDOR_IGNORE_END_RADIUS:-0.75}" \

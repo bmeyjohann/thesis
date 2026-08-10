@@ -856,9 +856,15 @@ def make_env(args: argparse.Namespace, *, render: bool = False):
         enabled=bool(getattr(args, "resample_terrain_tiles", False)),
     )
     env_cfg.scene.num_envs = int(args.num_envs if not render else 1)
-    env_cfg.episode_length_s = float(args.episode_length_s)
+    continuous_goals = str(getattr(args, "navigation_episode_mode", "episodic")) == "continuous_goals"
+    environment_horizon = (
+        float(getattr(args, "continuous_environment_horizon_s", 3600.0))
+        if continuous_goals
+        else float(args.episode_length_s)
+    )
+    env_cfg.episode_length_s = environment_horizon
     if "pose" in env_cfg.commands:
-        env_cfg.commands["pose"].resampling_time_range = (float(args.episode_length_s), float(args.episode_length_s))
+        env_cfg.commands["pose"].resampling_time_range = (environment_horizon, environment_horizon)
         goal_min = float(getattr(args, "goal_distance_min", 0.0))
         goal_max = float(getattr(args, "goal_distance_max", 0.0))
         if goal_min > 0.0 or goal_max > 0.0:
@@ -1434,6 +1440,9 @@ def run_training(args: argparse.Namespace) -> Path:
         interval_student_rows += int((~teacher_intervened).sum().detach().cpu().item())
         success = _goal_success(next_obs, args.success_dist) | terminal_success
         first_success = success & ~episode_success
+        continuous_goals = str(args.navigation_episode_mode) == "continuous_goals"
+        goal_boundary = success if continuous_goals else torch.zeros_like(success)
+        transition_done = done | goal_boundary
         if args.learner_reward_mode in {"dense_progress", "dense_progress_exp"}:
             pre_distance = torch.linalg.norm(obs[:, 6:8], dim=-1)
             post_distance = torch.linalg.norm(next_obs[:, 6:8], dim=-1)
@@ -1462,7 +1471,7 @@ def run_training(args: argparse.Namespace) -> Path:
             student_actions=student_action,
             next_obs=next_obs,
             rewards=reward,
-            dones=done,
+            dones=transition_done,
             truncations=trunc,
             teacher_intervened=teacher_intervened,
             intervention_start=intervention_start,
@@ -1492,18 +1501,34 @@ def run_training(args: argparse.Namespace) -> Path:
         episode_env_return += env_reward
         episode_cost += cost
         episode_success |= success
+        if transition_done.any():
+            boundary_idx = torch.nonzero(transition_done, as_tuple=False).flatten()
+            completed_returns.extend(episode_return[boundary_idx].detach().cpu().tolist())
+            completed_env_returns.extend(episode_env_return[boundary_idx].detach().cpu().tolist())
+            completed_costs.extend(episode_cost[boundary_idx].detach().cpu().tolist())
+            completed_successes.extend(episode_success[boundary_idx].float().detach().cpu().tolist())
+            episode_return[boundary_idx] = 0.0
+            episode_env_return[boundary_idx] = 0.0
+            episode_cost[boundary_idx] = 0.0
+            episode_success[boundary_idx] = False
+            teacher_state.reset(transition_done)
+            gate_state.reset(transition_done)
+            previous_student_action[transition_done] = 0.0
+            previous_teacher_intervened[transition_done] = False
+
+        if continuous_goals:
+            continuing_success = success & ~done
+            if continuing_success.any():
+                from eval_unitree_nav_baselines import _resample_continuous_goals
+
+                success_idx = torch.nonzero(continuing_success, as_tuple=False).flatten()
+                continued_raw, _, _ = _resample_continuous_goals(
+                    args, env, obstacle_cells, success_idx
+                )
+                next_obs = scan_history.reset(_prepare_actor_obs(continued_raw, args), success_idx)
+
         if done.any():
             done_idx = torch.nonzero(done, as_tuple=False).flatten()
-            completed_returns.extend(episode_return[done_idx].detach().cpu().tolist())
-            completed_env_returns.extend(episode_env_return[done_idx].detach().cpu().tolist())
-            completed_costs.extend(episode_cost[done_idx].detach().cpu().tolist())
-            completed_successes.extend(episode_success[done_idx].float().detach().cpu().tolist())
-            episode_return[done_idx] = 0.0
-            episode_env_return[done_idx] = 0.0
-            episode_cost[done_idx] = 0.0
-            episode_success[done_idx] = False
-            teacher_state.reset(done)
-            gate_state.reset(done)
             obstacle_cells = _terrain_obstacle_cells_by_env(env)
             adjusted_obs = _set_goal_through_obstacle(args, env, obstacle_cells, env_ids=done_idx)
             if adjusted_obs is not None:
@@ -1835,6 +1860,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-envs", type=int, default=16)
     parser.add_argument("--episode-length-s", type=float, default=16.0)
     parser.add_argument("--resample-terrain-tiles", action="store_true")
+    parser.add_argument("--start-position-range", type=float, default=0.0)
     parser.add_argument("--low-level-policy-path", default=str(DEFAULT_LOW_LEVEL))
     parser.add_argument("--output-dir", default=str(ROOT / "models" / "unitree_mjlab_nav_thesis"))
     parser.add_argument("--run-name", default=f"unitree_nav_thesis_{time.strftime('%Y%m%d_%H%M%S')}")
@@ -2013,6 +2039,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--deterministic-student", action="store_true")
     parser.add_argument("--success-dist", type=float, default=0.5)
     parser.add_argument("--terminate-on-goal", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--navigation-episode-mode",
+        choices=["episodic", "continuous_goals"],
+        default="episodic",
+    )
+    parser.add_argument("--continuous-environment-horizon-s", type=float, default=3600.0)
+    parser.add_argument("--continuous-goal-distance-min", type=float, default=0.0)
+    parser.add_argument("--continuous-goal-distance-max", type=float, default=0.0)
+    parser.add_argument("--continuous-goal-resample-attempts", type=int, default=256)
+    parser.add_argument("--continuous-goal-boundary-margin", type=float, default=0.5)
+    parser.add_argument("--continuous-goal-require-blocked-corridor", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--goal-distance-min", type=float, default=0.0)
     parser.add_argument("--goal-distance-max", type=float, default=0.0)
     parser.add_argument("--min-goal-obstacle-clearance", type=float, default=0.0)

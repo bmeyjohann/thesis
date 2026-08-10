@@ -675,6 +675,8 @@ def sac_update_step(
     action_high: Optional[torch.Tensor] = None,
     update_actor: bool = True,
     critic_loss_reduction: str = "mean",
+    critic_td_weight: float = 1.0,
+    actor_q_only: bool = False,
     actor_bc_weight: float = 0.0,
     actor_bc_teacher_only: bool = True,
     actor_bc_only: bool = False,
@@ -734,9 +736,9 @@ def sac_update_step(
     q_losses = torch.stack([F.mse_loss(q, target_q) for q in q_list], dim=0)
     critic_loss_replay_value = float(q_losses.detach().mean().cpu().item())
     if str(critic_loss_reduction).strip().lower() == "sum":
-        critic_loss = q_losses.sum()
+        critic_loss = float(critic_td_weight) * q_losses.sum()
     else:
-        critic_loss = q_losses.mean()
+        critic_loss = float(critic_td_weight) * q_losses.mean()
     critic_loss_pref = torch.tensor(0.0, device=obs.device)
     critic_loss_pref_weighted = torch.tensor(0.0, device=obs.device)
     pvp_proxy_teacher_loss = torch.tensor(0.0, device=obs.device)
@@ -1014,7 +1016,7 @@ def sac_update_step(
     alpha_updates = 0.0
 
     if bool(update_actor):
-        actor_loss_sac = ((sac.log_alpha.exp().detach() * log_pi) - q_pi).mean()
+        actor_loss_sac = (-q_pi).mean() if bool(actor_q_only) else ((sac.log_alpha.exp().detach() * log_pi) - q_pi).mean()
         actor_loss = torch.tensor(0.0, device=obs.device) if bool(actor_bc_only) else actor_loss_sac
         effective_actor_bc_weight = float(actor_bc_weight)
         if bool(actor_bc_only) and effective_actor_bc_weight <= 0.0:
@@ -1115,7 +1117,7 @@ def sac_update_step(
         else:
             actor_updates = 0.0
 
-        if not bool(actor_bc_only):
+        if not bool(actor_bc_only) and not bool(actor_q_only):
             alpha_loss = -sac.log_alpha.exp() * (log_pi.detach() + sac.target_entropy).mean()
             sac.alpha_optimizer.zero_grad(set_to_none=True)
             alpha_loss.backward()
@@ -1132,7 +1134,7 @@ def sac_update_step(
                 sac.log_alpha.clamp_(min=lower, max=upper)
         if bool(actor_loss.requires_grad):
             actor_updates = 1.0
-        alpha_updates = 0.0 if bool(actor_bc_only) else 1.0
+        alpha_updates = 0.0 if bool(actor_bc_only or actor_q_only) else 1.0
 
     soft_update(sac.critic, sac.critic_target, tau)
     actor_loss_sac_value = float(actor_loss_sac.detach().cpu().item())
@@ -1141,7 +1143,7 @@ def sac_update_step(
         critic_loss=float(critic_loss.detach().cpu().item()),
         critic_loss_replay=float(critic_loss_replay_value),
         critic_loss_total=float(
-            critic_loss_replay_value
+            float(critic_td_weight) * critic_loss_replay_value
             + float(critic_loss_pref_weighted.detach().cpu().item())
             + float(pvp_proxy_teacher_loss.detach().cpu().item())
             + float(pvp_proxy_student_loss.detach().cpu().item())

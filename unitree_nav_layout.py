@@ -39,17 +39,49 @@ def set_terrain_tile_indices(env, env_ids: torch.Tensor, tile_indices: torch.Ten
 
 
 def reset_terrain_tiles(env, env_ids: torch.Tensor, *, unique: bool = True) -> None:
-    """Reset event that samples new origins from the existing terrain bank."""
+    """Reset event that cycles through a shuffled terrain bank without replacement."""
     rows, cols = terrain_tile_shape(env)
     if rows <= 0 or cols <= 0:
         return
     env_ids = env_ids.reshape(-1)
     count = rows * cols
+    terrain = env.scene.terrain
     if unique and env_ids.numel() <= count:
-        tile_indices = torch.randperm(count, device=env_ids.device)[: env_ids.numel()]
+        order = getattr(terrain, "_unitree_nav_tile_order", None)
+        cursor = int(getattr(terrain, "_unitree_nav_tile_cursor", 0))
+        if order is None or int(order.numel()) != count:
+            order = torch.randperm(count, device=env_ids.device)
+            cursor = 0
+        selected = []
+        remaining = int(env_ids.numel())
+        while remaining > 0:
+            available = count - cursor
+            take = min(remaining, available)
+            selected.append(order[cursor : cursor + take])
+            cursor += take
+            remaining -= take
+            if cursor >= count:
+                order = torch.randperm(count, device=env_ids.device)
+                cursor = 0
+        tile_indices = torch.cat(selected, dim=0)
+        terrain._unitree_nav_tile_order = order
+        terrain._unitree_nav_tile_cursor = cursor
     else:
         tile_indices = torch.randint(count, (env_ids.numel(),), device=env_ids.device)
     set_terrain_tile_indices(env, env_ids, tile_indices)
+
+
+def configure_start_position_range(env_cfg, *, half_width: float) -> None:
+    """Override root-reset x/y jitter while preserving all other reset settings."""
+    if float(half_width) <= 0.0:
+        return
+    reset_cfg = env_cfg.events.get("reset_base")
+    if reset_cfg is None:
+        raise ValueError("start-position randomization requires a reset_base event")
+    pose_range = dict(reset_cfg.params.get("pose_range", {}))
+    pose_range["x"] = (-float(half_width), float(half_width))
+    pose_range["y"] = (-float(half_width), float(half_width))
+    reset_cfg.params = {**reset_cfg.params, "pose_range": pose_range}
 
 
 def configure_terrain_tile_resets(env_cfg, *, enabled: bool) -> None:

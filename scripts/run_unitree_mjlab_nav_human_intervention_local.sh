@@ -40,7 +40,10 @@ echo "gamepad:    $GAMEPAD_HOST:$GAMEPAD_PORT"
 echo "takeover:   stick deflection >= ${GAMEPAD_INTERVENTION_THRESHOLD:-0.05} command norm"
 echo "dataset:    $DATASET_DIR"
 echo "training:   ${ONLINE_TRAIN:-0} (run=${ONLINE_RUN_NAME:-$RUN_ID})"
+echo "objective:  ${ONLINE_OBJECTIVE_MODE:-pref_bc_rl}"
 echo "scanner:    ${HEIGHT_SCAN_FORWARD_SIZE:-checkpoint/default}m forward x ${HEIGHT_SCAN_LATERAL_SIZE:-checkpoint/default}m lateral @ ${HEIGHT_SCAN_RESOLUTION:-checkpoint/default}m"
+echo "start area: +/-${START_POSITION_RANGE:-0.8}m around each terrain-tile origin"
+echo "episode mode: ${NAVIGATION_EPISODE_MODE:-continuous_goals} (goal clearance >= ${MIN_GOAL_OBSTACLE_CLEARANCE:-1.0}m)"
 echo "reward:     dense distance progress x${ONLINE_DENSE_PROGRESS_SCALE:-1.0} + success ${ONLINE_SUCCESS_BONUS:-20.0} / failure ${ONLINE_FAILURE_PENALTY:--20.0}"
 echo "controls:   move stick past threshold to override; left stick forward/lateral (inverted); right stick yaw"
 
@@ -53,11 +56,14 @@ if [[ "${ONLINE_TRAIN:-0}" == "1" ]]; then
   ONLINE_ARGS=(
     --online-train
     --online-run-name "${ONLINE_RUN_NAME:-$RUN_ID}"
+    --online-objective-mode "${ONLINE_OBJECTIVE_MODE:-pref_bc_rl}"
     --online-output-dir "${ONLINE_OUTPUT_DIR:-$ROOT_DIR/models/unitree_mjlab_nav_human}"
     --online-learning-starts "${ONLINE_LEARNING_STARTS:-500}"
     --online-updates-per-step "${ONLINE_UPDATES_PER_STEP:-1}"
     --online-n-step "${ONLINE_N_STEP:-5}"
     --online-actor-bc-weight "${ONLINE_ACTOR_BC_WEIGHT:-0.2}"
+    --online-pref-rank-weight "${ONLINE_PREF_RANK_WEIGHT:-1.0}"
+    --online-pref-proxy-value-bound "${ONLINE_PREF_PROXY_VALUE_BOUND:-1.0}"
     --online-checkpoint-interval "${ONLINE_CHECKPOINT_INTERVAL:-1000}"
     --online-dense-progress-scale "${ONLINE_DENSE_PROGRESS_SCALE:-1.0}"
     --online-success-bonus "${ONLINE_SUCCESS_BONUS:-20.0}"
@@ -98,11 +104,19 @@ exec "$PYTHON_BIN" "$ROOT_DIR/eval_interactive_unitree_nav.py" \
   --show-scan-samples \
   --no-start-paused \
   --auto-reset \
+  --navigation-episode-mode "${NAVIGATION_EPISODE_MODE:-continuous_goals}" \
+  --continuous-environment-horizon-s "${CONTINUOUS_ENVIRONMENT_HORIZON_S:-3600}" \
+  --continuous-goal-distance-min "${CONTINUOUS_GOAL_DISTANCE_MIN:-4.5}" \
+  --continuous-goal-distance-max "${CONTINUOUS_GOAL_DISTANCE_MAX:-7.0}" \
+  --continuous-goal-resample-attempts "${CONTINUOUS_GOAL_RESAMPLE_ATTEMPTS:-256}" \
+  --continuous-goal-boundary-margin "${CONTINUOUS_GOAL_BOUNDARY_MARGIN:-0.5}" \
+  --min-goal-obstacle-clearance "${MIN_GOAL_OBSTACLE_CLEARANCE:-1.0}" \
   --checkpoint-env-config \
   --height-scan-resolution "${HEIGHT_SCAN_RESOLUTION:-0.25}" \
   --height-scan-forward-size "${HEIGHT_SCAN_FORWARD_SIZE:-0.0}" \
   --height-scan-lateral-size "${HEIGHT_SCAN_LATERAL_SIZE:-0.0}" \
   --force-obstacles \
   --force-obstacle-profile strict_blocked_v1 \
+  --start-position-range "${START_POSITION_RANGE:-0.8}" \
   "${STUDENT_VIEW_ARGS[@]}" \
   "${ONLINE_ARGS[@]}"

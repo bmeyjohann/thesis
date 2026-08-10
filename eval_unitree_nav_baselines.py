@@ -36,7 +36,47 @@ from unitree_nav_eval_manifest import (
     load_layout_manifest,
     save_layout_manifest,
 )
-from unitree_nav_observation import prepare_unitree_actor_obs
+from unitree_nav_observation import current_unitree_scan_obs, prepare_unitree_actor_obs
+
+
+def _frontal_obstacle_mask(obs: torch.Tensor, args: argparse.Namespace) -> torch.Tensor:
+    """Detect obstacle evidence in the policy-visible forward scan corridor."""
+    current = current_unitree_scan_obs(
+        obs,
+        scan_history=int(getattr(args, "scan_history", 1)),
+        action_history=int(getattr(args, "action_history", 0)),
+    )
+    resolution = float(args.height_scan_resolution)
+    rows = int(round(float(args.height_scan_lateral_size) / resolution)) + 1
+    cols = int(round(float(args.height_scan_forward_size) / resolution)) + 1
+    scan_values = current[:, 9:]
+    if scan_values.shape[1] != rows * cols:
+        raise ValueError(
+            f"Expected {rows}x{cols} scan from configured footprint, got {scan_values.shape[1]} values"
+        )
+    scan = torch.nan_to_num(scan_values.reshape(-1, rows, cols), nan=1.0)
+    lateral = torch.linspace(
+        -float(args.height_scan_lateral_size) / 2.0,
+        float(args.height_scan_lateral_size) / 2.0,
+        rows,
+        device=scan.device,
+    )
+    forward = torch.linspace(
+        -float(args.height_scan_forward_size) / 2.0,
+        float(args.height_scan_forward_size) / 2.0,
+        cols,
+        device=scan.device,
+    )
+    corridor = (
+        (lateral[:, None].abs() <= float(args.decisiveness_front_half_width))
+        & (forward[None, :] >= float(args.decisiveness_front_min_distance))
+        & (forward[None, :] <= float(args.decisiveness_front_max_distance))
+    )
+    blocked = scan < float(args.teacher_scan_block_threshold)
+    if float(args.teacher_scan_block_delta) > 0.0:
+        reference = torch.quantile(scan.flatten(start_dim=1), 0.9, dim=1)[:, None, None]
+        blocked |= scan < (reference - float(args.teacher_scan_block_delta))
+    return (blocked & corridor[None, :, :]).flatten(start_dim=1).any(dim=1)
 
 
 def _prepare_policy_obs(raw_obs: Any, args: argparse.Namespace) -> torch.Tensor:
@@ -141,7 +181,8 @@ def _apply_scan_and_goal_overrides(args: argparse.Namespace, env_cfg) -> None:
     success_dist = float(getattr(args, "success_dist", 0.5))
     if "pose" in env_cfg.commands:
         env_cfg.commands["pose"].success_threshold = success_dist
-    if bool(getattr(args, "terminate_on_goal", True)):
+    episodic_goals = str(getattr(args, "navigation_episode_mode", "episodic")) == "episodic"
+    if bool(getattr(args, "terminate_on_goal", True)) and episodic_goals:
         from mjlab.managers.termination_manager import TerminationTermCfg
 
         env_cfg.terminations["goal_reached"] = TerminationTermCfg(
@@ -160,7 +201,13 @@ def make_env(args: argparse.Namespace, *, num_envs: int, render: bool):
     from src.envs import build_env
 
     env_cfg = load_env_cfg(args.task, play=render)
-    from unitree_nav_layout import configure_terrain_tile_resets
+    if render:
+        env_cfg.viewer.distance = float(getattr(args, "video_camera_distance", env_cfg.viewer.distance))
+        env_cfg.viewer.elevation = float(getattr(args, "video_camera_elevation", env_cfg.viewer.elevation))
+        env_cfg.viewer.azimuth = float(getattr(args, "video_camera_azimuth", env_cfg.viewer.azimuth))
+        env_cfg.viewer.width = int(getattr(args, "video_width", env_cfg.viewer.width))
+        env_cfg.viewer.height = int(getattr(args, "video_height", env_cfg.viewer.height))
+    from unitree_nav_layout import configure_start_position_range, configure_terrain_tile_resets
 
     if hasattr(args, "seed"):
         env_cfg.seed = int(args.seed)
@@ -174,10 +221,20 @@ def make_env(args: argparse.Namespace, *, num_envs: int, render: bool):
         env_cfg,
         enabled=bool(getattr(args, "resample_terrain_tiles", False)),
     )
+    configure_start_position_range(
+        env_cfg,
+        half_width=float(getattr(args, "start_position_range", 0.0)),
+    )
     env_cfg.scene.num_envs = int(num_envs)
-    env_cfg.episode_length_s = float(args.episode_length_s)
+    continuous_goals = str(getattr(args, "navigation_episode_mode", "episodic")) == "continuous_goals"
+    environment_horizon = (
+        float(getattr(args, "continuous_environment_horizon_s", 3600.0))
+        if continuous_goals
+        else float(args.episode_length_s)
+    )
+    env_cfg.episode_length_s = environment_horizon
     if "pose" in env_cfg.commands:
-        env_cfg.commands["pose"].resampling_time_range = (float(args.episode_length_s), float(args.episode_length_s))
+        env_cfg.commands["pose"].resampling_time_range = (environment_horizon, environment_horizon)
         goal_min = float(getattr(args, "goal_distance_min", 0.0))
         goal_max = float(getattr(args, "goal_distance_max", 0.0))
         if goal_min > 0.0 or goal_max > 0.0:
@@ -273,6 +330,96 @@ def _goal_positions_xy(env) -> np.ndarray:
 def _robot_positions_xy(env) -> np.ndarray:
     robot = env.env.unwrapped.scene["robot"]
     return _to_numpy(robot.data.root_link_pos_w)[:, :2]
+
+
+def _resample_continuous_goals(
+    args: argparse.Namespace,
+    env,
+    obstacle_cells: list[np.ndarray],
+    env_ids: torch.Tensor | np.ndarray,
+):
+    """Sample new collision-free goals without resetting simulator state."""
+    term = env.env.unwrapped.command_manager._terms["pose"]
+    starts = _robot_positions_xy(env)
+    goals = _to_numpy(term._goal_pos_w).copy()
+    headings = _to_numpy(term._goal_heading_w).copy()
+    terrain = env.env.unwrapped.scene.terrain
+    origins = _to_numpy(terrain.env_origins)[:, :2]
+    generator = getattr(getattr(env.env.unwrapped.cfg.scene, "terrain", None), "terrain_generator", None)
+    tile_size = tuple(getattr(generator, "size", (8.0, 8.0))) if generator is not None else (8.0, 8.0)
+    boundary_margin = max(float(getattr(args, "continuous_goal_boundary_margin", 0.5)), 0.0)
+    min_distance = float(getattr(args, "continuous_goal_distance_min", 0.0))
+    max_distance = float(getattr(args, "continuous_goal_distance_max", 0.0))
+    if min_distance <= 0.0:
+        min_distance = max(float(getattr(args, "goal_distance_min", 0.0)), 1.0)
+    if max_distance < min_distance:
+        max_distance = max(float(getattr(args, "goal_distance_max", 0.0)), min_distance)
+    clearance_required = max(float(getattr(args, "min_goal_obstacle_clearance", 0.0)), 0.0)
+    require_blocked = bool(getattr(args, "continuous_goal_require_blocked_corridor", False))
+    attempts = max(1, int(getattr(args, "continuous_goal_resample_attempts", 256)))
+    selected = [int(i) for i in _to_numpy(env_ids).reshape(-1)]
+    stats_by_env: dict[int, dict[str, float | int | bool]] = {}
+
+    for i in selected:
+        chosen = None
+        chosen_stats = None
+        cells = obstacle_cells[i]
+        lower = origins[i] - np.asarray(tile_size[:2], dtype=np.float32) / 2.0 + boundary_margin
+        upper = origins[i] + np.asarray(tile_size[:2], dtype=np.float32) / 2.0 - boundary_margin
+        for _ in range(attempts):
+            angle = float(np.random.uniform(-np.pi, np.pi))
+            distance = float(np.random.uniform(min_distance, max_distance))
+            candidate = starts[i] + distance * np.asarray([np.cos(angle), np.sin(angle)], dtype=np.float32)
+            if np.any(candidate < lower) or np.any(candidate > upper):
+                continue
+            clearance = (
+                float("inf")
+                if cells.size == 0
+                else float(np.min(np.linalg.norm(cells - candidate.reshape(1, 2), axis=1)))
+            )
+            if clearance < clearance_required:
+                continue
+            stats = _line_obstacle_stats(
+                starts[i],
+                candidate,
+                cells,
+                corridor_radius=float(getattr(args, "blocked_corridor_radius", 0.45)),
+                ignore_end_radius=float(getattr(args, "blocked_corridor_ignore_end_radius", 0.75)),
+            )
+            if require_blocked and (
+                not bool(stats["blocked"])
+                or int(stats["blocked_cell_count"]) < int(getattr(args, "blocked_corridor_min_cells", 1))
+            ):
+                continue
+            chosen = candidate
+            chosen_stats = stats
+            break
+        if chosen is None:
+            raise RuntimeError(
+                f"Could not sample a continuous Unitree goal for env {i} after {attempts} attempts "
+                f"(distance={min_distance}-{max_distance}, clearance={clearance_required}, tile_size={tile_size})"
+            )
+        goals[i, :2] = chosen
+        headings[i] = 0.0
+        stats_by_env[i] = chosen_stats
+
+    term._goal_pos_w[:] = torch.as_tensor(goals, device=term._goal_pos_w.device, dtype=term._goal_pos_w.dtype)
+    term._goal_heading_w[:] = torch.as_tensor(headings, device=term._goal_heading_w.device, dtype=term._goal_heading_w.dtype)
+    term._update_command()
+    obs_raw = _recompute_observations(env)
+    clearances = _goal_clearances(env, obstacle_cells)
+    if bool(torch.any(clearances[torch.as_tensor(selected, device=clearances.device)] < clearance_required).item()):
+        raise RuntimeError("Continuous Unitree goal clearance postcondition failed")
+    return obs_raw, clearances, stats_by_env
+
+
+def _terrain_tile_ids(env) -> np.ndarray:
+    terrain = env.env.unwrapped.scene.terrain
+    levels = _to_numpy(terrain.terrain_levels).astype(np.int64).reshape(-1)
+    types = _to_numpy(terrain.terrain_types).astype(np.int64).reshape(-1)
+    origins = terrain.terrain_origins
+    cols = int(origins.shape[1]) if origins is not None and origins.ndim == 3 else 1
+    return levels * cols + types
 
 
 def _obstacle_components(cells: np.ndarray) -> list[np.ndarray]:
@@ -953,8 +1100,16 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     ep_action_sum = torch.zeros(num_envs, int(env.action_space.shape[-1]), device=args.device)
     ep_action_abs_sum = torch.zeros_like(ep_action_sum)
     ep_small_action_steps = torch.zeros(num_envs, device=args.device)
+    ep_front_obstacle_steps = torch.zeros(num_envs, device=args.device)
+    ep_front_steering_sum = torch.zeros(num_envs, device=args.device)
+    ep_front_abs_steering_sum = torch.zeros(num_envs, device=args.device)
+    ep_front_small_steering_steps = torch.zeros(num_envs, device=args.device)
+    ep_front_action_delta_sum = torch.zeros(num_envs, device=args.device)
     ep_min_goal_distance = torch.full((num_envs,), float("inf"), device=args.device)
     previous_action = torch.zeros(num_envs, int(env.action_space.shape[-1]), device=args.device)
+    episode_start_xy = _robot_positions_xy(env).copy()
+    episode_goal_xy = _goal_positions_xy(env).copy()
+    episode_tile_ids = _terrain_tile_ids(env).copy()
 
     episodes: list[dict[str, float | int | bool | None]] = []
     start = time.time()
@@ -975,10 +1130,18 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 controller=args.controller,
                 smoothing=args.policy_action_smoothing,
             )
+        front_obstacle = _frontal_obstacle_mask(obs, args)
+        steering = 0.5 * (action[:, 1] / 0.65 + action[:, 2] / 0.85)
+        action_delta = torch.linalg.norm(action - previous_action, dim=-1)
         ep_action_delta += torch.linalg.norm(action - previous_action, dim=-1)
         ep_action_sum += action
         ep_action_abs_sum += action.abs()
         ep_small_action_steps += (torch.linalg.norm(action, dim=-1) < 0.15).float()
+        ep_front_obstacle_steps += front_obstacle.float()
+        ep_front_steering_sum += torch.where(front_obstacle, steering, 0.0)
+        ep_front_abs_steering_sum += torch.where(front_obstacle, steering.abs(), 0.0)
+        ep_front_small_steering_steps += (front_obstacle & (steering.abs() < 0.15)).float()
+        ep_front_action_delta_sum += torch.where(front_obstacle, action_delta, 0.0)
         active = (action[:, 1:].abs() > 0.1) & (previous_action[:, 1:].abs() > 0.1)
         ep_action_flips += ((action[:, 1:] * previous_action[:, 1:] < 0.0) & active).any(dim=-1).float()
         previous_action.copy_(action)
@@ -1037,6 +1200,9 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                             float(layout_stats[i]["nearest_corridor_obstacle_dist"]) if layout_stats is not None else None
                         ),
                         "straight_path_length": float(layout_stats[i]["path_length"]) if layout_stats is not None else None,
+                        "terrain_tile_id": int(episode_tile_ids[i]),
+                        "start_xy": episode_start_xy[i].tolist(),
+                        "goal_xy": episode_goal_xy[i].tolist(),
                         **{
                             f"{name}_cost_sum": float(values[i].detach().cpu().item())
                             for name, values in ep_cost_terms.items()
@@ -1056,6 +1222,23 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                         ).tolist(),
                         "small_action_fraction": float(
                             ep_small_action_steps[i].detach().cpu().item() / max(1, int(ep_steps[i].item()))
+                        ),
+                        "front_obstacle_steps": int(ep_front_obstacle_steps[i].detach().cpu().item()),
+                        "front_obstacle_abs_steering": float(
+                            ep_front_abs_steering_sum[i].detach().cpu().item()
+                            / max(1, int(ep_front_obstacle_steps[i].item()))
+                        ),
+                        "front_obstacle_small_steering_fraction": float(
+                            ep_front_small_steering_steps[i].detach().cpu().item()
+                            / max(1, int(ep_front_obstacle_steps[i].item()))
+                        ),
+                        "front_obstacle_action_delta": float(
+                            ep_front_action_delta_sum[i].detach().cpu().item()
+                            / max(1, int(ep_front_obstacle_steps[i].item()))
+                        ),
+                        "front_obstacle_directional_consistency": float(
+                            abs(ep_front_steering_sum[i].detach().cpu().item())
+                            / max(ep_front_abs_steering_sum[i].detach().cpu().item(), 1e-6)
                         ),
                         "return": float(ep_return[i].detach().cpu().item()),
                         "env_index": int(i),
@@ -1089,6 +1272,11 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             ep_action_sum[done_idx] = 0.0
             ep_action_abs_sum[done_idx] = 0.0
             ep_small_action_steps[done_idx] = 0.0
+            ep_front_obstacle_steps[done_idx] = 0.0
+            ep_front_steering_sum[done_idx] = 0.0
+            ep_front_abs_steering_sum[done_idx] = 0.0
+            ep_front_small_steering_steps[done_idx] = 0.0
+            ep_front_action_delta_sum[done_idx] = 0.0
             ep_min_goal_distance[done_idx] = float("inf")
             previous_action[done_idx] = 0.0
             if teacher_state is not None:
@@ -1166,6 +1354,13 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 else:
                     for i in done_idx.tolist():
                         layout_stats[i] = next_layout_stats[i]
+            current_start_xy = _robot_positions_xy(env)
+            current_goal_xy = _goal_positions_xy(env)
+            current_tile_ids = _terrain_tile_ids(env)
+            for i in done_idx.tolist():
+                episode_start_xy[i] = current_start_xy[i]
+                episode_goal_xy[i] = current_goal_xy[i]
+                episode_tile_ids[i] = current_tile_ids[i]
         obs = next_obs
 
     env.close()
@@ -1178,12 +1373,23 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     lengths = [float(ep["episode_length_s"]) for ep in episodes]
     tts = [float(ep["time_to_success_s"]) for ep in episodes if ep["time_to_success_s"] is not None]
     returns = [float(ep["return"]) for ep in episodes]
+    tile_ids = [int(ep["terrain_tile_id"]) for ep in episodes]
+    rounded_layouts = {
+        (
+            int(ep["terrain_tile_id"]),
+            tuple(round(float(value), 2) for value in ep["start_xy"]),
+            tuple(round(float(value), 2) for value in ep["goal_xy"]),
+        )
+        for ep in episodes
+    }
     action_deltas = [float(ep["mean_action_delta"]) for ep in episodes]
     action_flips = [float(ep["action_sign_flips"]) for ep in episodes]
     min_goal_distances = [float(ep["min_goal_distance"]) for ep in episodes]
     action_means = [list(ep["mean_action"]) for ep in episodes]
     abs_action_means = [list(ep["mean_abs_action"]) for ep in episodes]
     small_action_fractions = [float(ep["small_action_fraction"]) for ep in episodes]
+    front_steps = [int(ep["front_obstacle_steps"]) for ep in episodes]
+    front_step_total = max(1, sum(front_steps))
     blocked_counts = [float(ep.get("blocked_corridor_cell_count") or 0.0) for ep in episodes]
     blocking_component_counts = [float(ep.get("blocking_component_count") or 0.0) for ep in episodes]
     path_lengths = [float(ep["straight_path_length"]) for ep in episodes if ep.get("straight_path_length") is not None]
@@ -1209,6 +1415,9 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         "mean_costful_steps": sum(costful_steps) / max(1, len(costful_steps)),
         "mean_collision_steps": sum(collision_steps) / max(1, len(collision_steps)),
         "mean_return": sum(returns) / max(1, len(returns)),
+        "unique_terrain_tiles": int(len(set(tile_ids))),
+        "unique_layout_triplets_2cm": int(len(rounded_layouts)),
+        "duplicate_layout_triplet_rate_2cm": float(1.0 - len(rounded_layouts) / max(1, len(episodes))),
         "mean_action_delta": sum(action_deltas) / max(1, len(action_deltas)),
         "mean_action_sign_flips": sum(action_flips) / max(1, len(action_flips)),
         "mean_min_goal_distance": sum(min_goal_distances) / max(1, len(min_goal_distances)),
@@ -1221,6 +1430,19 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             for axis in range(int(env.action_space.shape[-1]))
         ],
         "mean_small_action_fraction": sum(small_action_fractions) / max(1, len(small_action_fractions)),
+        "front_obstacle_step_fraction": sum(front_steps) / max(1, sum(float(ep["episode_length_s"]) / 0.05 for ep in episodes)),
+        "front_obstacle_abs_steering": sum(
+            float(ep["front_obstacle_abs_steering"]) * int(ep["front_obstacle_steps"]) for ep in episodes
+        ) / front_step_total,
+        "front_obstacle_small_steering_fraction": sum(
+            float(ep["front_obstacle_small_steering_fraction"]) * int(ep["front_obstacle_steps"]) for ep in episodes
+        ) / front_step_total,
+        "front_obstacle_action_delta": sum(
+            float(ep["front_obstacle_action_delta"]) * int(ep["front_obstacle_steps"]) for ep in episodes
+        ) / front_step_total,
+        "mean_front_obstacle_directional_consistency": sum(
+            float(ep["front_obstacle_directional_consistency"]) for ep in episodes if int(ep["front_obstacle_steps"]) > 0
+        ) / max(1, sum(int(ep["front_obstacle_steps"]) > 0 for ep in episodes)),
         "policy_action_smoothing": float(args.policy_action_smoothing),
         "layout_manifest": str(Path(args.layout_manifest).resolve()) if manifest is not None else None,
         "layout_manifest_version": int(manifest["version"]) if manifest is not None else None,
@@ -1250,10 +1472,23 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
 def record_video(args: argparse.Namespace) -> None:
     import imageio.v2 as imageio
 
+    manifest = None
+    manifest_index = int(getattr(args, "video_manifest_index", -1))
+    if str(getattr(args, "layout_manifest", "")):
+        minimum_episodes = manifest_index + 1 if manifest_index >= 0 else 1
+        manifest = load_layout_manifest(Path(args.layout_manifest).resolve(), minimum_episodes=minimum_episodes)
+        args.seed = int(manifest["metadata"]["seed"])
     np.random.seed(int(args.seed))
     torch.manual_seed(int(args.seed))
     env = make_env(args, num_envs=1, render=True)
-    obs_raw, _, _, _, obstacle_cells = _reset_until_feasible(args, env)
+    if manifest is not None and manifest_index >= 0:
+        obs_raw, _ = env.reset()
+        obs_raw, _, _, _, obstacle_cells = _apply_manifest_layouts(
+            args, env, [0], [manifest["episodes"][manifest_index]]
+        )
+        print(f"[video] replaying manifest episode {manifest_index}", flush=True)
+    else:
+        obs_raw, _, _, _, obstacle_cells = _reset_until_feasible(args, env)
     obs = _extract_actor_obs(obs_raw).to(args.device, dtype=torch.float32)
     policy_actor = (
         _load_policy_actor(args, obs_dim=int(obs.shape[1]), act_dim=int(env.action_space.shape[-1]))
@@ -1273,6 +1508,8 @@ def record_video(args: argparse.Namespace) -> None:
         if frame is not None:
             frames.append(frame)
         if bool(done.reshape(-1)[0].item()):
+            if bool(getattr(args, "video_stop_on_done", False)):
+                break
             obs_raw, _, _, _, obstacle_cells = _reset_until_feasible(args, env)
             if teacher_state is not None:
                 teacher_state.reset()
@@ -1297,7 +1534,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-envs", type=int, default=32)
     parser.add_argument("--num-episodes", type=int, default=200)
     parser.add_argument("--episode-length-s", type=float, default=16.0)
+    parser.add_argument(
+        "--navigation-episode-mode",
+        choices=["episodic", "continuous_goals"],
+        default="episodic",
+    )
+    parser.add_argument("--continuous-environment-horizon-s", type=float, default=3600.0)
+    parser.add_argument("--continuous-goal-distance-min", type=float, default=0.0)
+    parser.add_argument("--continuous-goal-distance-max", type=float, default=0.0)
+    parser.add_argument("--continuous-goal-resample-attempts", type=int, default=256)
+    parser.add_argument("--continuous-goal-boundary-margin", type=float, default=0.5)
+    parser.add_argument("--continuous-goal-require-blocked-corridor", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--resample-terrain-tiles", action="store_true")
+    parser.add_argument("--start-position-range", type=float, default=0.0)
     parser.add_argument("--success-dist", type=float, default=0.5)
     parser.add_argument("--terminate-on-goal", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--height-scan-resolution", type=float, default=0.5)
@@ -1319,6 +1568,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name", default=f"unitree_baselines_{time.strftime('%Y%m%d_%H%M%S')}")
     parser.add_argument("--teacher-scan-block-threshold", type=float, default=0.12)
     parser.add_argument("--teacher-scan-block-delta", type=float, default=0.0)
+    parser.add_argument("--decisiveness-front-half-width", type=float, default=0.75)
+    parser.add_argument("--decisiveness-front-min-distance", type=float, default=0.25)
+    parser.add_argument("--decisiveness-front-max-distance", type=float, default=2.0)
     parser.add_argument("--teacher-scan-planner", choices=["heuristic", "astar"], default="heuristic")
     parser.add_argument("--teacher-scan-astar-clearance", type=float, default=0.6)
     parser.add_argument("--teacher-scan-astar-cell-padding", type=float, default=0.35)
@@ -1430,6 +1682,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video-dir", default=str(ROOT / "logs" / "unitree_mjlab" / "baseline_videos"))
     parser.add_argument("--video-length", type=int, default=480)
     parser.add_argument("--video-fps", type=int, default=30)
+    parser.add_argument("--video-manifest-index", type=int, default=-1)
+    parser.add_argument("--video-stop-on-done", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--video-camera-distance", type=float, default=5.0)
+    parser.add_argument("--video-camera-elevation", type=float, default=-10.0)
+    parser.add_argument("--video-camera-azimuth", type=float, default=90.0)
+    parser.add_argument("--video-width", type=int, default=640)
+    parser.add_argument("--video-height", type=int, default=640)
     parser.add_argument("--skip-metrics", action="store_true")
     parser.add_argument("--layout-manifest", default="")
     parser.add_argument("--generate-layout-manifest", default="")
