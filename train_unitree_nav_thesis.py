@@ -886,15 +886,24 @@ def make_env(args: argparse.Namespace, *, render: bool = False):
     env_cfg.seed = int(args.seed)
     from unitree_nav_layout import configure_terrain_tile_resets
 
-    _apply_debug_obstacle_overrides(args, env_cfg)
+    from unitree_target_navigation import configure_target_navigation_terrain
+
+    target_terrain = configure_target_navigation_terrain(
+        env_cfg,
+        args,
+        num_envs=int(args.num_envs if not render else 1),
+    )
+    if not target_terrain:
+        _apply_debug_obstacle_overrides(args, env_cfg)
     _apply_scan_and_goal_overrides(args, env_cfg)
     terrain_generator = getattr(getattr(env_cfg.scene, "terrain", None), "terrain_generator", None)
     if terrain_generator is not None and hasattr(terrain_generator, "seed"):
         terrain_generator.seed = int(args.seed)
-    configure_terrain_tile_resets(
-        env_cfg,
-        enabled=bool(getattr(args, "resample_terrain_tiles", False)),
-    )
+    if not target_terrain:
+        configure_terrain_tile_resets(
+            env_cfg,
+            enabled=bool(getattr(args, "resample_terrain_tiles", False)),
+        )
     env_cfg.scene.num_envs = int(args.num_envs if not render else 1)
     continuous_goals = str(getattr(args, "navigation_episode_mode", "episodic")) == "continuous_goals"
     environment_horizon = (
@@ -1251,6 +1260,8 @@ def run_training(args: argparse.Namespace) -> Path:
     completed_env_returns: list[float] = []
     completed_costs: list[float] = []
     completed_successes: list[float] = []
+    completed_falls: list[float] = []
+    completed_timeouts: list[float] = []
     update_metrics: list[dict[str, float]] = []
     teacher_state = (
         GeomTeacherState.create(num_envs)
@@ -1302,6 +1313,7 @@ def run_training(args: argparse.Namespace) -> Path:
                 student_action, _, student_mean = policy_actor(obs)
                 if args.deterministic_student:
                     student_action = student_mean
+            student_action = student_action * float(args.student_action_scale)
             if float(args.student_action_smoothing) > 0.0:
                 keep = float(args.student_action_smoothing)
                 student_action = keep * previous_student_action + (1.0 - keep) * student_action
@@ -1478,6 +1490,10 @@ def run_training(args: argparse.Namespace) -> Path:
         next_current_obs = _prepare_actor_obs(next_raw, args)
         env_reward = env_reward.to(device=device, dtype=torch.float32).reshape(num_envs)
         done = done.to(device=device).reshape(num_envs).bool()
+        time_outs = torch.as_tensor(
+            extras.get("time_outs", torch.zeros(num_envs, device=device)),
+            device=device,
+        ).reshape(num_envs).bool()
         next_obs = scan_history.step(next_current_obs, done, action=action)
         previous_student_action[done] = 0.0
         previous_teacher_intervened[done] = False
@@ -1509,6 +1525,8 @@ def run_training(args: argparse.Namespace) -> Path:
             reward -= float(args.lateral_action_penalty) * lateral_action_abs
             reward += float(args.success_bonus) * first_success.float()
             reward += float(args.failure_penalty) * (done & ~success).float()
+            reward += float(args.fall_penalty) * (done & ~success & ~time_outs).float()
+            reward += float(args.timeout_penalty) * (done & ~success & time_outs).float()
         else:
             reward = env_reward
         # The vector environment auto-resets before returning next_obs, so a
@@ -1558,6 +1576,8 @@ def run_training(args: argparse.Namespace) -> Path:
             completed_env_returns.extend(episode_env_return[boundary_idx].detach().cpu().tolist())
             completed_costs.extend(episode_cost[boundary_idx].detach().cpu().tolist())
             completed_successes.extend(episode_success[boundary_idx].float().detach().cpu().tolist())
+            completed_falls.extend((done & ~success & ~time_outs)[boundary_idx].float().detach().cpu().tolist())
+            completed_timeouts.extend((done & ~success & time_outs)[boundary_idx].float().detach().cpu().tolist())
             episode_return[boundary_idx] = 0.0
             episode_env_return[boundary_idx] = 0.0
             episode_cost[boundary_idx] = 0.0
@@ -1687,6 +1707,8 @@ def run_training(args: argparse.Namespace) -> Path:
             recent_env_returns = completed_env_returns[-50:]
             recent_costs = completed_costs[-50:]
             recent_successes = completed_successes[-50:]
+            recent_falls = completed_falls[-50:]
+            recent_timeouts = completed_timeouts[-50:]
             latest_updates = update_metrics[-20:]
             avg_update = {
                 k: sum(m.get(k, 0.0) for m in latest_updates) / max(1, len(latest_updates))
@@ -1713,6 +1735,8 @@ def run_training(args: argparse.Namespace) -> Path:
                 "episode_env_return_mean": float(sum(recent_env_returns) / max(1, len(recent_env_returns))) if recent_env_returns else 0.0,
                 "episode_cost_mean": float(sum(recent_costs) / max(1, len(recent_costs))) if recent_costs else 0.0,
                 "success_rate": float(sum(recent_successes) / max(1, len(recent_successes))) if recent_successes else 0.0,
+                "fall_rate": float(sum(recent_falls) / max(1, len(recent_falls))) if recent_falls else 0.0,
+                "timeout_rate": float(sum(recent_timeouts) / max(1, len(recent_timeouts))) if recent_timeouts else 0.0,
                 "ongoing_episode_cost_mean": float(episode_cost.mean().cpu().item()),
                 "ongoing_episode_cost_max": float(episode_cost.max().cpu().item()),
                 "ongoing_success_fraction": float(episode_success.float().mean().cpu().item()),
@@ -1901,6 +1925,9 @@ def render_policy(checkpoint_path: Path, args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+    from unitree_target_navigation import add_target_terrain_args
+
+    add_target_terrain_args(parser)
     parser.add_argument("--task", default="Unitree-G1-Nav-Obstacles-Safe-Collision")
     parser.add_argument(
         "--method",
@@ -1941,6 +1968,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scan-history-stride", type=int, default=1)
     parser.add_argument("--action-history", type=int, default=0)
     parser.add_argument("--student-action-smoothing", type=float, default=0.0)
+    parser.add_argument("--student-action-scale", type=float, default=1.0)
     parser.add_argument("--pad-obs-to-dim", type=int, default=0)
     parser.add_argument("--mask-height-scan", action="store_true")
     parser.add_argument("--mask-proprioception", action="store_true")
@@ -2005,6 +2033,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lateral-action-penalty", type=float, default=0.0)
     parser.add_argument("--success-bonus", type=float, default=1.0)
     parser.add_argument("--failure-penalty", type=float, default=0.0)
+    parser.add_argument("--fall-penalty", type=float, default=0.0)
+    parser.add_argument("--timeout-penalty", type=float, default=0.0)
     parser.add_argument("--teacher-type", choices=["scan", "geom_scan"], default="geom_scan")
     parser.add_argument(
         "--intervention-gate-mode",
