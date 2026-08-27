@@ -87,6 +87,7 @@
 
 - The active integration is the submodule `external/unitree_rl_mjlab`.
 - The target locomotion benchmark is a single seeded continuous arena built by `unitree_target_terrain.py`, not the older isolated 8x8 geometry/material cells. Independent material and geometry brushes may overlap; ice is blue, sand is yellow, static obstacles are red, and moving obstacles are magenta. Preserve exact layout metadata with every train/eval artifact. Use `eval_unitree_target_terrain_policy.py` for flat-policy transfer checks; report matched-flat control, varied target paths, fall timing, command progress, and survival together.
+- High-level target-terrain navigation uses `--target-terrain`; checkpoints preserve its preset, seed, arena size, and material raster resolution. The legacy collision sensor is heightfield-specific and must be disabled for direct-geometry arenas so ordinary ramp/material contact is not mislabeled as collision. Keep fall and timeout penalties and rates separate.
 - Native rough-terrain locomotion inspection uses `eval_unitree_velocity_policy.py` and `scripts/run_unitree_mjlab_velocity_inspect_local.sh`; keep it separate from the high-level navigation task.
 - Rough-terrain inspection must override the velocity task's small contact capacity when needed; the local launcher defaults `NCONMAX=256` to prevent seed-dependent MuJoCo Warp initialization overflow.
 - G1 and Go2 velocity checkpoints are not interchangeable: validate the checkpoint actor output before environment construction (`29` G1 joints versus `12` Go2 joints).

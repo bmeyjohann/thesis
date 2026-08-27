@@ -620,6 +620,7 @@ class TargetArenaTerrainCfg(SubTerrainCfg):
 
     seed: int = 3
     preset: str = "balanced"
+    material_resolution: float = 0.5
 
     def function(
         self,
@@ -655,6 +656,7 @@ class TargetArenaTerrainCfg(SubTerrainCfg):
             min_x=0.0,
             min_y=0.0,
             prefix="target_material_tile",
+            resolution=float(self.material_resolution),
         )
 
         for index, brush in enumerate(layout.geometry):

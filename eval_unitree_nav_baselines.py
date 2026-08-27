@@ -260,16 +260,21 @@ def make_env(args: argparse.Namespace, *, num_envs: int, render: bool):
 
     if hasattr(args, "seed"):
         env_cfg.seed = int(args.seed)
-    _apply_debug_obstacle_overrides(args, env_cfg)
+    from unitree_target_navigation import configure_target_navigation_terrain
+
+    target_terrain = configure_target_navigation_terrain(env_cfg, args, num_envs=int(num_envs))
+    if not target_terrain:
+        _apply_debug_obstacle_overrides(args, env_cfg)
     _apply_scan_and_goal_overrides(args, env_cfg)
     terrain_generator = getattr(getattr(env_cfg.scene, "terrain", None), "terrain_generator", None)
     if terrain_generator is not None and hasattr(terrain_generator, "seed"):
         # Environment reset seeding does not necessarily seed procedural terrain generation.
         terrain_generator.seed = int(args.seed)
-    configure_terrain_tile_resets(
-        env_cfg,
-        enabled=bool(getattr(args, "resample_terrain_tiles", False)),
-    )
+    if not target_terrain:
+        configure_terrain_tile_resets(
+            env_cfg,
+            enabled=bool(getattr(args, "resample_terrain_tiles", False)),
+        )
     configure_start_position_range(
         env_cfg,
         half_width=float(getattr(args, "start_position_range", 0.0)),
@@ -319,6 +324,11 @@ def _terrain_obstacle_cells_by_env(env) -> list[np.ndarray]:
     model = unwrapped.sim.model
     nrow = _to_numpy(model.hfield_nrow).astype(int)
     ncol = _to_numpy(model.hfield_ncol).astype(int)
+    # Target arenas are assembled from direct MuJoCo geoms and intentionally
+    # have no hfield. Their geometry is still visible to the policy scanner;
+    # legacy heightfield-only feasibility diagnostics simply have no cells.
+    if nrow.size == 0 or ncol.size == 0:
+        return [np.zeros((0, 2), dtype=np.float32) for _ in range(len(env_origins))]
     sizes = _to_numpy(model.hfield_size)
     data = _to_numpy(model.hfield_data)
     offsets = np.concatenate([[0], np.cumsum(nrow * ncol)])
@@ -1755,6 +1765,9 @@ def record_video(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+    from unitree_target_navigation import add_target_terrain_args
+
+    add_target_terrain_args(parser)
     parser.add_argument("--controller", choices=["direct_goal", "scan_teacher", "geom_scan_teacher", "policy"], required=True)
     parser.add_argument("--model-path", default="")
     parser.add_argument("--task", default="Unitree-G1-Nav-Obstacles-Safe-Collision")

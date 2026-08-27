@@ -8,6 +8,11 @@ import torch
 
 UNITREE_EVAL_CONFIG_KEYS = (
     "task",
+    "target_terrain",
+    "target_terrain_preset",
+    "target_terrain_seed",
+    "target_terrain_arena_size",
+    "target_terrain_material_resolution",
     "low_level_policy_path",
     "episode_length_s",
     "navigation_episode_mode",
@@ -32,6 +37,7 @@ UNITREE_EVAL_CONFIG_KEYS = (
     "scan_history",
     "scan_history_stride",
     "action_history",
+    "student_action_scale",
     "mask_height_scan",
     "mask_proprioception",
     "mask_goal_heading",
