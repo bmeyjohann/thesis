@@ -3,10 +3,12 @@
 ## Core Working Rules
 
 - When the user corrects a workflow or is dissatisfied, add one concise durable rule here and a short local note under `codex/`.
+- Preserve requested capabilities behind explicit approval gates; do not turn permission requirements into default read-only restrictions.
 - Save other durable project context under `codex/` and always tell the user when doing so.
 - Never commit `codex/`, `.codex/config.toml`, runtime credentials, local datasets, model artifacts, or machine-specific state.
 - Use `apply_patch` for file edits and follow tool/API contracts literally.
 - Default copy/paste commands to multiline shell syntax with trailing `\` continuations.
+- Present user-facing local artifact paths as clickable Markdown links. For WSL artifacts use Markdown links of the form [label](file://wsl.localhost/Ubuntu/...); do not use plain or code-formatted paths when the user needs to open them.
 - Keep train, eval, plotting, and launch commands synchronized. Checkpoints should serialize settings required to reconstruct evaluation.
 - Update this file in the same change whenever project architecture or durable operating constraints change.
 - Prefer explicit environment-family entrypoints and control paths over opaque generic routing.
@@ -29,7 +31,7 @@
 
 ## Experiment Operations
 
-- GPU experiments must use the `autonomous-research` skill and experiment queue; do not probe `/dev/dxg` or assume sandbox GPU access.
+- GPU experiments should use the established experiment queue when appropriate; the retired user-level `autonomous-research` skill is not required. Run WSL GPU commands through the approved WSL workflow and verify device visibility before expensive work.
 - Queue wrappers under `scripts/generated/` must be self-contained, export the full config, and invoke repo launchers by absolute path.
 - Smoke-check generated launchers against the live parser before queue submission.
 - `stop_now` is queue-wide. Use `cancel_job` only for queued jobs; do not use `stop_now` to target one running job.
@@ -84,6 +86,7 @@
 ## Unitree / Isaac Navigation Architecture
 
 - The active integration is the submodule `external/unitree_rl_mjlab`.
+- The target locomotion benchmark is a single seeded continuous arena built by `unitree_target_terrain.py`, not the older isolated 8x8 geometry/material cells. Independent material and geometry brushes may overlap; ice is blue, sand is yellow, static obstacles are red, and moving obstacles are magenta. Preserve exact layout metadata with every train/eval artifact. Use `eval_unitree_target_terrain_policy.py` for flat-policy transfer checks; report matched-flat control, varied target paths, fall timing, command progress, and survival together.
 - Native rough-terrain locomotion inspection uses `eval_unitree_velocity_policy.py` and `scripts/run_unitree_mjlab_velocity_inspect_local.sh`; keep it separate from the high-level navigation task.
 - Rough-terrain inspection must override the velocity task's small contact capacity when needed; the local launcher defaults `NCONMAX=256` to prevent seed-dependent MuJoCo Warp initialization overflow.
 - G1 and Go2 velocity checkpoints are not interchangeable: validate the checkpoint actor output before environment construction (`29` G1 joints versus `12` Go2 joints).
@@ -141,6 +144,9 @@
 - PowerShell launchers that emit Bash commands must avoid nested quote literals. Build shell-escape sequences with explicit character codes or pass values through a robust transport, then run a native PowerShell parse check before reporting them runnable.
 - Human Unitree datasets are immutable chunked NPZ directories with a manifest. Preserve policy and human transitions, intervention edges, and transport status; derive cleaned subsets separately after auditing the raw collection.
 - Goal-only checkpoints may restore `disable_obstacles=True`; human collection must restore their policy shape while explicitly forcing the obstacle benchmark back on.
+- Unitree checkpoint-initialized human launchers must default scanner overrides to zero so checkpoint metadata reconstructs the trained observation shape; only scratch runs may choose a new scanner geometry automatically.
+- Unitree continuous terrain-bank navigation must use one authoritative global heightfield geometry for goal feasibility and viewer overlays; never clamp continuous goals or obstacle overlays to the initially assigned terrain tile.
+- Unitree interactive global maps must use a robot-centered moving viewport and filter authoritative terrain geometry against that viewport each frame; do not auto-fit distant goals. Keep a low-resolution MuJoCo RGB panel available alongside the height-scan overlay, with configurable frame skipping and expensive shadows/reflections disabled by default.
 - Human-control status must report transport connection, fresh receipt, state age, axes, and gate state; "configured" is not evidence that Windows input is arriving in WSL.
 - Windows controller publishers must use the existing `C:\Users\benja\miniconda3\envs\thesis\python.exe` environment, not a transient `uv` environment with only Pygame.
 - Windows-to-WSL human collection must probe the Windows publisher port before launching WSL; fail locally with the sender traceback rather than beginning a run that can only report connection refused.
@@ -181,3 +187,16 @@
 - Confirm train/eval manifests and checkpoint metadata agree.
 - Inspect generated trajectory/visual artifacts rather than relying only on scalar summaries.
 - Report anything not tested, unavailable GPU/runtime dependencies, and any publish blocker explicitly.
+
+<!-- codex-windows-wsl-migration:start -->
+## Codex Windows/WSL Environment
+
+- Codex Desktop now runs with the native Windows agent, but this repository and its established environments remain WSL-native.
+- The canonical repository is `/home/benjamin/thesis` inside the `Ubuntu` distribution; Windows registers the same repository as `\\wsl$\Ubuntu\home\benjamin\thesis`.
+- Continue using the existing WSL environments, dependency caches, Linux tooling, and GPU workflow. Do not recreate them on Windows unless the user explicitly requests a Windows environment.
+- Run repository builds, tests, training, evaluation, and environment commands through `wsl.exe -d Ubuntu -- bash -lc 'cd /home/benjamin/thesis && ...'` or in a dedicated WSL shell. Native Windows tools remain appropriate for Desktop integrations, Browser, Chrome, Computer Use, and host-side utilities.
+- Before running commands in a migrated task, verify the current working directory and intended environment. Old conversational context may still describe Codex itself as WSL-backed; that is historical, while the project environment remains in WSL.
+- WSL commands launched from native Codex cross the Windows sandbox boundary and may require explicit approval. Do not weaken the global sandbox or switch to Full Access merely to avoid that approval.
+- Treat the Windows Codex task history as canonical from now on. Do not continue the same migrated task independently from the old WSL Codex home, because the two histories are no longer synchronized.
+- The retired user-level `autonomous-research` and `codex-thread-rollover` skills are not required for ordinary work. Follow any still-relevant repository-local experiment-queue rules directly.
+<!-- codex-windows-wsl-migration:end -->
