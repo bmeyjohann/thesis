@@ -21,9 +21,10 @@ for arg in "$@"; do
   fi
 done
 
-export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/mplconfig}"
-export WARP_CACHE_PATH="${WARP_CACHE_PATH:-/tmp/warp-cache}"
-export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/tmp/unitree-cache}"
+UNITREE_CACHE_ROOT="${UNITREE_CACHE_ROOT:-$HOME/.cache/unitree-nav}"
+export MPLCONFIGDIR="${MPLCONFIGDIR:-$UNITREE_CACHE_ROOT/matplotlib}"
+export WARP_CACHE_PATH="${WARP_CACHE_PATH:-$UNITREE_CACHE_ROOT/warp}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$UNITREE_CACHE_ROOT/xdg}"
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
 
 mkdir -p "$MPLCONFIGDIR" "$WARP_CACHE_PATH" "$XDG_CACHE_HOME"
@@ -120,6 +121,11 @@ fi
 # EVAL_INTERVAL=0 explicitly only for short infrastructure smoke tests.
 EVAL_INTERVAL_RESOLVED="${EVAL_INTERVAL:-${CHECKPOINT_INTERVAL:-5000}}"
 
+CONTINUOUS_BLOCKED_ARGS=(--no-continuous-goal-require-blocked-corridor)
+if [[ "${CONTINUOUS_GOAL_REQUIRE_BLOCKED_CORRIDOR:-0}" == "1" ]]; then
+  CONTINUOUS_BLOCKED_ARGS=(--continuous-goal-require-blocked-corridor)
+fi
+
 exec "$PYTHON_BIN" "$ROOT_DIR/train_unitree_nav_thesis.py" \
   --task "$TASK" \
   --method "${METHOD:-thesis}" \
@@ -131,6 +137,9 @@ exec "$PYTHON_BIN" "$ROOT_DIR/train_unitree_nav_thesis.py" \
   --continuous-environment-horizon-s "${CONTINUOUS_ENVIRONMENT_HORIZON_S:-3600}" \
   --continuous-goal-distance-min "${CONTINUOUS_GOAL_DISTANCE_MIN:-0.0}" \
   --continuous-goal-distance-max "${CONTINUOUS_GOAL_DISTANCE_MAX:-0.0}" \
+  --continuous-goal-region-mode "${CONTINUOUS_GOAL_REGION_MODE:-assigned_tile}" \
+  --continuous-goal-blocked-probability "${CONTINUOUS_GOAL_BLOCKED_PROBABILITY:-1.0}" \
+  "${CONTINUOUS_BLOCKED_ARGS[@]}" \
   --continuous-goal-resample-attempts "${CONTINUOUS_GOAL_RESAMPLE_ATTEMPTS:-256}" \
   --continuous-goal-boundary-margin "${CONTINUOUS_GOAL_BOUNDARY_MARGIN:-0.5}" \
   --low-level-policy-path "$LOW_LEVEL_POLICY_PATH" \
@@ -151,8 +160,19 @@ exec "$PYTHON_BIN" "$ROOT_DIR/train_unitree_nav_thesis.py" \
   --hidden-dim "${HIDDEN_DIM:-256}" \
   --policy-encoder "${POLICY_ENCODER:-mlp}" \
   --height-scan-resolution "${HEIGHT_SCAN_RESOLUTION:-0.5}" \
+  --height-scan-pattern "${HEIGHT_SCAN_PATTERN:-grid}" \
+  --height-scan-frustum-near "${HEIGHT_SCAN_FRUSTUM_NEAR:-0.25}" \
+  --height-scan-frustum-far "${HEIGHT_SCAN_FRUSTUM_FAR:-4.0}" \
+  --height-scan-frustum-fov-deg "${HEIGHT_SCAN_FRUSTUM_FOV_DEG:-70.0}" \
+  --height-scan-frustum-side "${HEIGHT_SCAN_FRUSTUM_SIDE:-17}" \
+  --height-scan-forward-size "${HEIGHT_SCAN_FORWARD_SIZE:-0.0}" \
+  --height-scan-lateral-size "${HEIGHT_SCAN_LATERAL_SIZE:-0.0}" \
   --scan-history "${SCAN_HISTORY:-1}" \
+  --scan-history-stride "${SCAN_HISTORY_STRIDE:-1}" \
   --action-history "${ACTION_HISTORY:-0}" \
+  --goal-encoding "${GOAL_ENCODING:-cartesian}" \
+  --goal-distance-scale "${GOAL_DISTANCE_SCALE:-14.0}" \
+  --velocity-scale "${VELOCITY_SCALE:-1.0}" \
   "${MASK_HEIGHT_SCAN_FLAG[@]}" \
   "${MASK_PROPRIOCEPTION_FLAG[@]}" \
   "${MASK_GOAL_HEADING_FLAG[@]}" \

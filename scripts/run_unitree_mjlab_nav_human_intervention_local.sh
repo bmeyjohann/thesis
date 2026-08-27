@@ -27,13 +27,19 @@ GAMEPAD_PORT="${GAMEPAD_PORT:-8794}"
 
 RUN_ID="${RUN_ID:-unitree_human_$(date +%Y%m%d_%H%M%S)}"
 DATASET_DIR="${HUMAN_DATASET_DIR:-$ROOT_DIR/local/unitree_human_interventions/$RUN_ID}"
-export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/mplconfig}"
-export WARP_CACHE_PATH="${WARP_CACHE_PATH:-/tmp/warp-cache}"
-export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/tmp/unitree-cache}"
+UNITREE_CACHE_ROOT="${UNITREE_CACHE_ROOT:-$HOME/.cache/unitree-nav}"
+export MPLCONFIGDIR="${MPLCONFIGDIR:-$UNITREE_CACHE_ROOT/matplotlib}"
+export WARP_CACHE_PATH="${WARP_CACHE_PATH:-$UNITREE_CACHE_ROOT/warp}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$UNITREE_CACHE_ROOT/xdg}"
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
 mkdir -p "$MPLCONFIGDIR" "$WARP_CACHE_PATH" "$XDG_CACHE_HOME"
 
+if [[ "${UNITREE_WSLG_PREFLIGHT:-1}" == "1" ]]; then
+  "$ROOT_DIR/scripts/unitree_wslg_preflight.sh"
+fi
+
 echo "Starting Unitree human-intervention collection"
+echo "cache root: $UNITREE_CACHE_ROOT"
 echo "checkpoint: $MODEL_PATH"
 echo "environment: obstacle navigation forced on (checkpoint policy architecture retained)"
 echo "gamepad:    $GAMEPAD_HOST:$GAMEPAD_PORT"
@@ -57,6 +63,7 @@ if [[ "${ONLINE_TRAIN:-0}" == "1" ]]; then
     --online-train
     --online-run-name "${ONLINE_RUN_NAME:-$RUN_ID}"
     --online-objective-mode "${ONLINE_OBJECTIVE_MODE:-pref_bc_rl}"
+    --online-total-steps "${ONLINE_TOTAL_STEPS:-0}"
     --online-output-dir "${ONLINE_OUTPUT_DIR:-$ROOT_DIR/models/unitree_mjlab_nav_human}"
     --online-learning-starts "${ONLINE_LEARNING_STARTS:-500}"
     --online-updates-per-step "${ONLINE_UPDATES_PER_STEP:-1}"
@@ -79,8 +86,17 @@ if [[ "${ONLINE_TRAIN:-0}" == "1" ]]; then
   fi
 fi
 STUDENT_VIEW_ARGS=()
-if [[ "${STUDENT_VIEW:-1}" == "1" ]]; then
+if [[ "${STUDENT_VIEW:-0}" == "1" ]]; then
   STUDENT_VIEW_ARGS=(--student-view)
+fi
+RGB_VIEW_ARGS=()
+if [[ "${SHOW_RGB:-1}" == "1" ]]; then
+  RGB_VIEW_ARGS=(--show-rgb)
+fi
+
+CONTINUOUS_BLOCKED_ARGS=(--no-continuous-goal-require-blocked-corridor)
+if [[ "${CONTINUOUS_GOAL_REQUIRE_BLOCKED_CORRIDOR:-1}" == "1" ]]; then
+  CONTINUOUS_BLOCKED_ARGS=(--continuous-goal-require-blocked-corridor)
 fi
 
 exec "$PYTHON_BIN" "$ROOT_DIR/eval_interactive_unitree_nav.py" \
@@ -100,21 +116,46 @@ exec "$PYTHON_BIN" "$ROOT_DIR/eval_interactive_unitree_nav.py" \
   --gamepad-status-interval-s "${GAMEPAD_STATUS_INTERVAL_S:-1.0}" \
   --fps "${FPS:-30}" \
   --sim-fps "${SIM_FPS:-20}" \
-  --show-rgb \
+  "${RGB_VIEW_ARGS[@]}" \
+  --rgb-every "${RGB_EVERY:-5}" \
+  --video-width "${VIDEO_WIDTH:-320}" \
+  --video-height "${VIDEO_HEIGHT:-240}" \
+  --video-camera-distance "${VIDEO_CAMERA_DISTANCE:-7.0}" \
+  --video-camera-elevation "${VIDEO_CAMERA_ELEVATION:--65.0}" \
+  --video-camera-azimuth "${VIDEO_CAMERA_AZIMUTH:-90.0}" \
+  --video-max-extra-envs "${VIDEO_MAX_EXTRA_ENVS:-0}" \
+  --no-video-enable-shadows \
+  --no-video-enable-reflections \
   --show-scan-samples \
   --no-start-paused \
   --auto-reset \
-  --navigation-episode-mode "${NAVIGATION_EPISODE_MODE:-continuous_goals}" \
+  --runtime-navigation-episode-mode "${NAVIGATION_EPISODE_MODE:-continuous_goals}" \
+  --seed "${SEED:-0}" \
   --continuous-environment-horizon-s "${CONTINUOUS_ENVIRONMENT_HORIZON_S:-3600}" \
-  --continuous-goal-distance-min "${CONTINUOUS_GOAL_DISTANCE_MIN:-4.5}" \
-  --continuous-goal-distance-max "${CONTINUOUS_GOAL_DISTANCE_MAX:-7.0}" \
-  --continuous-goal-resample-attempts "${CONTINUOUS_GOAL_RESAMPLE_ATTEMPTS:-256}" \
+  --continuous-goal-distance-min "${CONTINUOUS_GOAL_DISTANCE_MIN:-8.0}" \
+  --continuous-goal-distance-max "${CONTINUOUS_GOAL_DISTANCE_MAX:-14.0}" \
+  --continuous-goal-region-mode "${CONTINUOUS_GOAL_REGION_MODE:-terrain_bank}" \
+  --continuous-goal-blocked-probability "${CONTINUOUS_GOAL_BLOCKED_PROBABILITY:-0.85}" \
+  "${CONTINUOUS_BLOCKED_ARGS[@]}" \
+  --continuous-goal-resample-attempts "${CONTINUOUS_GOAL_RESAMPLE_ATTEMPTS:-1024}" \
   --continuous-goal-boundary-margin "${CONTINUOUS_GOAL_BOUNDARY_MARGIN:-0.5}" \
+  --viewer-map-radius "${VIEWER_MAP_RADIUS:-7.0}" \
   --min-goal-obstacle-clearance "${MIN_GOAL_OBSTACLE_CLEARANCE:-1.0}" \
   --checkpoint-env-config \
-  --height-scan-resolution "${HEIGHT_SCAN_RESOLUTION:-0.25}" \
+  --height-scan-resolution "${HEIGHT_SCAN_RESOLUTION:-0.0}" \
+  --height-scan-pattern "${HEIGHT_SCAN_PATTERN:-grid}" \
+  --height-scan-frustum-near "${HEIGHT_SCAN_FRUSTUM_NEAR:-0.25}" \
+  --height-scan-frustum-far "${HEIGHT_SCAN_FRUSTUM_FAR:-4.0}" \
+  --height-scan-frustum-fov-deg "${HEIGHT_SCAN_FRUSTUM_FOV_DEG:-70.0}" \
+  --height-scan-frustum-side "${HEIGHT_SCAN_FRUSTUM_SIDE:-17}" \
   --height-scan-forward-size "${HEIGHT_SCAN_FORWARD_SIZE:-0.0}" \
   --height-scan-lateral-size "${HEIGHT_SCAN_LATERAL_SIZE:-0.0}" \
+  --scan-history "${SCAN_HISTORY:-1}" \
+  --scan-history-stride "${SCAN_HISTORY_STRIDE:-1}" \
+  --action-history "${ACTION_HISTORY:-0}" \
+  --goal-encoding "${GOAL_ENCODING:-distance_bearing}" \
+  --goal-distance-scale "${GOAL_DISTANCE_SCALE:-14.0}" \
+  --velocity-scale "${VELOCITY_SCALE:-1.0}" \
   --force-obstacles \
   --force-obstacle-profile strict_blocked_v1 \
   --start-position-range "${START_POSITION_RANGE:-0.8}" \

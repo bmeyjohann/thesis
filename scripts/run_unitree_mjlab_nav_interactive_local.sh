@@ -5,9 +5,10 @@ ROOT_DIR="${REPO_ROOT:-/home/benjamin/thesis}"
 PYTHON_BIN="${PYTHON_BIN:-/home/benjamin/miniconda3/envs/fasttd3/bin/python}"
 : "${MODEL_PATH:?Set MODEL_PATH to a Unitree navigation checkpoint}"
 
-export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/mplconfig}"
-export WARP_CACHE_PATH="${WARP_CACHE_PATH:-/tmp/warp-cache}"
-export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/tmp/unitree-cache}"
+UNITREE_CACHE_ROOT="${UNITREE_CACHE_ROOT:-$HOME/.cache/unitree-nav}"
+export MPLCONFIGDIR="${MPLCONFIGDIR:-$UNITREE_CACHE_ROOT/matplotlib}"
+export WARP_CACHE_PATH="${WARP_CACHE_PATH:-$UNITREE_CACHE_ROOT/warp}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$UNITREE_CACHE_ROOT/xdg}"
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
 mkdir -p "$MPLCONFIGDIR" "$WARP_CACHE_PATH" "$XDG_CACHE_HOME"
 

@@ -356,6 +356,9 @@ def _prepare_actor_obs(obs: Any, args: argparse.Namespace) -> torch.Tensor:
         mask_proprioception=bool(getattr(args, "mask_proprioception", False)),
         mask_goal_heading=bool(getattr(args, "mask_goal_heading", False)),
         mask_height_scan=bool(getattr(args, "mask_height_scan", False)),
+        goal_encoding=str(getattr(args, "goal_encoding", "cartesian")),
+        goal_distance_scale=float(getattr(args, "goal_distance_scale", 14.0)),
+        velocity_scale=float(getattr(args, "velocity_scale", 1.0)),
     )
 
 
@@ -389,9 +392,15 @@ def _extract_cost(extras: Any, num_envs: int, device: torch.device) -> torch.Ten
     return torch.zeros(num_envs, device=device)
 
 
-def _goal_success(obs: torch.Tensor, threshold: float) -> torch.Tensor:
-    goal_xy = obs[:, 6:8]
-    return torch.linalg.norm(goal_xy, dim=-1) <= float(threshold)
+def _goal_success(obs: torch.Tensor, threshold: float, args: argparse.Namespace) -> torch.Tensor:
+    from unitree_nav_observation import unitree_goal_distance
+
+    distance = unitree_goal_distance(
+        obs,
+        goal_encoding=str(getattr(args, "goal_encoding", "cartesian")),
+        goal_distance_scale=float(getattr(args, "goal_distance_scale", 14.0)),
+    )
+    return distance <= float(threshold)
 
 
 def _scan_astar_teacher_action(
@@ -412,6 +421,12 @@ def _scan_astar_teacher_action(
     waypoint_index: int,
     side_penalty: float,
     commit_steps: int,
+    scan_pattern: str,
+    scan_forward_size: float,
+    scan_lateral_size: float,
+    scan_frustum_near: float,
+    scan_frustum_far: float,
+    scan_frustum_fov_deg: float,
 ) -> tuple[torch.Tensor, torch.Tensor, TeacherDiagnostics]:
     """Plan over the exact square scan supplied to the student policy."""
     from unitree_nav_geom_teacher import _astar_local_target
@@ -430,11 +445,17 @@ def _scan_astar_teacher_action(
     if float(scan_block_delta) > 0.0:
         blocked |= flat_scan < (reference - float(scan_block_delta))
 
-    coords = np.linspace(-1.5, 1.5, side, dtype=np.float64)
-    forward, lateral = np.meshgrid(coords, coords, indexing="xy")
-    # meshgrid(x=forward, y=lateral) yields rows=lateral, columns=forward,
-    # matching the actor observation flattening verified against hit_pos_w.
-    scan_points = np.stack([forward.reshape(-1), lateral.reshape(-1)], axis=1)
+    from unitree_nav_scan import scan_points_numpy
+
+    scan_points = scan_points_numpy(
+        pattern=scan_pattern,
+        side=side,
+        forward_size=scan_forward_size,
+        lateral_size=scan_lateral_size,
+        frustum_near=scan_frustum_near,
+        frustum_far=scan_frustum_far,
+        frustum_fov_deg=scan_frustum_fov_deg,
+    )
     blocked_np = blocked.detach().cpu().numpy()
     goals_np = goal_xy.detach().cpu().numpy()
     actions: list[list[float]] = []
@@ -557,6 +578,12 @@ def scan_teacher_action(
     astar_waypoint_index: int = 3,
     astar_side_penalty: float = 8.0,
     astar_commit_steps: int = 30,
+    scan_pattern: str = "grid",
+    scan_forward_size: float = 3.0,
+    scan_lateral_size: float = 3.0,
+    scan_frustum_near: float = 0.25,
+    scan_frustum_far: float = 4.0,
+    scan_frustum_fov_deg: float = 70.0,
 ) -> tuple[torch.Tensor, torch.Tensor, TeacherDiagnostics]:
     """Observation-only height-scan teacher.
 
@@ -583,6 +610,12 @@ def scan_teacher_action(
             waypoint_index=astar_waypoint_index,
             side_penalty=astar_side_penalty,
             commit_steps=astar_commit_steps,
+            scan_pattern=scan_pattern,
+            scan_forward_size=scan_forward_size,
+            scan_lateral_size=scan_lateral_size,
+            scan_frustum_near=scan_frustum_near,
+            scan_frustum_far=scan_frustum_far,
+            scan_frustum_fov_deg=scan_frustum_fov_deg,
         )
 
     device = obs.device
@@ -597,11 +630,18 @@ def scan_teacher_action(
     scan = obs[:, 9:].reshape(n, side, side)
     min_scan = torch.nan_to_num(scan, nan=1.0).amin(dim=(1, 2))
 
-    coords = torch.linspace(-1.5, 1.5, side, device=device)
-    # Isaac's grid flattens with row=lateral and column=forward.  This was
-    # verified against terrain_scan.data.hit_pos_w; do not swap these axes.
-    forward = coords.view(1, side).expand(side, side)
-    lateral = coords.view(side, 1).expand(side, side)
+    from unitree_nav_scan import scan_lateral_forward_coordinates
+
+    lateral, forward = scan_lateral_forward_coordinates(
+        pattern=scan_pattern,
+        side=side,
+        forward_size=scan_forward_size,
+        lateral_size=scan_lateral_size,
+        frustum_near=scan_frustum_near,
+        frustum_far=scan_frustum_far,
+        frustum_fov_deg=scan_frustum_fov_deg,
+        device=device,
+    )
     cell_angle = torch.atan2(lateral.reshape(-1), forward.reshape(-1).clamp_min(1e-4))
     front_mask = forward.reshape(-1) > 0.0
     flat_scan = scan.reshape(n, scan_dim)
@@ -1076,6 +1116,7 @@ def run_training(args: argparse.Namespace) -> Path:
         _terrain_obstacle_cells_by_env,
         _layout_blocked_corridor_stats,
         _resample_close_goals,
+        _reset_until_feasible,
         _set_goal_through_obstacle,
         _validate_required_blocked_corridors,
         direct_goal_action,
@@ -1104,18 +1145,21 @@ def run_training(args: argparse.Namespace) -> Path:
         )
 
     env = make_env(args, render=False)
-    obs_raw = _reset_train_env(args, env)
-    obstacle_cells = _terrain_obstacle_cells_by_env(env)
-    adjusted_obs = _set_goal_through_obstacle(args, env, obstacle_cells)
-    if adjusted_obs is not None:
-        obs_raw = adjusted_obs
-    clearance_obs, _ = _resample_close_goals(args, env, obstacle_cells)
-    if clearance_obs is not None:
-        obs_raw = clearance_obs
-    _validate_required_blocked_corridors(args, env, obstacle_cells)
-    from unitree_nav_observation import UnitreeScanHistory, current_unitree_scan_obs
+    (
+        obs_raw,
+        _,
+        _,
+        _,
+        obstacle_cells,
+    ) = _reset_until_feasible(args, env)
+    from unitree_nav_observation import UnitreeScanHistory, current_unitree_scan_obs, unitree_goal_distance, unitree_goal_xy
 
-    scan_history = UnitreeScanHistory(args.scan_history, args.action_history, int(env.action_space.shape[-1]))
+    scan_history = UnitreeScanHistory(
+        args.scan_history,
+        args.action_history,
+        int(env.action_space.shape[-1]),
+        history_stride=args.scan_history_stride,
+    )
     obs = scan_history.reset(_prepare_actor_obs(obs_raw, args))
     num_envs, obs_dim = int(obs.shape[0]), int(obs.shape[1])
     act_dim = int(env.action_space.shape[-1])
@@ -1335,13 +1379,19 @@ def run_training(args: argparse.Namespace) -> Path:
                     astar_waypoint_index=args.teacher_scan_astar_waypoint_index,
                     astar_side_penalty=args.teacher_scan_astar_side_penalty,
                     astar_commit_steps=args.teacher_scan_astar_commit_steps,
+                    scan_pattern=args.height_scan_pattern,
+                    scan_forward_size=args.height_scan_forward_size or 3.0,
+                    scan_lateral_size=args.height_scan_lateral_size or 3.0,
+                    scan_frustum_near=args.height_scan_frustum_near,
+                    scan_frustum_far=args.height_scan_frustum_far,
+                    scan_frustum_fov_deg=args.height_scan_frustum_fov_deg,
                 )
                 goal_blocked_fraction = diag.goal_blocked_fraction
                 min_scan_mean = diag.min_scan_mean
             delta = torch.linalg.norm(student_action - teacher_action, dim=-1)
             delta_gate = delta >= float(args.intervention_delta)
             clearance = _robot_clearances(env, obstacle_cells)
-            goal_distance = torch.linalg.norm(obs[:, 6:8], dim=-1)
+            goal_distance = unitree_goal_distance(obs, goal_encoding=args.goal_encoding, goal_distance_scale=args.goal_distance_scale)
             if args.intervention_gate_mode == "clearance_or_stall":
                 (
                     clearance_gate,
@@ -1392,7 +1442,8 @@ def run_training(args: argparse.Namespace) -> Path:
 
         # Goal-only pretraining should learn to turn and walk forward rather
         # than exploit backwards or lateral locomotion for Euclidean progress.
-        goal_angle = torch.atan2(obs[:, 7], obs[:, 6])
+        goal_xy_for_reward = unitree_goal_xy(obs, goal_encoding=args.goal_encoding, goal_distance_scale=args.goal_distance_scale)
+        goal_angle = torch.atan2(goal_xy_for_reward[:, 1], goal_xy_for_reward[:, 0])
         reverse_action = torch.relu(-action[:, 0])
         lateral_action_abs = action[:, 1].abs()
         goal_turn_alignment = torch.sign(goal_angle) * action[:, 2]
@@ -1438,7 +1489,7 @@ def run_training(args: argparse.Namespace) -> Path:
         interval_student_costful_steps += int((costful & ~teacher_intervened).sum().detach().cpu().item())
         interval_teacher_rows += int(teacher_intervened.sum().detach().cpu().item())
         interval_student_rows += int((~teacher_intervened).sum().detach().cpu().item())
-        success = _goal_success(next_obs, args.success_dist) | terminal_success
+        success = _goal_success(next_obs, args.success_dist, args) | terminal_success
         first_success = success & ~episode_success
         continuous_goals = str(args.navigation_episode_mode) == "continuous_goals"
         goal_boundary = success if continuous_goals else torch.zeros_like(success)
@@ -1529,6 +1580,9 @@ def run_training(args: argparse.Namespace) -> Path:
 
         if done.any():
             done_idx = torch.nonzero(done, as_tuple=False).flatten()
+            if _needs_feasible_reset(args):
+                obs = scan_history.reset(_prepare_actor_obs(_reset_train_env(args, env), args))
+                continue
             obstacle_cells = _terrain_obstacle_cells_by_env(env)
             adjusted_obs = _set_goal_through_obstacle(args, env, obstacle_cells, env_ids=done_idx)
             if adjusted_obs is not None:
@@ -1537,9 +1591,6 @@ def run_training(args: argparse.Namespace) -> Path:
             if clearance_obs is not None:
                 next_obs = scan_history.reset(_prepare_actor_obs(clearance_obs, args), done_idx)
             _validate_required_blocked_corridors(args, env, obstacle_cells, done_idx)
-            if _needs_feasible_reset(args):
-                obs = scan_history.reset(_prepare_actor_obs(_reset_train_env(args, env), args))
-                continue
 
         obs = next_obs
 
@@ -1828,6 +1879,7 @@ def render_policy(checkpoint_path: Path, args: argparse.Namespace) -> None:
         getattr(eval_args, "scan_history", 1),
         getattr(eval_args, "action_history", 0),
         int(env.action_space.shape[-1]),
+        history_stride=getattr(eval_args, "scan_history_stride", 1),
     )
     obs = scan_history.reset(_prepare_actor_obs(obs_raw, eval_args))
     from eval_unitree_nav_baselines import _load_policy_actor
@@ -1878,15 +1930,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--policy-encoder", choices=["mlp", "scan_cnn"], default="mlp")
     parser.add_argument("--height-scan-resolution", type=float, default=0.5)
+    parser.add_argument("--height-scan-pattern", choices=["grid", "forward_frustum"], default="grid")
+    parser.add_argument("--height-scan-frustum-near", type=float, default=0.25)
+    parser.add_argument("--height-scan-frustum-far", type=float, default=4.0)
+    parser.add_argument("--height-scan-frustum-fov-deg", type=float, default=70.0)
+    parser.add_argument("--height-scan-frustum-side", type=int, default=17)
     parser.add_argument("--height-scan-forward-size", type=float, default=0.0)
     parser.add_argument("--height-scan-lateral-size", type=float, default=0.0)
     parser.add_argument("--scan-history", type=int, default=1)
+    parser.add_argument("--scan-history-stride", type=int, default=1)
     parser.add_argument("--action-history", type=int, default=0)
     parser.add_argument("--student-action-smoothing", type=float, default=0.0)
     parser.add_argument("--pad-obs-to-dim", type=int, default=0)
     parser.add_argument("--mask-height-scan", action="store_true")
     parser.add_argument("--mask-proprioception", action="store_true")
     parser.add_argument("--mask-goal-heading", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--goal-encoding", choices=["cartesian", "distance_bearing"], default="cartesian")
+    parser.add_argument("--goal-distance-scale", type=float, default=14.0)
+    parser.add_argument("--velocity-scale", type=float, default=1.0)
     parser.add_argument("--use-layer-norm", action="store_true")
     parser.add_argument("--lr-actor", type=float, default=3e-4)
     parser.add_argument("--lr-critic", type=float, default=3e-4)
@@ -2047,9 +2108,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--continuous-environment-horizon-s", type=float, default=3600.0)
     parser.add_argument("--continuous-goal-distance-min", type=float, default=0.0)
     parser.add_argument("--continuous-goal-distance-max", type=float, default=0.0)
+    parser.add_argument(
+        "--continuous-goal-region-mode",
+        choices=["assigned_tile", "terrain_bank"],
+        default="assigned_tile",
+)
     parser.add_argument("--continuous-goal-resample-attempts", type=int, default=256)
     parser.add_argument("--continuous-goal-boundary-margin", type=float, default=0.5)
     parser.add_argument("--continuous-goal-require-blocked-corridor", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--continuous-goal-blocked-probability", type=float, default=1.0)
     parser.add_argument("--goal-distance-min", type=float, default=0.0)
     parser.add_argument("--goal-distance-max", type=float, default=0.0)
     parser.add_argument("--min-goal-obstacle-clearance", type=float, default=0.0)

@@ -22,9 +22,10 @@ done
 
 PYTHON_BIN="${PYTHON_BIN:-/home/benjamin/miniconda3/envs/fasttd3/bin/python}"
 
-export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/mplconfig}"
-export WARP_CACHE_PATH="${WARP_CACHE_PATH:-/tmp/warp-cache}"
-export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/tmp/unitree-cache}"
+UNITREE_CACHE_ROOT="${UNITREE_CACHE_ROOT:-$HOME/.cache/unitree-nav}"
+export MPLCONFIGDIR="${MPLCONFIGDIR:-$UNITREE_CACHE_ROOT/matplotlib}"
+export WARP_CACHE_PATH="${WARP_CACHE_PATH:-$UNITREE_CACHE_ROOT/warp}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$UNITREE_CACHE_ROOT/xdg}"
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
 
 mkdir -p "$MPLCONFIGDIR" "$WARP_CACHE_PATH" "$XDG_CACHE_HOME"
@@ -53,6 +54,11 @@ fi
 SKIP_METRICS_FLAG=()
 if [[ "${SKIP_METRICS:-0}" == "1" ]]; then
   SKIP_METRICS_FLAG=(--skip-metrics)
+fi
+
+RECORD_TRAJECTORIES_FLAG=()
+if [[ "${RECORD_TRAJECTORIES:-0}" == "1" ]]; then
+  RECORD_TRAJECTORIES_FLAG=(--record-trajectories)
 fi
 
 ESCAPE_ALL_DIRECTIONS_FLAG=()
@@ -97,6 +103,11 @@ fi
 echo "[unitree-eval] controller=$CONTROLLER envs=$NUM_ENVS episodes=$NUM_EPISODES rows=${DEBUG_TERRAIN_ROWS:-5} cols=${DEBUG_TERRAIN_COLS:-10}" \
   "obstacles=${DEBUG_NUM_OBSTACLES:-6} width=${DEBUG_OBSTACLE_WIDTH_MIN:-1.0}-${DEBUG_OBSTACLE_WIDTH_MAX:-1.4} device=$DEVICE"
 
+CONTINUOUS_BLOCKED_ARGS=(--no-continuous-goal-require-blocked-corridor)
+if [[ "${CONTINUOUS_GOAL_REQUIRE_BLOCKED_CORRIDOR:-0}" == "1" ]]; then
+  CONTINUOUS_BLOCKED_ARGS=(--continuous-goal-require-blocked-corridor)
+fi
+
 exec "$PYTHON_BIN" -u "$ROOT_DIR/eval_unitree_nav_baselines.py" \
   --controller "$CONTROLLER" \
   --model-path "$MODEL_PATH" \
@@ -110,6 +121,9 @@ exec "$PYTHON_BIN" -u "$ROOT_DIR/eval_unitree_nav_baselines.py" \
   --continuous-environment-horizon-s "${CONTINUOUS_ENVIRONMENT_HORIZON_S:-3600}" \
   --continuous-goal-distance-min "${CONTINUOUS_GOAL_DISTANCE_MIN:-0.0}" \
   --continuous-goal-distance-max "${CONTINUOUS_GOAL_DISTANCE_MAX:-0.0}" \
+  --continuous-goal-region-mode "${CONTINUOUS_GOAL_REGION_MODE:-assigned_tile}" \
+  --continuous-goal-blocked-probability "${CONTINUOUS_GOAL_BLOCKED_PROBABILITY:-1.0}" \
+  "${CONTINUOUS_BLOCKED_ARGS[@]}" \
   --continuous-goal-resample-attempts "${CONTINUOUS_GOAL_RESAMPLE_ATTEMPTS:-256}" \
   --continuous-goal-boundary-margin "${CONTINUOUS_GOAL_BOUNDARY_MARGIN:-0.5}" \
   --success-dist "${SUCCESS_DIST:-0.5}" \
@@ -225,4 +239,5 @@ exec "$PYTHON_BIN" -u "$ROOT_DIR/eval_unitree_nav_baselines.py" \
   "${DEBUG_GOAL_THROUGH_OBSTACLE_FLAG[@]}" \
   "${RESAMPLE_TERRAIN_TILES_FLAG[@]}" \
   "${VIDEO_FLAG[@]}" \
-  "${SKIP_METRICS_FLAG[@]}"
+  "${SKIP_METRICS_FLAG[@]}" \
+  "${RECORD_TRAJECTORIES_FLAG[@]}"

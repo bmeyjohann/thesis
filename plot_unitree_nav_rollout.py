@@ -39,7 +39,7 @@ from train_unitree_nav_thesis import (
     _extract_cost,
     resolve_intervention_clearances,
 )
-from unitree_nav_observation import prepare_unitree_actor_obs
+from unitree_nav_observation import prepare_unitree_actor_obs, unitree_goal_distance
 
 
 def _prepare_policy_obs(raw_obs, args):
@@ -49,6 +49,9 @@ def _prepare_policy_obs(raw_obs, args):
         mask_proprioception=bool(getattr(args, "mask_proprioception", False)),
         mask_goal_heading=bool(args.mask_goal_heading),
         mask_height_scan=bool(getattr(args, "mask_height_scan", False)),
+        goal_encoding=str(getattr(args, "goal_encoding", "cartesian")),
+        goal_distance_scale=float(getattr(args, "goal_distance_scale", 14.0)),
+        velocity_scale=float(getattr(args, "velocity_scale", 1.0)),
     )
 from unitree_nav_geom_teacher import GeomTeacherState, local_geometry_scan_teacher_action
 
@@ -79,39 +82,27 @@ def _robot_xy_heading(env) -> tuple[np.ndarray, float]:
 
 
 def _scan_points_world(
+    env,
     obs: torch.Tensor,
-    xy: np.ndarray,
-    heading: float,
     threshold: float,
     *,
-    forward_size: float,
-    lateral_size: float,
-    resolution: float,
+    delta: float = 0.0,
 ) -> np.ndarray:
-    scan_values = obs.shape[1] - 9
-    forward_size = float(forward_size) if float(forward_size) > 0 else 3.0
-    lateral_size = float(lateral_size) if float(lateral_size) > 0 else 3.0
-    resolution = float(resolution)
-    forward_count = int(round(forward_size / resolution)) + 1
-    lateral_count = int(round(lateral_size / resolution)) + 1
-    if forward_count * lateral_count != scan_values:
-        raise ValueError(
-            "Height-scan shape metadata does not match observation: "
-            f"{lateral_count}x{forward_count} != {scan_values}"
-        )
-    scan = obs[0, 9:].detach().cpu().numpy().reshape(lateral_count, forward_count)
-    forward_coords = np.linspace(-forward_size / 2.0, forward_size / 2.0, forward_count)
-    lateral_coords = np.linspace(-lateral_size / 2.0, lateral_size / 2.0, lateral_count)
-    c, s = math.cos(heading), math.sin(heading)
-    pts = []
-    for i, lateral in enumerate(lateral_coords):
-        for j, forward in enumerate(forward_coords):
-            if scan[i, j] >= threshold:
-                continue
-            local = np.array([forward, lateral])
-            world = xy + np.array([c * local[0] - s * local[1], s * local[0] + c * local[1]])
-            pts.append(world)
-    return np.asarray(pts, dtype=np.float32) if pts else np.zeros((0, 2), dtype=np.float32)
+    """Return actual blocked ray hit positions for any configured scan pattern."""
+    try:
+        sensor = env.env.unwrapped.scene.sensors.get("terrain_scan")
+        hit_xy = _to_numpy(sensor.data.hit_pos_w)[0, :, :2]
+    except Exception:
+        return np.zeros((0, 2), dtype=np.float32)
+    values = obs[0, 9:].detach().cpu().numpy().astype(np.float32)
+    if len(values) != len(hit_xy):
+        raise ValueError(f"Height-scan values/hits differ: {len(values)} != {len(hit_xy)}")
+    blocked = values < float(threshold)
+    if float(delta) > 0.0:
+        reference = float(np.nanpercentile(values, 90.0))
+        blocked |= values < (reference - float(delta))
+    valid = blocked & np.isfinite(hit_xy).all(axis=1)
+    return hit_xy[valid].astype(np.float32)
 
 
 def _active_terrain_heightfield(env) -> tuple[np.ndarray, tuple[float, float, float, float], np.ndarray] | None:
@@ -225,10 +216,15 @@ def rollout_and_plot(
             env.close()
         raise
     terrain_debug = _active_terrain_heightfield(env)
+    from eval_unitree_nav_baselines import _terrain_obstacle_cells_global
+    global_obstacle_xy = _terrain_obstacle_cells_global(env)
     from unitree_nav_observation import UnitreeScanHistory, current_unitree_scan_obs
 
     scan_history = UnitreeScanHistory(
-        getattr(args, "scan_history", 1), getattr(args, "action_history", 0), int(env.action_space.shape[-1])
+        getattr(args, "scan_history", 1),
+        getattr(args, "action_history", 0),
+        int(env.action_space.shape[-1]),
+        history_stride=getattr(args, "scan_history_stride", 1)
     )
     obs = scan_history.reset(_prepare_policy_obs(obs_raw, args))
     policy_actor = (
@@ -251,6 +247,11 @@ def rollout_and_plot(
     intervention_hist: list[bool] = []
     total_cost = 0.0
     success_step: int | None = None
+    continuous_goals = str(getattr(args, "navigation_episode_mode", "episodic")) == "continuous_goals"
+    completed_goal_steps: list[int] = []
+    goal_boundary_indices: list[int] = [0]
+    goal_targets: list[np.ndarray] = []
+    segment_start_step = 0
     previous_action = torch.zeros(1, int(env.action_space.shape[-1]), device=args.device)
 
     for step in range(int(args.steps)):
@@ -279,7 +280,7 @@ def rollout_and_plot(
             )
             action_delta = torch.linalg.norm(action - teacher_action, dim=-1)
             gate_values = gate_state.update(
-                distance=torch.linalg.norm(obs[:, 6:8], dim=-1),
+                distance=unitree_goal_distance(obs, goal_encoding=args.goal_encoding, goal_distance_scale=args.goal_distance_scale),
                 clearance=_robot_clearances(env, obstacle_cells),
                 action_delta=action_delta,
                 clearance_threshold=gate_clearance,
@@ -307,16 +308,15 @@ def rollout_and_plot(
         intervention_hist.append(bool(teacher_intervened[0].item()))
         if goal is not None:
             goal_hist.append(goal)
+            if not goal_targets or np.linalg.norm(goal_targets[-1] - goal) > 1e-4:
+                goal_targets.append(goal.copy())
         perceived = _scan_points_world(
+            env,
             current_unitree_scan_obs(
                 obs, scan_history=args.scan_history, action_history=args.action_history
             ),
-            xy,
-            heading,
             args.teacher_scan_block_threshold,
-            forward_size=args.height_scan_forward_size,
-            lateral_size=args.height_scan_lateral_size,
-            resolution=args.height_scan_resolution,
+            delta=args.teacher_scan_block_delta,
         )
         if perceived.size:
             perceived_obstacles.append(perceived)
@@ -340,8 +340,32 @@ def rollout_and_plot(
         total_cost += cost
         if cost > 0.0:
             cost_xy.append(xy.copy())
-        if success_step is None and terminal_success:
+        next_goal_distance = float(torch.linalg.norm(obs[0, 6:8]).detach().cpu().item())
+        reached_goal = bool(terminal_success or next_goal_distance <= float(args.success_dist))
+        if success_step is None and reached_goal:
             success_step = step + 1
+        if reached_goal and continuous_goals:
+            completed_goal_steps.append(step + 1 - segment_start_step)
+            goal_boundary_indices.append(len(xy_hist))
+            segment_start_step = step + 1
+            if len(completed_goal_steps) >= int(args.continuous_goal_count):
+                break
+            from eval_unitree_nav_baselines import _resample_continuous_goals
+
+            next_raw, _, _ = _resample_continuous_goals(
+                args,
+                env,
+                obstacle_cells,
+                torch.zeros(1, dtype=torch.long, device=args.device),
+            )
+            obs = scan_history.reset(_prepare_policy_obs(next_raw, args))
+            if teacher_state is not None:
+                teacher_state.reset()
+            if gate_teacher_state is not None:
+                gate_teacher_state.reset()
+            previous_action.zero_()
+            success_step = None
+            continue
         if success_step is not None and not bool(args.continue_after_success):
             break
         if bool(done.reshape(-1)[0].item()):
@@ -350,7 +374,7 @@ def rollout_and_plot(
     if owns_env:
         env.close()
     xy_arr = np.asarray(xy_hist)
-    goal_arr = np.asarray(goal_hist) if goal_hist else np.zeros((0, 2))
+    goal_arr = np.asarray(goal_targets) if goal_targets else np.zeros((0, 2))
     obs_arr = np.concatenate(perceived_obstacles, axis=0) if perceived_obstacles else np.zeros((0, 2))
     cost_arr = np.asarray(cost_xy) if cost_xy else np.zeros((0, 2))
     intervention_arr = np.asarray(intervention_hist, dtype=bool)
@@ -361,12 +385,49 @@ def rollout_and_plot(
     out_path = out_dir / f"{args.controller}_topdown_rollout{suffix}.png"
 
     fig, ax = plt.subplots(figsize=(8, 8), dpi=160)
+    visible_obstacle_xy = global_obstacle_xy
+    if global_obstacle_xy.size and xy_arr.size:
+        points_for_bounds = xy_arr
+        if goal_arr.size:
+            points_for_bounds = np.concatenate((points_for_bounds, goal_arr), axis=0)
+        lower = points_for_bounds.min(axis=0) - 2.0
+        upper = points_for_bounds.max(axis=0) + 2.0
+        visible = np.logical_and(
+            np.all(global_obstacle_xy >= lower, axis=1),
+            np.all(global_obstacle_xy <= upper, axis=1),
+        )
+        visible_obstacle_xy = global_obstacle_xy[visible]
+    if visible_obstacle_xy.size:
+        ax.scatter(
+            visible_obstacle_xy[:, 0], visible_obstacle_xy[:, 1], s=7, c="#7a4b28",
+            alpha=0.28, marker="s", label="terrain obstacles", zorder=0,
+        )
     if obs_arr.size:
-        ax.scatter(obs_arr[:, 0], obs_arr[:, 1], s=5, c="black", alpha=0.18, label="height-scan blocked cells")
+        ax.scatter(obs_arr[:, 0], obs_arr[:, 1], s=5, c="black", alpha=0.16, label="scan-detected blocked cells")
     if goal_arr.size:
-        ax.scatter(goal_arr[0, 0], goal_arr[0, 1], s=260, c="limegreen", marker="*", edgecolors="black", linewidths=1.5, label="goal")
-        ax.scatter(goal_arr[0, 0], goal_arr[0, 1], s=900, facecolors="none", edgecolors="limegreen", linewidths=1.6, alpha=0.8, label="goal marker")
-    ax.plot(xy_arr[:, 0], xy_arr[:, 1], color="dodgerblue", linewidth=2.0, label="robot trajectory")
+        completed_count = len(completed_goal_steps)
+        for goal_idx, goal_point in enumerate(goal_arr):
+            completed = goal_idx < completed_count
+            color = "limegreen" if completed else "gold"
+            ax.scatter(
+                goal_point[0], goal_point[1], s=230, c=color, marker="*",
+                edgecolors="black", linewidths=1.2,
+                label="completed goals" if completed and goal_idx == 0 else ("active goal" if not completed else None),
+                zorder=5,
+            )
+            ax.text(goal_point[0], goal_point[1], f"G{goal_idx + 1}", fontsize=8, weight="bold", zorder=6)
+    boundaries = goal_boundary_indices + [len(xy_arr)]
+    colors = plt.cm.viridis(np.linspace(0.12, 0.9, max(1, len(boundaries) - 1)))
+    for segment_idx, (lo, hi) in enumerate(zip(boundaries[:-1], boundaries[1:])):
+        if hi - lo < 2:
+            continue
+        ax.plot(
+            xy_arr[lo:hi, 0], xy_arr[lo:hi, 1], color=colors[segment_idx],
+            linewidth=2.3, label="continuous trajectory" if segment_idx == 0 else None,
+        )
+    for boundary in goal_boundary_indices[1:]:
+        if 0 < boundary <= len(xy_arr):
+            ax.scatter(xy_arr[boundary - 1, 0], xy_arr[boundary - 1, 1], s=75, c="limegreen", edgecolors="black", zorder=5)
     teacher_label_added = False
     for idx in range(max(0, len(xy_arr) - 1)):
         if intervention_arr[idx]:
@@ -447,8 +508,8 @@ def rollout_and_plot(
     for origin, vec in arrows:
         ax.arrow(origin[0], origin[1], vec[0], vec[1], color="orange", width=0.01, head_width=0.08, alpha=0.8)
     ax.set_title(
-        f"{args.controller}: cost={total_cost:.1f}, success_step={success_step}, steps={len(xy_hist)}, "
-        f"teacher={float(intervention_arr.mean()) if intervention_arr.size else 0.0:.1%}"
+        f"{args.controller}: goals={len(completed_goal_steps)}, cost={total_cost:.1f}, "
+        f"steps={len(xy_hist)}, teacher={float(intervention_arr.mean()) if intervention_arr.size else 0.0:.1%}"
     )
     ax.set_aspect("equal", adjustable="box")
     ax.grid(True, alpha=0.25)
@@ -463,6 +524,10 @@ def rollout_and_plot(
         "steps": len(xy_hist),
         "total_cost": total_cost,
         "success_step": success_step,
+        "continuous_goals_reached": len(completed_goal_steps),
+        "continuous_goal_steps": completed_goal_steps,
+        "goal_boundary_indices": goal_boundary_indices,
+        "goal_targets": goal_arr.tolist(),
         "teacher_fraction": float(intervention_arr.mean()) if intervention_arr.size else 0.0,
         "goal_nearest_terrain_obstacle_m": goal_obstacle_min_dist,
         "start_nearest_terrain_obstacle_m": start_obstacle_min_dist,
@@ -498,13 +563,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--success-dist", type=float, default=0.5)
     parser.add_argument("--terminate-on-goal", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--height-scan-resolution", type=float, default=0.5)
+    parser.add_argument("--height-scan-pattern", choices=["grid", "forward_frustum"], default="grid")
+    parser.add_argument("--height-scan-frustum-near", type=float, default=0.25)
+    parser.add_argument("--height-scan-frustum-far", type=float, default=4.0)
+    parser.add_argument("--height-scan-frustum-fov-deg", type=float, default=70.0)
+    parser.add_argument("--height-scan-frustum-side", type=int, default=17)
     parser.add_argument("--height-scan-forward-size", type=float, default=0.0)
     parser.add_argument("--height-scan-lateral-size", type=float, default=0.0)
     parser.add_argument("--scan-history", type=int, default=1)
+    parser.add_argument("--scan-history-stride", type=int, default=1)
     parser.add_argument("--action-history", type=int, default=0)
     parser.add_argument("--mask-height-scan", action="store_true")
     parser.add_argument("--mask-proprioception", action="store_true")
     parser.add_argument("--mask-goal-heading", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--goal-encoding", choices=["cartesian", "distance_bearing"], default="cartesian")
+    parser.add_argument("--goal-distance-scale", type=float, default=14.0)
+    parser.add_argument("--velocity-scale", type=float, default=1.0)
     parser.add_argument("--checkpoint-env-config", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--policy-action-smoothing", type=float, default=0.0)
     parser.add_argument("--policy-teacher-gate", action="store_true")
@@ -519,6 +593,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--intervention-release-progress-tolerance", type=float, default=0.005)
     parser.add_argument("--intervention-release-action-delta-max", type=float, default=0.8)
     parser.add_argument("--continue-after-success", action="store_true")
+    parser.add_argument("--continuous-goal-count", type=int, default=5)
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--use-layer-norm", action="store_true")
     parser.add_argument("--low-level-policy-path", default=str(DEFAULT_LOW_LEVEL))

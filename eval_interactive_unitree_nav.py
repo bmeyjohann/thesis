@@ -58,6 +58,9 @@ def _prepare_policy_obs(raw_obs, args):
         mask_proprioception=bool(getattr(args, "mask_proprioception", False)),
         mask_goal_heading=bool(args.mask_goal_heading),
         mask_height_scan=bool(getattr(args, "mask_height_scan", False)),
+        goal_encoding=str(getattr(args, "goal_encoding", "cartesian")),
+        goal_distance_scale=float(getattr(args, "goal_distance_scale", 14.0)),
+        velocity_scale=float(getattr(args, "velocity_scale", 1.0)),
     )
 
 
@@ -292,6 +295,7 @@ def _draw_topdown(
     goal_radius: float,
     paused: bool,
     gamepad_takeover: bool,
+    viewport_radius: float,
 ) -> None:
     pygame.draw.rect(screen, (245, 242, 235), rect)
     pygame.draw.rect(screen, (70, 70, 70), rect, width=1)
@@ -304,13 +308,19 @@ def _draw_topdown(
     ]
     if goal_xy is not None:
         pts_for_bounds.append(goal_xy.reshape(1, 2))
-    bounds = _world_bounds(pts_for_bounds, pad=1.0)
+    viewport_radius = max(1.0, float(viewport_radius))
+    bounds = (
+        float(robot_xy[0] - viewport_radius),
+        float(robot_xy[0] + viewport_radius),
+        float(robot_xy[1] - viewport_radius),
+        float(robot_xy[1] + viewport_radius),
+    )
     project = _make_projector(rect, bounds)
 
     if terrain_obstacles.size:
         p = project(terrain_obstacles)
         for x, y in p.astype(int):
-            pygame.draw.rect(screen, (95, 95, 95), (x - 2, y - 2, 4, 4))
+            pygame.draw.rect(screen, (82, 82, 82), (x - 4, y - 4, 8, 8))
     if show_scan_samples and scan_xy.size:
         vmin = float(np.nanpercentile(scan_values, 5.0)) if scan_values.size else 0.0
         vmax = float(np.nanpercentile(scan_values, 95.0)) if scan_values.size else 1.0
@@ -321,7 +331,7 @@ def _draw_topdown(
         for idx, (x, y) in enumerate(p.astype(int)):
             is_blocked = bool(scan_blocked[idx])
             color = (235, 45, 35) if is_blocked else _scan_value_color(float(scan_values[idx]), vmin, vmax)
-            radius = 8 if is_blocked else 5
+            radius = 11 if is_blocked else 7
             pygame.draw.circle(screen, color, (x, y), radius)
             pygame.draw.circle(screen, (245, 245, 245), (x, y), radius, width=1)
             if is_blocked:
@@ -338,13 +348,27 @@ def _draw_topdown(
         for p in project(np.asarray(cost_points)).astype(int):
             pygame.draw.line(screen, (230, 20, 20), (p[0] - 7, p[1] - 7), (p[0] + 7, p[1] + 7), 3)
             pygame.draw.line(screen, (230, 20, 20), (p[0] - 7, p[1] + 7), (p[0] + 7, p[1] - 7), 3)
-    if goal_xy is not None:
-        gp = project(goal_xy.reshape(1, 2))[0].astype(int)
-        radius_point = project((goal_xy + np.array([max(0.0, goal_radius), 0.0])).reshape(1, 2))[0]
-        goal_radius_px = max(4, int(round(abs(float(radius_point[0] - gp[0])))))
-        pygame.draw.circle(screen, (50, 220, 60), tuple(gp), goal_radius_px, width=3)
-        pygame.draw.circle(screen, (240, 220, 20), tuple(gp), 7)
     rp = project(robot_xy.reshape(1, 2))[0].astype(int)
+    if goal_xy is not None:
+        gp_unclipped = project(goal_xy.reshape(1, 2))[0]
+        inset = 18
+        gp = np.array(
+            [
+                np.clip(gp_unclipped[0], rect[0] + inset, rect[0] + rect[2] - inset),
+                np.clip(gp_unclipped[1], rect[1] + inset, rect[1] + rect[3] - inset),
+            ],
+            dtype=np.int32,
+        )
+        goal_visible = bool(np.allclose(gp, gp_unclipped, atol=1.0))
+        pygame.draw.line(screen, (70, 175, 70), tuple(rp), tuple(gp), 2)
+        if goal_visible:
+            radius_point = project((goal_xy + np.array([max(0.0, goal_radius), 0.0])).reshape(1, 2))[0]
+            goal_radius_px = max(4, int(round(abs(float(radius_point[0] - gp[0])))))
+            pygame.draw.circle(screen, (50, 220, 60), tuple(gp), goal_radius_px, width=3)
+            pygame.draw.circle(screen, (240, 220, 20), tuple(gp), 7)
+        else:
+            pygame.draw.circle(screen, (240, 220, 20), tuple(gp), 10)
+            pygame.draw.circle(screen, (50, 220, 60), tuple(gp), 14, width=3)
     robot_color = (220, 35, 45) if gamepad_takeover else (40, 190, 240)
     pygame.draw.circle(screen, robot_color, tuple(rp), 9)
     if gamepad_takeover:
@@ -442,24 +466,51 @@ def _draw_student_observation_view(
     )
 
 
-def run(args: argparse.Namespace) -> int:
+_ACTIVE_INTERACTIVE_CLEANUPS: list[tuple[str, object]] = []
+
+
+def _register_interactive_cleanup(name: str, callback) -> None:
+    _ACTIVE_INTERACTIVE_CLEANUPS.append((name, callback))
+
+
+def _close_dataset_writer(writer) -> None:
+    writer.close()
+    print(
+        f"[human-dataset] saved {writer.summary.rows} transitions in {writer.root}",
+        flush=True,
+    )
+
+
+def _run_interactive(args: argparse.Namespace) -> int:
     import pygame
 
     np.random.seed(int(args.seed))
     torch.manual_seed(int(args.seed))
     pygame.init()
+    _register_interactive_cleanup("pygame", pygame.quit)
+    _register_interactive_cleanup("pygame display", pygame.display.quit)
     pygame.display.set_caption("Unitree Navigation Interactive Debugger")
-    screen = pygame.display.set_mode((int(args.window_width), int(args.window_height)))
+    windowed_size = (int(args.window_width), int(args.window_height))
+    fullscreen = False
+    screen = pygame.display.set_mode(windowed_size, pygame.RESIZABLE)
+    args.window_width, args.window_height = screen.get_size()
     clock = pygame.time.Clock()
     font = pygame.font.Font(None, 22)
     small = pygame.font.Font(None, 18)
 
     env = make_env(args, num_envs=1, render=bool(args.show_rgb))
+    _register_interactive_cleanup("environment", env.close)
     obs_raw, _, _, layout_stats, obstacle_cells = _reset_until_feasible(args, env)
+    from eval_unitree_nav_baselines import _terrain_obstacle_cells_global
+
+    global_terrain_xy = _terrain_obstacle_cells_global(env)
     from unitree_nav_observation import UnitreeScanHistory
 
     scan_history = UnitreeScanHistory(
-        getattr(args, "scan_history", 1), getattr(args, "action_history", 0), int(env.action_space.shape[-1])
+        getattr(args, "scan_history", 1),
+        getattr(args, "action_history", 0),
+        int(env.action_space.shape[-1]),
+        history_stride=getattr(args, "scan_history_stride", 1)
     )
     obs = scan_history.reset(_prepare_policy_obs(obs_raw, args))
     online_learner = None
@@ -471,6 +522,7 @@ def run(args: argparse.Namespace) -> int:
         online_learner = UnitreeOnlineHumanLearner(
             args, obs_dim=int(obs.shape[1]), act_dim=int(env.action_space.shape[-1])
         )
+        _register_interactive_cleanup("online learner", online_learner.close)
         policy_actor = online_learner.actor
     else:
         policy_actor = (
@@ -496,6 +548,7 @@ def run(args: argparse.Namespace) -> int:
             intervention_threshold=float(args.gamepad_intervention_threshold),
             invert_lateral=bool(args.gamepad_invert_lateral),
         )
+        _register_interactive_cleanup("human controller", human_controller.close)
         print(
             "[human-gamepad] "
             f"mode={args.gamepad_mode} target={args.gamepad_host}:{args.gamepad_port} "
@@ -523,6 +576,10 @@ def run(args: argparse.Namespace) -> int:
             },
             chunk_size=int(args.human_dataset_chunk_size),
         )
+        _register_interactive_cleanup(
+            "human dataset",
+            lambda writer=dataset_writer: _close_dataset_writer(writer),
+        )
         print(f"[human-dataset] recording immutable raw transitions to {dataset_writer.root}", flush=True)
 
     keys = {k: False for k in ["w", "a", "s", "d", "q", "e"]}
@@ -545,12 +602,14 @@ def run(args: argparse.Namespace) -> int:
     previous_policy_action = torch.zeros(1, int(env.action_space.shape[-1]), device=args.device)
     display_every = max(1, int(args.display_every))
     rgb_every = max(1, int(args.rgb_every))
+    viewer_radius = max(1.0, float(args.viewer_map_radius))
     rgb_enabled = bool(args.show_rgb)
     scan_samples_enabled = bool(args.show_scan_samples)
     student_view_enabled = bool(args.student_view)
     previous_human_active = False
     previous_gamepad_active = False
     previous_gamepad_buttons: dict[str, bool] = {}
+    ui_details_enabled = not bool(args.compact_ui)
     last_gamepad_status_at = 0.0
     last_gamepad_transport_signature: tuple[object, ...] | None = None
 
@@ -600,9 +659,26 @@ def run(args: argparse.Namespace) -> int:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
+            elif event.type == pygame.VIDEORESIZE and not fullscreen:
+                windowed_size = (max(900, int(event.w)), max(600, int(event.h)))
+                screen = pygame.display.set_mode(windowed_size, pygame.RESIZABLE)
+                args.window_width, args.window_height = screen.get_size()
             elif event.type in (pygame.KEYDOWN, pygame.KEYUP):
                 down = event.type == pygame.KEYDOWN
-                if event.key == pygame.K_ESCAPE and down:
+                if event.key == pygame.K_F11 and down:
+                    if fullscreen:
+                        screen = pygame.display.set_mode(windowed_size, pygame.RESIZABLE)
+                        fullscreen = False
+                    else:
+                        windowed_size = screen.get_size()
+                        screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+                        fullscreen = True
+                    args.window_width, args.window_height = screen.get_size()
+                    previous_note = (
+                        "fullscreen enabled" if fullscreen else
+                        f"windowed {args.window_width}x{args.window_height}"
+                    )
+                elif event.key == pygame.K_ESCAPE and down:
                     running = False
                 elif event.key == pygame.K_SPACE and down:
                     paused = not paused
@@ -616,6 +692,12 @@ def run(args: argparse.Namespace) -> int:
                 elif event.key == pygame.K_MINUS and down:
                     display_every = max(1, display_every // 2)
                     previous_note = f"display every {display_every} simulation steps"
+                elif event.key == pygame.K_PAGEUP and down:
+                    viewer_radius = max(2.0, viewer_radius / 1.25)
+                    previous_note = f"map radius {viewer_radius:.1f}m"
+                elif event.key == pygame.K_PAGEDOWN and down:
+                    viewer_radius = min(30.0, viewer_radius * 1.25)
+                    previous_note = f"map radius {viewer_radius:.1f}m"
                 elif event.key in (pygame.K_UP, pygame.K_RIGHTBRACKET) and down:
                     rgb_every = min(128, rgb_every * 2)
                     previous_note = f"RGB render every {rgb_every} simulation steps"
@@ -633,6 +715,9 @@ def run(args: argparse.Namespace) -> int:
                 elif event.key == pygame.K_h and down:
                     scan_samples_enabled = not scan_samples_enabled
                     previous_note = f"scan samples {'enabled' if scan_samples_enabled else 'hidden'}"
+                elif event.key == pygame.K_i and down:
+                    ui_details_enabled = not ui_details_enabled
+                    previous_note = f"detailed telemetry {'enabled' if ui_details_enabled else 'hidden'}"
                 elif event.key == pygame.K_o and down:
                     student_view_enabled = not student_view_enabled
                     previous_note = f"student-only view {'enabled' if student_view_enabled else 'disabled'}"
@@ -669,11 +754,12 @@ def run(args: argparse.Namespace) -> int:
             if bool(args.show_reconstructed_scan)
             else np.zeros((0, 2), dtype=np.float32)
         )
-        terrain_xy = (
-            np.asarray(obstacle_cells[0], dtype=np.float32)
-            if obstacle_cells and np.asarray(obstacle_cells[0]).size
-            else np.zeros((0, 2), dtype=np.float32)
-        )
+        if global_terrain_xy.size:
+            relative_terrain = np.abs(global_terrain_xy - robot_xy.reshape(1, 2))
+            inside_viewport = np.max(relative_terrain, axis=1) <= viewer_radius
+            terrain_xy = global_terrain_xy[inside_viewport]
+        else:
+            terrain_xy = np.zeros((0, 2), dtype=np.float32)
         goal_clearance = (
             float(np.min(np.linalg.norm(terrain_xy - goal_xy.reshape(1, 2), axis=1)))
             if goal_xy is not None and terrain_xy.size
@@ -819,7 +905,7 @@ def run(args: argparse.Namespace) -> int:
             current_obs = _prepare_policy_obs(obs_raw, args)
             done_mask = done.to(args.device).reshape(-1).bool()
             obs = scan_history.step(current_obs, done_mask, action=action)
-            next_goal_distance = float(torch.linalg.norm(obs[0, 6:8]).detach().cpu().item())
+            next_goal_distance = float(_current_goal_distance(env, 1, torch.device(args.device))[0].detach().cpu().item())
             reached_goal = bool(terminal_success or next_goal_distance <= args.success_dist)
             continuous_goals = str(args.navigation_episode_mode) == "continuous_goals"
             learning_boundary = bool(done_mask[0].item() or (continuous_goals and reached_goal))
@@ -892,12 +978,13 @@ def run(args: argparse.Namespace) -> int:
             if continuous_goals and reached_goal and not bool(done_mask[0].item()):
                 from eval_unitree_nav_baselines import _resample_continuous_goals
 
-                next_raw, goal_clearances, _ = _resample_continuous_goals(
+                next_raw, goal_clearances, next_layout_stats = _resample_continuous_goals(
                     args,
                     env,
                     obstacle_cells,
                     torch.zeros(1, dtype=torch.long, device=args.device),
                 )
+                layout_stats[0] = next_layout_stats[0]
                 obs = scan_history.reset(_prepare_policy_obs(next_raw, args))
                 if teacher_state is not None:
                     teacher_state.reset()
@@ -931,14 +1018,21 @@ def run(args: argparse.Namespace) -> int:
 
         screen.fill((18, 18, 22))
         show_rgb_panel = bool(args.show_rgb) and not student_view_enabled
-        top_rect = (10, 10, int(args.window_width * (0.62 if show_rgb_panel else 0.72)), int(args.window_height) - 20)
-        rgb_rect = (
-            top_rect[0] + top_rect[2] + 10,
-            10,
-            int(args.window_width) - (top_rect[0] + top_rect[2] + 20),
-            int(args.window_height * 0.55),
-        )
-        info_rect = (rgb_rect[0], rgb_rect[1] + rgb_rect[3] + 10, rgb_rect[2], int(args.window_height) - rgb_rect[3] - 30)
+        top_width = int(args.window_width * (0.68 if show_rgb_panel else 0.76))
+        top_rect = (10, 10, top_width, int(args.window_height) - 20)
+        side_x = top_rect[0] + top_rect[2] + 10
+        side_width = int(args.window_width) - side_x - 10
+        if show_rgb_panel:
+            rgb_rect = (side_x, 10, side_width, int(args.window_height * 0.48))
+            info_rect = (
+                side_x,
+                rgb_rect[1] + rgb_rect[3] + 10,
+                side_width,
+                int(args.window_height) - rgb_rect[3] - 30,
+            )
+        else:
+            rgb_rect = (side_x, 10, side_width, 0)
+            info_rect = (side_x, 10, side_width, int(args.window_height) - 20)
         if student_view_enabled:
             _draw_student_observation_view(
                 pygame,
@@ -972,6 +1066,7 @@ def run(args: argparse.Namespace) -> int:
                 goal_radius=float(args.success_dist),
                 paused=paused,
                 gamepad_takeover=gamepad_active,
+                viewport_radius=viewer_radius,
             )
         if gamepad_active:
             # This is deliberately large and high-contrast: the human must
@@ -994,72 +1089,111 @@ def run(args: argparse.Namespace) -> int:
         pygame.draw.rect(screen, (32, 32, 40), info_rect)
         pygame.draw.rect(screen, (70, 70, 80), info_rect, width=1)
         layout_line = layout_stats[0] if layout_stats else {}
+        goal_distance_now = float(_current_goal_distance(env, 1, torch.device(args.device))[0].detach().cpu().item())
+        detailed_info_lines = [
+            f"episode={episode_idx} step={step} paused={paused} autopilot={autopilot}",
+            f"sim_fps={'unlimited' if float(args.sim_fps) <= 0.0 else f'{args.sim_fps:g}'} ui_fps={args.fps:g}",
+            f"display_every={display_every} rgb={'ON' if rgb_enabled else 'off'} every={rgb_every}",
+            f"control={['policy', 'keyboard', 'gamepad'][control_source]} controller={args.controller}",
+            (
+                "gamepad=disabled"
+                if gamepad_sample is None
+                else f"takeover={'ON' if gamepad_active else 'off'} connected={int(gamepad_sample.connected)} stale={int(gamepad_sample.stale)}"
+            ),
+            f"cost={total_cost:.1f} success_step={success_step}",
+            f"goal={goal_distance_now:.2f}m clearance={goal_clearance:.2f}m",
+            f"sampling={args.continuous_goal_region_mode} {args.continuous_goal_distance_min:g}-{args.continuous_goal_distance_max:g}m",
+            f"blocked={layout_line.get('blocked', None)} p={args.continuous_goal_blocked_probability:.2f}",
+            f"map_radius={viewer_radius:g}m cells={len(terrain_xy)}",
+            "",
+            "O student/map | I compact/details | H scan",
+            "PgUp/PgDn map zoom | V RGB | Up/Down RGB stride",
+            "F11 fullscreen | resize window | Space pause | Esc quit",
+            previous_note,
+        ]
+        compact_info_lines = [
+            f"episode={episode_idx} step={step} {'PAUSED' if paused else 'RUNNING'}",
+            f"control={['policy', 'keyboard', 'gamepad'][control_source]} takeover={'ON' if gamepad_active else 'off'}",
+            f"goal={goal_distance_now:.2f}m clearance={goal_clearance:.2f}m",
+            f"cost={total_cost:.1f} success={success_step}",
+            f"map={viewer_radius:g}m blocked={layout_line.get('blocked', None)}",
+            "",
+            "O student/map | I details | H scan",
+            "PgUp/PgDn zoom | V RGB",
+            "F11 fullscreen | resize | Space pause | Esc quit",
+            previous_note,
+        ]
         _draw_text(
             screen,
-            font,
-            [
-                f"episode={episode_idx} step={step} paused={paused} autopilot={autopilot}",
-                f"done_waiting={done_waiting} sim_fps={'unlimited' if float(args.sim_fps) <= 0.0 else f'{args.sim_fps:g}'} ui_fps={args.fps:g}",
-                f"display_every={display_every} rgb={'ON' if rgb_enabled else 'off'} every={rgb_every} live_scan={'ON' if scan_samples_enabled else 'off'}",
-                f"human={'ON' if human_active else 'off'} source={['policy', 'keyboard', 'gamepad'][control_source]} controller={args.controller}",
-                (
-                    "gamepad=disabled"
-                    if gamepad_sample is None
-                    else f"GAMEPAD TAKEOVER={'ON' if gamepad_active else 'off'} connected={int(gamepad_sample.connected)} stale={int(gamepad_sample.stale)} stick_threshold={args.gamepad_intervention_threshold:.2f} command={np.array2string(gamepad_action[0].detach().cpu().numpy(), precision=2)}"
-                ),
-                f"cost={total_cost:.1f} success_step={success_step}",
-                f"goal_dist={float(torch.linalg.norm(obs[0, 6:8]).detach().cpu().item()):.2f}",
-                f"goal_clearance={goal_clearance:.2f} required={args.min_goal_obstacle_clearance:.2f}",
-                f"blocked_corridor={layout_line.get('blocked', None)} cells={layout_line.get('blocked_cell_count', None)}",
-                "",
-                "W/S forward/back | A/D yaw | Q/E strafe | move gamepad stick to override (CRIMSON = live takeover)",
-                "gamepad: stick deflection takes over | Start pause/run | Back stop | X reset | Y next layout | A step",
-                "T autopilot | R reset | Right next | Left note",
-                "V RGB on/off | H scan points | O student-only view | Up/Down RGB stride | +/- UI stride",
-                "Space pause | N single-step | Esc quit",
-                previous_note,
-            ],
+            font if ui_details_enabled else small,
+            detailed_info_lines if ui_details_enabled else compact_info_lines,
             info_rect[0] + 10,
             info_rect[1] + 10,
+            line_h=20 if ui_details_enabled else 18,
         )
-        legend_lines = (
-            [
-                "STUDENT VIEW: body-frame live height scan only; forward is up",
-                "green arrow/yellow marker: relative goal direction projected to scan horizon",
-                "no privileged terrain geometry, trajectory, or cost history is shown",
-                "crimson robot/window: gamepad action is live",
-            ]
-            if student_view_enabled
-            else [
-                "round colored points: scan samples; cyan/green=clear, yellow=mid, red=low",
-                "black outline: threshold-blocked terrain_scan ray",
-                "purple rings: reconstructed grid overlay, if enabled",
-                "gray: reset geometry | red x: cost",
-                "crimson robot/arrow/window: gamepad action is the action passed to env.step",
-            ]
-        )
+        if student_view_enabled:
+            legend_lines = (
+                [
+                    "STUDENT VIEW: live scan + relative goal only",
+                    "crimson: human takeover | O: global map",
+                ]
+                if not ui_details_enabled
+                else [
+                    "STUDENT VIEW: body-frame live height scan only; forward is up",
+                    "green arrow/yellow marker: relative goal direction projected to scan horizon",
+                    "no privileged terrain geometry, trajectory, or cost history is shown",
+                    "crimson robot/window: gamepad action is live",
+                ]
+            )
+        else:
+            legend_lines = (
+                [
+                    "colored: live scan | gray: global terrain | red x: cost",
+                    "yellow edge marker: off-screen goal | crimson: takeover",
+                ]
+                if not ui_details_enabled
+                else [
+                    "round colored points: live terrain scan values",
+                    "black outline: blocked terrain-scan ray",
+                    "purple rings: reconstructed grid, if enabled",
+                    "gray: global heightfield geometry in moving viewport | red x: cost",
+                    "yellow edge marker: off-screen goal | crimson: human action",
+                ]
+            )
         _draw_text(
             screen,
             small,
             legend_lines,
             top_rect[0] + 12,
-            top_rect[1] + top_rect[3] - 84,
+            top_rect[1] + top_rect[3] - (42 if not ui_details_enabled else 84),
             color=(20, 20, 20),
             line_h=16,
         )
         pygame.display.flip()
         clock.tick(float(args.fps))
 
-    if online_learner is not None:
-        online_learner.close()
-    if dataset_writer is not None:
-        dataset_writer.close()
-        print(f"[human-dataset] saved {dataset_writer.summary.rows} transitions in {dataset_writer.root}", flush=True)
-    if human_controller is not None:
-        human_controller.close()
-    env.close()
-    pygame.quit()
     return 0
+
+
+def run(args: argparse.Namespace) -> int:
+    global _ACTIVE_INTERACTIVE_CLEANUPS
+    _ACTIVE_INTERACTIVE_CLEANUPS = []
+    try:
+        return _run_interactive(args)
+    finally:
+        cleanup_errors: list[str] = []
+        for name, callback in reversed(_ACTIVE_INTERACTIVE_CLEANUPS):
+            try:
+                callback()
+            except Exception as exc:
+                cleanup_errors.append(f"{name}: {exc}")
+        _ACTIVE_INTERACTIVE_CLEANUPS = []
+        if cleanup_errors:
+            print(
+                "[interactive-cleanup] " + " | ".join(cleanup_errors),
+                file=sys.stderr,
+                flush=True,
+            )
 
 
 def parse_args() -> argparse.Namespace:
@@ -1078,22 +1212,43 @@ def parse_args() -> argparse.Namespace:
         choices=["episodic", "continuous_goals"],
         default="episodic",
     )
+    p.add_argument(
+        "--runtime-navigation-episode-mode",
+        choices=["episodic", "continuous_goals"],
+        default=None,
+        help="Runtime override applied after checkpoint environment reconstruction.",
+    )
     p.add_argument("--continuous-environment-horizon-s", type=float, default=3600.0)
     p.add_argument("--continuous-goal-distance-min", type=float, default=0.0)
     p.add_argument("--continuous-goal-distance-max", type=float, default=0.0)
+    p.add_argument(
+        "--continuous-goal-region-mode",
+        choices=["assigned_tile", "terrain_bank"],
+        default="assigned_tile",
+)
     p.add_argument("--continuous-goal-resample-attempts", type=int, default=256)
     p.add_argument("--continuous-goal-boundary-margin", type=float, default=0.5)
     p.add_argument("--continuous-goal-require-blocked-corridor", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--continuous-goal-blocked-probability", type=float, default=1.0)
     p.add_argument("--success-dist", type=float, default=0.5)
     p.add_argument("--terminate-on-goal", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--height-scan-resolution", type=float, default=0.5)
+    p.add_argument("--height-scan-pattern", choices=["grid", "forward_frustum"], default="grid")
+    p.add_argument("--height-scan-frustum-near", type=float, default=0.25)
+    p.add_argument("--height-scan-frustum-far", type=float, default=4.0)
+    p.add_argument("--height-scan-frustum-fov-deg", type=float, default=70.0)
+    p.add_argument("--height-scan-frustum-side", type=int, default=17)
     p.add_argument("--height-scan-forward-size", type=float, default=0.0)
     p.add_argument("--height-scan-lateral-size", type=float, default=0.0)
     p.add_argument("--scan-history", type=int, default=1)
+    p.add_argument("--scan-history-stride", type=int, default=1)
     p.add_argument("--action-history", type=int, default=0)
     p.add_argument("--mask-height-scan", action="store_true")
     p.add_argument("--mask-proprioception", action="store_true")
     p.add_argument("--mask-goal-heading", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--goal-encoding", choices=["cartesian", "distance_bearing"], default="cartesian")
+    p.add_argument("--goal-distance-scale", type=float, default=14.0)
+    p.add_argument("--velocity-scale", type=float, default=1.0)
     p.add_argument("--checkpoint-env-config", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument(
         "--force-obstacles",
@@ -1119,8 +1274,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--display-every", type=int, default=1, help="Draw the UI once per N simulation steps.")
     p.add_argument("--window-width", type=int, default=1500)
     p.add_argument("--window-height", type=int, default=900)
+    p.add_argument("--viewer-map-radius", type=float, default=7.0)
+    p.add_argument("--compact-ui", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--show-rgb", action="store_true")
     p.add_argument("--rgb-every", type=int, default=5)
+    p.add_argument("--video-width", type=int, default=320)
+    p.add_argument("--video-height", type=int, default=240)
+    p.add_argument("--video-camera-distance", type=float, default=7.0)
+    p.add_argument("--video-camera-elevation", type=float, default=-65.0)
+    p.add_argument("--video-camera-azimuth", type=float, default=90.0)
+    p.add_argument("--video-max-extra-envs", type=int, default=0)
+    p.add_argument("--video-enable-shadows", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--video-enable-reflections", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--show-scan-samples", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--show-reconstructed-scan", action="store_true")
     p.add_argument("--student-view", action=argparse.BooleanOptionalAction, default=False)
@@ -1301,7 +1466,25 @@ def main() -> int:
     args = parse_args()
     from unitree_nav_checkpoint import apply_unitree_checkpoint_config
 
+    runtime_continuous_overrides = {
+        key: getattr(args, key)
+        for key in (
+            "continuous_environment_horizon_s",
+            "continuous_goal_distance_min",
+            "continuous_goal_distance_max",
+            "continuous_goal_region_mode",
+            "continuous_goal_resample_attempts",
+            "continuous_goal_boundary_margin",
+            "continuous_goal_require_blocked_corridor",
+            "continuous_goal_blocked_probability",
+            "min_goal_obstacle_clearance",
+        )
+    }
     apply_unitree_checkpoint_config(args)
+    if args.runtime_navigation_episode_mode is not None:
+        args.navigation_episode_mode = args.runtime_navigation_episode_mode
+        for key, value in runtime_continuous_overrides.items():
+            setattr(args, key, value)
     if bool(args.force_obstacles):
         # Goal-only pretrains carry disable_obstacles=True. Keep their policy
         # shape but collect takeover data on the actual obstacle benchmark.
