@@ -1,0 +1,35 @@
+experiment: unitree_g1_multimodal_locomotion_memory_ablation
+dependency: artifacts/unitree_multimodal/modality_matrix_results/modality_transfer_matrix_results.csv
+teacher:
+  initialization: supervisor_rough_model9999
+  rollout_control: teacher
+architectures:
+  gru:
+    modalities: [height_scan, depth, mono_rgb, stereo_rgb]
+    hidden_dim: 128
+    unroll_length: 25
+    loss: action_mse
+  gru_reconstruction:
+    modalities: [depth, mono_rgb, stereo_rgb]
+    hidden_dim: 128
+    unroll_length: 25
+    loss: action_mse_plus_privileged_height_reconstruction
+    reconstruction_dim: 187
+    reconstruction_weight: 1.0
+    deployment_uses_privileged_height: false
+training:
+  steps_per_physical_cell: 10000
+  num_envs: 16
+  learning_rate: 0.0003
+  gradient_clip_norm: 1.0
+  camera_resolution: [80, 60]
+evaluation:
+  seeds: [11, 23, 37, 51, 73]
+  steps: 1000
+  num_envs: 128
+  metrics:
+    - mean_velocity_tracking_error
+    - fall_events_per_1000_env_steps
+    - mean_achieved_speed
+    - mean_abs_action_delta
+    - mean_step_reward

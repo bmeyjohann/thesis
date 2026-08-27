@@ -14,6 +14,8 @@ NCONMAX="${NCONMAX:-256}"
 HEAD_CAMERA="${HEAD_CAMERA:-0}"
 CAMERA_PITCH_DOWN_DEG="${CAMERA_PITCH_DOWN_DEG:-25}"
 CAMERA_FOVY="${CAMERA_FOVY:-70}"
+VISION_MODE="${VISION_MODE:-rgbd}"
+STEREO_BASELINE_M="${STEREO_BASELINE_M:-0.12}"
 EGOCENTRIC_VIDEO="${EGOCENTRIC_VIDEO:-}"
 NUM_ENVS="${NUM_ENVS:-1}"
 SEED="${SEED:-0}"
@@ -44,12 +46,14 @@ echo "device:     $DEVICE"
 echo "num envs:   $NUM_ENVS"
 echo "seed:       $SEED"
 echo "nconmax:    $NCONMAX"
-echo "head cam:   $HEAD_CAMERA (pitch=${CAMERA_PITCH_DOWN_DEG}deg fovy=${CAMERA_FOVY}deg)"
+echo "head cam:   $HEAD_CAMERA (mode=${VISION_MODE} pitch=${CAMERA_PITCH_DOWN_DEG}deg fovy=${CAMERA_FOVY}deg baseline=${STEREO_BASELINE_M}m)"
 
 CAMERA_ARGS=()
 if [[ "$HEAD_CAMERA" == "1" ]]; then
   CAMERA_ARGS+=(
     --head-camera
+    --vision-mode "$VISION_MODE"
+    --stereo-baseline-m "$STEREO_BASELINE_M"
     --camera-pitch-down-deg "$CAMERA_PITCH_DOWN_DEG"
     --camera-fovy "$CAMERA_FOVY"
   )

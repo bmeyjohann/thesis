@@ -1,0 +1,58 @@
+experiment: unitree_g1_multimodal_locomotion_nomemory
+method:
+  stage_1: privileged_height_material_experts
+  stage_2: multimodal_distillation
+  stage_3: optional_rl_finetuning
+architecture:
+  memory: none
+  terrain_latent_dim: 64
+  fusion: masked_mean_with_availability_vector
+  actor_hidden: [256, 256]
+modalities: [height_scan, depth, mono_rgb, stereo_rgb]
+camera:
+  resolution: [160, 120]
+  fovy_deg: 70
+  pitch_down_deg: 25
+  stereo_baseline_m: 0.12
+curriculum:
+  phase_1:
+    iterations: 2000
+    terrain: [flat, random_rough, cobblestone]
+    modality: height_scan
+    objective: train_privileged_expert
+  phase_2:
+    iterations: 2000
+    terrain: [flat, random_rough, cobblestone, stairs]
+    modality: [height_scan, depth]
+    single_modality_probability: 0.9
+    distillation_weight: 1.0
+  phase_3:
+    iterations: 3000
+    terrain: [flat, random_rough, cobblestone, stairs, stepping_stones]
+    modality: [height_scan, depth, mono_rgb, stereo_rgb]
+    single_modality_probability: 0.7
+    multimodal_probability: 0.25
+    proprio_only_probability: 0.05
+    distillation_weight: 0.5
+  phase_4:
+    iterations: 3000
+    terrain: all
+    modality: all
+    sensor_dropout_probability: 0.15
+    sensor_latency_steps: [0, 3]
+    depth_noise_std_m: [0.0, 0.03]
+    rl_finetuning: true
+terrain:
+  geometry: [flat, random_rough, cobblestone, stairs, stepping_stones]
+  material: [rigid, slippery, sand_drag]
+  factors_are_crossed: true
+  cobblestone_proxy: randomized_low_boxes_and_perlin
+  sand_proxy: increased_foot_drag_plus_moderate_friction
+evaluation:
+  fixed_seeds: [11, 23, 37, 51, 73]
+  episodes_per_geometry_material_modality_cell: 20
+  metrics: [command_tracking_error, fall_rate, traversal_success, forward_speed, energy_per_meter, foot_slip, time_to_cross]
+launch_gate:
+  live_material_physics: required
+  custom_actor_runner: required
+  matrix_smoke_test: required

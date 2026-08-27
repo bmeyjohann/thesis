@@ -62,13 +62,22 @@ def _actor_linear_shapes(checkpoint_path: Path) -> tuple[int, int]:
         raise TypeError("Checkpoint does not contain a model state dictionary")
 
     layers: list[tuple[int, torch.Tensor]] = []
+    explicitly_named_actor_layers: list[tuple[int, torch.Tensor]] = []
     pattern = re.compile(
         r"(?:^|\.)(?:actor(?:\.network)?|mlp|network)\.(\d+)\.weight$"
     )
     for key, value in state.items():
         match = pattern.search(str(key))
         if match and isinstance(value, torch.Tensor) and value.ndim == 2:
-            layers.append((int(match.group(1)), value))
+            layer = (int(match.group(1)), value)
+            layers.append(layer)
+            if str(key).startswith("actor."):
+                explicitly_named_actor_layers.append(layer)
+    # Legacy RSL checkpoints contain actor, critic, and ensemble-critic networks
+    # in one dictionary. Their layer indices overlap, so generic ``network.*``
+    # matches must not be allowed to replace the actor output dimension.
+    if explicitly_named_actor_layers:
+        layers = explicitly_named_actor_layers
     if not layers:
         raise ValueError("Could not identify actor linear layers in checkpoint")
     layers.sort(key=lambda item: item[0])
@@ -173,6 +182,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video-height", type=int, default=720)
     parser.add_argument("--viewer", choices=("none", "native", "viser"), default="none")
     parser.add_argument("--head-camera", action="store_true")
+    parser.add_argument(
+        "--vision-mode",
+        choices=("rgbd", "mono_rgb", "stereo_rgb", "stereo_rgbd"),
+        default="rgbd",
+        help="Torso-mounted inspection sensor configuration.",
+    )
+    parser.add_argument("--stereo-baseline-m", type=float, default=0.12)
     parser.add_argument("--camera-pitch-down-deg", type=float, default=25.0)
     parser.add_argument("--camera-yaw-deg", type=float, default=0.0)
     parser.add_argument("--camera-fovy", type=float, default=70.0)
@@ -219,7 +235,6 @@ def main() -> int:
     import src.tasks  # noqa: F401
     from mjlab.envs import ManagerBasedRlEnv
     from mjlab.rl import MjlabOnPolicyRunner, RslRlVecEnvWrapper
-    from mjlab.sensor import CameraSensorCfg
     from mjlab.tasks.registry import load_env_cfg, load_rl_cfg, load_runner_cls
     from mjlab.utils.torch import configure_torch_backends
     from mjlab.utils.wrappers import VideoRecorder
@@ -259,25 +274,25 @@ def main() -> int:
             raise ValueError("Head-camera inspection currently requires --num-envs 1")
         if args.camera_width < 1 or args.camera_height < 1 or args.camera_max_depth <= 0:
             raise ValueError("Camera dimensions and maximum depth must be positive")
-        camera_cfg = CameraSensorCfg(
-            name="head_rgbd",
-            parent_body="robot/torso_link",
-            pos=(0.08, 0.0, 0.42),
-            quat=_head_camera_quat(args.camera_pitch_down_deg, args.camera_yaw_deg),
-            fovy=float(args.camera_fovy),
-            width=int(args.camera_width),
-            height=int(args.camera_height),
-            data_types=("rgb", "depth"),
-            use_textures=True,
-            use_shadows=False,
-            clone_data=True,
+        from unitree_nav_vision import UnitreeVisionCfg, attach_vision_sensors
+
+        vision_cfg = UnitreeVisionCfg(
+            mode=args.vision_mode,
+            width=args.camera_width,
+            height=args.camera_height,
+            fovy=args.camera_fovy,
+            pitch_down_deg=args.camera_pitch_down_deg,
+            yaw_deg=args.camera_yaw_deg,
+            stereo_baseline_m=args.stereo_baseline_m,
+            max_depth_m=args.camera_max_depth,
         )
-        env_cfg.scene.sensors = (env_cfg.scene.sensors or ()) + (camera_cfg,)
+        camera_names = attach_vision_sensors(env_cfg, vision_cfg)
         print(
-            "[velocity-eval] head_camera="
-            f"parent=robot/torso_link pos={camera_cfg.pos} "
+            "[velocity-eval] vision="
+            f"mode={args.vision_mode} parent=robot/torso_link "
             f"pitch_down_deg={args.camera_pitch_down_deg} yaw_deg={args.camera_yaw_deg} "
-            f"fovy={args.camera_fovy} resolution={args.camera_width}x{args.camera_height}"
+            f"fovy={args.camera_fovy} resolution={args.camera_width}x{args.camera_height} "
+            f"baseline_m={args.stereo_baseline_m} sensors={camera_names}"
         )
 
     render_mode = "rgb_array" if args.video else None
@@ -319,7 +334,7 @@ def main() -> int:
         return 0
 
     obs, _ = env.reset()
-    camera_sensor = env.unwrapped.scene.sensors.get("head_rgbd") if camera_enabled else None
+    camera_names = camera_names if camera_enabled else ()
     camera_frames = []
     last_depth = None
     reward_sum = torch.zeros(args.num_envs, device=args.device)
@@ -335,12 +350,14 @@ def main() -> int:
         action_abs_sum += float(actions.abs().mean().item())
         action_samples += 1
         obs, rewards, dones, _ = env.step(actions)
-        if camera_sensor is not None and args.egocentric_video is not None:
-            camera_data = camera_sensor.data
-            if camera_data.rgb is None or camera_data.depth is None:
-                raise RuntimeError("Head RGB-D camera did not produce both modalities")
-            frame, last_depth = _camera_frame(
-                camera_data.rgb, camera_data.depth, float(args.camera_max_depth)
+        if camera_names and args.egocentric_video is not None:
+            from unitree_nav_vision import compose_vision_frame
+
+            frame = compose_vision_frame(env.unwrapped.scene, camera_names, vision_cfg)
+            first_data = env.unwrapped.scene.sensors.get(camera_names[0]).data
+            last_depth = (
+                first_data.depth[0, ..., 0].detach().cpu().numpy()
+                if first_data.depth is not None else None
             )
             camera_frames.append(frame)
         reward_sum += rewards
