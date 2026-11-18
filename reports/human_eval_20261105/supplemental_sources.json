@@ -1,0 +1,12 @@
+[
+  {
+    "path": "artifacts/human_eval_20261105_matched32/r1_php_depth_pref_rl/results.json",
+    "sha256": "182bdf1b19cbe9fd06362e389d05c239a279ccae288efca46489ee1a621220dc",
+    "additional_cases": 13
+  },
+  {
+    "path": "artifacts/human_eval_20261105_matched32/r1_rgb_height_pref_rl/results.json",
+    "sha256": "25133feeda9f3c204dd8b0b0d791ca6ce3e36849fe83ef5b128a05899a385c06",
+    "additional_cases": 24
+  }
+]

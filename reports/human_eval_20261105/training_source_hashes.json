@@ -1,0 +1,62 @@
+[
+  {
+    "path": "/home/benjamin/thesis/local/unitree_human_interventions/human_20261105_163356_f43bdbee_r1_rgb_height_pref_rl/parts/part_00000.npz",
+    "sha256": "0e33ad581927358fc1f27e979365c288cae0148333fd066765dba14410a51e14"
+  },
+  {
+    "path": "/home/benjamin/thesis/local/unitree_human_interventions/human_20261105_163356_f43bdbee_r1_rgb_height_pref_rl/parts/part_00001.npz",
+    "sha256": "4156514fa0d687c223b2c0f5f6ab95406b6b43b254fd3f42b0a038e067cee677"
+  },
+  {
+    "path": "/home/benjamin/thesis/local/unitree_human_interventions/human_20261105_163356_f43bdbee_r1_rgb_height_pref_rl/parts/part_00002.npz",
+    "sha256": "64c6d56716865e085c39533c8afeceee77c29414be8eef5165391017ef7a52cf"
+  },
+  {
+    "path": "/home/benjamin/thesis/local/unitree_human_interventions/human_20261105_163356_f43bdbee_r1_rgb_height_pref_rl/parts/part_00003.npz",
+    "sha256": "97dc8f140529f8d1c8f249680ca22dbd6db4c82ef4e1d85e0699153c8e6c2d62"
+  },
+  {
+    "path": "/home/benjamin/thesis/local/unitree_human_interventions/human_20261105_163356_f43bdbee_r1_rgb_height_pref_rl/parts/part_00004.npz",
+    "sha256": "822ef4354d625a24e9606072d96a9fc82873a394cfb265ced7f34f0cc1d2dbdb"
+  },
+  {
+    "path": "/home/benjamin/thesis/local/unitree_human_interventions/human_20261105_163356_f43bdbee_r1_php_depth_pref_rl/parts/part_00000.npz",
+    "sha256": "7bc0a90579d294e9e9a8740abc6e30d9a79ebd214770fb4f63cbf6c219cdce90"
+  },
+  {
+    "path": "/home/benjamin/thesis/local/unitree_human_interventions/human_20261105_163356_f43bdbee_r1_php_depth_pref_rl/parts/part_00001.npz",
+    "sha256": "d8028bd7e0c93a01e4da19372cf67c2bd2811dc07cce15ff5c1f7d1dd7ec778b"
+  },
+  {
+    "path": "/home/benjamin/thesis/local/unitree_human_interventions/human_20261105_163356_f43bdbee_r1_php_depth_pref_rl/parts/part_00002.npz",
+    "sha256": "ca8a2e380232a085aaa7ff09833fd5803af3fe052ebf4e80d55cc00877fa4d86"
+  },
+  {
+    "path": "/home/benjamin/thesis/local/unitree_human_interventions/human_20261105_163356_f43bdbee_r1_php_depth_pref_rl/parts/part_00003.npz",
+    "sha256": "d2b6002f1c4acfcb4581f188dbcdfa87afb803b1ebd8d07f1d4799dd22642108"
+  },
+  {
+    "path": "/home/benjamin/thesis/local/unitree_human_interventions/human_20261105_163356_f43bdbee_r1_php_depth_pref_rl/parts/part_00004.npz",
+    "sha256": "df98a28986f8f9c3212fff8efb1ce3aaa706698ca33022f72e0729ff1ba51ee5"
+  },
+  {
+    "path": "/home/benjamin/thesis/local/unitree_human_interventions/human_20261105_163356_f43bdbee_r1_rgb_height_pref_bc_rl/parts/part_00000.npz",
+    "sha256": "f3f510ccebf852aa5313ac3f6a7a558e98dc849b3bfdc77e049f9d85ad1129bf"
+  },
+  {
+    "path": "/home/benjamin/thesis/local/unitree_human_interventions/human_20261105_163356_f43bdbee_r1_rgb_height_pref_bc_rl/parts/part_00001.npz",
+    "sha256": "9a76ca7abfed7439b86245d6f994dd280bfbdcc4f5b744e17c6065b3066248dd"
+  },
+  {
+    "path": "/home/benjamin/thesis/local/unitree_human_interventions/human_20261105_163356_f43bdbee_r1_rgb_height_pref_bc_rl/parts/part_00002.npz",
+    "sha256": "5a9e7d03af0db31aaee9c725ea2e5e17ac943086f54a02cefd1c0c7778fb0957"
+  },
+  {
+    "path": "/home/benjamin/thesis/local/unitree_human_interventions/human_20261105_163356_f43bdbee_r1_rgb_height_pref_bc_rl/parts/part_00003.npz",
+    "sha256": "8f49ca418489db7be360ae6c4b6e6e7ad4fb5e462f5e32da407a63daa6a22403"
+  },
+  {
+    "path": "/home/benjamin/thesis/local/unitree_human_interventions/human_20261105_163356_f43bdbee_r1_rgb_height_pref_bc_rl/parts/part_00004.npz",
+    "sha256": "c7a8c44741eea1b9a6eae92109c95c2a14fff579c1e6cc3859b3837bef77ee2c"
+  }
+]
