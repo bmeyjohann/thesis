@@ -406,6 +406,10 @@ class SACUpdateMetrics:
     actor_loss: float = 0.0
     actor_loss_sac: float = 0.0
     actor_loss_bc: float = 0.0
+    actor_pair_bc_loss: float = 0.0
+    actor_anti_loss: float = 0.0
+    actor_aux_rows: float = 0.0
+    actor_rejected_distance: float = 0.0
     actor_loss_ref: float = 0.0
     actor_bc_rows: float = 0.0
     actor_bc_weight_mean: float = 0.0
@@ -424,6 +428,10 @@ class SACUpdateMetrics:
     replay_reward_abs_mean: float = 0.0
     actor_updates: float = 1.0
     alpha_updates: float = 1.0
+    alpha_rows: float = 0.0
+    policy_entropy_student: float = 0.0
+    policy_entropy_teacher: float = 0.0
+    pref_source_rows: float = 0.0
     critic_loss_pref: float = 0.0
     critic_loss_pref_weighted: float = 0.0
     pvp_proxy_teacher_loss: float = 0.0
@@ -434,6 +442,9 @@ class SACUpdateMetrics:
     eil_good_batch_fraction: float = 0.0
     eil_bad_batch_fraction: float = 0.0
     pref_q_delta: float = 0.0
+    pref_violation_rate: float = 0.0
+    pref_margin_gap_mean: float = 0.0
+    pref_margin_gap_p95: float = 0.0
     pref_q_teacher_mean: float = 0.0
     pref_q_student_mean: float = 0.0
     pref_action_delta_l2: float = 0.0
@@ -644,6 +655,7 @@ def sac_update_step(
     tau: float,
     max_grad_norm: float,
     obs_preprocess=None,
+    actor_action_transform=None,
     pref_batch=None,
     pref_sampling_mode: str = "separate",
     pref_rank_weight: float = 0.0,
@@ -656,6 +668,8 @@ def sac_update_step(
     pref_violation_clip: float = 10.0,
     pref_violation_target: float = 0.0,
     pref_lagrangian_violation_type: str = "hinge",
+    pref_dual_mode: str = "hinge",
+    pref_loss_temperature: float = 1.0,
     pref_obs_noise_std: float = 0.0,
     pref_action_noise_std: float = 0.0,
     pref_action_noise_copies: int = 1,
@@ -670,6 +684,7 @@ def sac_update_step(
     eil_pair_margin: float = 0.01,
     alpha_min: float = 0.0,
     alpha_max: float = 1.0,
+    alpha_state_scope: str = "all",
     scale_actor_to_env_bounds: bool = False,
     action_low: Optional[torch.Tensor] = None,
     action_high: Optional[torch.Tensor] = None,
@@ -680,6 +695,10 @@ def sac_update_step(
     actor_bc_weight: float = 0.0,
     actor_bc_teacher_only: bool = True,
     actor_bc_only: bool = False,
+    actor_pair_bc_weight: float = 0.0,
+    actor_anti_weight: float = 0.0,
+    actor_anti_radius: float = 0.35,
+    actor_anti_samples: int = 4,
     actor_bc_reward_weight_scale: float = 0.0,
     actor_bc_reward_weight_max: float = 10.0,
     actor_bc_obstacle_lidar_weight_scale: float = 0.0,
@@ -691,6 +710,13 @@ def sac_update_step(
     intervention_aux_weight: float = 0.0,
     intervention_aux_pos_weight: float = 0.0,
 ) -> SACUpdateMetrics:
+    if (not np.isfinite(actor_anti_radius) or actor_anti_radius <= 0 or actor_anti_samples < 1
+            or not np.isfinite(actor_anti_weight) or actor_anti_weight < 0
+            or not np.isfinite(actor_pair_bc_weight) or actor_pair_bc_weight < 0):
+        raise ValueError("Invalid actor pair supervision settings")
+    if (pref_batch is not None and (actor_pair_bc_weight > 0 or actor_anti_weight > 0)
+            and "qualified_bad" not in pref_batch):
+        raise ValueError("Actor pair supervision requires qualified intervention labels")
     obs_raw = batch["observations"]
     obs = obs_raw
     actions = batch["actions"]
@@ -713,13 +739,27 @@ def sac_update_step(
     bootstrap = (trunc | ~dones).float()
 
     def _scale_actions(actions: torch.Tensor) -> torch.Tensor:
-        if not bool(scale_actor_to_env_bounds):
-            return actions
-        if action_low is None or action_high is None:
-            raise ValueError("action bounds are required when scale_actor_to_env_bounds is enabled")
-        center = 0.5 * (action_high + action_low)
-        half = 0.5 * (action_high - action_low)
-        return center + actions * half
+        if bool(scale_actor_to_env_bounds):
+            if action_low is None or action_high is None:
+                raise ValueError("action bounds are required when scale_actor_to_env_bounds is enabled")
+            center = 0.5 * (action_high + action_low)
+            half = 0.5 * (action_high - action_low)
+            actions = center + actions * half
+        # Q and BC use executed commands; entropy remains over the latent actor sample.
+        return actions if actor_action_transform is None else actor_action_transform(actions)
+
+    if alpha_state_scope not in {"all", "student"}:
+        raise ValueError("alpha_state_scope must be all or student")
+    if float(pref_loss_temperature) <= 0.0:
+        raise ValueError("pref_loss_temperature must be positive")
+    if pref_dual_mode not in {"hinge", "signed"}:
+        raise ValueError("pref_dual_mode must be hinge or signed")
+    if float(alpha_max) > 0.0 and float(alpha_min) > float(alpha_max):
+        raise ValueError("alpha_min must not exceed alpha_max")
+    fixed_alpha = float(alpha_min) > 0.0 and float(alpha_min) == float(alpha_max)
+    if fixed_alpha:
+        with torch.no_grad():
+            sac.log_alpha.fill_(float(np.log(float(alpha_min))))
 
     with torch.no_grad():
         next_actions_norm, next_log_pi, _ = sac.actor(next_obs)
@@ -749,11 +789,13 @@ def sac_update_step(
     eil_good_batch_fraction = 0.0
     eil_bad_batch_fraction = 0.0
     pref_q_delta = 0.0
+    pref_violation_rate = pref_margin_gap_mean = pref_margin_gap_p95 = 0.0
     pref_q_teacher_mean = 0.0
     pref_q_student_mean = 0.0
     pref_action_delta_l2 = 0.0
     pref_action_weight_mean = 0.0
     pref_linked_rows = 0.0
+    base_pref_rows = 0.0
     pref_augmented_rows = 0.0
     pref_action_delta_kept_fraction = 1.0
     pref_lambda_value = float(sac.pref_lambda)
@@ -782,6 +824,8 @@ def sac_update_step(
         if bool(non_teacher_mask.any().item()):
             q_min_non_teacher_action_mean = float(q_min_data_flat[non_teacher_mask].detach().mean().cpu().item())
             q_min_non_teacher_action_count = float(int(non_teacher_mask.sum().item()))
+    if alpha_state_scope == "student" and teacher_mask is None:
+        raise ValueError("student-only temperature updates require teacher_intervened labels")
 
     if pref_batch is not None and float(pref_rank_weight) > 0.0:
         pref_obs = pref_batch["obs"]
@@ -816,6 +860,15 @@ def sac_update_step(
         if obs_preprocess is not None and pref_obs is not obs:
             pref_obs = obs_preprocess(pref_obs)
         base_pref_rows = float(pref_obs.shape[0])
+        if actor_action_transform is not None:
+            pref_teacher = actor_action_transform(pref_teacher)
+            pref_student = actor_action_transform(pref_student)
+        # Filter the recorded pair before noise can manufacture disagreement.
+        if float(pref_action_delta_min) > 0:
+            original_keep = (pref_teacher - pref_student).detach().norm(dim=-1) >= float(pref_action_delta_min)
+            pref_obs = pref_obs[original_keep]
+            pref_teacher = pref_teacher[original_keep]
+            pref_student = pref_student[original_keep]
         aug_copies = int(max(1, pref_action_noise_copies))
         obs_noise_std = float(max(0.0, pref_obs_noise_std))
         noise_std = float(max(0.0, pref_action_noise_std))
@@ -835,6 +888,9 @@ def sac_update_step(
             elif bool(scale_actor_to_env_bounds):
                 pref_teacher = pref_teacher.clamp(-1.0, 1.0)
                 pref_student = pref_student.clamp(-1.0, 1.0)
+        if actor_action_transform is not None:
+            pref_teacher = actor_action_transform(pref_teacher)
+            pref_student = actor_action_transform(pref_student)
         action_delta_l2 = (pref_teacher - pref_student).detach().norm(dim=-1)
         rows_before_delta_filter = int(action_delta_l2.numel())
         min_action_delta = float(max(0.0, pref_action_delta_min))
@@ -876,9 +932,14 @@ def sac_update_step(
             q_teacher_term = q_teacher.detach() if bool(pref_stopgrad_positive) else q_teacher
             delta = q_teacher_term - q_student
             pref_q_delta = float(delta.detach().mean().cpu().item())
+            gaps = (float(pref_rank_margin) - delta.detach()).flatten()
+            pref_violation_rate = float((gaps > 0).float().mean().cpu().item())
+            pref_margin_gap_mean = float(gaps.mean().cpu().item())
+            pref_margin_gap_p95 = float(torch.quantile(gaps, 0.95).cpu().item())
             pref_loss_mode = str(pref_loss_type).strip().lower()
             if pref_loss_mode == "bradley_terry":
-                loss_tensor = F.softplus(-delta)
+                temperature = float(pref_loss_temperature)
+                loss_tensor = temperature * F.softplus(-delta / temperature)
                 if pref_weight_tensor is not None:
                     loss_tensor = loss_tensor * pref_weight_tensor
                 critic_loss_pref = loss_tensor.mean()
@@ -888,7 +949,8 @@ def sac_update_step(
                 violation_mode = str(pref_lagrangian_violation_type).strip().lower()
                 margin_gap = float(pref_rank_margin) - delta
                 if violation_mode == "smooth":
-                    violation_tensor = F.softplus(margin_gap)
+                    temperature = float(pref_loss_temperature)
+                    violation_tensor = temperature * F.softplus(margin_gap / temperature)
                 else:
                     violation_tensor = torch.clamp(margin_gap, min=0.0)
                 pref_violation = float(violation_tensor.detach().mean().cpu().item())
@@ -896,14 +958,18 @@ def sac_update_step(
                     violation_tensor = torch.clamp(violation_tensor, max=float(pref_violation_clip))
                 if pref_weight_tensor is not None:
                     violation_tensor = violation_tensor * pref_weight_tensor
+                dual_observation = (
+                    float(margin_gap.detach().mean().cpu().item())
+                    if pref_dual_mode == "signed" else pref_violation
+                )
                 if float(pref_lambda_ema) > 0.0:
                     sac.pref_violation_ema = (
                         float(pref_lambda_ema) * float(sac.pref_violation_ema)
-                        + (1.0 - float(pref_lambda_ema)) * float(pref_violation)
+                        + (1.0 - float(pref_lambda_ema)) * dual_observation
                     )
                     pref_dual_violation = float(sac.pref_violation_ema)
                 else:
-                    pref_dual_violation = float(pref_violation)
+                    pref_dual_violation = dual_observation
                 pref_dual_signal = float(pref_dual_violation - float(pref_violation_target))
                 if float(pref_lambda_lr) > 0.0:
                     sac.pref_lambda = max(0.0, float(sac.pref_lambda) + float(pref_lambda_lr) * pref_dual_signal)
@@ -916,7 +982,13 @@ def sac_update_step(
                 critic_loss_pref_weighted = critic_loss_pref
                 pref_lagrangian_loss = float(critic_loss_pref_weighted.detach().cpu().item())
             else:
-                loss_tensor = F.softplus(float(pref_rank_margin) - delta)
+                margin_gap = float(pref_rank_margin) - delta
+                if pref_loss_mode == "hinge":
+                    loss_tensor = torch.relu(margin_gap)
+                else:
+                    # Preserve legacy margin/softplus aliases; hinge has an explicit name.
+                    temperature = float(pref_loss_temperature)
+                    loss_tensor = temperature * F.softplus(margin_gap / temperature)
                 if pref_weight_tensor is not None:
                     loss_tensor = loss_tensor * pref_weight_tensor
                 critic_loss_pref = loss_tensor.mean()
@@ -1004,6 +1076,9 @@ def sac_update_step(
     actor_loss = torch.tensor(0.0, device=obs.device)
     actor_loss_sac = torch.tensor(0.0, device=obs.device)
     actor_loss_bc = torch.tensor(0.0, device=obs.device)
+    actor_pair_bc_loss = torch.tensor(0.0, device=obs.device)
+    actor_anti_loss = torch.tensor(0.0, device=obs.device)
+    actor_aux_rows = actor_rejected_distance = 0.0
     actor_loss_ref = torch.tensor(0.0, device=obs.device)
     actor_bc_rows = 0.0
     actor_bc_weight_mean = 0.0
@@ -1014,10 +1089,34 @@ def sac_update_step(
     intervention_aux_pred_rate = 0.0
     actor_updates = 0.0
     alpha_updates = 0.0
+    alpha_rows = 0.0
 
     if bool(update_actor):
         actor_loss_sac = (-q_pi).mean() if bool(actor_q_only) else ((sac.log_alpha.exp().detach() * log_pi) - q_pi).mean()
         actor_loss = torch.tensor(0.0, device=obs.device) if bool(actor_bc_only) else actor_loss_sac
+        if pref_batch is not None and (actor_pair_bc_weight > 0 or actor_anti_weight > 0):
+            if "qualified_bad" not in pref_batch:
+                raise ValueError("Actor pair supervision requires qualified intervention labels")
+            mask = pref_batch["qualified_bad"].bool().reshape(-1)
+            actor_aux_rows = float(mask.sum().item())
+            if actor_aux_rows > 0:
+                aux_obs = pref_batch["obs"][mask]
+                if obs_preprocess is not None:
+                    aux_obs = obs_preprocess(aux_obs)
+                copies = int(actor_anti_samples) if actor_anti_weight > 0 else 1
+                sampled, _, means = sac.actor(aux_obs.repeat_interleave(copies, dim=0))
+                sampled = _scale_actions(sampled).reshape(-1, copies, actions.shape[-1])
+                means = _scale_actions(means).reshape(-1, copies, actions.shape[-1])[:, 0]
+                good = pref_batch["teacher_actions"][mask].detach()
+                bad = pref_batch["student_actions"][mask].detach()
+                actor_pair_bc_loss = F.mse_loss(means, good)
+                distances = (sampled - bad[:, None]).pow(2).sum(-1)
+                # Bounded kernel repulsion in the executed action domain, not
+                # an invalid continuous-density "1 - probability" objective.
+                actor_anti_loss = torch.exp(-distances / (2 * float(actor_anti_radius) ** 2)).mean()
+                actor_rejected_distance = float((means.detach() - bad).norm(dim=-1).mean().item())
+                actor_loss = actor_loss + float(actor_pair_bc_weight) * actor_pair_bc_loss
+                actor_loss = actor_loss + float(actor_anti_weight) * actor_anti_loss
         effective_actor_bc_weight = float(actor_bc_weight)
         if bool(actor_bc_only) and effective_actor_bc_weight <= 0.0:
             effective_actor_bc_weight = 1.0
@@ -1117,11 +1216,16 @@ def sac_update_step(
         else:
             actor_updates = 0.0
 
-        if not bool(actor_bc_only) and not bool(actor_q_only):
-            alpha_loss = -sac.log_alpha.exp() * (log_pi.detach() + sac.target_entropy).mean()
+        alpha_mask = torch.ones(obs.shape[0], device=obs.device, dtype=torch.bool)
+        if alpha_state_scope == "student":
+            alpha_mask = ~teacher_mask
+        alpha_rows = float(alpha_mask.sum().detach().cpu().item())
+        if not bool(actor_bc_only or actor_q_only or fixed_alpha) and alpha_rows > 0:
+            alpha_loss = -sac.log_alpha.exp() * (log_pi.detach().reshape(-1)[alpha_mask] + sac.target_entropy).mean()
             sac.alpha_optimizer.zero_grad(set_to_none=True)
             alpha_loss.backward()
             sac.alpha_optimizer.step()
+            alpha_updates = 1.0
             with torch.no_grad():
                 min_log_alpha = None
                 if float(alpha_min) > 0.0:
@@ -1134,7 +1238,6 @@ def sac_update_step(
                 sac.log_alpha.clamp_(min=lower, max=upper)
         if bool(actor_loss.requires_grad):
             actor_updates = 1.0
-        alpha_updates = 0.0 if bool(actor_bc_only or actor_q_only) else 1.0
 
     soft_update(sac.critic, sac.critic_target, tau)
     actor_loss_sac_value = float(actor_loss_sac.detach().cpu().item())
@@ -1154,6 +1257,10 @@ def sac_update_step(
         actor_loss=float(actor_loss.detach().cpu().item()),
         actor_loss_sac=float(actor_loss_sac_value),
         actor_loss_bc=float(actor_loss_bc.detach().cpu().item()),
+        actor_pair_bc_loss=float(actor_pair_bc_loss.detach().cpu().item()),
+        actor_anti_loss=float(actor_anti_loss.detach().cpu().item()),
+        actor_aux_rows=actor_aux_rows,
+        actor_rejected_distance=actor_rejected_distance,
         actor_loss_ref=float(actor_loss_ref.detach().cpu().item()),
         actor_bc_rows=float(actor_bc_rows),
         actor_bc_weight_mean=float(actor_bc_weight_mean),
@@ -1172,6 +1279,12 @@ def sac_update_step(
         replay_reward_abs_mean=float(rewards.detach().abs().mean().cpu().item()),
         actor_updates=float(actor_updates),
         alpha_updates=float(alpha_updates),
+        alpha_rows=float(alpha_rows),
+        policy_entropy_student=(float((-log_pi.detach().reshape(-1)[~teacher_mask]).mean().cpu().item())
+                                if teacher_mask is not None and bool((~teacher_mask).any()) else 0.0),
+        policy_entropy_teacher=(float((-log_pi.detach().reshape(-1)[teacher_mask]).mean().cpu().item())
+                                if teacher_mask is not None and bool(teacher_mask.any()) else 0.0),
+        pref_source_rows=float(base_pref_rows) if pref_obs is not None and float(pref_rank_weight) > 0.0 else 0.0,
         critic_loss_pref=float(critic_loss_pref.detach().cpu().item()),
         critic_loss_pref_weighted=float(critic_loss_pref_weighted.detach().cpu().item()),
         pvp_proxy_teacher_loss=float(pvp_proxy_teacher_loss.detach().cpu().item()),
@@ -1182,6 +1295,9 @@ def sac_update_step(
         eil_good_batch_fraction=float(eil_good_batch_fraction),
         eil_bad_batch_fraction=float(eil_bad_batch_fraction),
         pref_q_delta=float(pref_q_delta),
+        pref_violation_rate=pref_violation_rate,
+        pref_margin_gap_mean=pref_margin_gap_mean,
+        pref_margin_gap_p95=pref_margin_gap_p95,
         pref_q_teacher_mean=float(pref_q_teacher_mean),
         pref_q_student_mean=float(pref_q_student_mean),
         pref_action_delta_l2=float(pref_action_delta_l2),
