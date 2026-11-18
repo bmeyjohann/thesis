@@ -62,6 +62,23 @@ if [[ "${PREF_STOPGRAD_POSITIVE:-1}" == "1" ]]; then
   PREF_STOPGRAD_POSITIVE_FLAG=(--pref-stopgrad-positive)
 fi
 
+LEARNER_EXTRA_ARGS=()
+if [[ -n "${PREF_LAMBDA_INIT:-}" ]]; then
+  LEARNER_EXTRA_ARGS+=(--pref-lambda-init "$PREF_LAMBDA_INIT")
+fi
+if [[ -n "${PREF_REPLAY_CAPACITY:-}" ]]; then
+  LEARNER_EXTRA_ARGS+=(--pref-replay-capacity "$PREF_REPLAY_CAPACITY")
+fi
+if [[ -n "${TARGET_ENTROPY:-}" ]]; then
+  LEARNER_EXTRA_ARGS+=(--target-entropy "$TARGET_ENTROPY")
+fi
+if [[ -n "${ALPHA_LR:-}" ]]; then
+  LEARNER_EXTRA_ARGS+=(--alpha-lr "$ALPHA_LR")
+fi
+if [[ "${RESET_LEARNER_STATE:-0}" == "1" ]]; then
+  LEARNER_EXTRA_ARGS+=(--reset-learner-state)
+fi
+
 MASK_GOAL_HEADING_FLAG=()
 if [[ "${MASK_GOAL_HEADING:-1}" == "1" ]]; then
   MASK_GOAL_HEADING_FLAG=(--mask-goal-heading)
@@ -170,6 +187,8 @@ exec "$PYTHON_BIN" "$ROOT_DIR/train_unitree_nav_thesis.py" \
   --scan-history "${SCAN_HISTORY:-1}" \
   --scan-history-stride "${SCAN_HISTORY_STRIDE:-1}" \
   --action-history "${ACTION_HISTORY:-0}" \
+  --navigation-policy-hz "${NAVIGATION_POLICY_HZ:-5.0}" \
+  --navigation-transition-mode "${NAVIGATION_TRANSITION_MODE:-tick}" \
   --goal-encoding "${GOAL_ENCODING:-cartesian}" \
   --goal-distance-scale "${GOAL_DISTANCE_SCALE:-14.0}" \
   --velocity-scale "${VELOCITY_SCALE:-1.0}" \
@@ -187,7 +206,13 @@ exec "$PYTHON_BIN" "$ROOT_DIR/train_unitree_nav_thesis.py" \
   --alpha-init "${ALPHA_INIT:-0.001}" \
   --alpha-min "${ALPHA_MIN:-0.0}" \
   --alpha-max "${ALPHA_MAX:-0.05}" \
+  --alpha-state-scope "${ALPHA_STATE_SCOPE:-all}" \
+  "${LEARNER_EXTRA_ARGS[@]}" \
   --actor-bc-weight "${ACTOR_BC_WEIGHT:-0.2}" \
+  --actor-pair-bc-weight "${ACTOR_PAIR_BC_WEIGHT:-0.0}" \
+  --actor-anti-weight "${ACTOR_ANTI_WEIGHT:-0.0}" \
+  --actor-anti-radius "${ACTOR_ANTI_RADIUS:-0.35}" \
+  --actor-anti-samples "${ACTOR_ANTI_SAMPLES:-4}" \
   "${ACTOR_BC_ONLY_FLAG[@]}" \
   --hilserl-demo-ratio "${HILSERL_DEMO_RATIO:-0.5}" \
   --eil-threshold "${EIL_THRESHOLD:-0.0}" \
@@ -231,6 +256,13 @@ exec "$PYTHON_BIN" "$ROOT_DIR/train_unitree_nav_thesis.py" \
   --pref-loss-type "${PREF_LOSS_TYPE:-lagrangian}" \
   --pref-lambda-lr "${PREF_LAMBDA_LR:-0.01}" \
   --pref-lambda-max "${PREF_LAMBDA_MAX:-10.0}" \
+  --pref-sampling-mode "${PREF_SAMPLING_MODE:-linked}" \
+  --pref-batch-size "${PREF_BATCH_SIZE:-256}" \
+  --pref-lambda-ema "${PREF_LAMBDA_EMA:-0.9}" \
+  --pref-violation-target "${PREF_VIOLATION_TARGET:-0.0}" \
+  --pref-dual-mode "${PREF_DUAL_MODE:-hinge}" \
+  --pref-lagrangian-violation-type "${PREF_LAGRANGIAN_VIOLATION_TYPE:-hinge}" \
+  --pref-loss-temperature "${PREF_LOSS_TEMPERATURE:-1.0}" \
   --pref-action-delta-min "${PREF_ACTION_DELTA_MIN:-0.05}" \
   --teacher-scan-block-threshold "${TEACHER_SCAN_BLOCK_THRESHOLD:-0.12}" \
   --teacher-scan-block-delta "${TEACHER_SCAN_BLOCK_DELTA:-0.0}" \

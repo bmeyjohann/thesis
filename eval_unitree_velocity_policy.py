@@ -181,6 +181,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video-width", type=int, default=1280)
     parser.add_argument("--video-height", type=int, default=720)
     parser.add_argument("--viewer", choices=("none", "native", "viser"), default="none")
+    parser.add_argument("--gamepad", action="store_true", help="Drive the velocity command from the Unitree gamepad receiver.")
+    parser.add_argument("--gamepad-host", default="127.0.0.1")
+    parser.add_argument("--gamepad-port", type=int, default=8794)
+    parser.add_argument("--gamepad-stale-timeout-s", type=float, default=0.25)
     parser.add_argument("--head-camera", action="store_true")
     parser.add_argument(
         "--vision-mode",
@@ -322,6 +326,8 @@ def main() -> int:
     if args.viewer != "none":
         if args.video:
             raise ValueError("--viewer and --video are mutually exclusive")
+        if args.gamepad and args.viewer != "viser":
+            raise ValueError("--gamepad currently requires --viewer viser")
         if args.viewer == "native":
             from mjlab.viewer import NativeMujocoViewer
 
@@ -329,7 +335,42 @@ def main() -> int:
         else:
             from mjlab.viewer import ViserPlayViewer
 
-            ViserPlayViewer(env, policy).run()
+            if args.gamepad:
+                from unitree_nav_gamepad import UnitreeGamepadController
+
+                controller = UnitreeGamepadController(
+                    mode="connect",
+                    host=args.gamepad_host,
+                    port=args.gamepad_port,
+                    stale_timeout_s=args.gamepad_stale_timeout_s,
+                    intervention_mode="stick",
+                    intervention_threshold=0.0,
+                    invert_lateral=True,
+                )
+                command_term = env.unwrapped.command_manager.get_term("twist")
+
+                class GamepadVelocityViewer(ViserPlayViewer):
+                    def _execute_step(self) -> bool:
+                        sample = controller.sample()
+                        command = torch.as_tensor(
+                            sample.action,
+                            dtype=command_term.vel_command_b.dtype,
+                            device=command_term.vel_command_b.device,
+                        )
+                        command_term.vel_command_b[:] = command
+                        return super()._execute_step()
+
+                print(
+                    "[velocity-eval] gamepad control active: "
+                    f"{args.gamepad_host}:{args.gamepad_port}",
+                    flush=True,
+                )
+                try:
+                    GamepadVelocityViewer(env, policy).run()
+                finally:
+                    controller.close()
+            else:
+                ViserPlayViewer(env, policy).run()
         env.close()
         return 0
 

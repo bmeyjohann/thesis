@@ -14,6 +14,25 @@ from unitree_nav_layout import set_terrain_tile_indices, terrain_tile_shape
 MANIFEST_VERSION = 1
 
 
+class ManifestEpisodeCursor:
+    """Per-environment case order, independent of asynchronous reset order."""
+
+    def __init__(self, num_envs: int, num_cases: int):
+        if num_envs <= 0 or num_cases < num_envs or num_cases % num_envs:
+            raise ValueError("Training cases must be a positive multiple of num_envs")
+        self.num_envs, self.num_cases = num_envs, num_cases
+        self.counts = [0] * num_envs
+
+    def next(self, env_ids):
+        ids = [int(i) for i in env_ids]
+        if len(set(ids)) != len(ids) or any(i < 0 or i >= self.num_envs for i in ids):
+            raise ValueError("Invalid or duplicate environment ids")
+        indices = [(i + self.counts[i] * self.num_envs) % self.num_cases for i in ids]
+        for i in ids:
+            self.counts[i] += 1
+        return indices
+
+
 def _tolist(value: torch.Tensor) -> list[float]:
     return value.detach().cpu().tolist()
 
@@ -43,6 +62,8 @@ def capture_layout_entries(env, env_ids: Sequence[int] | None = None) -> list[di
                 "tile_index": tile_index,
                 "root_pose_relative": _tolist(pose_relative),
                 "root_velocity": _tolist(root_velocity[env_id]),
+                "joint_position": _tolist(robot.data.joint_pos[env_id]),
+                "joint_velocity": _tolist(robot.data.joint_vel[env_id]),
                 "goal_xy_relative": _tolist(goal_relative[:2]),
                 "goal_heading": float(command._goal_heading_w[env_id].detach().cpu().item()),
             }
@@ -72,6 +93,15 @@ def apply_layout_entries(env, env_ids: Sequence[int] | torch.Tensor, entries: Se
         [entry["root_velocity"] for entry in entries], device=device, dtype=robot.data.root_link_vel_w.dtype
     )
     robot.write_root_state_to_sim(torch.cat([root_pose, root_velocity], dim=-1), env_ids=ids)
+    joint_entries = ["joint_position" in entry and "joint_velocity" in entry for entry in entries]
+    if any(joint_entries):
+        if not all(joint_entries):
+            raise ValueError("A manifest batch must consistently include joint states")
+        positions = torch.as_tensor([entry["joint_position"] for entry in entries],
+                                    device=device, dtype=robot.data.joint_pos.dtype)
+        velocities = torch.as_tensor([entry["joint_velocity"] for entry in entries],
+                                     device=device, dtype=robot.data.joint_vel.dtype)
+        robot.write_joint_state_to_sim(positions, velocities, env_ids=ids)
     unwrapped.sim.forward()
 
     goals = torch.as_tensor(

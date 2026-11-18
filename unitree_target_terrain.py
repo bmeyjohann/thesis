@@ -27,7 +27,9 @@ MATERIAL_STYLE = {
     },
     "ice": {
         "rgba": (0.20, 0.68, 0.96, 1.0),
-        "friction": (0.055, 0.004, 0.0005),
+        # Slippery enough to expose weak control, but not the near-zero-friction
+        # setting that made the flat locomotion policy fall almost immediately.
+        "friction": (0.30, 0.004, 0.0005),
         "speed_scale": 0.72,
     },
     "sand": {
@@ -146,6 +148,7 @@ PRESET_COUNTS = {
     "balanced": {"materials": 11, "geometry": 9, "static": 8, "moving": 2},
     "traversal": {"materials": 14, "geometry": 13, "static": 5, "moving": 1},
     "navigation": {"materials": 9, "geometry": 7, "static": 13, "moving": 4},
+    "challenge": {"materials": 11, "geometry": 13, "static": 8, "moving": 4},
 }
 
 MOVING_OBSTACLE_SPEED_RANGE_MPS = (0.65, 1.8)
@@ -225,9 +228,13 @@ def generate_target_terrain(
                 center=_sample_center(rng, arena_size, radius, protected),
                 radius=radius,
                 yaw=float(rng.uniform(-math.pi, math.pi)),
-                strength=float(rng.uniform(0.45, 1.0)),
+                strength=float(rng.uniform(0.45, 3.5 if preset == "challenge" else 1.0)),
             )
         )
+
+        if preset == "challenge" and index % len(geometry_kinds) == 4:
+            # Retain easier patches, but guarantee genuinely tall stair options.
+            geometry[-1] = replace(geometry[-1], strength=max(2.8, geometry[-1].strength))
 
     obstacles: list[Obstacle] = []
     for index in range(counts["static"]):
@@ -380,6 +387,9 @@ def _add_stairs(world: mujoco.MjsBody, layout: TargetTerrainLayout, brush: Geome
     depth = usable_length / segments
     width = brush.radius * float(rng.uniform(1.05, 1.55))
     peak_height = float(rng.uniform(0.20, 0.48) * (0.65 + 0.35 * brush.strength))
+    if layout.preset == "challenge":
+        # Mix easy stairs with steps too tall to climb safely; routes can go around.
+        peak_height *= brush.strength
     step_height = peak_height / side_steps
     axis = np.array((math.cos(brush.yaw), math.sin(brush.yaw)))
     heights = (
@@ -411,6 +421,8 @@ def _add_ramp(world: mujoco.MjsBody, layout: TargetTerrainLayout, brush: Geometr
     side_length = (total_length - plateau_length) / 2.0
     width = brush.radius * float(rng.uniform(1.0, 1.45))
     rise = float(rng.uniform(0.18, 0.52) * (0.65 + 0.35 * brush.strength))
+    if layout.preset == "challenge":
+        rise *= brush.strength
     pitch = math.atan2(rise, side_length)
     slope_length = math.hypot(rise, side_length)
     half_thickness = 0.035
@@ -614,13 +626,16 @@ class TargetArenaTerrainCfg(SubTerrainCfg):
     MJLab sub-terrain coordinates start at a patch corner, whereas the preview
     generator is centered at the origin.  This adapter translates the same
     deterministic layout and returns every direct geom so TerrainGenerator can
-    apply its world-grid offset.  Moving obstacles are frozen at their initial
-    positions for the first locomotion-transfer diagnostic.
+    apply its world-grid offset. Dynamic obstacles are separate scene entities;
+    old checkpoints retain the original frozen-obstacle diagnostic by default.
     """
 
     seed: int = 3
     preset: str = "balanced"
     material_resolution: float = 0.5
+    dynamic_obstacles: bool = False
+    ice_friction: float = 0.30
+    ice_contact_priority: int = 0
 
     def function(
         self,
@@ -670,6 +685,8 @@ class TargetArenaTerrainCfg(SubTerrainCfg):
                 _add_ramp(body, layout, brush, index)
 
         for index, obstacle in enumerate(layout.obstacles):
+            if obstacle.moving and self.dynamic_obstacles:
+                continue
             geom_type = (
                 mujoco.mjtGeom.mjGEOM_CYLINDER
                 if obstacle.kind == "cylinder"
@@ -694,6 +711,9 @@ class TargetArenaTerrainCfg(SubTerrainCfg):
 
         new_geoms = list(body.geoms)[before:]
         for geom_index, geom in enumerate(new_geoms):
+            if np.allclose(geom.friction, MATERIAL_STYLE["ice"]["friction"]):
+                geom.friction = (self.ice_friction, 0.004, 0.0005)
+                geom.priority = self.ice_contact_priority
             geom.name = f"target_{patch_token}_{geom_index}"
         geometries = [TerrainGeometry(geom=geom) for geom in new_geoms]
         return TerrainOutput(

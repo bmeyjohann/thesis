@@ -238,6 +238,7 @@ def make_env(args: argparse.Namespace, *, num_envs: int, render: bool):
     import src.tasks  # noqa: F401
     from mjlab.rl import RslRlVecEnvWrapper
     from mjlab.tasks.registry import load_env_cfg
+    from mjlab.utils.wrappers import VideoRecorder
     from src.envs import build_env
 
     env_cfg = load_env_cfg(args.task, play=render)
@@ -296,7 +297,30 @@ def make_env(args: argparse.Namespace, *, num_envs: int, render: bool):
                 raise ValueError("goal_distance_min/max must satisfy 0 < min <= max")
             env_cfg.commands["pose"].distance_range = (goal_min, goal_max)
 
+    if (
+        render
+        and bool(getattr(args, "record_video", False))
+        and bool(getattr(args, "video_reset_free", True))
+    ):
+        # MJLab's single-environment CUDA camera path can fail while auto-resetting
+        # goal markers. Detect goal/fall in record_video() and end the clip before
+        # any simulator reset instead.
+        for termination_name in ("time_out", "fell_over", "goal_reached"):
+            env_cfg.terminations.pop(termination_name, None)
+
+    from unitree_nav_camera_features import configure_navigation_cameras
+    configure_navigation_cameras(env_cfg, args)
     env = build_env(env_cfg, device=args.device, render_mode=("rgb_array" if render else None))
+    if render and bool(getattr(args, "record_video", False)):
+        video_dir = Path(args.video_dir) / args.controller
+        video_dir.mkdir(parents=True, exist_ok=True)
+        env = VideoRecorder(
+            env,
+            video_folder=str(video_dir),
+            step_trigger=lambda step: step == 0,
+            video_length=int(args.video_length),
+            disable_logger=True,
+        )
     return RslRlVecEnvWrapper(env, clip_actions=1.0)
 
 
@@ -421,6 +445,10 @@ def _goal_positions_xy(env) -> np.ndarray:
 def _robot_positions_xy(env) -> np.ndarray:
     robot = env.env.unwrapped.scene["robot"]
     return _to_numpy(robot.data.root_link_pos_w)[:, :2]
+
+
+def _environment_origins_xy(env) -> np.ndarray:
+    return _to_numpy(env.env.unwrapped.scene.env_origins)[:, :2]
 
 
 def _resample_continuous_goals(
@@ -828,6 +856,25 @@ def _resample_close_goals(
         selected = torch.zeros(num_envs, dtype=torch.bool, device=term._pose_command_b.device)
         selected[torch.as_tensor(env_ids, device=selected.device, dtype=torch.long).reshape(-1)] = True
 
+    changed = False
+    if bool(getattr(args, "target_terrain", False)):
+        # Target arenas deliberately place the robot at a protected local
+        # start rather than at env_origins. The legacy command sampler anchors
+        # goals to env_origins, so sample target goals relative to the actual
+        # post-reset robot pose instead.
+        target_ids = (
+            torch.nonzero(selected, as_tuple=False).flatten()
+            if selected is not None
+            else torch.arange(num_envs, device=term._pose_command_b.device)
+        )
+        if target_ids.numel() > 0:
+            from unitree_target_navigation import sample_target_goal_positions
+
+            goals = sample_target_goal_positions(env, args, target_ids)
+            term._goal_pos_w[target_ids, :2] = goals
+            term._update_command()
+            changed = True
+
     # The first environment reset can precede the first pose-command sample,
     # leaving a zero vector that is incorrectly counted as immediate success.
     goal_distance = torch.linalg.norm(term._pose_command_b[:, :2], dim=-1)
@@ -835,10 +882,11 @@ def _resample_close_goals(
     if selected is not None:
         invalid_goal &= selected
     invalid_ids = torch.nonzero(invalid_goal, as_tuple=False).flatten()
-    changed = invalid_ids.numel() > 0
-    if changed:
+    invalid_changed = invalid_ids.numel() > 0
+    if invalid_changed:
         term._resample_command(invalid_ids)
         term._update_command()
+        changed = True
     if min_clearance <= 0.0:
         return (_recompute_observations(env) if changed else None), None
 
@@ -1002,12 +1050,20 @@ def _cost_terms(extras: Any, num_envs: int, device: torch.device, term_names: li
 def direct_goal_action(
     obs: torch.Tensor,
     *,
+    goal_encoding: str,
+    goal_distance_scale: float,
     max_vx: float,
     max_vy: float,
     yaw_gain: float,
     align_angle: float,
 ) -> torch.Tensor:
-    goal_xy = obs[:, 6:8]
+    from unitree_nav_observation import unitree_goal_xy
+
+    goal_xy = unitree_goal_xy(
+        obs,
+        goal_encoding=goal_encoding,
+        goal_distance_scale=goal_distance_scale,
+    )
     goal_dist = torch.linalg.norm(goal_xy, dim=-1)
     angle = torch.atan2(goal_xy[:, 1], goal_xy[:, 0]).clamp(-math.pi / 2.0, math.pi / 2.0)
     yaw = torch.clamp(float(yaw_gain) * angle, -1.0, 1.0)
@@ -1087,6 +1143,8 @@ def controller_action(
     if args.controller == "direct_goal":
         return direct_goal_action(
             teacher_obs,
+            goal_encoding=str(args.goal_encoding),
+            goal_distance_scale=float(args.goal_distance_scale),
             max_vx=args.teacher_max_vx,
             max_vy=args.teacher_max_vy,
             yaw_gain=args.teacher_yaw_gain,
@@ -1168,6 +1226,9 @@ def smooth_policy_action(
 
 
 def evaluate(args: argparse.Namespace) -> dict[str, Any]:
+    from unitree_nav_camera_features import camera_enabled
+    if camera_enabled(args):
+        raise ValueError("Camera checkpoints use eval_unitree_browser_policy.py for decision-rate feature/history parity")
     continuous_goals = str(getattr(args, "navigation_episode_mode", "episodic")) == "continuous_goals"
     if continuous_goals and str(getattr(args, "layout_manifest", "")):
         print(
@@ -1226,6 +1287,9 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     if args.controller == "geom_scan_teacher":
         teacher_state = GeomTeacherState.create(num_envs)
     step_dt = 0.05
+    from unitree_nav_control import navigation_action_repeat, project_navigation_action
+
+    navigation_repeat = navigation_action_repeat(float(args.navigation_policy_hz))
 
     ep_return = torch.zeros(num_envs, device=args.device)
     ep_cost = torch.zeros(num_envs, device=args.device)
@@ -1247,8 +1311,12 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     ep_front_action_delta_sum = torch.zeros(num_envs, device=args.device)
     ep_min_goal_distance = torch.full((num_envs,), float("inf"), device=args.device)
     previous_action = torch.zeros(num_envs, int(env.action_space.shape[-1]), device=args.device)
+    held_action = torch.zeros_like(previous_action)
+    control_step = 0
     episode_start_xy = _robot_positions_xy(env).copy()
+    episode_start_quaternion = env.env.unwrapped.scene["robot"].data.root_link_pose_w[:, 3:7].detach().cpu().numpy().copy()
     episode_goal_xy = _goal_positions_xy(env).copy()
+    episode_origin_xy = _environment_origins_xy(env).copy()
     episode_tile_ids = _terrain_tile_ids(env).copy()
     record_trajectories = bool(getattr(args, "record_trajectories", False))
     episode_trajectories = [[episode_start_xy[i].tolist()] for i in range(num_envs)]
@@ -1267,13 +1335,16 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         ep_success |= pre_dist <= float(args.success_dist)
 
         with torch.no_grad():
-            action = controller_action(obs, args, policy_actor, teacher_state, env=env, obstacle_cells=obstacle_cells)
-            action = smooth_policy_action(
-                action,
-                previous_action,
-                controller=args.controller,
-                smoothing=args.policy_action_smoothing,
-            )
+            if control_step % navigation_repeat == 0:
+                held_action = controller_action(obs, args, policy_actor, teacher_state, env=env, obstacle_cells=obstacle_cells)
+                held_action = smooth_policy_action(
+                    held_action,
+                    previous_action,
+                    controller=args.controller,
+                    smoothing=args.policy_action_smoothing,
+                )
+                held_action = project_navigation_action(held_action)
+            action = held_action
         front_obstacle = _frontal_obstacle_mask(obs, args)
         steering = 0.5 * (action[:, 1] / 0.65 + action[:, 2] / 0.85)
         action_delta = torch.linalg.norm(action - previous_action, dim=-1)
@@ -1290,6 +1361,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         ep_action_flips += ((action[:, 1:] * previous_action[:, 1:] < 0.0) & active).any(dim=-1).float()
         previous_action.copy_(action)
         next_raw, reward, done, extras = env.step(action)
+        control_step += 1
         terminal_success = _goal_termination_mask(env, num_envs, torch.device(args.device))
         next_current_obs = _prepare_policy_obs(next_raw, args)
         reward = reward.to(args.device, dtype=torch.float32).reshape(num_envs)
@@ -1341,6 +1413,30 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 if completed_per_env[i] >= episode_quota[i]:
                     continue
                 first_step = int(ep_first_success_step[i].detach().cpu().item())
+                origin_xy = episode_origin_xy[i]
+                start_local = episode_start_xy[i] - origin_xy
+                goal_local = episode_goal_xy[i] - origin_xy
+                trajectory_local = (
+                    (np.asarray(episode_trajectories[i], dtype=np.float32) - origin_xy).tolist()
+                    if record_trajectories
+                    else None
+                )
+                cost_points_local = (
+                    (np.asarray(episode_cost_points[i], dtype=np.float32) - origin_xy).tolist()
+                    if record_trajectories and episode_cost_points[i]
+                    else ([] if record_trajectories else None)
+                )
+                route_features: tuple[str, ...] = ()
+                if bool(getattr(args, "target_terrain", False)):
+                    from unitree_target_navigation import _segment_feature_labels
+                    from unitree_target_terrain import generate_target_terrain
+
+                    route_layout = generate_target_terrain(
+                        int(args.target_terrain_seed if args.target_terrain_seed >= 0 else args.seed),
+                        preset=str(args.target_terrain_preset),
+                        arena_size=float(args.target_terrain_arena_size),
+                    )
+                    route_features = _segment_feature_labels(start_local, goal_local, route_layout)
                 episodes.append(
                     {
                         "success": bool(ep_success[i].detach().cpu().item()),
@@ -1365,10 +1461,18 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                         ),
                         "straight_path_length": float(layout_stats[i]["path_length"]) if layout_stats is not None else None,
                         "terrain_tile_id": int(episode_tile_ids[i]),
+                        "env_origin_xy": origin_xy.tolist(),
                         "start_xy": episode_start_xy[i].tolist(),
+                        "start_quaternion": episode_start_quaternion[i].tolist(),
                         "goal_xy": episode_goal_xy[i].tolist(),
+                        "start_local_xy": start_local.tolist(),
+                        "goal_local_xy": goal_local.tolist(),
                         "trajectory_xy": episode_trajectories[i] if record_trajectories else None,
                         "cost_points_xy": episode_cost_points[i] if record_trajectories else None,
+                        "trajectory_local_xy": trajectory_local,
+                        "cost_points_local_xy": cost_points_local,
+                        "route_features": list(route_features),
+                        "nontrivial_route": bool(route_features),
                         "obstacle_cells_xy": episode_obstacle_cells[i] if record_trajectories else None,
                         **{
                             f"{name}_cost_sum": float(values[i].detach().cpu().item())
@@ -1471,6 +1575,8 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                     layout_stats[i] = next_layout_stats[i]
 
         if done.any():
+            if num_envs == 1:
+                control_step = 0
             done_idx = torch.nonzero(done, as_tuple=False).flatten()
             if manifest is not None:
                 replay_ids = [
@@ -1547,10 +1653,13 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                         layout_stats[i] = next_layout_stats[i]
             current_start_xy = _robot_positions_xy(env)
             current_goal_xy = _goal_positions_xy(env)
+            current_origin_xy = _environment_origins_xy(env)
             current_tile_ids = _terrain_tile_ids(env)
             for i in done_idx.tolist():
                 episode_start_xy[i] = current_start_xy[i]
+                episode_start_quaternion[i] = env.env.unwrapped.scene["robot"].data.root_link_pose_w[i, 3:7].detach().cpu().numpy()
                 episode_goal_xy[i] = current_goal_xy[i]
+                episode_origin_xy[i] = current_origin_xy[i]
                 episode_tile_ids[i] = current_tile_ids[i]
                 if record_trajectories:
                     episode_trajectories[i] = [current_start_xy[i].tolist()]
@@ -1559,10 +1668,13 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         if task_boundary.any():
             current_start_xy = _robot_positions_xy(env)
             current_goal_xy = _goal_positions_xy(env)
+            current_origin_xy = _environment_origins_xy(env)
             current_tile_ids = _terrain_tile_ids(env)
             for i in boundary_idx.tolist():
                 episode_start_xy[i] = current_start_xy[i]
+                episode_start_quaternion[i] = env.env.unwrapped.scene["robot"].data.root_link_pose_w[i, 3:7].detach().cpu().numpy()
                 episode_goal_xy[i] = current_goal_xy[i]
+                episode_origin_xy[i] = current_origin_xy[i]
                 episode_tile_ids[i] = current_tile_ids[i]
                 if record_trajectories:
                     episode_trajectories[i] = [current_start_xy[i].tolist()]
@@ -1678,8 +1790,6 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def record_video(args: argparse.Namespace) -> None:
-    import imageio.v2 as imageio
-
     manifest = None
     manifest_index = int(getattr(args, "video_manifest_index", -1))
     if str(getattr(args, "layout_manifest", "")):
@@ -1714,11 +1824,25 @@ def record_video(args: argparse.Namespace) -> None:
     teacher_state = ScanTeacherState(1, torch.device(args.device)) if args.controller == "scan_teacher" else None
     if args.controller == "geom_scan_teacher":
         teacher_state = GeomTeacherState.create(1)
-    frames = []
-    for _ in range(int(args.video_length)):
+    from unitree_nav_control import navigation_action_repeat, project_navigation_action
+
+    navigation_repeat = navigation_action_repeat(float(args.navigation_policy_hz))
+    held_action = torch.zeros(1, int(env.action_space.shape[-1]), device=args.device)
+    video_cost_sum = 0.0
+    video_min_goal_distance = float("inf")
+    video_outcome = "video_limit"
+    completed_steps = 0
+    for video_step in range(int(args.video_length)):
         with torch.no_grad():
-            action = controller_action(obs, args, policy_actor, teacher_state, env=env, obstacle_cells=obstacle_cells)
-        obs_raw, _, done, _ = env.step(action)
+            if video_step % navigation_repeat == 0:
+                held_action = project_navigation_action(
+                    controller_action(obs, args, policy_actor, teacher_state, env=env, obstacle_cells=obstacle_cells)
+                )
+            action = held_action
+        obs_raw, _, done, extras = env.step(action)
+        completed_steps = video_step + 1
+        cost_vec = _extract_cost(extras, 1, torch.device(args.device))
+        video_cost_sum += float(cost_vec.reshape(-1).sum().detach().cpu().item())
         terminal_success = _goal_termination_mask(env, 1, torch.device(args.device))
         obs = video_history.step(_prepare_policy_obs(obs_raw, args), done, action=action)
         goal_distance = unitree_goal_distance(
@@ -1726,14 +1850,17 @@ def record_video(args: argparse.Namespace) -> None:
             goal_encoding=args.goal_encoding,
             goal_distance_scale=args.goal_distance_scale,
         )
+        video_min_goal_distance = min(
+            video_min_goal_distance,
+            float(goal_distance.reshape(-1)[0].detach().cpu().item()),
+        )
         reached_goal = bool(
             terminal_success.reshape(-1)[0].item()
             or goal_distance.reshape(-1)[0].item() <= float(args.success_dist)
         )
-        frame = env.env.render()
-        if frame is not None:
-            frames.append(frame)
-        if bool(done.reshape(-1)[0].item()) or reached_goal:
+        costful = video_cost_sum > 0.0
+        if bool(done.reshape(-1)[0].item()) or reached_goal or costful:
+            video_outcome = "success" if reached_goal else ("fall" if costful else "timeout")
             if bool(getattr(args, "video_stop_on_done", False)):
                 break
             if (
@@ -1755,12 +1882,21 @@ def record_video(args: argparse.Namespace) -> None:
                 teacher_state.reset()
     env.close()
     video_dir = Path(args.video_dir) / args.controller
-    video_dir.mkdir(parents=True, exist_ok=True)
-    out_path = video_dir / f"{args.controller}.mp4"
-    if not frames:
-        raise RuntimeError("No RGB frames were captured from env.render()")
-    imageio.mimsave(out_path, frames, fps=int(args.video_fps))
-    print(f"[video] wrote {out_path}", flush=True)
+    videos = sorted(video_dir.glob("*.mp4"), key=lambda path: path.stat().st_mtime_ns)
+    if not videos:
+        raise RuntimeError(f"VideoRecorder did not produce an MP4 in {video_dir}")
+    video_path = videos[-1]
+    sidecar = {
+        "video": str(video_path),
+        "seed": int(args.seed),
+        "outcome": video_outcome,
+        "steps": int(completed_steps),
+        "cost_sum": float(video_cost_sum),
+        "min_goal_distance": float(video_min_goal_distance),
+    }
+    video_path.with_suffix(".json").write_text(json.dumps(sidecar, indent=2) + "\n", encoding="utf-8")
+    print(f"[video] wrote actual simulator recording {video_path}", flush=True)
+    print(f"[video] outcome {json.dumps(sidecar, sort_keys=True)}", flush=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -1817,6 +1953,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--velocity-scale", type=float, default=1.0)
     parser.add_argument("--checkpoint-env-config", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--policy-action-smoothing", type=float, default=0.0)
+    parser.add_argument("--navigation-policy-hz", type=float, default=5.0)
     parser.add_argument("--goal-distance-min", type=float, default=0.0)
     parser.add_argument("--goal-distance-max", type=float, default=0.0)
     parser.add_argument("--hidden-dim", type=int, default=256)
@@ -1943,6 +2080,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video-fps", type=int, default=30)
     parser.add_argument("--video-manifest-index", type=int, default=-1)
     parser.add_argument("--video-stop-on-done", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--video-reset-free", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--video-camera-distance", type=float, default=5.0)
     parser.add_argument("--video-camera-elevation", type=float, default=-10.0)
     parser.add_argument("--video-camera-azimuth", type=float, default=90.0)

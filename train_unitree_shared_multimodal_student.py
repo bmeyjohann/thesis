@@ -21,6 +21,18 @@ from unitree_multimodal_locomotion import (
 from unitree_nav_vision import UnitreeVisionCfg, attach_vision_sensors
 
 ARCHITECTURES = ("nomemory", "gru", "gru_reconstruction")
+MODALITY_PATTERNS = (
+    *((name,) for name in MODALITIES),
+    *((name,) for name in MODALITIES),
+    ("height_scan", "depth"),
+    ("height_scan", "mono_rgb"),
+    ("height_scan", "stereo_rgb"),
+    ("depth", "mono_rgb"),
+    ("depth", "stereo_rgb"),
+    ("mono_rgb", "stereo_rgb"),
+    MODALITIES,
+    MODALITIES,
+)
 
 
 def balanced_modality_names(
@@ -33,6 +45,31 @@ def balanced_modality_names(
     return [MODALITIES[(index + phase) % len(MODALITIES)] for index in range(num_envs)]
 
 
+def balanced_modality_availability(
+    num_envs: int,
+    global_step: int,
+    device: torch.device,
+    *,
+    hold_steps: int = 500,
+    sampling: str = "mixed_subsets",
+) -> tuple[torch.Tensor, list[str]]:
+    """Balance deployable single sensors while also training useful combinations."""
+    if sampling == "one_hot":
+        names = balanced_modality_names(num_envs, global_step, hold_steps)
+        return modality_mask(names, device), names
+    if sampling != "mixed_subsets":
+        raise ValueError(f"Unsupported modality sampling mode: {sampling}")
+    phase = global_step // hold_steps
+    masks = torch.zeros((num_envs, len(MODALITIES)), device=device)
+    labels: list[str] = []
+    for row in range(num_envs):
+        pattern = MODALITY_PATTERNS[(row + phase * num_envs) % len(MODALITY_PATTERNS)]
+        for name in pattern:
+            masks[row, MODALITIES.index(name)] = 1.0
+        labels.append("+".join(pattern))
+    return masks, labels
+
+
 def masked_reconstruction_loss(
     prediction: torch.Tensor,
     target: torch.Tensor,
@@ -42,7 +79,7 @@ def masked_reconstruction_loss(
     rows = availability[:, MODALITIES.index("height_scan")] < 0.5
     if not torch.any(rows):
         return prediction.new_zeros(())
-    return F.mse_loss(prediction[rows], target[rows])
+    return F.smooth_l1_loss(prediction[rows], target[rows])
 
 
 def _all_sensor_inputs(
@@ -99,6 +136,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--reconstruction-weight", type=float, default=1.0)
     parser.add_argument("--modality-hold-steps", type=int, default=500)
+    parser.add_argument(
+        "--modality-sampling",
+        choices=("one_hot", "mixed_subsets"),
+        default="mixed_subsets",
+    )
     parser.add_argument("--camera-width", type=int, default=80)
     parser.add_argument("--camera-height", type=int, default=60)
     parser.add_argument("--camera-max-depth", type=float, default=5.0)
@@ -122,7 +164,9 @@ def _save(
         "global_step": global_step,
         "architecture": args.architecture,
         "modalities": list(MODALITIES),
-        "modality_sampling": "balanced_per_environment_held_one_hot",
+        "modality_sampling": "balanced_per_environment_held_subsets",
+        "modality_sampling_mode": args.modality_sampling,
+        "modality_patterns": [list(pattern) for pattern in MODALITY_PATTERNS],
         "modality_hold_steps": args.modality_hold_steps,
         "teacher_obs_normalization_epsilon": 1e-2,
         "input_normalization": {
@@ -197,6 +241,7 @@ def main() -> int:
     done_total = 0
     latest = {"bc_loss": 0.0, "reconstruction_loss": 0.0}
     latest.update({f"bc_loss_{name}": 0.0 for name in MODALITIES})
+    optimizer_updates = 0
 
     for local_step in range(args.steps):
         global_step = start_step + local_step
@@ -215,10 +260,13 @@ def main() -> int:
         student_proprio = (
             actor_obs[:, :98] - teacher_mean[:, :98]
         ) / teacher_std[:, :98]
-        names = balanced_modality_names(
-            args.num_envs, global_step, args.modality_hold_steps
+        availability, assignment_labels = balanced_modality_availability(
+            args.num_envs,
+            global_step,
+            device,
+            hold_steps=args.modality_hold_steps,
+            sampling=args.modality_sampling,
         )
-        availability = modality_mask(names, device)
         if args.architecture == "nomemory":
             predicted = student(student_proprio, observations, availability)
             reconstruction_loss = predicted.new_zeros(())
@@ -243,7 +291,10 @@ def main() -> int:
         latest["reconstruction_loss"] = float(reconstruction_loss.detach().item())
         for index, name in enumerate(MODALITIES):
             rows = availability[:, index] > 0.5
-            latest[f"bc_loss_{name}"] = float(F.mse_loss(predicted[rows], target[rows]).detach().item())
+            if torch.any(rows):
+                latest[f"bc_loss_{name}"] = float(
+                    F.mse_loss(predicted[rows], target[rows]).detach().item()
+                )
 
         if recurrent:
             pending_losses.append(loss)
@@ -252,6 +303,7 @@ def main() -> int:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
             optimizer.step()
+            optimizer_updates += 1
         obs, reward, dones, _ = env.step(target)
         reward_total += float(reward.mean().item())
         done_total += int(dones.sum().item())
@@ -262,12 +314,19 @@ def main() -> int:
                 torch.stack(pending_losses).mean().backward()
                 torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
                 optimizer.step()
+                optimizer_updates += 1
                 hidden = hidden.detach()
                 pending_losses.clear()
 
         completed_step = global_step + 1
         if completed_step % 100 == 0 or local_step + 1 == args.steps:
-            counts = {name: names.count(name) for name in MODALITIES}
+            counts = {
+                name: int((availability[:, index] > 0.5).sum().item())
+                for index, name in enumerate(MODALITIES)
+            }
+            combination_counts = {
+                label: assignment_labels.count(label) for label in sorted(set(assignment_labels))
+            }
             row = {
                 "global_step": completed_step,
                 "cell_step": local_step + 1,
@@ -276,8 +335,11 @@ def main() -> int:
                 "material": args.material,
                 "mean_step_reward": reward_total / (local_step + 1),
                 "termination_count": done_total,
+                "optimizer_updates": optimizer_updates,
+                "modality_sampling": args.modality_sampling,
                 **latest,
                 **{f"assigned_{name}": count for name, count in counts.items()},
+                "assigned_combinations": combination_counts,
             }
             with metrics_path.open("a") as handle:
                 handle.write(json.dumps(row, sort_keys=True) + "\n")

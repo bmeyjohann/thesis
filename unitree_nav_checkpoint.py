@@ -7,12 +7,31 @@ import torch
 
 
 UNITREE_EVAL_CONFIG_KEYS = (
+    "navigation_observation_mode",
+    "navigation_feature_lags",
+    "navigation_image_profile",
+    "navigation_encoder_checkpoint",
+    "navigation_camera_config",
+    "navigation_encoder_sha256",
+    "navigation_encoder_frozen",
     "task",
     "target_terrain",
     "target_terrain_preset",
     "target_terrain_seed",
     "target_terrain_arena_size",
     "target_terrain_material_resolution",
+    "target_terrain_dynamic_obstacles",
+    "target_terrain_ice_friction",
+    "target_terrain_ice_contact_priority",
+    "target_terrain_sand_linear_drag",
+    "target_terrain_start_jitter",
+    "target_terrain_start_boundary_margin",
+    "target_terrain_start_clearance",
+    "target_terrain_start_attempts",
+    "target_terrain_goal_boundary_margin",
+    "target_terrain_goal_clearance",
+    "target_terrain_goal_attempts",
+    "target_terrain_goal_feature_fraction",
     "low_level_policy_path",
     "episode_length_s",
     "navigation_episode_mode",
@@ -37,6 +56,7 @@ UNITREE_EVAL_CONFIG_KEYS = (
     "scan_history",
     "scan_history_stride",
     "action_history",
+    "navigation_policy_hz",
     "student_action_scale",
     "mask_height_scan",
     "mask_proprioception",
@@ -100,6 +120,10 @@ def apply_unitree_checkpoint_config(args: argparse.Namespace) -> dict:
             applied[key] = saved[key]
     if "action_history" not in applied:
         args.action_history = 0
+    if "navigation_feature_lags" not in applied:
+        args.navigation_feature_lags = None
+    if "navigation_image_profile" not in applied:
+        args.navigation_image_profile = 'legacy'
     if "student_action_smoothing" in saved and hasattr(args, "policy_action_smoothing"):
         args.policy_action_smoothing = saved["student_action_smoothing"]
         applied["policy_action_smoothing"] = saved["student_action_smoothing"]

@@ -253,6 +253,10 @@ def rollout_and_plot(
     goal_targets: list[np.ndarray] = []
     segment_start_step = 0
     previous_action = torch.zeros(1, int(env.action_space.shape[-1]), device=args.device)
+    held_action = torch.zeros_like(previous_action)
+    from unitree_nav_control import navigation_action_repeat, project_navigation_action
+
+    navigation_repeat = navigation_action_repeat(float(args.navigation_policy_hz))
 
     for step in range(int(args.steps)):
         xy, heading = _robot_xy_heading(env)
@@ -266,7 +270,9 @@ def rollout_and_plot(
         )
         if success_step is None and live_dist <= args.success_dist:
             success_step = step
-        action = controller_action(obs, args, policy_actor, teacher_state, env=env, obstacle_cells=obstacle_cells)
+        if step % navigation_repeat == 0:
+            held_action = controller_action(obs, args, policy_actor, teacher_state, env=env, obstacle_cells=obstacle_cells)
+        action = held_action
         teacher_intervened = torch.zeros(1, dtype=torch.bool, device=args.device)
         if args.policy_teacher_gate:
             teacher_action = local_geometry_scan_teacher_action(
@@ -296,12 +302,15 @@ def rollout_and_plot(
             action = torch.where(teacher_intervened.unsqueeze(-1), teacher_action, action)
         from eval_unitree_nav_baselines import smooth_policy_action
 
-        action = smooth_policy_action(
-            action,
-            previous_action,
-            controller=args.controller,
-            smoothing=args.policy_action_smoothing,
-        )
+        if step % navigation_repeat == 0:
+            action = smooth_policy_action(
+                action,
+                previous_action,
+                controller=args.controller,
+                smoothing=args.policy_action_smoothing,
+            )
+            held_action = project_navigation_action(action)
+            action = held_action
         previous_action.copy_(action)
 
         xy_hist.append(xy)
@@ -581,6 +590,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--velocity-scale", type=float, default=1.0)
     parser.add_argument("--checkpoint-env-config", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--policy-action-smoothing", type=float, default=0.0)
+    parser.add_argument("--navigation-policy-hz", type=float, default=5.0)
     parser.add_argument("--policy-teacher-gate", action="store_true")
     parser.add_argument("--intervention-clearance-threshold", type=float, default=0.75)
     parser.add_argument("--intervention-release-clearance", type=float, default=0.85)

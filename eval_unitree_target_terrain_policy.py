@@ -19,6 +19,7 @@ from unitree_target_terrain import (
     TargetArenaTerrainCfg,
     generate_target_terrain,
 )
+from unitree_locomotion_cells import _subterrain
 
 
 ROOT = Path(__file__).resolve().parent
@@ -36,7 +37,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--terrain-seed", type=int, default=3)
     parser.add_argument(
-        "--terrain-mode", choices=("target", "flat", "surface", "ramp", "stairs"), default="target"
+        "--terrain-mode",
+        choices=("target", "flat", "surface", "ramp", "stairs", "cobblestone"),
+        default="target",
     )
     parser.add_argument("--surface", choices=("rigid", "ice", "sand"), default="rigid")
     parser.add_argument("--surface-sliding-friction", type=float)
@@ -64,6 +67,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--video", action="store_true")
+    parser.add_argument("--viewer", choices=("none", "viser"), default="none")
+    parser.add_argument("--gamepad", action="store_true")
+    parser.add_argument("--gamepad-host", default="127.0.0.1")
+    parser.add_argument("--gamepad-port", type=int, default=8794)
     parser.add_argument("--video-width", type=int, default=960)
     parser.add_argument("--video-height", type=int, default=720)
     return parser.parse_args()
@@ -235,8 +242,11 @@ def main() -> int:
     from eval_unitree_velocity_policy import _runner_checkpoint_path, _validate_robot_compatibility
 
     obs_dim, action_dim = _validate_robot_compatibility("Unitree-G1-Rough", checkpoint)
-    if obs_dim != 98:
-        raise ValueError(f"Expected the scan-blind flat policy to have 98 observations, got {obs_dim}")
+    if obs_dim not in {98, 285}:
+        raise ValueError(
+            "Expected either the 98-observation flat policy or the "
+            f"285-observation rough/gentle policy, got {obs_dim}"
+        )
 
     layout = (
         generate_target_terrain(args.terrain_seed, preset=args.preset, arena_size=24.0)
@@ -286,8 +296,11 @@ def main() -> int:
                     "ranges": (args.joint_damping_scale, args.joint_damping_scale),
                 },
             )
-    env_cfg.observations["actor"].terms.pop("height_scan", None)
-    env_cfg.observations["critic"].terms.pop("height_scan", None)
+    # Legacy flat checkpoints are scan-blind (98 observations). Rough and
+    # gentle-terrain checkpoints retain the task height scan (285 observations).
+    if obs_dim == 98:
+        env_cfg.observations["actor"].terms.pop("height_scan", None)
+        env_cfg.observations["critic"].terms.pop("height_scan", None)
 
     reset_base = env_cfg.events["reset_base"]
     reset_base.params["pose_range"] = {
@@ -305,8 +318,14 @@ def main() -> int:
     twist.ranges.heading = None
 
     arena_size = 24.0
-    if args.terrain_mode in {"target", "surface", "ramp", "stairs"}:
-        terrain_size = (24.0, 24.0) if args.terrain_mode in {"target", "surface"} else (16.0, 8.0)
+    if args.terrain_mode in {"target", "surface", "ramp", "stairs", "cobblestone"}:
+        terrain_size = (
+            (24.0, 24.0)
+            if args.terrain_mode in {"target", "surface"}
+            else (8.0, 8.0)
+            if args.terrain_mode == "cobblestone"
+            else (16.0, 8.0)
+        )
         subterrain = (
             TargetArenaTerrainCfg(
                 proportion=1.0,
@@ -334,6 +353,8 @@ def main() -> int:
                 contact_priority=int(args.surface_contact_priority),
             )
             if args.terrain_mode == "surface"
+            else _subterrain("cobblestone")
+            if args.terrain_mode == "cobblestone"
             else BidirectionalTraversalTerrainCfg(
                 proportion=1.0,
                 size=terrain_size,
@@ -345,6 +366,8 @@ def main() -> int:
                 steps_per_side=int(args.geometry_steps_per_side),
             )
         )
+        subterrain.proportion = 1.0
+        subterrain.size = terrain_size
         env_cfg.scene.terrain.terrain_generator = TerrainGeneratorCfg(
             seed=int(args.terrain_seed),
             curriculum=False,
@@ -403,6 +426,50 @@ def main() -> int:
     root_state[:, 6] = torch.sin(yaw / 2.0)
     root_state[:, 7:13] = 0.0
     robot.write_root_state_to_sim(root_state)
+
+    if args.viewer != "none":
+        if args.video:
+            raise ValueError("--viewer and --video are mutually exclusive")
+        if num_envs != 1:
+            raise ValueError("Interactive viewing requires --num-paths 1")
+        from mjlab.viewer import ViserPlayViewer
+
+        if args.gamepad:
+            from unitree_nav_gamepad import UnitreeGamepadController
+
+            controller = UnitreeGamepadController(
+                mode="connect",
+                host=args.gamepad_host,
+                port=args.gamepad_port,
+                intervention_mode="stick",
+                intervention_threshold=0.0,
+                invert_lateral=True,
+            )
+            command_term = base_env.command_manager.get_term("twist")
+
+            class GamepadTargetTerrainViewer(ViserPlayViewer):
+                def _execute_step(self) -> bool:
+                    sample = controller.sample()
+                    command_term.vel_command_b[:] = torch.as_tensor(
+                        sample.action,
+                        dtype=command_term.vel_command_b.dtype,
+                        device=command_term.vel_command_b.device,
+                    )
+                    return super()._execute_step()
+
+            print(
+                "[target-terrain-eval] gamepad control active: "
+                f"{args.gamepad_host}:{args.gamepad_port}",
+                flush=True,
+            )
+            try:
+                GamepadTargetTerrainViewer(env, policy).run()
+            finally:
+                controller.close()
+        else:
+            ViserPlayViewer(env, policy).run()
+        env.close()
+        return 0
 
     origins = base_env.scene.env_origins[:, :2].detach().cpu().numpy()
     trajectories: list[list[list[float]]] = [[start.tolist()] for start in start_positions]

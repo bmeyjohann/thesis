@@ -92,6 +92,16 @@ class UnitreeHumanDatasetWriter:
             "step_index": self._as_array(row["step_index"], np.int64),
             "wall_time_unix_s": self._as_array(row["wall_time_unix_s"], np.float64),
         }
+        for prefix in ("", "next_"):
+            for name in ("vision_rgb", "vision_right_rgb", "vision_depth"):
+                key = prefix + name
+                if key in row:
+                    normalized[key] = self._as_array(row[key], np.float32 if name == "vision_depth" else np.uint8)
+            for name in ('policy_image_mono_rgb', 'policy_image_stereo_rgb', 'policy_image_depth',
+                         'policy_image_php_depth', 'vision_valid_mask'):
+                key = prefix + name
+                if key in row:
+                    normalized[key] = self._as_array(row[key], np.float32)
         if not all(np.isfinite(value).all() for key, value in normalized.items() if np.issubdtype(value.dtype, np.floating)):
             raise ValueError("Refusing to record a non-finite human intervention transition")
         self.rows.append(normalized)

@@ -71,11 +71,21 @@ class UnitreeScanHistory:
         action_history: int = 0,
         action_dim: int = 3,
         history_stride: int = 1,
+        scan_lags: list[int] | tuple[int, ...] | None = None,
     ):
         self.history = max(1, int(history))
         self.action_history = max(0, int(action_history))
         self.action_dim = int(action_dim)
         self.history_stride = max(1, int(history_stride))
+        self.scan_lags = tuple(scan_lags) if scan_lags is not None else None
+        if self.scan_lags is not None:
+            if (len(self.scan_lags) != self.history or not self.scan_lags
+                    or self.scan_lags[0] != 0
+                    or any(type(v) is not int or v < 0 for v in self.scan_lags)
+                    or any(a >= b for a, b in zip(self.scan_lags, self.scan_lags[1:]))
+                    or self.history_stride != 1):
+                raise ValueError("scan_lags must be increasing integer decision ages starting at zero, matching history; stride must be one")
+        self._lag_buffer: torch.Tensor | None = None
         self._scans: torch.Tensor | None = None
         self._scan_anchors: torch.Tensor | None = None
         self._scan_steps: torch.Tensor | None = None
@@ -105,6 +115,13 @@ class UnitreeScanHistory:
             self._scan_steps[env_ids] = 0
             if self._actions is not None:
                 self._actions[env_ids] = 0.0
+        if self.scan_lags is not None:
+            if self._lag_buffer is None or self._lag_buffer.shape[0] != obs.shape[0]:
+                self._lag_buffer = scan[:, None, :].repeat(1, max(self.scan_lags) + 1, 1)
+            elif env_ids is None:
+                self._lag_buffer[:] = scan[:, None, :]
+            else:
+                self._lag_buffer[env_ids] = scan[env_ids, None, :]
         return self._join(context)
 
     def step(
@@ -117,16 +134,22 @@ class UnitreeScanHistory:
         if self._scans is None:
             return self.reset(obs)
         assert self._scan_anchors is not None and self._scan_steps is not None
-        self._scan_steps += 1
-        capture = self._scan_steps >= self.history_stride
-        if self.history > 1 and capture.any():
-            captured_history = self._scans[capture].clone()
-            if self.history > 2:
-                self._scans[capture, 2:, :] = captured_history[:, 1:-1, :]
-            self._scans[capture, 1, :] = self._scan_anchors[capture]
-            self._scan_anchors[capture] = scan[capture]
-            self._scan_steps[capture] = 0
-        self._scans[:, 0, :] = scan
+        if self.scan_lags is not None:
+            assert self._lag_buffer is not None
+            self._lag_buffer = torch.roll(self._lag_buffer, shifts=1, dims=1)
+            self._lag_buffer[:, 0, :] = scan
+            self._scans = self._lag_buffer[:, list(self.scan_lags), :].clone()
+        else:
+            self._scan_steps += 1
+            capture = self._scan_steps >= self.history_stride
+            if self.history > 1 and capture.any():
+                captured_history = self._scans[capture].clone()
+                if self.history > 2:
+                    self._scans[capture, 2:, :] = captured_history[:, 1:-1, :]
+                self._scans[capture, 1, :] = self._scan_anchors[capture]
+                self._scan_anchors[capture] = scan[capture]
+                self._scan_steps[capture] = 0
+            self._scans[:, 0, :] = scan
         if self.action_history:
             if action is None:
                 raise ValueError("Unitree action history requires the executed action on every step")
@@ -137,6 +160,8 @@ class UnitreeScanHistory:
             self._scans[done] = scan[done, None, :]
             self._scan_anchors[done] = scan[done]
             self._scan_steps[done] = 0
+            if self._lag_buffer is not None:
+                self._lag_buffer[done] = scan[done, None, :]
             if self._actions is not None:
                 self._actions[done] = 0.0
         return self._join(context)
