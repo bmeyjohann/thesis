@@ -147,6 +147,7 @@ def _make_env_with_wrappers(
             threshold=float(args.intervention_threshold),
             hold_seconds=float(args.intervention_hold_seconds),
             clearance_override_threshold=float(getattr(args, "teacher_override_clearance_threshold", -1.0)),
+            debug_console=bool(getattr(args, "debug_intervention_console", False)),
         )
     return env
 
@@ -1630,6 +1631,8 @@ def run_minimal_training(args) -> None:
     win = EpisodeWindow(size=100)
     max_steps = extract_step_limit(env)
     start_time = time.time()
+    env_fps_limit = float(max(0.0, getattr(args, "env_fps_limit", 0.0)))
+    env_step_period = (1.0 / env_fps_limit) if env_fps_limit > 0.0 else 0.0
     next_log = int(args.log_interval) if int(args.log_interval) > 0 else None
     next_eval = int(args.eval_interval)
     next_save = int(args.save_interval)
@@ -1660,6 +1663,7 @@ def run_minimal_training(args) -> None:
     update_window: dict[str, float] = defaultdict(float)
 
     for step in range(1, int(args.total_timesteps) + 1):
+        step_t0 = time.perf_counter()
         if step <= int(effective_learning_starts):
             student_action = env.action_space.sample().astype(np.float32)
         else:
@@ -1812,6 +1816,11 @@ def run_minimal_training(args) -> None:
             ep_first_goal_hit_step = None
             ep_first_goal_reward_sum = 0.0
             ep_first_goal_dense_reward_sum = 0.0
+
+        if env_step_period > 0.0:
+            remaining = env_step_period - (time.perf_counter() - step_t0)
+            if remaining > 0.0:
+                time.sleep(remaining)
 
         if next_log is not None and step >= next_log:
             next_log += int(args.log_interval)

@@ -72,12 +72,14 @@ class HumanInterventionWrapper(gym.Wrapper):
         threshold: float = 0.1,
         hold_seconds: float = 0.25,
         clearance_override_threshold: float = -1.0,
+        debug_console: bool = False,
     ):
         super().__init__(env)
         self.controller = controller
         self.threshold = float(threshold)
         self.hold_seconds = float(hold_seconds)
         self.clearance_override_threshold = float(clearance_override_threshold)
+        self.debug_console = bool(debug_console)
 
         self._last_override_ts = -1e9
         self._last_override_action: Optional[np.ndarray] = None
@@ -85,6 +87,10 @@ class HumanInterventionWrapper(gym.Wrapper):
         self._last_obs: Optional[np.ndarray] = None
         self._last_teacher_reason: Optional[str] = None
         self._last_trigger_clearance: Optional[float] = None
+        self._last_human_norm: float = 0.0
+        self._last_human_above_threshold: bool = False
+        self._last_human_action: Optional[np.ndarray] = None
+        self._was_intervening_prev_step: bool = False
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
@@ -94,6 +100,10 @@ class HumanInterventionWrapper(gym.Wrapper):
         self._last_obs = np.asarray(obs, dtype=np.float32).reshape(-1)
         self._last_teacher_reason = None
         self._last_trigger_clearance = None
+        self._last_human_norm = 0.0
+        self._last_human_above_threshold = False
+        self._last_human_action = None
+        self._was_intervening_prev_step = False
         return obs, info
 
     def _clearance_override_active(self) -> tuple[bool, Optional[float]]:
@@ -131,10 +141,15 @@ class HumanInterventionWrapper(gym.Wrapper):
         except TypeError:
             human_raw = self.controller.get_action()
         human = np.asarray(human_raw, dtype=np.float32)
+        self._last_human_action = np.asarray(human, dtype=np.float32)
+        self._last_human_norm = float(np.linalg.norm(human))
         now = time.perf_counter()
-        if float(np.linalg.norm(human)) > self.threshold:
+        if self._last_human_norm > self.threshold:
             self._last_override_ts = now
             self._last_override_action = human
+            self._last_human_above_threshold = True
+        else:
+            self._last_human_above_threshold = False
         active = (now - self._last_override_ts) <= self.hold_seconds
         if active and self._last_override_action is not None:
             self._last_teacher_reason = "human"
@@ -163,6 +178,8 @@ class HumanInterventionWrapper(gym.Wrapper):
         info = dict(info)
         info["teacher_intervened"] = bool(intervened)
         info["teacher_reason"] = self._last_teacher_reason if intervened else None
+        info["human_input_norm"] = float(self._last_human_norm)
+        info["human_input_above_threshold"] = bool(self._last_human_above_threshold)
         info["teacher_trigger_clearance"] = (
             float(self._last_trigger_clearance) if intervened and self._last_trigger_clearance is not None else None
         )
@@ -170,6 +187,25 @@ class HumanInterventionWrapper(gym.Wrapper):
         info["student_action"] = np.asarray(student_action, dtype=np.float32)
         info["teacher_delta_l2"] = float(np.linalg.norm(info["teacher_action"] - info["student_action"]))
         info["teacher_controller_ms"] = float(controller_ms)
+
+        if self.debug_console:
+            if intervened and not self._was_intervening_prev_step:
+                print(
+                    "[Intervention] START "
+                    f"norm={self._last_human_norm:.4f} "
+                    f"threshold={self.threshold:.4f} "
+                    f"hold={self.hold_seconds:.3f}s "
+                    f"action={np.array2string(np.asarray(info['teacher_action']), precision=3)}",
+                    flush=True,
+                )
+            elif (not intervened) and self._was_intervening_prev_step:
+                print(
+                    "[Intervention] END "
+                    f"norm={self._last_human_norm:.4f} "
+                    f"above_threshold={int(self._last_human_above_threshold)}",
+                    flush=True,
+                )
+        self._was_intervening_prev_step = bool(intervened)
 
         if terminated or truncated:
             info.update(self._stats.finalize())
